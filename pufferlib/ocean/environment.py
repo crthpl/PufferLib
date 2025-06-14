@@ -141,7 +141,7 @@ MAKE_FUNCTIONS = {
     'trash_pickup': 'TrashPickupEnv',
     'tower_climb': 'TowerClimb',
     'grid': 'Grid',
-    'cpr': 'PyCPR',
+    'shared_pool': 'PyCPR',
     'impulse_wars': 'ImpulseWars',
     'gpudrive': 'GPUDrive',
     'pacman': 'Pacman',
