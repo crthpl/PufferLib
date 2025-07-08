@@ -34,7 +34,7 @@ int main() {
             else if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) action = LEFT;
             else if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) action = RIGHT;
             env.actions[0] = action - 1;
-        } else if (frame % 10 != 0) {
+        } else if (frame % 1 != 0) {
             continue;
         } else {
             action = 1;
