@@ -354,6 +354,13 @@ void calc_whisker_lengths(WhiskerRacer* env) {
             c_reset(env);
         }
     }
+
+    if (*lengths[0] >= 0.99f && *lengths[1] >= 0.99f) { // Car probably left the track
+        for (int j = 0; j < 2; j++) *lengths[j] = 0.0f;
+        env->terminals[0] = 1;
+        add_log(env);
+        c_reset(env);
+    }
 }
 
 void update_radial_progress(WhiskerRacer* env) {
@@ -866,7 +873,6 @@ void c_render(WhiskerRacer* env) {
     }
 
     Vector2* center_points = malloc(sizeof(Vector2) * (env->track.total_points + 3));
-    //center_points[0] = (Vector2){SCREEN_WIDTH*0.5f, SCREEN_HEIGHT*0.5f};
     for (int i = 0; i < env->track.total_points; i++) {
         center_points[i] = env->track.centerline[i];
         center_points[i].y = env->height - center_points[i].y;
