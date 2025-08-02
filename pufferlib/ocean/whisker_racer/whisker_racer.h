@@ -762,6 +762,7 @@ void Mode7(WhiskerRacer* env, RenderTexture2D mode7RenderTexture) {
     int height = env->height;
     int width = env->width;
     float inv_width = env->inv_width;
+    float inv_height = env->inv_height;
 
     int horizon = height / 2;
 
@@ -772,6 +773,8 @@ void Mode7(WhiskerRacer* env, RenderTexture2D mode7RenderTexture) {
     float sin_ang2 = 2.0f * sin_ang;
 
     float height9 = 9.0f * height;
+
+    DrawRectangle(0, horizon, width, height-horizon, DARKGREEN);
 
     for (int screenY = horizon; screenY < height; screenY += 3) {
         float row = (float)(screenY - horizon);
@@ -804,6 +807,33 @@ void Mode7(WhiskerRacer* env, RenderTexture2D mode7RenderTexture) {
     }
     UnloadImageColors(pixels);
     UnloadImage(sceneImage);
+
+    int minimap_width = width * 0.333f;
+    int minimap_height = height * 0.333f;
+    int minimap_x = width - minimap_width;
+    int minimap_y = 0;
+
+    DrawTexturePro(
+        scene,
+        (Rectangle){0, 0, width, -height},
+        (Rectangle){minimap_x, minimap_y, minimap_width, minimap_height},
+        (Vector2){0, 0},
+        0,
+        WHITE
+    );
+
+    float minimap_puffer_size = 8.0f;
+    float minimap_px = minimap_x + (env->px * inv_width) * minimap_width;
+    float minimap_py = minimap_y + ((height - env->py) * inv_height) * minimap_height;
+
+    DrawTexturePro(
+        env->puffer,
+        (Rectangle){0, 0, 128, 128},
+        (Rectangle){minimap_px, minimap_py, minimap_puffer_size, minimap_puffer_size},
+        (Vector2){minimap_puffer_size / 2.0f, minimap_puffer_size / 2.0f},
+        (-env->ang * 180.0f / PI) - 10,
+        WHITE
+    );
 
     EndDrawing();
 }
