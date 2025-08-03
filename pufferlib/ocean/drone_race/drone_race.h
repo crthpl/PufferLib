@@ -130,7 +130,7 @@ void c_reset(DroneRace *env) {
     Drone *drone = &env->drone;
 
     float size = rndf(0.05f, 0.8f);
-    init_drone(drone, size, 0.0f);
+    init_drone(drone, size, 0.1f);
     
     // creates rings
     float ring_radius = 2.0f;

@@ -390,7 +390,7 @@ void reset_agent(DroneSwarm* env, Drone *agent, int idx) {
     //float size = 0.2f;
     //init_drone(agent, size, 0.0f);
     float size = rndf(0.1f, 0.4);
-    init_drone(agent, size, 0.0f);
+    init_drone(agent, size, 0.1f);
     compute_reward(env, agent, env->task != TASK_RACE);
 }
 
