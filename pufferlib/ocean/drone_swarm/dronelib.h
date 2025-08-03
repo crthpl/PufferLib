@@ -441,6 +441,17 @@ void move_drone(Drone* drone, float* actions) {
     clamp3(&drone->state.omega, -drone->params.max_omega, drone->params.max_omega);
 }
 
+void reset_rings(Ring* ring_buffer, int num_rings, float ring_radius) {
+    ring_buffer[0] = rndring(ring_radius);
+    
+    // ensure rings are spaced at least 2*ring_radius apart
+    for (int i = 1; i < num_rings; i++) {
+        do {
+            ring_buffer[i] = rndring(ring_radius);
+        }  while (norm3(sub3(ring_buffer[i].pos, ring_buffer[i - 1].pos)) < 2.0f*ring_radius);
+    }   
+}
+
 float check_ring(Drone* drone, Ring* ring) {
     // previous dot product negative if on the 'entry' side of the ring's plane
     float prev_dot = dot3(sub3(drone->prev_pos, ring->pos), ring->normal);

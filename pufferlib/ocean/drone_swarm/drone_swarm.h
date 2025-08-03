@@ -420,20 +420,17 @@ void c_reset(DroneSwarm *env) {
     }
     if (env->task == TASK_RACE) {
         float ring_radius = 2.0f;
-        
-        env->ring_buffer[0] = rndring(ring_radius);
-
-        for (int i = 1; i < env->max_rings; i++) {
-            do {
-                env->ring_buffer[i] = rndring(ring_radius);
-            } while (norm3(sub3(env->ring_buffer[i].pos, env->ring_buffer[i - 1].pos)) < 2.0f*ring_radius);
-        }
+        reset_rings(env->ring_buffer, env->max_rings, ring_radius);
 
         // start drone at least MARGIN away from the first ring
         for (int i = 0; i < env->num_agents; i++) {
             Drone *drone = &env->agents[i];
             do {
-                drone->state.pos = (Vec3){rndf(-GRID_X + 1, GRID_X - 1), rndf(-GRID_Y + 1, GRID_Y - 1), rndf(-GRID_Z + 1, GRID_Z - 1)};
+                drone->state.pos = (Vec3){
+                    rndf(-MARGIN_X, MARGIN_X), 
+                    rndf(-MARGIN_Y, MARGIN_Y), 
+                    rndf(-MARGIN_Z, MARGIN_Z)
+                };
             } while (norm3(sub3(drone->state.pos, env->ring_buffer[0].pos)) < 2.0f*ring_radius);
         }
     }
@@ -648,6 +645,10 @@ void c_render(DroneSwarm *env) {
         env->task = (env->task + 1) % TASK_N;
         for (int i = 0; i < env->num_agents; i++) {
             set_target(env, i);
+        }
+        if (env->task == TASK_RACE) {
+            float ring_radius = 2.0f;
+            reset_rings(env->ring_buffer, env->max_rings, ring_radius);
         }
     }
 
