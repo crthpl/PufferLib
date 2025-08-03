@@ -24,6 +24,8 @@ struct Client {
     float camera_elevation;
     bool is_dragging;
     Vector2 last_mouse_pos;
+
+    Trail trail;
 };
 
 typedef struct DroneRace DroneRace;
@@ -298,6 +300,12 @@ Client *make_client(DroneRace *env) {
 
     update_camera_position(client);
 
+    client->trail.index = 0;
+    client->trail.count = 0;
+    for (int j = 0; j < TRAIL_LENGTH; j++) {
+        client->trail.pos[j] = env->drone.state.pos;
+    }
+
     return client;
 }
 
@@ -342,6 +350,16 @@ void c_render(DroneRace *env) {
     handle_camera_controls(env->client);
 
     Client *client = env->client;
+
+    client->trail.pos[client->trail.index] = env->drone.state.pos;
+    client->trail.index = (client->trail.index + 1) % TRAIL_LENGTH;
+    if (client->trail.count < TRAIL_LENGTH) {
+        client->trail.count++;
+    }
+    if (env->terminals[0]) {
+        client->trail.index = 0;
+        client->trail.count = 0;
+    }    
 
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
@@ -398,6 +416,18 @@ void c_render(DroneRace *env) {
                    (Vector3){drone->state.pos.x + drone->state.vel.x * 0.1f, drone->state.pos.y + drone->state.vel.y * 0.1f,
                              drone->state.pos.z + drone->state.vel.z * 0.1f},
                    MAGENTA);
+    }
+
+    if (client->trail.count > 2) {
+        for (int j = 0; j < client->trail.count - 1; j++) {
+            int idx0 = (client->trail.index - j - 1 + TRAIL_LENGTH) % TRAIL_LENGTH;
+            int idx1 = (client->trail.index - j - 2 + TRAIL_LENGTH) % TRAIL_LENGTH;
+            float alpha = (float)(TRAIL_LENGTH - j) / (float)client->trail.count * 0.8f; // fade out
+            Color trail_color = ColorAlpha((Color){0, 187, 187, 255}, alpha);
+            DrawLine3D((Vector3){client->trail.pos[idx0].x, client->trail.pos[idx0].y, client->trail.pos[idx0].z},
+                        (Vector3){client->trail.pos[idx1].x, client->trail.pos[idx1].y, client->trail.pos[idx1].z},
+                        trail_color);
+        }
     }
 
     // draws current and previous ring
