@@ -242,10 +242,10 @@ void reset_round(WhiskerRacer* env) {
 }
 
 void c_reset(WhiskerRacer* env) {
+    compute_observations(env);
     env->score = 0;
     reset_round(env);
     env->tick = 0;
-    compute_observations(env);
 }
 
 // Line segment intersection helper function
