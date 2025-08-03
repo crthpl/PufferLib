@@ -397,16 +397,13 @@ void reset_agent(DroneSwarm* env, Drone *agent, int idx) {
 void c_reset(DroneSwarm *env) {
     env->tick = 0;
     //env->task = rand() % (TASK_N - 1);
-    //env->task = TASK_FLAG;
-    //env->task = TASK_CONGO;
-    env->task = rand() % (TASK_N - 1);
-    /*
+    
     if (rand() % 4) {
         env->task = TASK_RACE;
     } else {
         env->task = rand() % (TASK_N - 1);
     }
-    */
+    
     //env->task = TASK_RACE;
     //env->task = TASK_HOVER;
     //env->task = TASK_FLAG;
@@ -423,9 +420,8 @@ void c_reset(DroneSwarm *env) {
     }
     if (env->task == TASK_RACE) {
         float ring_radius = 2.0f;
-        if (env->max_rings + 1 > 0) {
-            env->ring_buffer[0] = rndring(ring_radius);
-        }
+        
+        env->ring_buffer[0] = rndring(ring_radius);
 
         for (int i = 1; i < env->max_rings; i++) {
             do {
@@ -437,7 +433,7 @@ void c_reset(DroneSwarm *env) {
         for (int i = 0; i < env->num_agents; i++) {
             Drone *drone = &env->agents[i];
             do {
-                drone->state.pos = (Vec3){rndf(-9, 9), rndf(-9, 9), rndf(-9, 9)};
+                drone->state.pos = (Vec3){rndf(-GRID_X + 1, GRID_X - 1), rndf(-GRID_Y + 1, GRID_Y - 1), rndf(-GRID_Z + 1, GRID_Z - 1)};
             } while (norm3(sub3(drone->state.pos, env->ring_buffer[0].pos)) < 2.0f*ring_radius);
         }
     }
