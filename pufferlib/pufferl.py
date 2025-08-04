@@ -531,7 +531,7 @@ class PuffeRL:
         return model_path
 
     def print_dashboard(self, clear=False, idx=[0],
-            c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
+            c1='[cyan]', c2='[dim default]', b1='[bright_cyan]', b2='[default]'):
         config = self.config
         sps = dist_sum(self.sps, config['device'])
         agent_steps = dist_sum(self.global_step, config['device'])
@@ -562,7 +562,7 @@ class PuffeRL:
         idx[0] = (idx[0] - 1) % 10
             
         s = Table(box=None, expand=True)
-        remaining = 'A hair past a freckle'
+        remaining = f'{b2}A hair past a freckle{c2}'
         if sps != 0:
             remaining = duration((config['total_timesteps'] - agent_steps)/sps, b2, c2)
 
@@ -661,15 +661,15 @@ def compute_puff_advantage(values, rewards, terminals,
 
 def abbreviate(num, b2, c2):
     if num < 1e3:
-        return str(num)
+        return f'{b2}{num}{c2}'
     elif num < 1e6:
-        return f'{num/1e3:.1f}K'
+        return f'{b2}{num/1e3:.1f}{c2}K'
     elif num < 1e9:
-        return f'{num/1e6:.1f}M'
+        return f'{b2}{num/1e6:.1f}{c2}M'
     elif num < 1e12:
-        return f'{num/1e9:.1f}B'
+        return f'{b2}{num/1e9:.1f}{c2}B'
     else:
-        return f'{num/1e12:.2f}T'
+        return f'{b2}{num/1e12:.2f}{c2}T'
 
 def duration(seconds, b2, c2):
     if seconds < 0:
