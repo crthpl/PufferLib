@@ -56,6 +56,7 @@ struct Log {
     float rings_passed;
     float collision_rate;
     float oob;
+    float timeout;
     float score;
     float perf;
     float n;

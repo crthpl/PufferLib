@@ -59,11 +59,14 @@ void init(DroneRace *env) {
     //printf("init");
 }
 
-void add_log(DroneRace *env) {
+void add_log(DroneRace *env, float oob, float collision, float timeout) {
     env->log.score += env->score;
     env->log.episode_return += env->episodic_return;
     env->log.episode_length += env->tick;
     env->log.perf += (float)env->ring_idx / (float)env->max_rings;
+    env->log.oob += oob;
+    env->log.collision_rate += collision;
+    env->log.timeout += timeout;
     env->log.n += 1.0f;
 }
 
@@ -115,6 +118,11 @@ void compute_observations(DroneRace *env) {
     env->observations[22] = drone->state.quat.x;
     env->observations[23] = drone->state.quat.y;
     env->observations[24] = drone->state.quat.z;
+
+    env->observations[25] = drone->state.rpms[0] / drone->params.max_rpm;
+    env->observations[26] = drone->state.rpms[1] / drone->params.max_rpm;
+    env->observations[27] = drone->state.rpms[2] / drone->params.max_rpm;
+    env->observations[28] = drone->state.rpms[3] / drone->params.max_rpm;
 }
 
 void c_reset(DroneRace *env) {
@@ -170,7 +178,7 @@ void c_step(DroneRace *env) {
         env->rewards[0] -= 1;
         env->episodic_return -= 1;
         env->terminals[0] = 1;
-        add_log(env);
+        add_log(env, 1.0f, 0.0f, 0.0f);
         c_reset(env);
         compute_observations(env);
         return;
@@ -186,7 +194,7 @@ void c_step(DroneRace *env) {
         env->ring_idx++;
     } else if (reward < 0) {
         env->terminals[0] = 1;
-        add_log(env);
+        add_log(env, 0.0f, 1.0f, 0.0f);
         c_reset(env);
         return;
     }
@@ -195,7 +203,7 @@ void c_step(DroneRace *env) {
     env->moves_left -= 1;
     if (env->moves_left == 0 || env->ring_idx == env->max_rings) {
         env->terminals[0] = 1;
-        add_log(env);
+        add_log(env, 0.0f, 0.0f, env->moves_left == 0 ? 1.0f : 0.0f);
         c_reset(env);
         return;
     }
