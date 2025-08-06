@@ -1,13 +1,10 @@
-# TODO: Add information
-# - Help menu
-# - Docs link
-#python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=1 clean_pufferl.py --env puffer_nmmo3 --mode train
-# torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
-from torch.distributed.elastic.multiprocessing.errors import record
+## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
+# This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
+# Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
 
+import contextlib
 import warnings
 warnings.filterwarnings('error', category=RuntimeWarning)
-
 
 import os
 import sys
@@ -27,6 +24,7 @@ import psutil
 
 import torch
 import torch.distributed
+from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
 
 import pufferlib
@@ -138,7 +136,9 @@ class PuffeRL:
         self.uncompiled_policy = policy
         self.policy = policy
         if config['compile']:
-            self.policy = torch.compile(policy, mode=config['compile_mode'], fullgraph=config['compile_fullgraph'])
+            self.policy = torch.compile(policy, mode=config['compile_mode'])
+            self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+            pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         # Optimizer
         if config['optimizer'] == 'adam':
@@ -176,7 +176,9 @@ class PuffeRL:
 
         # Automatic mixed precision
         precision = config['precision']
-        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
+        self.amp_context = contextlib.nullcontext()
+        if config.get('amp', True) and config['device'] == 'cuda':
+            self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
         if precision not in ('float32', 'bfloat16'):
             raise pufferlib.APIUsageError(f'Invalid precision: {precision}: use float32 or bfloat16')
 
@@ -220,8 +222,8 @@ class PuffeRL:
 
         if config['use_rnn']:
             for k in self.lstm_h:
-                self.lstm_h[k].zero_()
-                self.lstm_c[k].zero_()
+                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
+                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
 
         self.full_rows = 0
         while self.full_rows < self.segments:
@@ -229,11 +231,9 @@ class PuffeRL:
             o, r, d, t, info, env_id, mask = self.vecenv.recv()
 
             profile('eval_misc', epoch)
-            # TODO: Port to vecenv
             env_id = slice(env_id[0], env_id[-1] + 1)
 
-            # TODO: Handle truncations
-            done_mask = d + t
+            done_mask = d + t # TODO: Handle truncations separately
             self.global_step += int(mask.sum())
 
             profile('eval_copy', epoch)
@@ -280,9 +280,7 @@ class PuffeRL:
                 self.terminals[batch_rows, l] = d.float()
                 self.values[batch_rows, l] = value.flatten()
 
-                # TODO: Handle masks!!
-                #indices = np.where(mask)[0]
-                #data.ep_lengths[env_id[mask]] += 1
+                # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
                 if l+1 >= config['bptt_horizon']:
                     num_full = env_id.stop - env_id.start
@@ -368,31 +366,26 @@ class PuffeRL:
                 lstm_c=None,
             )
 
-            # TODO: Currently only returning traj shaped value as a hack
             logits, newvalue = self.policy(mb_obs, state)
-            # TODO: Redundant actions?
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile('train_misc', epoch)
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
             ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach() # TODO: Experiment with this
+            self.ratio[idx] = ratio.detach()
 
-            # TODO: Only do this if we are KL clipping? Saves 1-2% compute
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
-            # TODO: Do you need to do this? Policy hasn't changed
             adv = advantages[idx]
             adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
                 ratio, adv, config['gamma'], config['gae_lambda'],
                 config['vtrace_rho_clip'], config['vtrace_c_clip'])
             adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8) # TODO: Norm by full batch
-            #adv = mb_prio * (adv - advantages.mean()) / (advantages.std() + 1e-8) # TODO: Norm by full batch
+            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
             # Losses
             pg_loss1 = -adv * ratio
@@ -408,7 +401,7 @@ class PuffeRL:
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            self.amp_context.__enter__() # TODO: Debug
+            self.amp_context.__enter__() # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
             self.values[idx] = newvalue.detach().float()
@@ -503,7 +496,7 @@ class PuffeRL:
         self.utilization.stop()
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], f'{run_id}.pt')
+        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}.pt')
         shutil.copy(model_path, path)
         return path
 
@@ -513,11 +506,11 @@ class PuffeRL:
                return
  
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], run_id)
+        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}')
         if not os.path.exists(path):
             os.makedirs(path)
 
-        model_name = f'model_{self.epoch:06d}.pt'
+        model_name = f'model_{self.config["env"]}_{self.epoch:06d}.pt'
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
@@ -560,7 +553,7 @@ class PuffeRL:
         table.add_column(justify="right", width=13)
 
         table.add_row(
-            f'{b1}PufferLib {b2}2.0.0 {idx[0]*" "}:blowfish:',
+            f'{b1}PufferLib {b2}3.0 {idx[0]*" "}:blowfish:',
             f'{c1}CPU: {b2}{np.mean(self.utilization.cpu_util):.1f}{c2}%',
             f'{c1}GPU: {b2}{np.mean(self.utilization.gpu_util):.1f}{c2}%',
             f'{c1}DRAM: {b2}{np.mean(self.utilization.cpu_mem):.1f}{c2}%',
@@ -679,6 +672,8 @@ def abbreviate(num, b2, c2):
         return f'{num/1e12:.2f}T'
 
 def duration(seconds, b2, c2):
+    if seconds < 0:
+        return f"{b2}0{c2}s"
     seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
@@ -875,8 +870,6 @@ class WandbLogger:
  
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
-    vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
     if 'LOCAL_RANK' in os.environ:
@@ -887,6 +880,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         local_rank = int(os.environ["LOCAL_RANK"])
         print(f"rank: {local_rank}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
         torch.cuda.set_device(local_rank)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+
+    vecenv = vecenv or load_env(env_name, args)
+    policy = policy or load_policy(args, vecenv, env_name)
+
+    if 'LOCAL_RANK' in os.environ:
         args['train']['device'] = torch.cuda.current_device()
         torch.distributed.init_process_group(backend='nccl', world_size=world_size)
         policy = policy.to(local_rank)
@@ -910,7 +909,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     all_logs = []
     while pufferl.global_step < train_config['total_timesteps']:
+        if train_config['device'] == 'cuda':
+            torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
+        if train_config['device'] == 'cuda':
+            torch.compiler.cudagraph_mark_step_begin()
         logs = pufferl.train()
 
         if logs is not None:
@@ -937,12 +940,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
 def eval(env_name, args=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
-    args['vec'] = dict(backend='Serial', num_envs=1)
-    vecenv = vecenv or load_env(env_name, args)
-    if not isinstance(vecenv, pufferlib.vector.Serial):
-        raise pufferlib.APIUsageError('eval requires Serial vector env')
+    backend = args['vec']['backend']
+    if backend != 'PufferEnv':
+        backend = 'Serial'
 
-    policy = policy or load_policy(args, vecenv)
+    args['vec'] = dict(backend=backend, num_envs=1)
+    vecenv = vecenv or load_env(env_name, args)
+
+    policy = policy or load_policy(args, vecenv, env_name)
     ob, info = vecenv.reset()
     driver = vecenv.driver_env
     num_agents = vecenv.observation_space.shape[0]
@@ -966,11 +971,12 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             print('\033[0;0H' + render + '\n')
             time.sleep(1/args['fps'])
         elif driver.render_mode == 'rgb_array':
-            import cv2
-            render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
-            cv2.imshow('frame', render)
-            cv2.waitKey(1)
-            time.sleep(1/args['fps'])
+            pass
+            #import cv2
+            #render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
+            #cv2.imshow('frame', render)
+            #cv2.waitKey(1)
+            #time.sleep(1/args['fps'])
 
         with torch.no_grad():
             ob = torch.as_tensor(ob).to(device)
@@ -1070,7 +1076,7 @@ def load_env(env_name, args):
     make_env = env_module.env_creator(env_name)
     return pufferlib.vector.make(make_env, env_kwargs=args['env'], **args['vec'])
 
-def load_policy(args, vecenv):
+def load_policy(args, vecenv, env_name=''):
     package = args['package']
     module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
     env_module = importlib.import_module(module_name)
@@ -1088,9 +1094,6 @@ def load_policy(args, vecenv):
 
     load_id = args['load_id']
     if load_id is not None:
-        if args['mode'] not in ('train', 'eval'):
-            raise pufferlib.APIUsageError('load_id requires mode to be train or eval')
-
         if args['neptune']:
             path = NeptuneLogger(args, load_id, mode='read-only').download()
         elif args['wandb']:
@@ -1098,14 +1101,18 @@ def load_policy(args, vecenv):
         else:
             raise pufferlib.APIUsageError('No run id provided for eval')
 
-        policy.load_state_dict(torch.load(path, map_location=device))
+        state_dict = torch.load(path, map_location=device)
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        policy.load_state_dict(state_dict)
 
     load_path = args['load_model_path']
     if load_path == 'latest':
-        load_path = max(glob.glob("experiments/*.pt"), key=os.path.getctime)
+        load_path = max(glob.glob(f"experiments/{env_name}*.pt"), key=os.path.getctime)
 
     if load_path is not None:
-        policy.load_state_dict(torch.load(load_path, map_location=args['train']['device']))
+        state_dict = torch.load(load_path, map_location=device)
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        policy.load_state_dict(state_dict)
         #state_path = os.path.join(*load_path.split('/')[:-1], 'state.pt')
         #optim_state = torch.load(state_path)['optimizer_state_dict']
         #pufferl.optimizer.load_state_dict(optim_state)
@@ -1153,24 +1160,19 @@ def load_config(env_name):
             raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
 
     # Dynamic help menu from config
-    def auto_type(value):
-        """Type inference for numeric args that use 'auto' as a default value"""
-        if value == 'auto': return value
-        if value.isnumeric(): return int(value)
-        return float(value)
+    def puffer_type(value):
+        try:
+            return ast.literal_eval(value)
+        except:
+            return value
 
     for section in p.sections():
         for key in p[section]:
-            try:
-                value = ast.literal_eval(p[section][key])
-            except:
-                value = p[section][key]
-
             fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
             parser.add_argument(
                 fmt.replace('_', '-'),
-                default=value,
-                type=auto_type if value == 'auto' else type(value)
+                default=puffer_type(p[section][key]),
+                type=puffer_type
             )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,
@@ -1188,8 +1190,6 @@ def load_config(env_name):
         prev[subkey] = value
 
     args['train']['use_rnn'] = args['rnn_name'] is not None
-    #args['train']['env'] = env_name
-    #args['env_name'] = env_name
     return args
 
 def main():

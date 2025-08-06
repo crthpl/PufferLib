@@ -13,7 +13,6 @@ __host__ __device__ void puff_advantage_row_cuda(float* values, float* rewards, 
         float nextnonterminal = 1.0 - dones[t_next];
         float rho_t = fminf(importance[t], rho_clip);
         float c_t = fminf(importance[t], c_clip);
-        // TODO: t_next works and t doesn't. Check original formula
         float delta = rho_t*(rewards[t_next] + gamma*values[t_next]*nextnonterminal - values[t]);
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
         advantages[t] = lastpufferlam;
