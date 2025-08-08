@@ -380,17 +380,21 @@ void reset_agent(DroneSwarm* env, Drone *agent, int idx) {
     agent->episode_length = 0;
     agent->collisions = 0.0f;
     agent->score = 0.0f;
-    agent->state.pos = (Vec3){rndf(-9, 9), rndf(-9, 9), rndf(-9, 9)};
-    agent->spawn_pos = agent->state.pos;
-    agent->state.vel = (Vec3){0.0f, 0.0f, 0.0f};
-    agent->state.omega = (Vec3){0.0f, 0.0f, 0.0f};
-    agent->state.quat = (Quat){1.0f, 0.0f, 0.0f, 0.0f};
     agent->ring_idx = 0;
 
     //float size = 0.2f;
     //init_drone(agent, size, 0.0f);
     float size = rndf(0.1f, 0.4);
     init_drone(agent, size, 0.1f);
+
+    agent->state.pos = (Vec3){
+        rndf(-MARGIN_X, MARGIN_X),
+        rndf(-MARGIN_Y, MARGIN_Y),
+        rndf(-MARGIN_Z, MARGIN_Z)
+    };
+    agent->prev_pos = agent->state.pos;
+    agent->spawn_pos = agent->state.pos;
+
     compute_reward(env, agent, env->task != TASK_RACE);
 }
 
