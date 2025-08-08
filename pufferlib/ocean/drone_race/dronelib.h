@@ -286,11 +286,17 @@ void init_drone(Drone* drone, float size, float dr) {
     drone->params.max_vel = BASE_MAX_VEL;
     drone->params.max_omega = BASE_MAX_OMEGA;
 
+    drone->params.k_mot = BASE_K_MOT * rndf(1.0f - dr, 1.0f + dr);
+    drone->params.j_mot = BASE_J_MOT * I_scale * rndf(1.0f - dr, 1.0f + dr);
+    
     for (int i = 0; i < 4; i++) {
         drone->state.rpms[i] = 0.0f;
     }
-    drone->params.k_mot = BASE_K_MOT * rndf(1.0f - dr, 1.0f + dr);
-    drone->params.j_mot = BASE_J_MOT * I_scale * rndf(1.0f - dr, 1.0f + dr);
+    drone->state.pos = (Vec3){0.0f, 0.0f, 0.0f};
+    drone->prev_pos = drone->state.pos;
+    drone->state.vel = (Vec3){0.0f, 0.0f, 0.0f};
+    drone->state.omega = (Vec3){0.0f, 0.0f, 0.0f};
+    drone->state.quat = (Quat){1.0f, 0.0f, 0.0f, 0.0f};
 }
 
 void compute_derivatives(State* state, Params* params, float* actions, StateDerivative* derivatives) {

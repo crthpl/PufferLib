@@ -56,7 +56,6 @@ void init(DroneRace *env) {
     env->log = (Log){0};
     env->tick = 0;
     env->ring_buffer = (Ring*)malloc((env->max_rings) * sizeof(Ring));
-    //printf("init");
 }
 
 void add_log(DroneRace *env, float oob, float collision, float timeout) {
@@ -126,25 +125,21 @@ void compute_observations(DroneRace *env) {
 }
 
 void c_reset(DroneRace *env) {
-    //printf("startig reset");
     env->tick = 0;
     env->score = 0;
     env->episodic_return = 0.0f;
-
     env->moves_left = env->max_moves;
 
-    env->ring_idx = 0;
-
-    Drone *drone = &env->drone;
-
-    float size = rndf(0.05f, 0.8f);
-    init_drone(drone, size, 0.1f);
-    
     // creates rings
+    env->ring_idx = 0;
     float ring_radius = 2.0f;
     reset_rings(env->ring_buffer, env->max_rings, ring_radius);
 
-    // start drone at least MARGIN away from the first ring
+    // creates drone
+    Drone *drone = &env->drone;
+    float size = rndf(0.05f, 0.8f);
+    init_drone(drone, size, 0.1f);
+
     do {
         drone->state.pos = (Vec3){
             rndf(-MARGIN_X, MARGIN_X), 
@@ -154,9 +149,7 @@ void c_reset(DroneRace *env) {
     } while (norm3(sub3(drone->state.pos, env->ring_buffer[0].pos)) < 2.0f*ring_radius);
 
     drone->prev_pos = drone->state.pos;
-    drone->state.vel = (Vec3){0.0f, 0.0f, 0.0f};
-    drone->state.omega = (Vec3){0.0f, 0.0f, 0.0f};
-    drone->state.quat = (Quat){1.0f, 0.0f, 0.0f, 0.0f};
+
     compute_observations(env);
 }
 
@@ -184,6 +177,7 @@ void c_step(DroneRace *env) {
         return;
     }
 
+    // check for passing ring
     Ring *ring = &env->ring_buffer[env->ring_idx];
     float reward = check_ring(drone, ring);
     env->rewards[0] += reward;
@@ -211,7 +205,6 @@ void c_step(DroneRace *env) {
     drone->prev_pos = drone->state.pos;
 
     compute_observations(env);
-    //printf("reset");
 }
 
 void c_close_client(Client *client) {
