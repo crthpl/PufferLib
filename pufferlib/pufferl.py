@@ -992,7 +992,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         if len(frames) > 0 and len(frames) == args['save_frames']:
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
-            frames.append('Done')
+            print(f'Saved {len(frames)} frames to {args["gif_path"]}')
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
@@ -1120,6 +1120,39 @@ def load_policy(args, vecenv, env_name=''):
     return policy
 
 def load_config(env_name):
+    puffer_dir = os.path.dirname(os.path.realpath(__file__))
+    puffer_config_dir = os.path.join(puffer_dir, 'config/**/*.ini')
+    puffer_default_config = os.path.join(puffer_dir, 'config/default.ini')
+    if env_name == 'default':
+        p = configparser.ConfigParser()
+        p.read(puffer_default_config)
+    else:
+        for path in glob.glob(puffer_config_dir, recursive=True):
+            p = configparser.ConfigParser()
+            p.read([puffer_default_config, path])
+            if env_name in p['base']['env_name'].split(): break
+        else:
+            raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
+
+    return process_config(p)
+
+def load_config_file(file_path, fill_in_default=True):
+    if not os.path.exists(file_path):
+        raise pufferlib.APIUsageError('No config file found')
+
+    config_paths = [file_path]
+
+    if fill_in_default:
+        puffer_dir = os.path.dirname(os.path.realpath(__file__))
+        # Process the puffer defaults first
+        config_paths.insert(0, os.path.join(puffer_dir, 'config/default.ini'))
+
+    p = configparser.ConfigParser()
+    p.read(config_paths)
+
+    return process_config(p)
+
+def process_config(config):
     parser = argparse.ArgumentParser(
         description=f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]'
         ' demo options. Shows valid args for your env and policy',
@@ -1144,21 +1177,6 @@ def load_config(env_name):
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     args = parser.parse_known_args()[0]
 
-    # Load defaults and config
-    puffer_dir = os.path.dirname(os.path.realpath(__file__))
-    puffer_config_dir = os.path.join(puffer_dir, 'config/**/*.ini')
-    puffer_default_config = os.path.join(puffer_dir, 'config/default.ini')
-    if env_name == 'default':
-        p = configparser.ConfigParser()
-        p.read(puffer_default_config)
-    else:
-        for path in glob.glob(puffer_config_dir, recursive=True):
-            p = configparser.ConfigParser()
-            p.read([puffer_default_config, path])
-            if env_name in p['base']['env_name'].split(): break
-        else:
-            raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
-
     # Dynamic help menu from config
     def puffer_type(value):
         try:
@@ -1166,12 +1184,12 @@ def load_config(env_name):
         except:
             return value
 
-    for section in p.sections():
-        for key in p[section]:
+    for section in config.sections():
+        for key in config[section]:
             fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
             parser.add_argument(
                 fmt.replace('_', '-'),
-                default=puffer_type(p[section][key]),
+                default=puffer_type(config[section][key]),
                 type=puffer_type
             )
 
@@ -1189,6 +1207,7 @@ def load_config(env_name):
 
         prev[subkey] = value
 
+    args['train']['env'] = args['env_name'] or ''  # for trainer dashboard
     args['train']['use_rnn'] = args['rnn_name'] is not None
     return args
 
