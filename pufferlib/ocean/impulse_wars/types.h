@@ -310,6 +310,8 @@ typedef struct droneStats {
     float totalBursts;
     float burstsHit;
     float energyEmptied;
+    float selfKills;
+    float kills;
     float wins;
 
     float shotsFired[_NUM_WEAPONS];
