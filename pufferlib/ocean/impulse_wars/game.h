@@ -930,7 +930,7 @@ void droneChangeWeapon(const iwEnv *e, droneEntity *drone, const enum weaponType
     drone->ammo = weaponAmmo(e->defaultWeapon->type, drone->weaponInfo->type);
 }
 
-int8_t findBiggestContributor(const iwEnv *e, const enum entityType type, const CC_Array *physicsTracking, const b2Vec2 lastVelocity, float *maxMoveContrib) {
+int8_t findBiggestContributor(iwEnv *e, const enum entityType type, const CC_Array *physicsTracking, const b2Vec2 lastVelocity, float *maxMoveContrib) {
     b2Vec2 contrib[e->numDrones];
     memset(contrib, 0x0, e->numDrones * sizeof(b2Vec2));
     uint16_t step = 0;
@@ -1000,7 +1000,7 @@ int8_t findBiggestContributor(const iwEnv *e, const enum entityType type, const 
     return killer;
 }
 
-void findDroneKiller(const iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
+void findDroneKiller(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
     float maxMoveContrib = -FLT_MAX;
     DEBUG_LOG("finding drone killer");
     int8_t killer = findBiggestContributor(e, DRONE_ENTITY, drone->physicsTracking, drone->lastVelocity, &maxMoveContrib);
@@ -1014,8 +1014,18 @@ void findDroneKiller(const iwEnv *e, droneEntity *drone, const wallEntity *killW
         }
     }
 
+    if (killer == -1) {
+        DEBUG_LOGF(">>> drone %d killed by UNKNOWN", drone->idx);
+        return;
+    }
+
     DEBUG_LOGF(">>> drone %d killed by drone %d", drone->idx, killer);
 
+    if (killer == drone->idx) {
+        e->stats[drone->idx].selfKills++;
+    } else {
+        e->stats[killer].kills++;
+    }
     drone->killedBy = killer;
     droneEntity *killerDrone = safe_array_get_at(e->drones, killer);
     killerDrone->killed[drone->idx] = true;
