@@ -772,11 +772,9 @@ void computeRewards(iwEnv *e, const bool roundOver, const int8_t winner, const i
     for (uint8_t i = 0; i < e->numDrones; i++) {
         float reward = 0.0f;
         droneEntity *drone = safe_array_get_at(e->drones, i);
-        if (!drone->dead) {
-            reward = computeReward(e, drone);
-            if (roundOver && winningTeam == drone->team) {
-                reward += WIN_REWARD;
-            }
+        reward = computeReward(e, drone);
+        if (!drone->dead && roundOver && winningTeam == drone->team) {
+            reward += WIN_REWARD;
         } else if (drone->diedThisStep) {
             reward = DEATH_PUNISHMENT;
             if (drone->killedBy == drone->idx) {

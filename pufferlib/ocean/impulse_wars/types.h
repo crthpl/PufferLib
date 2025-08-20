@@ -119,6 +119,7 @@ typedef struct wallEntity {
     bool isFloating;
     enum entityType type;
     bool isSuddenDeath;
+    CC_Array *physicsTracking;
 
     entity *ent;
 } wallEntity;

@@ -24,7 +24,7 @@ const uint8_t NUM_MAPS = 9;
 
 #define MAX_NEAREST_WALLS 8
 
-const uint8_t DRONE_LIVES = 1;
+const uint8_t DRONE_LIVES = 3;
 const float DRONE_RESPAWN_WAIT = 2.0f;
 const uint8_t ROUND_STEPS = 90;
 const uint8_t SUDDEN_DEATH_STEPS = 5;
@@ -34,7 +34,7 @@ const uint8_t MAX_DRONES = _MAX_DRONES;
 const uint16_t LOG_BUFFER_SIZE = 1024;
 
 // reward settings
-const float WIN_REWARD = 1.5f;
+const float WIN_REWARD = 2.0f;
 const float SELF_KILL_PUNISHMENT = -2.0f;
 const float ENEMY_DEATH_REWARD = 1.0f;
 const float ENEMY_KILL_REWARD = 1.0f;
