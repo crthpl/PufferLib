@@ -850,6 +850,7 @@ void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces)
         droneAddEnergy(drone, DRONE_SHIELD_BREAK_ENERGY_COST);
     }
     drone->shield = NULL;
+    e->stats[drone->idx].ownShieldBroken++;
 
     b2DestroyBody(shield->bodyID);
     b2DestroyShape(shield->bufferShapeID, false);
@@ -2444,6 +2445,8 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
         if (shield->health <= 0.0f) {
             droneEntity *parentDrone = safe_array_get_at(e->drones, projectile->droneIdx);
             droneAddEnergy(parentDrone, DRONE_SHIELD_BREAK_ENERGY_REFILL);
+            parentDrone->stepInfo.brokeShield[shield->drone->idx] = true;
+            e->stats[parentDrone->idx].shieldsBroken++;
         }
 
         return false;

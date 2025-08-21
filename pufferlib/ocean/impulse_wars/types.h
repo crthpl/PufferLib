@@ -215,6 +215,7 @@ typedef struct droneStepInfo {
     float explosionHit[_MAX_DRONES];
     float shotTaken[_MAX_DRONES];
     float explosionTaken[_MAX_DRONES];
+    bool brokeShield[_MAX_DRONES];
     bool ownShotTaken;
 } droneStepInfo;
 
@@ -311,6 +312,8 @@ typedef struct droneStats {
     float totalBursts;
     float burstsHit;
     float energyEmptied;
+    float shieldsBroken;
+    float ownShieldBroken;
     float selfKills;
     float kills;
     float wins;

@@ -680,16 +680,6 @@ void resetEnv(iwEnv *e) {
     setupEnv(e);
 }
 
-float computeShotReward(const droneEntity *drone, const weaponInformation *weaponInfo) {
-    const float weaponForce = weaponInfo->fireMagnitude * weaponInfo->invMass;
-    const float scaledForce = (weaponForce * (weaponForce * SHOT_HIT_REWARD_COEF)) + 0.25f;
-    return scaledForce + computeHitStrength(drone);
-}
-
-float computeExplosionReward(const droneEntity *drone) {
-    return computeHitStrength(drone) * EXPLOSION_HIT_REWARD_COEF;
-}
-
 float computeReward(iwEnv *e, droneEntity *drone) {
     float reward = 0.0f;
 
@@ -712,20 +702,22 @@ float computeReward(iwEnv *e, droneEntity *drone) {
         droneEntity *enemyDrone = safe_array_get_at(e->drones, i);
         const bool onTeam = drone->team == enemyDrone->team;
 
+        // TODO: punish for hitting teammates?
         if (drone->stepInfo.shotHit[i] != 0.0f && !onTeam) {
-            // subtract 1 from the weapon type because 1 is added so we
-            // can use 0 as no shot was hit
             reward += drone->stepInfo.shotHit[i] * SHOT_HIT_REWARD_COEF;
         }
         if (drone->stepInfo.explosionHit[i] != 0.0f && !onTeam) {
             reward += drone->stepInfo.explosionHit[i] * EXPLOSION_HIT_REWARD_COEF;
         }
+        if (drone->stepInfo.brokeShield[i] && !onTeam) {
+            reward += SHIELD_BREAK_REWARD;
+        }
 
         if (e->numAgents == e->numDrones) {
-            if (drone->stepInfo.shotTaken[i] != 0 && !onTeam) {
+            if (drone->stepInfo.shotTaken[i] != 0) {
                 reward -= drone->stepInfo.shotTaken[i] * SHOT_HIT_REWARD_COEF;
             }
-            if (drone->stepInfo.explosionTaken[i] && !onTeam) {
+            if (drone->stepInfo.explosionTaken[i]) {
                 reward -= drone->stepInfo.explosionTaken[i] * EXPLOSION_HIT_REWARD_COEF;
             }
         }

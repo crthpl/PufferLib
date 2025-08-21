@@ -43,6 +43,7 @@ const float TEAMMATE_KILL_PUNISHMENT = -1.0f;
 const float DEATH_PUNISHMENT = 0.0f;
 const float ENERGY_EMPTY_PUNISHMENT = -0.75f;
 const float WEAPON_PICKUP_REWARD = 0.5f;
+const float SHIELD_BREAK_REWARD = 0.5f;
 const float SHOT_HIT_REWARD_COEF = 0.005f;
 const float EXPLOSION_HIT_REWARD_COEF = 0.005f;
 const float APPROACH_REWARD = 0.0f;
