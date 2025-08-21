@@ -150,6 +150,7 @@ static int my_log(PyObject *dict, Log *log) {
         assign_to_dict(dict, droneLog(buf, i, "own_shield_broken"), log->stats[i].ownShieldBroken);
         assign_to_dict(dict, droneLog(buf, i, "self_kills"), log->stats[i].selfKills);
         assign_to_dict(dict, droneLog(buf, i, "kills"), log->stats[i].kills);
+        assign_to_dict(dict, droneLog(buf, i, "unknown_kills"), log->stats[i].unknownKills);
         assign_to_dict(dict, droneLog(buf, i, "wins"), log->stats[i].wins);
 
         // useful for debugging weapon balance, but really slows down

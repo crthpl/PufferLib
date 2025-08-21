@@ -1005,6 +1005,7 @@ void addLog(iwEnv *e, Log *log) {
         e->log.stats[j].ownShieldBroken += log->stats[j].ownShieldBroken;
         e->log.stats[j].selfKills += log->stats[j].selfKills;
         e->log.stats[j].kills += log->stats[j].kills;
+        e->log.stats[j].unknownKills += log->stats[j].unknownKills;
 
         for (uint8_t k = 0; k < NUM_WEAPONS; k++) {
             e->log.stats[j].shotsFired[k] += log->stats[j].shotsFired[k];

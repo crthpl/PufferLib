@@ -1017,6 +1017,7 @@ void findDroneKiller(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
 
     if (killer == -1) {
         DEBUG_LOGF(">>> drone %d killed by UNKNOWN", drone->idx);
+        e->stats[drone->idx].unknownKills++;
         return;
     }
 

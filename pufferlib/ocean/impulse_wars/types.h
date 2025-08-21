@@ -316,6 +316,7 @@ typedef struct droneStats {
     float ownShieldBroken;
     float selfKills;
     float kills;
+    float unknownKills;
     float wins;
 
     float shotsFired[_NUM_WEAPONS];
