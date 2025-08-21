@@ -412,6 +412,19 @@ typedef struct iwEnv {
     bool sittingDuck;
     bool isTraining;
 
+    float winReward;
+    float selfKillPunishment;
+    float enemyDeathReward;
+    float enemyKillReward;
+    float teammateDeathPunishment;
+    float teammateKillPunishment;
+    float deathPunishment;
+    float energyEmptiedPunishment;
+    float weaponPickupReward;
+    float shieldBreakReward;
+    float shotHitRewardCoef;
+    float explosionHitRewardCoef;
+
     uint16_t obsBytes;
     uint16_t discreteObsBytes;
     bool continuousActions;

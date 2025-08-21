@@ -539,6 +539,19 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     e->sittingDuck = sittingDuck;
     e->isTraining = isTraining;
 
+    e->winReward = WIN_REWARD;
+    e->selfKillPunishment = SELF_KILL_PUNISHMENT;
+    e->enemyDeathReward = ENEMY_DEATH_REWARD;
+    e->enemyKillReward = ENEMY_KILL_REWARD;
+    e->teammateDeathPunishment = TEAMMATE_DEATH_PUNISHMENT;
+    e->teammateKillPunishment = TEAMMATE_KILL_PUNISHMENT;
+    e->deathPunishment = DEATH_PUNISHMENT;
+    e->energyEmptiedPunishment = ENERGY_EMPTY_PUNISHMENT;
+    e->weaponPickupReward = WEAPON_PICKUP_REWARD;
+    e->shieldBreakReward = SHIELD_BREAK_REWARD;
+    e->shotHitRewardCoef = SHOT_HIT_REWARD_COEF;
+    e->explosionHitRewardCoef = EXPLOSION_HIT_REWARD_COEF;
+
     e->obsBytes = obsBytes(e->numDrones);
     e->discreteObsBytes = alignedSize(discreteObsSize(e->numDrones) * sizeof(uint8_t), sizeof(float));
 
@@ -584,6 +597,21 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     e->connectedControllers = 0;
 
     return e;
+}
+
+void setRewards(iwEnv *e, float winReward, float selfKillPunishment, float enemyDeathReward, float enemyKillReward, float teammateDeathPunishment, float teammateKillPunishment, float deathPunishment, float energyEmptiedPunishment, float weaponPickupReward, float shieldBreakReward, float shotHitRewardCoef, float explosionHitRewardCoef) {
+    e->winReward = winReward;
+    e->selfKillPunishment = selfKillPunishment;
+    e->enemyDeathReward = enemyDeathReward;
+    e->enemyKillReward = enemyKillReward;
+    e->teammateDeathPunishment = teammateDeathPunishment;
+    e->teammateKillPunishment = teammateKillPunishment;
+    e->deathPunishment = deathPunishment;
+    e->energyEmptiedPunishment = energyEmptiedPunishment;
+    e->weaponPickupReward = weaponPickupReward;
+    e->shieldBreakReward = shieldBreakReward;
+    e->shotHitRewardCoef = shotHitRewardCoef;
+    e->explosionHitRewardCoef = explosionHitRewardCoef;
 }
 
 void clearEnv(iwEnv *e) {
@@ -684,7 +712,7 @@ float computeReward(iwEnv *e, droneEntity *drone) {
     float reward = 0.0f;
 
     if (drone->energyFullyDepleted && drone->energyRefillWait == DRONE_ENERGY_REFILL_EMPTY_WAIT) {
-        reward += ENERGY_EMPTY_PUNISHMENT;
+        reward += e->energyEmptiedPunishment;
     }
 
     // only reward picking up a weapon if the standard weapon was
@@ -692,7 +720,7 @@ float computeReward(iwEnv *e, droneEntity *drone) {
     // weapon, but other weapons are situational better so don't
     // reward switching a non-standard weapon
     if (drone->stepInfo.pickedUpWeapon && drone->stepInfo.prevWeapon == STANDARD_WEAPON) {
-        reward += WEAPON_PICKUP_REWARD;
+        reward += e->weaponPickupReward;
     }
 
     for (uint8_t i = 0; i < e->numDrones; i++) {
@@ -704,34 +732,34 @@ float computeReward(iwEnv *e, droneEntity *drone) {
 
         // TODO: punish for hitting teammates?
         if (drone->stepInfo.shotHit[i] != 0.0f && !onTeam) {
-            reward += drone->stepInfo.shotHit[i] * SHOT_HIT_REWARD_COEF;
+            reward += drone->stepInfo.shotHit[i] * e->shotHitRewardCoef;
         }
         if (drone->stepInfo.explosionHit[i] != 0.0f && !onTeam) {
-            reward += drone->stepInfo.explosionHit[i] * EXPLOSION_HIT_REWARD_COEF;
+            reward += drone->stepInfo.explosionHit[i] * e->explosionHitRewardCoef;
         }
         if (drone->stepInfo.brokeShield[i] && !onTeam) {
-            reward += SHIELD_BREAK_REWARD;
+            reward += e->shieldBreakReward;
         }
 
         if (e->numAgents == e->numDrones) {
             if (drone->stepInfo.shotTaken[i] != 0) {
-                reward -= drone->stepInfo.shotTaken[i] * SHOT_HIT_REWARD_COEF;
+                reward -= drone->stepInfo.shotTaken[i] * e->shotHitRewardCoef;
             }
             if (drone->stepInfo.explosionTaken[i]) {
-                reward -= drone->stepInfo.explosionTaken[i] * EXPLOSION_HIT_REWARD_COEF;
+                reward -= drone->stepInfo.explosionTaken[i] * e->explosionHitRewardCoef;
             }
         }
 
         if (enemyDrone->dead && enemyDrone->diedThisStep) {
             if (!onTeam) {
-                reward += ENEMY_DEATH_REWARD;
+                reward += e->enemyDeathReward;
                 if (drone->killed[i]) {
-                    reward += ENEMY_KILL_REWARD;
+                    reward += e->enemyKillReward;
                 }
             } else {
-                reward += TEAMMATE_DEATH_PUNISHMENT;
+                reward += e->teammateDeathPunishment;
                 if (drone->killed[i]) {
-                    reward += TEAMMATE_KILL_PUNISHMENT;
+                    reward += e->teammateKillPunishment;
                 }
             }
             continue;
@@ -756,7 +784,7 @@ const float REWARD_EPS = 1.0e-6f;
 
 void computeRewards(iwEnv *e, const bool roundOver, const int8_t winner, const int8_t winningTeam) {
     if (roundOver && winner != -1 && winner < e->numAgents) {
-        e->rewards[winner] += WIN_REWARD;
+        e->rewards[winner] += e->winReward;
     }
 
     for (uint8_t i = 0; i < e->numDrones; i++) {
@@ -764,11 +792,11 @@ void computeRewards(iwEnv *e, const bool roundOver, const int8_t winner, const i
         droneEntity *drone = safe_array_get_at(e->drones, i);
         reward = computeReward(e, drone);
         if (!drone->dead && roundOver && winningTeam == drone->team) {
-            reward += WIN_REWARD;
+            reward += e->winReward;
         } else if (drone->diedThisStep) {
-            reward = DEATH_PUNISHMENT;
+            reward = e->deathPunishment;
             if (drone->killedBy == drone->idx) {
-                reward += SELF_KILL_PUNISHMENT;
+                reward += e->selfKillPunishment;
             }
         }
         if (i < e->numAgents) {
@@ -973,6 +1001,10 @@ void addLog(iwEnv *e, Log *log) {
         e->log.stats[j].totalBursts += log->stats[j].totalBursts;
         e->log.stats[j].burstsHit += log->stats[j].burstsHit;
         e->log.stats[j].energyEmptied += log->stats[j].energyEmptied;
+        e->log.stats[j].shieldsBroken += log->stats[j].shieldsBroken;
+        e->log.stats[j].ownShieldBroken += log->stats[j].ownShieldBroken;
+        e->log.stats[j].selfKills += log->stats[j].selfKills;
+        e->log.stats[j].kills += log->stats[j].kills;
 
         for (uint8_t k = 0; k < NUM_WEAPONS; k++) {
             e->log.stats[j].shotsFired[k] += log->stats[j].shotsFired[k];
