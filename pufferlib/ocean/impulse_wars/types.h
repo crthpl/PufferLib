@@ -211,10 +211,10 @@ typedef struct droneStepInfo {
     bool firedShot;
     bool pickedUpWeapon;
     enum weaponType prevWeapon;
-    uint8_t shotHit[_MAX_DRONES];
-    bool explosionHit[_MAX_DRONES];
-    uint8_t shotTaken[_MAX_DRONES];
-    bool explosionTaken[_MAX_DRONES];
+    float shotHit[_MAX_DRONES];
+    float explosionHit[_MAX_DRONES];
+    float shotTaken[_MAX_DRONES];
+    float explosionTaken[_MAX_DRONES];
     bool ownShotTaken;
 } droneStepInfo;
 

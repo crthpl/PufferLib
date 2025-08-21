@@ -1312,7 +1312,6 @@ bool explodeCallback(b2ShapeId shapeID, void *context) {
             ctx->e->stats[drone->idx].totalOwnShotsTaken++;
             DEBUG_LOGF("drone %d hit itself with explosion from weapon %d", drone->idx, ctx->projectile->weaponInfo->type);
         }
-        ctx->parentDrone->stepInfo.explosionHit[drone->idx] = true;
         if (ctx->isBurst) {
             DEBUG_LOGF("drone %d hit drone %d with burst", ctx->parentDrone->idx, drone->idx);
             ctx->e->stats[ctx->parentDrone->idx].burstsHit++;
@@ -1323,7 +1322,6 @@ bool explodeCallback(b2ShapeId shapeID, void *context) {
             ctx->e->stats[ctx->parentDrone->idx].totalShotsHit++;
             DEBUG_LOGF("drone %d hit by explosion from weapon %d from drone %d", drone->idx, ctx->projectile->weaponInfo->type, ctx->parentDrone->idx);
         }
-        drone->stepInfo.explosionTaken[ctx->parentDrone->idx] = true;
         transform.p = drone->pos;
         transform.q = b2Rot_identity;
         break;
@@ -1517,6 +1515,10 @@ bool explodeCallback(b2ShapeId shapeID, void *context) {
                 droneAddEnergy(ctx->parentDrone, DRONE_SHIELD_BREAK_ENERGY_REFILL);
             }
         }
+
+        const float explosionStrength = b2AbsFloat(b2Length(impulse));
+        ctx->parentDrone->stepInfo.explosionHit[drone->idx] += explosionStrength;
+        drone->stepInfo.explosionTaken[ctx->parentDrone->idx] += explosionStrength;
 
         break;
     default:
@@ -2452,6 +2454,7 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
     }
     if (ent->type == DRONE_ENTITY) {
         droneEntity *hitDrone = ent->entity;
+        float hitStrength = 0.0f;
         if (b2Contact_IsValid(contactID)) {
             const b2Manifold manifold = b2Contact_GetData(contactID).manifold;
             ASSERT(manifold.pointCount == 1);
@@ -2460,6 +2463,7 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
                 hitImpulse = b2Neg(hitImpulse);
             }
             applyTrackedImpulse(e, hitDrone->bodyID, hitDrone->physicsTracking, hitImpulse, projectile->droneIdx);
+            hitStrength = b2AbsFloat(b2Length(hitImpulse));
         }
 
         if (projectile->droneIdx != hitDrone->idx) {
@@ -2469,12 +2473,11 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
                 const float impulseEnergy = projectile->lastSpeed * projectile->weaponInfo->mass * projectile->weaponInfo->energyRefillCoef;
                 droneAddEnergy(shooterDrone, impulseEnergy);
             }
-            // add 1 so we can differentiate between no weapon and weapon 0
-            shooterDrone->stepInfo.shotHit[hitDrone->idx] = projectile->weaponInfo->type + 1;
+            shooterDrone->stepInfo.shotHit[hitDrone->idx] += hitStrength;
             e->stats[shooterDrone->idx].shotsHit[projectile->weaponInfo->type]++;
             e->stats[shooterDrone->idx].totalShotsHit++;
             DEBUG_LOGF("drone %d hit drone %d with weapon %d", shooterDrone->idx, hitDrone->idx, projectile->weaponInfo->type);
-            hitDrone->stepInfo.shotTaken[shooterDrone->idx] = projectile->weaponInfo->type + 1;
+            hitDrone->stepInfo.shotTaken[shooterDrone->idx] += hitStrength;
             e->stats[hitDrone->idx].shotsTaken[projectile->weaponInfo->type]++;
             e->stats[hitDrone->idx].totalShotsTaken++;
             DEBUG_LOGF("drone %d hit by drone %d with weapon %d", hitDrone->idx, shooterDrone->idx, projectile->weaponInfo->type);

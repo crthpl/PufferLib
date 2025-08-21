@@ -367,10 +367,10 @@ void computeObs(iwEnv *e) {
                 continue;
             }
 
-            if (agentDrone->stepInfo.shotHit[i]) {
+            if (agentDrone->stepInfo.shotHit[i] != 0.0f) {
                 hitShot = true;
             }
-            if (agentDrone->stepInfo.shotTaken[i]) {
+            if (agentDrone->stepInfo.shotTaken[i] != 0.0f) {
                 tookShot = true;
             }
 
@@ -712,23 +712,21 @@ float computeReward(iwEnv *e, droneEntity *drone) {
         droneEntity *enemyDrone = safe_array_get_at(e->drones, i);
         const bool onTeam = drone->team == enemyDrone->team;
 
-        if (drone->stepInfo.shotHit[i] != 0 && !onTeam) {
+        if (drone->stepInfo.shotHit[i] != 0.0f && !onTeam) {
             // subtract 1 from the weapon type because 1 is added so we
             // can use 0 as no shot was hit
-            const weaponInformation *weaponInfo = weaponInfos[drone->stepInfo.shotHit[i] - 1];
-            reward += computeShotReward(enemyDrone, weaponInfo);
+            reward += drone->stepInfo.shotHit[i] * SHOT_HIT_REWARD_COEF;
         }
-        if (drone->stepInfo.explosionHit[i] && !onTeam) {
-            reward += computeExplosionReward(enemyDrone);
+        if (drone->stepInfo.explosionHit[i] != 0.0f && !onTeam) {
+            reward += drone->stepInfo.explosionHit[i] * EXPLOSION_HIT_REWARD_COEF;
         }
 
         if (e->numAgents == e->numDrones) {
             if (drone->stepInfo.shotTaken[i] != 0 && !onTeam) {
-                const weaponInformation *weaponInfo = weaponInfos[drone->stepInfo.shotTaken[i] - 1];
-                reward -= computeShotReward(drone, weaponInfo) * 0.5f;
+                reward -= drone->stepInfo.shotTaken[i] * SHOT_HIT_REWARD_COEF;
             }
             if (drone->stepInfo.explosionTaken[i] && !onTeam) {
-                reward -= computeExplosionReward(drone) * 0.5f;
+                reward -= drone->stepInfo.explosionTaken[i] * EXPLOSION_HIT_REWARD_COEF;
             }
         }
 
@@ -747,16 +745,16 @@ float computeReward(iwEnv *e, droneEntity *drone) {
             continue;
         }
 
-        const b2Vec2 enemyDirection = b2Normalize(b2Sub(enemyDrone->pos, drone->pos));
-        const float velocityToEnemy = b2Dot(drone->lastVelocity, enemyDirection);
-        const float enemyDistance = b2Distance(enemyDrone->pos, drone->pos);
-        // stop rewarding approaching an enemy if they're very close
-        // to avoid constant clashing; always reward approaching when
-        // the current weapon is the shotgun, it greatly benefits from
-        // being close to enemies
-        if (velocityToEnemy > 0.1f && (drone->weaponInfo->type == SHOTGUN_WEAPON || enemyDistance > DISTANCE_CUTOFF)) {
-            reward += APPROACH_REWARD;
-        }
+        // const b2Vec2 enemyDirection = b2Normalize(b2Sub(enemyDrone->pos, drone->pos));
+        // const float velocityToEnemy = b2Dot(drone->lastVelocity, enemyDirection);
+        // const float enemyDistance = b2Distance(enemyDrone->pos, drone->pos);
+        // // stop rewarding approaching an enemy if they're very close
+        // // to avoid constant clashing; always reward approaching when
+        // // the current weapon is the shotgun, it greatly benefits from
+        // // being close to enemies
+        // if (velocityToEnemy > 0.1f && (drone->weaponInfo->type == SHOTGUN_WEAPON || enemyDistance > DISTANCE_CUTOFF)) {
+        //     reward += APPROACH_REWARD;
+        // }
     }
 
     return reward;
