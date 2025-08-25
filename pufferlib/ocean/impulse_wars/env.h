@@ -596,6 +596,10 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     e->humanDroneInput = 0;
     e->connectedControllers = 0;
 
+#ifndef NDEBUG
+    create_array(&e->debugPoints, 4);
+#endif
+
     return e;
 }
 
@@ -701,6 +705,10 @@ void destroyEnv(iwEnv *e) {
     cc_array_destroy(e->dronePieces);
 
     b2DestroyWorld(e->worldID);
+
+#ifndef NDEBUG
+    cc_array_destroy(e->debugPoints);
+#endif
 }
 
 void resetEnv(iwEnv *e) {
@@ -1027,6 +1035,7 @@ void addLog(iwEnv *e, Log *log) {
     e->log.n += 1.0f;
 }
 
+// TODO: 2nd agent doesn't seem to work right
 void stepEnv(iwEnv *e) {
     if (e->needsReset) {
         DEBUG_LOG("Resetting environment");
@@ -1037,6 +1046,14 @@ void stepEnv(iwEnv *e) {
         accumulator = 0.0;
 #endif
     }
+
+#ifndef NDEBUG
+    for (uint8_t i = 0; i < cc_array_size(e->debugPoints); i++) {
+        debugPoint *point = safe_array_get_at(e->debugPoints, i);
+        fastFree(point);
+    }
+    cc_array_remove_all(e->debugPoints);
+#endif
 
     agentActions stepActions[e->numDrones];
     memset(stepActions, 0x0, e->numDrones * sizeof(agentActions));

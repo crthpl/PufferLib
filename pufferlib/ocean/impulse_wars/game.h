@@ -102,10 +102,12 @@ bool isOverlappingAABB(const iwEnv *e, const b2Vec2 pos, const float distance, c
     return ctx.overlaps;
 }
 
-// TODO: store a shape proxy in entities?
-b2ShapeProxy makeDistanceProxyFromType(const enum entityType type, bool *isCircle) {
+b2ShapeProxy makeDistanceProxy(const entity *ent, bool *isCircle) {
     b2ShapeProxy proxy = {0};
-    switch (type) {
+    float extent = 0.0f;
+    wallEntity *wall = NULL;
+
+    switch (ent->type) {
     case DRONE_ENTITY:
         *isCircle = true;
         proxy.count = 1;
@@ -116,40 +118,42 @@ b2ShapeProxy makeDistanceProxyFromType(const enum entityType type, bool *isCircl
         proxy.count = 1;
         proxy.radius = DRONE_SHIELD_RADIUS;
         break;
+    case PROJECTILE_ENTITY:
+        *isCircle = true;
+        const projectileEntity *proj = ent->entity;
+        proxy.count = 1;
+        proxy.radius = proj->weaponInfo->radius;
+        break;
     case WEAPON_PICKUP_ENTITY:
+        extent = PICKUP_THICKNESS / 2.0f;
+
         proxy.count = 4;
-        proxy.points[0] = (b2Vec2){.x = -PICKUP_THICKNESS / 2.0f, .y = -PICKUP_THICKNESS / 2.0f};
-        proxy.points[1] = (b2Vec2){.x = -PICKUP_THICKNESS / 2.0f, .y = +PICKUP_THICKNESS / 2.0f};
-        proxy.points[2] = (b2Vec2){.x = +PICKUP_THICKNESS / 2.0f, .y = -PICKUP_THICKNESS / 2.0f};
-        proxy.points[3] = (b2Vec2){.x = +PICKUP_THICKNESS / 2.0f, .y = +PICKUP_THICKNESS / 2.0f};
+        proxy.points[0] = (b2Vec2){.x = -extent, .y = -extent};
+        proxy.points[1] = (b2Vec2){.x = -extent, .y = +extent};
+        proxy.points[2] = (b2Vec2){.x = +extent, .y = -extent};
+        proxy.points[3] = (b2Vec2){.x = +extent, .y = +extent};
         break;
     case STANDARD_WALL_ENTITY:
     case BOUNCY_WALL_ENTITY:
     case DEATH_WALL_ENTITY:
+        extent = WALL_THICKNESS;
+        wall = ent->entity;
+        if (wall->isFloating) {
+            extent = FLOATING_WALL_THICKNESS;
+        }
+        extent /= 2.0f;
+
         proxy.count = 4;
-        proxy.points[0] = (b2Vec2){.x = -FLOATING_WALL_THICKNESS / 2.0f, .y = -FLOATING_WALL_THICKNESS / 2.0f};
-        proxy.points[1] = (b2Vec2){.x = -FLOATING_WALL_THICKNESS / 2.0f, .y = +FLOATING_WALL_THICKNESS / 2.0f};
-        proxy.points[2] = (b2Vec2){.x = +FLOATING_WALL_THICKNESS / 2.0f, .y = -FLOATING_WALL_THICKNESS / 2.0f};
-        proxy.points[3] = (b2Vec2){.x = +FLOATING_WALL_THICKNESS / 2.0f, .y = +FLOATING_WALL_THICKNESS / 2.0f};
+        proxy.points[0] = (b2Vec2){.x = -extent, .y = -extent};
+        proxy.points[1] = (b2Vec2){.x = -extent, .y = +extent};
+        proxy.points[2] = (b2Vec2){.x = +extent, .y = -extent};
+        proxy.points[3] = (b2Vec2){.x = +extent, .y = +extent};
         break;
     default:
-        ERRORF("unknown entity type for shape distance: %d", type);
+        ERRORF("unknown entity type for shape distance: %d", ent->type);
     }
 
     return proxy;
-}
-
-b2ShapeProxy makeDistanceProxy(const entity *ent, bool *isCircle) {
-    if (ent->type == PROJECTILE_ENTITY) {
-        *isCircle = true;
-        b2ShapeProxy proxy = {0};
-        const projectileEntity *proj = ent->entity;
-        proxy.count = 1;
-        proxy.radius = proj->weaponInfo->radius;
-        return proxy;
-    }
-
-    return makeDistanceProxyFromType(ent->type, isCircle);
 }
 
 b2Transform entityTransform(const entity *ent) {
@@ -1357,6 +1361,7 @@ bool explodeCallback(b2ShapeId shapeID, void *context) {
 
     b2SimplexCache cache = {0};
     const b2DistanceOutput output = b2ShapeDistance(&input, &cache, NULL, 0);
+
     if (output.distance > ctx->def->radius) {
         return true;
     }
@@ -1981,6 +1986,7 @@ void droneBurst(iwEnv *e, droneEntity *drone) {
     b2ExplosionDef explosion = {
         .position = drone->pos,
         .radius = radius,
+        .falloff = 0.0f,
         .impulsePerLength = (DRONE_BURST_IMPACT_BASE * drone->burstCharge) + DRONE_BURST_IMPACT_MIN,
         .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE,
     };

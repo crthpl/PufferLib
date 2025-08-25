@@ -405,6 +405,12 @@ typedef struct pathingInfo {
     int8_t *pathBuffer;
 } pathingInfo;
 
+typedef struct debugPoint {
+    b2Vec2 pos;
+    float size;
+    Color color;
+} debugPoint;
+
 typedef struct iwEnv {
     uint8_t numDrones;
     uint8_t numAgents;
@@ -486,7 +492,7 @@ typedef struct iwEnv {
     rayClient *client;
     float renderScale;
     CC_Array *explosions;
-    b2Vec2 debugPoint;
+    CC_Array *debugPoints;
 } iwEnv;
 
 #endif
