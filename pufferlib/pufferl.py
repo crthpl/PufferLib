@@ -904,7 +904,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = dict(**args['train'], env=env_name)
+    train_config = { **args['train'], 'env': env_name }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     all_logs = []
