@@ -47,6 +47,7 @@ def download_raylib(platform, ext):
 
 if not NO_OCEAN:
     download_raylib('raylib-5.5_webassembly', '.zip')
+    download_raylib(RAYLIB_NAME, '.tar.gz')
 
 BOX2D_URL = 'https://github.com/capnspacehook/box2d/releases/latest/download/'
 BOX2D_NAME = 'box2d-macos-arm64' if platform.system() == "Darwin" else 'box2d-linux-amd64'
@@ -64,6 +65,7 @@ def download_box2d(platform):
 
 if not NO_OCEAN:
     download_box2d('box2d-web')
+    download_box2d(BOX2D_NAME)
 
 # Shared compile args for all platforms
 extra_compile_args = [
@@ -122,8 +124,6 @@ if system == 'Linux':
     extra_link_args += [
         '-Bsymbolic-functions',
     ]
-    if not NO_OCEAN:
-        download_raylib('raylib-5.5_linux_amd64', '.tar.gz')
 elif system == 'Darwin':
     extra_compile_args += [
         '-Wno-error=int-conversion',
@@ -135,13 +135,8 @@ elif system == 'Darwin':
         '-framework', 'OpenGL',
         '-framework', 'IOKit',
     ]
-    if not NO_OCEAN:
-        download_raylib('raylib-5.5_macos', '.tar.gz')
 else:
     raise ValueError(f'Unsupported system: {system}')
-
-if not NO_OCEAN:
-    download_box2d(BOX2D_NAME)
 
 # Default Gym/Gymnasium/PettingZoo versions
 # Gym:
