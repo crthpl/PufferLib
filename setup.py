@@ -178,7 +178,7 @@ class TorchBuildExt(cpp_extension.BuildExtension):
         super().run()
 
 RAYLIB_A = f'{RAYLIB_NAME}/lib/libraylib.a'
-INCLUDE = [numpy.get_include(), 'raylib/include', f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
+INCLUDE = [numpy.get_include(), f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
 extension_kwargs = dict(
     include_dirs=INCLUDE,
     extra_compile_args=extra_compile_args,
