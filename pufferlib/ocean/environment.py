@@ -158,6 +158,7 @@ MAKE_FUNCTIONS = {
     'whisker_racer': 'WhiskerRacer',
     'spaces': make_spaces,
     'multiagent': make_multiagent,
+    'slimevolley': 'SlimeVolley',
 }
 
 def env_creator(name='squared', *args, **kwargs):
