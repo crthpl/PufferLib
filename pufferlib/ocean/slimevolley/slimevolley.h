@@ -492,9 +492,12 @@ void abranti_simple_bot(float* obs, float* action) {
 // Required function
 void c_step(SlimeVolley* env) {
     env->rewards[0] = 0;
-    env->rewards[1] = 0;
     env->terminals[0] = 0;
-    env->terminals[1] = 0;
+    if (env->num_agents == 2){
+        env->rewards[1] = 0;
+        env->terminals[1] = 0;
+    }
+    
     Agent* left = &env->agents[0];
     Agent* right = &env->agents[1];
     Ball* ball = env->ball;
@@ -539,12 +542,16 @@ void c_step(SlimeVolley* env) {
         if (right_reward == -1){
             right->lives--;
             env->rewards[0] = 1.0f;
-            env->rewards[1] = -1.0f;
+            if (env->num_agents == 2){
+                env->rewards[1] = -1.0f;
+            }
         }
         else{
             left->lives--;
             env->rewards[0] = -1.0f;
-            env->rewards[1] = 1.0f;
+            if (env->num_agents == 2){
+                env->rewards[1] = 1.0f;
+            }
         }
     }
     agent_update_state(left, ball, right);
@@ -552,7 +559,9 @@ void c_step(SlimeVolley* env) {
 
     if (env->tick > MAX_TICKS || left->lives <= 0 || right->lives <= 0){
         env->terminals[0] = 1;
-        env->terminals[1] = 1;
+        if (env->num_agents == 2){
+            env->terminals[1] = 1;
+        }
         env->log.perf = (left->lives - right->lives + 5.0f)  / 10.0f; // normalize to 0-1
         env->log.score = (float)(left->lives - right->lives);
         env->log.episode_return = (5.0f - right->lives);
