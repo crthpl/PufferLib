@@ -153,6 +153,7 @@ MAKE_FUNCTIONS = {
     'impulse_wars': 'ImpulseWars',
     'drive': 'Drive',
     'pacman': 'Pacman',
+    'tmaze': 'TMaze',
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',
     'whisker_racer': 'WhiskerRacer',
