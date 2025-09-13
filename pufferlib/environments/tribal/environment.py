@@ -19,27 +19,32 @@ def env_creator(name='tribal'):
     return functools.partial(make, name=name)
 
 
-def make(name='tribal', config=None, render_mode='rgb_array', buf=None, seed=0):
+def make(name='tribal', config=None, render_mode='rgb_array', buf=None, seed=0, **kwargs):
     """Create a tribal PufferLib environment instance."""
     
     # Try to import the TribalPufferEnv from the metta project
     try:
-        # This assumes the metta project is installed or accessible
         from metta.sim.tribal_puffer import TribalPufferEnv
-        
+
+        # Merge config with kwargs
+        if config is None:
+            config = {}
+        config = {**config, **kwargs}
+
         # Create the environment with the provided config
         env = TribalPufferEnv(config=config, render_mode=render_mode, buf=buf)
-        
+
         # Wrap with episode stats for PufferLib compatibility
         env = pufferlib.EpisodeStats(env)
-        
+
         return env
-        
+
     except ImportError as e:
         raise ImportError(
             f"Failed to import TribalPufferEnv: {e}\\n\\n"
             "This environment requires the Metta AI project with tribal bindings. "
-            "Please ensure the metta package is installed and tribal bindings are built."
+            "Please ensure the metta package is installed and tribal bindings are built. "
+            "Run 'cd tribal && ./build_bindings.sh' to build the bindings."
         ) from e
 
 
