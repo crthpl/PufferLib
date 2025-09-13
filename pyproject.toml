@@ -220,6 +220,12 @@ ray = [
     'ray==2.23.0',
 ]
 
+tribal-village = [
+    'gym==0.23',
+    'gymnasium==0.29.1',
+    'numpy<2.0',
+]
+
 cleanrl = [
     'stable_baselines3==2.1.0',
     'tensorboard==2.11.2',
