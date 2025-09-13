@@ -3,9 +3,14 @@ Tribal Village Environment PufferLib Integration.
 
 This provides PufferLib compatibility for the Tribal Village environment,
 a multi-agent reinforcement learning environment built with Nim.
+
+The environment requires the tribal-village repository to be cloned and built.
 """
 
 import functools
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pufferlib
@@ -19,8 +24,35 @@ def make(name='tribal_village', config=None, buf=None, **kwargs):
     """Create a tribal village PufferLib environment instance."""
 
     try:
-        # Import from the external tribal-village-env package
-        from tribal_village_env import TribalVillageEnv
+        # This assumes tribal-village repo is cloned and accessible
+        # Users should: git clone https://github.com/Metta-AI/tribal-village.git
+
+        # Try to find the tribal-village repository
+        possible_paths = [
+            Path("tribal-village"),
+            Path("../tribal-village"),
+            Path.home() / "tribal-village",
+            Path.cwd() / "tribal-village"
+        ]
+
+        tribal_village_path = None
+        for path in possible_paths:
+            if path.exists() and (path / "build_lib.sh").exists():
+                tribal_village_path = path
+                break
+
+        if tribal_village_path is None:
+            raise ImportError(
+                "Tribal Village repository not found. Please clone it:\n"
+                "git clone https://github.com/Metta-AI/tribal-village.git\n"
+                "Then run: cd tribal-village && ./build_lib.sh"
+            )
+
+        # Add the tribal-village path to Python path
+        sys.path.insert(0, str(tribal_village_path))
+
+        # Import the ctypes-based environment
+        from tribal_village_env.environment import TribalVillageEnv
 
         # Merge config with kwargs
         if config is None:
@@ -34,15 +66,16 @@ def make(name='tribal_village', config=None, buf=None, **kwargs):
 
     except ImportError as e:
         raise ImportError(
-            f"Failed to import tribal-village-env: {e}\\n\\n"
-            "This environment requires the tribal-village-env package. "
-            "Install with: pip install tribal-village-env\\n"
-            "Or from source: pip install git+https://github.com/Metta-AI/tribal-village.git"
+            f"Failed to import tribal-village environment: {e}\n\n"
+            "This environment requires the tribal-village repository. "
+            "Clone and build it with:\n"
+            "  git clone https://github.com/Metta-AI/tribal-village.git\n"
+            "  cd tribal-village && ./build_lib.sh"
         ) from e
 
 
-# Default configuration for tribal environment
-TRIBAL_CONFIG = {
+# Default configuration for tribal village environment
+TRIBAL_VILLAGE_CONFIG = {
     'max_steps': 512,
     'ore_per_battery': 3,
     'batteries_per_heart': 2,
