@@ -51,7 +51,6 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
-
         # Backend perf optimization
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.deterministic = config['torch_deterministic']
@@ -356,7 +355,7 @@ class PuffeRL:
             mb_values = self.values[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
-            
+
             profile('train_forward', epoch)
             if not config['use_rnn']:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
@@ -366,6 +365,7 @@ class PuffeRL:
                 lstm_h=None,
                 lstm_c=None,
             )
+
             logits, newvalue = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
@@ -399,9 +399,8 @@ class PuffeRL:
             v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
             entropy_loss = entropy.mean()
-                
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
 
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
             self.amp_context.__enter__() # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -905,8 +904,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    env_conf = args['env']
-    train_config = dict(**args['train'], env=env_name, env_conf=env_conf)
+    train_config = dict(**args['train'], env=env_name)
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     all_logs = []

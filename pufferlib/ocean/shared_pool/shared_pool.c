@@ -1,11 +1,8 @@
-<<<<<<< HEAD:pufferlib/ocean/shared_pool/shared_pool.c
-#include "shared_pool.h"
-=======
->>>>>>> upstream/3.0:pufferlib/ocean/cpr/cpr.c
 #include <raylib.h>
 #include <unistd.h>
 #include "cpr.h"
 #include "puffernet.h"
+#include "shared_pool.h"
 
 int main() {
   CCpr env = {
