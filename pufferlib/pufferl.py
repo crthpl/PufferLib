@@ -133,20 +133,6 @@ class PuffeRL:
                 f'minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {horizon}'
             )
 
-        # LSD
-        if config["lsd"]:
-            # All this to force every agent in a Cenv to share the same skill
-            pop_size = config['lsd_population_size']
-            tot_envs = vecenv.num_environments * config['env_conf']['num_envs']
-            env_per_skill = pop_size // tot_envs
-            assert env_per_skill > 0, f"env_per_skill must be > 0, got {env_per_skill}"
-            assert pop_size % tot_envs == 0, f"pop_size {pop_size} must be divisible by tot_envs {tot_envs}"
-            agents_per_cenv = config['env_conf'].get('num_agents', vecenv.driver_env.num_agents//config['env_conf']['num_envs'])
-            self.agents_per_skill = agents_per_cenv * env_per_skill
-
-            self.skills = torch.randn(size=(pop_size, config['lsd_skill_dim']), device=device) # TODO: other skill init? read LSD
-            # self.skills = torch.repeat_interleave(skills, repeats=self.agents_per_skill, dim=0)
-
         # Torch compile
         self.uncompiled_policy = policy
         self.policy = policy
@@ -270,13 +256,6 @@ class PuffeRL:
                     state['lstm_h'] = self.lstm_h[env_id.start]
                     state['lstm_c'] = self.lstm_c[env_id.start]
 
-                if config['lsd']:
-                    skill_st = env_id.start // self.agents_per_skill
-                    skill_end = env_id.stop // self.agents_per_skill
-                    skills = self.skills[skill_st:skill_end]
-                    skills = skills.repeat_interleave(self.agents_per_skill, dim=0)
-                    state['skills'] = skills
-
                 logits, value = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
@@ -351,34 +330,6 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
-        if config['lsd']: 
-            # Compute discrim sur les mb_obs_latent (mb_segs, bptt, skill_dim) 
-            if config['use_rnn']:
-                obs_latent = self.policy.policy.discriminator_forward(self.observations.reshape(-1, *self.vecenv.single_observation_space.shape))
-            else: 
-                obs_latent = self.policy.discriminator_forward(self.observations.reshape(-1, *self.vecenv.single_observation_space.shape))
-            obs_latent = obs_latent.reshape(*self.observations.shape[:-1], -1)
-
-            # Get the diff on mb_obs_latent to get \phi(s_{t+1})-\phi(s_t) (mb_segs, bptt-1, skill_dim)
-            # Add the last one to 0, so we get the correct shape (mb_segs, bptt, skill_dim)
-            latent_diff = torch.zeros(obs_latent.shape, device=device)
-            latent_diff[:,:-1,:] = torch.diff(obs_latent, dim=-2)
-
-            # Add logic if terminal or truncation
-            valid_mask = (self.terminals == 0) & (self.truncations == 0)
-            latent_diff[~valid_mask] = 0
-
-            # Get the skills for each segment, and repeat to get shape (mb_segs, bptt, skill_dim)
-            skill_idx = torch.arange(end=self.segments) // self.agents_per_skill
-            skills = self.skills[skill_idx].repeat_interleave(
-                latent_diff.shape[1], dim=0
-            ).reshape(*latent_diff.shape[:-1], -1)
-
-            # compute dot product on last dim to get (mb_segs, bptt, 1)
-            r_lsd = (latent_diff * skills).sum(dim=-1)
-            # Overwrite rewards with this
-            self.rewards = r_lsd
-
         for mb in range(self.total_minibatches):
             profile('train_misc', epoch, nest=True)
             self.amp_context.__enter__()
@@ -405,9 +356,6 @@ class PuffeRL:
             mb_values = self.values[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
-            if config['lsd']:
-                mb_latent_diff = latent_diff[idx]
-                mb_skills = skills[idx]
             
             profile('train_forward', epoch)
             if not config['use_rnn']:
@@ -418,12 +366,6 @@ class PuffeRL:
                 lstm_h=None,
                 lstm_c=None,
             )
-
-            if config['lsd']: 
-                # TODO put correct skills
-                # skills = self.skills.repeat_interleave(self.minibatch_size // self.skills.shape[0], dim=0)
-                state['skills'] = mb_skills.reshape(-1, config['lsd_skill_dim'])
-
             logits, newvalue = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
@@ -459,28 +401,6 @@ class PuffeRL:
             entropy_loss = entropy.mean()
                 
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-
-            if config['lsd']:
-                # We need this again to not double backprop through discriminator
-                # Compute discrim sur les mb_obs_latent (mb_segs, bptt, skill_dim) 
-                if config['use_rnn']:
-                    mb_obs_latent = self.policy.policy.discriminator_forward(mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape))
-                else: 
-                    mb_obs_latent = self.policy.discriminator_forward(mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape))
-                mb_obs_latent = mb_obs_latent.reshape(*mb_obs.shape[:-1], -1)
-
-                # Get the diff on mb_obs_latent to get \phi(s_{t+1})-\phi(s_t) (mb_segs, bptt-1, skill_dim)
-                # Add the last one to 0, so we get the correct shape (mb_segs, bptt, skill_dim)
-                mb_latent_diff = torch.zeros(mb_obs_latent.shape, device=device)
-                mb_latent_diff[:,:-1,:] = torch.diff(mb_obs_latent, dim=-2)
-
-                # Add logic if terminal or truncation
-                valid_mask = (mb_terminals == 0) & (mb_truncations == 0)
-                mb_latent_diff[~valid_mask] = 0
-                
-                # LSD loss is basically r_lsd on the minibatch? 
-                lsd_loss = -(mb_latent_diff * mb_skills).sum(axis=-1).mean()
-                loss += lsd_loss
 
             self.amp_context.__enter__() # TODO: AMP needs some debugging
 
