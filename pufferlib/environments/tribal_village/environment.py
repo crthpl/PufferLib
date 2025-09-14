@@ -1,16 +1,11 @@
 """
 Tribal Village Environment PufferLib Integration.
 
-This provides PufferLib compatibility for the Tribal Village environment,
-a multi-agent reinforcement learning environment built with Nim.
-
-The environment requires the tribal-village repository to be cloned and built.
+Simple integration that imports the tribal-village environment directly.
+The tribal-village package should be installed via pip.
 """
 
 import functools
-import subprocess
-import sys
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pufferlib
@@ -24,34 +19,7 @@ def make(name='tribal_village', config=None, buf=None, **kwargs):
     """Create a tribal village PufferLib environment instance."""
 
     try:
-        # This assumes tribal-village repo is cloned and accessible
-        # Users should: git clone https://github.com/Metta-AI/tribal-village.git
-
-        # Try to find the tribal-village repository
-        possible_paths = [
-            Path("tribal-village"),
-            Path("../tribal-village"),
-            Path.home() / "tribal-village",
-            Path.cwd() / "tribal-village"
-        ]
-
-        tribal_village_path = None
-        for path in possible_paths:
-            if path.exists() and (path / "build_lib.sh").exists():
-                tribal_village_path = path
-                break
-
-        if tribal_village_path is None:
-            raise ImportError(
-                "Tribal Village repository not found. Please clone it:\n"
-                "git clone https://github.com/Metta-AI/tribal-village.git\n"
-                "Then run: cd tribal-village && ./build_lib.sh"
-            )
-
-        # Add the tribal-village path to Python path
-        sys.path.insert(0, str(tribal_village_path))
-
-        # Import the ctypes-based environment
+        # Import the installed tribal village environment
         from tribal_village_env.environment import TribalVillageEnv
 
         # Merge config with kwargs
@@ -59,18 +27,15 @@ def make(name='tribal_village', config=None, buf=None, **kwargs):
             config = {}
         config = {**config, **kwargs}
 
-        # Create the environment - it already implements PufferEnv interface
+        # Create the environment
         env = TribalVillageEnv(config=config, buf=buf)
-
         return env
 
     except ImportError as e:
         raise ImportError(
             f"Failed to import tribal-village environment: {e}\n\n"
-            "This environment requires the tribal-village repository. "
-            "Clone and build it with:\n"
-            "  git clone https://github.com/Metta-AI/tribal-village.git\n"
-            "  cd tribal-village && ./build_lib.sh"
+            "Install the tribal-village environment with:\n"
+            "  pip install pufferlib[tribal-village] --no-build-isolation"
         ) from e
 
 

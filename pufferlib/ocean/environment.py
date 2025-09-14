@@ -156,7 +156,6 @@ MAKE_FUNCTIONS = {
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',
     'whisker_racer': 'WhiskerRacer',
-    'tribal': 'Tribal',
     'spaces': make_spaces,
     'multiagent': make_multiagent,
 }
