@@ -1,7 +1,7 @@
 """
 PyTorch policy architectures for Tribal Village environment.
 
-Simplified policy following the metta pattern for token-based observations.
+Ultra-simplified policy for high performance, following metta pattern.
 """
 
 import torch
@@ -12,33 +12,23 @@ import pufferlib.models
 
 class Policy(nn.Module):
     """
-    Simplified policy for Tribal Village environment.
+    Ultra-simplified policy for Tribal Village environment.
 
-    Follows the metta pattern with token-based observations and multi-discrete actions.
+    Optimized for speed over sophistication - simple embeddings and small hidden sizes.
     """
 
-    def __init__(self, env, hidden_size=512, **kwargs):
+    def __init__(self, env, hidden_size=128, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
 
         # Token-based observation processing
         obs_space = env.single_observation_space
-        self.max_tokens = obs_space.shape[0]  # Should be 2541
+        self.max_tokens = obs_space.shape[0]
 
-        # Simple token embedding - map each token [coord_byte, layer, value] to features
-        self.token_embed = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(3, 128)),
-            nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Linear(128, 256)),
-            nn.ReLU(),
-        )
-
-        # Global pooling to fixed size
-        self.pooling = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(256, hidden_size)),
-            nn.ReLU(),
-        )
+        # Ultra-simple token processing - just embed and pool, no attention
+        self.token_embed = pufferlib.pytorch.layer_init(nn.Linear(3, 32))
+        self.pooling = pufferlib.pytorch.layer_init(nn.Linear(32, hidden_size))
 
         # Action heads for multi-discrete actions
         action_space = env.single_action_space
@@ -62,24 +52,23 @@ class Policy(nn.Module):
         return self.decode_actions(hidden)
 
     def encode_observations(self, observations: torch.Tensor, state=None) -> torch.Tensor:
-        """Encode token observations to features."""
-        batch_size = observations.shape[0]
-
+        """Ultra-simple token encoding - no attention, just embed and pool."""
         # observations shape: (batch, max_tokens, 3)
-        # Embed each token
-        token_features = self.token_embed(observations.float())  # (batch, max_tokens, 256)
 
-        # Simple mean pooling over tokens (ignoring padding tokens where coord_byte == 255)
+        # Simple embedding
+        token_features = torch.relu(self.token_embed(observations.float()))  # (batch, max_tokens, 32)
+
+        # Simple mean pooling over valid tokens (ignore padding where coord_byte == 255)
         coord_bytes = observations[:, :, 0]  # (batch, max_tokens)
         valid_mask = (coord_bytes != 255).float().unsqueeze(-1)  # (batch, max_tokens, 1)
 
         # Masked mean pooling
         masked_features = token_features * valid_mask
         valid_counts = valid_mask.sum(dim=1).clamp(min=1)  # (batch, 1)
-        pooled_features = masked_features.sum(dim=1) / valid_counts  # (batch, 256)
+        pooled_features = masked_features.sum(dim=1) / valid_counts  # (batch, 32)
 
         # Final processing
-        hidden = self.pooling(pooled_features)  # (batch, hidden_size)
+        hidden = torch.relu(self.pooling(pooled_features))  # (batch, hidden_size)
         return hidden
 
     def decode_actions(self, hidden: torch.Tensor):
@@ -96,5 +85,5 @@ class Policy(nn.Module):
 class Recurrent(pufferlib.models.LSTMWrapper):
     """Recurrent policy using PufferLib's LSTM wrapper."""
 
-    def __init__(self, env, policy, input_size=512, hidden_size=512):
+    def __init__(self, env, policy, input_size=128, hidden_size=128):
         super().__init__(env, policy, input_size, hidden_size)

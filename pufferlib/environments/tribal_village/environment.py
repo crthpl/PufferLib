@@ -39,17 +39,5 @@ def make(name='tribal_village', config=None, buf=None, **kwargs):
         ) from e
 
 
-# Default configuration for tribal village environment
-TRIBAL_VILLAGE_CONFIG = {
-    'max_steps': 512,
-    'ore_per_battery': 3,
-    'batteries_per_heart': 2,
-    'enable_combat': True,
-    'clippy_spawn_rate': 0.1,
-    'clippy_damage': 10,
-    'heart_reward': 1.0,
-    'battery_reward': 0.5,
-    'ore_reward': 0.1,
-    'survival_penalty': -0.01,
-    'death_penalty': -1.0,
-}
+# Configuration should come from the tribal-village repository's canonical config
+# No default overrides here - use tribal-village's own configuration
