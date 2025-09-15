@@ -16,7 +16,8 @@ class Policy(nn.Module):
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        # No preprocessing layers needed - direct dense observation processing
+        # Dense observation processing - 21 layers -> hidden_size
+        self.layer_proj = pufferlib.pytorch.layer_init(nn.Linear(21, hidden_size))
 
         # Action heads
         action_space = env.single_action_space
@@ -38,17 +39,14 @@ class Policy(nn.Module):
         return self.decode_actions(hidden)
 
     def encode_observations(self, observations: torch.Tensor, state=None) -> torch.Tensor:
-        """Ultra-fast dense observation processing - no token conversion."""
-        # observations shape: (batch, 21, 11, 11) - direct dense format
+        """Ultra-fast dense observation processing."""
+        # observations shape: (batch, 21, 11, 11) - direct dense format from Nim
 
-        # Global average pooling across spatial dimensions - very fast
+        # Global average pooling across spatial dimensions
         features = observations.float().mean(dim=(2, 3))  # (batch, 21) - one value per layer
 
-        # Sum across layers for single scalar per batch
-        scalar_features = features.sum(dim=1)  # (batch,) - single value per sample
-
-        # Expand to hidden size
-        hidden = scalar_features.unsqueeze(1).expand(-1, self.hidden_size)
+        # Use the pre-initialized layer projection
+        hidden = torch.relu(self.layer_proj(features))  # (batch, hidden_size)
         return hidden
 
     def decode_actions(self, hidden: torch.Tensor):
