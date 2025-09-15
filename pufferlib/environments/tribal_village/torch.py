@@ -26,7 +26,7 @@ class Policy(nn.Module):
         obs_space = env.single_observation_space
         self.max_tokens = obs_space.shape[0]
 
-        # Ultra-simple token processing - just embed and pool, no attention
+        # Token-native processing: embed tokens then pool to hidden size
         self.token_embed = pufferlib.pytorch.layer_init(nn.Linear(3, 32))
         self.pooling = pufferlib.pytorch.layer_init(nn.Linear(32, hidden_size))
 
@@ -52,10 +52,10 @@ class Policy(nn.Module):
         return self.decode_actions(hidden)
 
     def encode_observations(self, observations: torch.Tensor, state=None) -> torch.Tensor:
-        """Ultra-simple token encoding - no attention, just embed and pool."""
+        """Token-native processing - no grid rebuilding, direct token embedding."""
         # observations shape: (batch, max_tokens, 3)
 
-        # Simple embedding
+        # Simple token embedding - process tokens directly without grid conversion
         token_features = torch.relu(self.token_embed(observations.float()))  # (batch, max_tokens, 32)
 
         # Simple mean pooling over valid tokens (ignore padding where coord_byte == 255)
