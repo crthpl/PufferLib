@@ -224,6 +224,15 @@ tribal-village = [
     'gym==0.23',
     'gymnasium==0.29.1',
     'numpy<2.0',
+    'psutil',
+    'pynvml',
+    'rich',
+    'rich_argparse',
+    'imageio',
+    'pyro-ppl',
+    'heavyball',
+    'neptune',
+    'wandb',
     'tribal-village @ git+https://github.com/Metta-AI/tribal-village.git@main',
 ]
 
