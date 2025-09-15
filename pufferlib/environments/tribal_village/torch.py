@@ -18,7 +18,6 @@ class Policy(nn.Module):
 
         # Minimal token processing - just sum non-padding tokens
         self.token_proj = pufferlib.pytorch.layer_init(nn.Linear(3, 1))  # 3->1 projection
-        self.hidden_proj = pufferlib.pytorch.layer_init(nn.Linear(256, hidden_size))  # Fixed input size
 
         # Action heads
         action_space = env.single_action_space
@@ -52,14 +51,10 @@ class Policy(nn.Module):
 
         # Simple masked sum - very fast
         masked_values = token_values * valid_mask
-        features = masked_values.sum(dim=1, keepdim=True)  # (batch, 1)
+        features = masked_values.sum(dim=1)  # (batch,) scalar per sample
 
-        # Pad to fixed size for hidden projection
-        padded_features = torch.zeros(observations.shape[0], 256, device=observations.device)
-        padded_features[:, :1] = features
-
-        # Project to hidden size
-        hidden = torch.relu(self.hidden_proj(padded_features))
+        # Direct projection without padding allocation
+        hidden = torch.relu(features.unsqueeze(1).expand(-1, self.hidden_size))
         return hidden
 
     def decode_actions(self, hidden: torch.Tensor):
