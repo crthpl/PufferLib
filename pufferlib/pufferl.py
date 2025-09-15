@@ -198,7 +198,7 @@ class PuffeRL:
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        self.print_dashboard(clear=True)
+        #self.print_dashboard(clear=True)
 
     @property
     def uptime(self):
@@ -442,7 +442,7 @@ class PuffeRL:
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
             self.losses = losses
-            self.print_dashboard()
+            #self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
@@ -766,9 +766,9 @@ class Utilization(Thread):
                    time.sleep(self.delay)
                    continue
 
-                self.gpu_util.append(torch.cuda.utilization())
-                free, total = torch.cuda.mem_get_info()
-                self.gpu_mem.append(100*(total-free)/total)
+                #self.gpu_util.append(torch.cuda.utilization())
+                #free, total = torch.cuda.mem_get_info()
+                #self.gpu_mem.append(100*(total-free)/total)
             else:
                 self.gpu_util.append(0)
                 self.gpu_mem.append(0)
@@ -909,6 +909,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     all_logs = []
     while pufferl.global_step < train_config['total_timesteps']:
+        if pufferl.uptime > args['sweep']['max_cost']:
+            break
+
         if train_config['device'] == 'cuda':
             torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
@@ -925,15 +928,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     # rollouts within a fixed number of epochs)
     i = 0
     stats = {}
-    while i < 32 or not stats:
+    uptime = pufferl.uptime
+    agent_steps = pufferl.global_step
+    while i < 128 or not stats:
         stats = pufferl.evaluate()
         i += 1
 
     logs = pufferl.mean_and_log()
+    logs['uptime'] = uptime
+    logs['agent_steps'] = agent_steps
     if logs is not None:
         all_logs.append(logs)
 
-    pufferl.print_dashboard()
+    #pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.close(model_path)
     return all_logs
@@ -993,6 +1000,100 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             frames.append('Done')
+
+def _sweep_worker(env_name, q_host, q_worker, device):
+    while True:
+        #print("Worker waiting")
+        args = q_worker.get()
+        #print("Worker got data")
+        args['train']['device'] = device
+        seed = time.time_ns() & 0xFFFFFFFF
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        try:
+            all_logs = train(env_name, args=args)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+        #all_logs = [{'foo': 0}]
+        #print("Worker ran experiment")
+        q_host.put(all_logs)
+        #print("Worker submitted result")
+
+def multisweep(args=None, env_name=None):
+    args = args or load_config(env_name)
+    sweep_gpus = args['sweep_gpus']
+    if sweep_gpus == -1:
+        sweep_gpus = torch.cuda.device_count()
+
+    method = args['sweep'].pop('method')
+    try:
+        sweep_cls = getattr(pufferlib.sweep, method)
+    except:
+        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
+
+    sweep = sweep_cls(args['sweep'])
+    points_per_run = args['sweep']['downsample']
+    target_key = f'environment/{args["sweep"]["metric"]}'
+
+    from multiprocessing import Process, Queue, set_start_method
+    from copy import deepcopy
+
+    host_queues = []
+    worker_queues = []
+    workers = []
+    worker_args = []
+    set_start_method('spawn')
+    for i in range(sweep_gpus):
+        q_host = Queue()
+        q_worker = Queue()
+        w = Process(
+            target=_sweep_worker,
+            args=(env_name, q_host, q_worker, f'cuda:{i}')
+        )
+        w.start()
+        host_queues.append(q_host)
+        worker_queues.append(q_worker)
+        args = deepcopy(args)
+        worker_args.append(args)
+
+    for w in range(sweep_gpus):
+        args = worker_args[w]
+        sweep.suggest(args)
+        total_timesteps = args['train']['total_timesteps']
+        worker_queues[w].put(args)
+
+    runs = 0
+
+    suggestion = deepcopy(args)
+    while runs < args['max_runs']:
+        for w in range(sweep_gpus):
+            args = worker_args[w]
+            if host_queues[w].empty():
+                continue
+
+            all_logs = host_queues[w].get(timeout=0)
+            if not all_logs:
+                continue
+
+            all_logs = [e for e in all_logs if target_key in e]
+            scores = downsample([log[target_key] for log in all_logs], points_per_run)
+            times = downsample([log['uptime'] for log in all_logs], points_per_run)
+            steps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+            #costs = np.stack([times, steps], axis=1)
+            costs = times
+            timesteps = [log['agent_steps'] for log in all_logs]
+            timesteps = downsample(timesteps, points_per_run)
+            for score, cost, timestep in zip(scores, costs, timesteps):
+                args['train']['total_timesteps'] = timestep
+                sweep.observe(args, score, cost)
+
+            runs += 1
+
+            sweep.suggest(args)
+            worker_queues[w].put(args)
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
@@ -1141,6 +1242,7 @@ def load_config(env_name):
     parser.add_argument('--neptune-name', type=str, default='pufferai')
     parser.add_argument('--neptune-project', type=str, default='ablations')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
+    parser.add_argument('--sweep-gpus', type=int, default=-1, help='multigpu sweeps')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     args = parser.parse_known_args()[0]
 
@@ -1205,6 +1307,8 @@ def main():
         eval(env_name=env_name)
     elif mode == 'sweep':
         sweep(env_name=env_name)
+    elif mode == 'multisweep':
+        multisweep(env_name=env_name)
     elif mode == 'autotune':
         autotune(env_name=env_name)
     elif mode == 'profile':

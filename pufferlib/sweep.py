@@ -114,7 +114,7 @@ class Logit(Space):
 def _params_from_puffer_sweep(sweep_config):
     param_spaces = {}
     for name, param in sweep_config.items():
-        if name in ('method', 'metric', 'goal', 'downsample'):
+        if name in ('method', 'metric', 'goal', 'downsample', 'max_cost'):
             continue
 
         assert isinstance(param, dict)
@@ -337,6 +337,8 @@ class Protein:
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
             expansion_rate = 0.25,
+            buffer_size = 10,
+            max_cost = 30,
         ):
         self.hyperparameters = Hyperparameters(sweep_config)
         self.num_random_samples = num_random_samples
@@ -347,6 +349,8 @@ class Protein:
         self.resample_frequency = resample_frequency
         self.max_suggestion_cost = max_suggestion_cost
         self.expansion_rate = expansion_rate
+        self.buffer_size = buffer_size
+        self.buffer = []
 
         self.success_observations = []
         self.failure_observations = []
@@ -357,6 +361,11 @@ class Protein:
 
     def suggest(self, fill):
         # TODO: Clip random samples to bounds so we don't get bad high cost samples
+        if len(self.buffer) > 0:
+            suggestion = self.buffer.pop()
+            print('Suggested')
+            return self.hyperparameters.to_dict(suggestion, fill), {}
+
         info = {}
         self.suggestion_idx += 1
         if len(self.success_observations) == 0 and self.seed_with_search_center:
@@ -446,8 +455,13 @@ class Protein:
 
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
                 gp_y_norm*weight)
+        mask = gp_c > 30
+        suggestion_scores[mask.squeeze()] = -1e8
 
-        best_idx = np.argmax(suggestion_scores)
+        idxs = np.argsort(suggestion_scores)[::-1][:self.buffer_size]
+        best_idx = idxs[0]
+        self.buffer = [suggestions[i].numpy() for i in idxs[1:]]
+
         info = dict(
             cost = gp_c[best_idx].item(),
             score = gp_y[best_idx].item(),
