@@ -16,8 +16,7 @@ class Policy(nn.Module):
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        # Minimal token processing - just sum non-padding tokens
-        self.token_proj = pufferlib.pytorch.layer_init(nn.Linear(3, 1))  # 3->1 projection
+        # No preprocessing layers needed - direct dense observation processing
 
         # Action heads
         action_space = env.single_action_space
@@ -39,22 +38,17 @@ class Policy(nn.Module):
         return self.decode_actions(hidden)
 
     def encode_observations(self, observations: torch.Tensor, state=None) -> torch.Tensor:
-        """Ultra-minimal token processing - just count and sum."""
-        # observations shape: (batch, 256, 3)
+        """Ultra-fast dense observation processing - no token conversion."""
+        # observations shape: (batch, 21, 11, 11) - direct dense format
 
-        # Simple projection of each token to scalar
-        token_values = self.token_proj(observations.float()).squeeze(-1)  # (batch, 256)
+        # Global average pooling across spatial dimensions - very fast
+        features = observations.float().mean(dim=(2, 3))  # (batch, 21) - one value per layer
 
-        # Mask out padding tokens (coord_byte == 255)
-        coord_bytes = observations[:, :, 0]
-        valid_mask = (coord_bytes != 255).float()
+        # Sum across layers for single scalar per batch
+        scalar_features = features.sum(dim=1)  # (batch,) - single value per sample
 
-        # Simple masked sum - very fast
-        masked_values = token_values * valid_mask
-        features = masked_values.sum(dim=1)  # (batch,) scalar per sample
-
-        # Direct projection without padding allocation
-        hidden = torch.relu(features.unsqueeze(1).expand(-1, self.hidden_size))
+        # Expand to hidden size
+        hidden = scalar_features.unsqueeze(1).expand(-1, self.hidden_size)
         return hidden
 
     def decode_actions(self, hidden: torch.Tensor):
