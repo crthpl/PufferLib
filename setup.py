@@ -254,6 +254,13 @@ install_requires = [
     'pettingzoo==1.24.1',
 ]
 
+# Ship every bundled config so new environments work after editable/wheel installs.
+config_files = [
+    os.path.relpath(path, 'pufferlib')
+    for path in glob.glob('pufferlib/config/**/*.ini', recursive=True)
+]
+package_data_files = [RAYLIB_NAME + '/lib/libraylib.a'] + config_files
+
 if not NO_TRAIN:
     install_requires += [
         'torch',
@@ -272,7 +279,7 @@ setup(
     version="3.0.0",
     packages=find_namespace_packages() + find_packages() + c_extension_paths + ['pufferlib/extensions'],
     package_data={
-        "pufferlib": [RAYLIB_NAME + '/lib/libraylib.a']
+        "pufferlib": package_data_files
     },
     include_package_data=True,
     install_requires=install_requires,
