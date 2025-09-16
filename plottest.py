@@ -230,7 +230,8 @@ def load_sweep_data(path):
             exp = json.load(f)
 
         cost = exp['cost']
-        step = exp['total_timesteps']
+        #step = exp['total_timesteps']
+        step = exp['data'][-1]['agent_steps']
         score = exp['data'][-1]['environment/score']
         costs.append(cost)
         steps.append(step)

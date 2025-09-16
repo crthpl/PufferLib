@@ -115,17 +115,7 @@ class PuffeRL:
         minibatch_size = config['minibatch_size']
         max_minibatch_size = config['max_minibatch_size']
         self.minibatch_size = min(minibatch_size, max_minibatch_size)
-        if minibatch_size > max_minibatch_size and minibatch_size % max_minibatch_size != 0:
-            raise pufferlib.APIUsageError(
-                f'minibatch_size {minibatch_size} > max_minibatch_size {max_minibatch_size} must divide evenly')
-
-        if batch_size < minibatch_size:
-            raise pufferlib.APIUsageError(
-                f'batch_size {batch_size} must be >= minibatch_size {minibatch_size}'
-            )
-
         self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
-        self.total_minibatches = int(config['update_epochs'] * batch_size / self.minibatch_size)
         self.minibatch_segments = self.minibatch_size // horizon 
         if self.minibatch_segments * horizon != self.minibatch_size:
             raise pufferlib.APIUsageError(
@@ -329,7 +319,8 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
-        for mb in range(self.total_minibatches):
+        num_minibatches = config['num_minibatches']
+        for mb in range(num_minibatches):
             profile('train_misc', epoch, nest=True)
             self.amp_context.__enter__()
 
@@ -343,7 +334,8 @@ class PuffeRL:
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            idx = torch.multinomial(prio_probs,
+                self.minibatch_segments, replacement=True)
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
@@ -408,13 +400,13 @@ class PuffeRL:
 
             # Logging
             profile('train_misc', epoch)
-            losses['policy_loss'] += pg_loss.item() / self.total_minibatches
-            losses['value_loss'] += v_loss.item() / self.total_minibatches
-            losses['entropy'] += entropy_loss.item() / self.total_minibatches
-            losses['old_approx_kl'] += old_approx_kl.item() / self.total_minibatches
-            losses['approx_kl'] += approx_kl.item() / self.total_minibatches
-            losses['clipfrac'] += clipfrac.item() / self.total_minibatches
-            losses['importance'] += ratio.mean().item() / self.total_minibatches
+            losses['policy_loss'] += pg_loss.item() / num_minibatches
+            losses['value_loss'] += v_loss.item() / num_minibatches
+            losses['entropy'] += entropy_loss.item() / num_minibatches
+            losses['old_approx_kl'] += old_approx_kl.item() / num_minibatches
+            losses['approx_kl'] += approx_kl.item() / num_minibatches
+            losses['clipfrac'] += clipfrac.item() / num_minibatches
+            losses['importance'] += ratio.mean().item() / num_minibatches
 
             # Learn on accumulated minibatches
             profile('learn', epoch)
@@ -432,8 +424,8 @@ class PuffeRL:
         y_pred = self.values.flatten()
         y_true = advantages.flatten() + self.values.flatten()
         var_y = y_true.var()
-        explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
-        losses['explained_variance'] = explained_var.item()
+        explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
+        losses['explained_variance'] = explained_var
 
         profile.end()
         logs = None
@@ -1205,7 +1197,7 @@ def load_policy(args, vecenv, env_name=''):
     rnn_name = args['rnn_name']
     if rnn_name is not None:
         rnn_cls = getattr(env_module.torch, args['rnn_name'])
-        policy = rnn_cls(vecenv.driver_env, policy, **args['rnn'])
+        policy = rnn_cls(vecenv.driver_env, policy, **args['policy'])
 
     policy = policy.to(device)
 
