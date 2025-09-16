@@ -167,7 +167,7 @@ class PuffeRL:
         # Logging
         self.logger = logger
         if logger is None:
-            self.logger = NoLogger(config)
+            self.logger = Logger(config)
 
         # Learning rate scheduler
         epochs = config['total_timesteps'] // config['batch_size']
@@ -496,7 +496,8 @@ class PuffeRL:
         self.utilization.stop()
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}.pt')
+        path = os.path.join(self.config['data_dir'],
+            self.config["env"], f'{run_id}.pt')
         shutil.copy(model_path, path)
         return path
 
@@ -506,7 +507,8 @@ class PuffeRL:
                return
  
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}')
+        path = os.path.join(self.config['data_dir'],
+            self.config["env"], run_id)
         if not os.path.exists(path):
             os.makedirs(path)
 
@@ -795,15 +797,28 @@ def downsample(arr, m):
     downsampled = arr.reshape(m, -1).mean(axis=1)
     return np.concatenate([downsampled, [last]])
 
-class NoLogger:
+class Logger:
     def __init__(self, args):
-        self.run_id = str(int(100*time.time()))
+        self.run_id = str(int(1000*time.time()))
+        root = os.path.join(args['data_dir'], 'logs', args['env'])
+        if not os.path.exists(root):
+            os.makedirs(root)
+
+        self.path = os.path.join(root, self.run_id + '.json')
+        self.logs = {'data': []}
+        for k, v in pufferlib.unroll_nested_dict(args):
+            self.logs[k] = v
 
     def log(self, logs, step):
-        pass
+        self.logs['data'].append(logs)
+
+    def log_cost(self, cost):
+        self.logs['cost'] = cost
 
     def close(self, model_path):
-        pass
+        import json
+        with open(self.path, 'w') as f:
+            json.dump(self.logs, f)
 
 class NeptuneLogger:
     def __init__(self, args, load_id=None, mode='async'):
@@ -942,6 +957,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     #pufferl.print_dashboard()
     model_path = pufferl.close()
+    pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path)
     return all_logs
 
@@ -1119,7 +1135,7 @@ def sweep(args=None, env_name=None):
         all_logs = train(env_name, args=args)
         all_logs = [e for e in all_logs if target_key in e]
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
-        costs = downsample([log['uptime'] for log in all_logs], points_per_run)
+        costs = downsample([log['agent_steps'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
