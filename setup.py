@@ -177,8 +177,8 @@ class TorchBuildExt(cpp_extension.BuildExtension):
         self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
         super().run()
 
+INCLUDE = [f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
 RAYLIB_A = f'{RAYLIB_NAME}/lib/libraylib.a'
-INCLUDE = [numpy.get_include(), 'raylib/include', f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
 extension_kwargs = dict(
     include_dirs=INCLUDE,
     extra_compile_args=extra_compile_args,
