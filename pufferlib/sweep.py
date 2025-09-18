@@ -337,7 +337,7 @@ class Protein:
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
             expansion_rate = 0.25,
-            buffer_size = 10,
+            buffer_size = 5,
             max_cost = 30,
         ):
         self.hyperparameters = Hyperparameters(sweep_config)

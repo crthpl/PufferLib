@@ -160,7 +160,7 @@ class PuffeRL:
             self.logger = Logger(config)
 
         # Learning rate scheduler
-        epochs = config['total_timesteps'] // config['batch_size']
+        epochs = max(1, config['total_timesteps'] // config['batch_size'])
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
 
@@ -773,7 +773,7 @@ class Utilization(Thread):
         self.stopped = True
 
 def downsample(arr, m):
-    if len(arr) < m:
+    if len(arr) <= m:
         return arr
 
     if m == 0:
@@ -1103,6 +1103,86 @@ def multisweep(args=None, env_name=None):
             sweep.suggest(args)
             worker_queues[w].put(args)
 
+def paretosweep(args=None, env_name=None):
+    args = args or load_config(env_name)
+    sweep_gpus = args['sweep_gpus']
+    if sweep_gpus == -1:
+        sweep_gpus = torch.cuda.device_count()
+
+    method = args['sweep'].pop('method')
+    try:
+        sweep_cls = getattr(pufferlib.sweep, method)
+    except:
+        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
+
+    total_timesteps = args['sweep']['train'].pop('total_timesteps')
+    mmin = total_timesteps['min']
+    mmax = total_timesteps['max']
+    all_timesteps = np.geomspace(mmin, mmax, sweep_gpus)
+    # You hardcoded buffer size to 5 instead of 10 for this
+    sweeps = [sweep_cls(args['sweep']) for _ in range(sweep_gpus)]
+    points_per_run = args['sweep']['downsample']
+    target_key = f'environment/{args["sweep"]["metric"]}'
+
+    from multiprocessing import Process, Queue, set_start_method
+    from copy import deepcopy
+
+    host_queues = []
+    worker_queues = []
+    workers = []
+    worker_args = []
+    set_start_method('spawn')
+    for i in range(sweep_gpus):
+        q_host = Queue()
+        q_worker = Queue()
+        w = Process(
+            target=_sweep_worker,
+            args=(env_name, q_host, q_worker, f'cuda:{i}')
+        )
+        w.start()
+        host_queues.append(q_host)
+        worker_queues.append(q_worker)
+        args = deepcopy(args)
+        worker_args.append(args)
+
+    for w in range(sweep_gpus):
+        args = worker_args[w]
+        sweeps[w].suggest(args)
+        args['train']['total_timesteps'] = all_timesteps[w]
+        worker_queues[w].put(args)
+
+    runs = 0
+
+    suggestion = deepcopy(args)
+    while runs < args['max_runs']:
+        for w in range(sweep_gpus):
+            args = worker_args[w]
+            if host_queues[w].empty():
+                continue
+
+            all_logs = host_queues[w].get(timeout=0)
+            if not all_logs:
+                continue
+
+            all_logs = [e for e in all_logs if target_key in e]
+            scores = downsample([log[target_key] for log in all_logs], points_per_run)
+            times = downsample([log['uptime'] for log in all_logs], points_per_run)
+            steps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+            #costs = np.stack([times, steps], axis=1)
+            costs = times
+            timesteps = [log['agent_steps'] for log in all_logs]
+            timesteps = downsample(timesteps, points_per_run)
+            for score, cost, timestep in zip(scores, costs, timesteps):
+                args['train']['total_timesteps'] = timestep
+                sweeps[w].observe(args, score, cost)
+
+            runs += 1
+
+            sweeps[w].suggest(args)
+            args['train']['total_timesteps'] = all_timesteps[w]
+            worker_queues[w].put(args)
+
+
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
@@ -1317,6 +1397,8 @@ def main():
         sweep(env_name=env_name)
     elif mode == 'multisweep':
         multisweep(env_name=env_name)
+    elif mode == 'paretosweep':
+        paretosweep(env_name=env_name)
     elif mode == 'autotune':
         autotune(env_name=env_name)
     elif mode == 'profile':
