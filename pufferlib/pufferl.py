@@ -1188,6 +1188,7 @@ def paretosweep(args=None, env_name=None):
             args['train']['total_timesteps'] = all_timesteps[w]
             worker_queues[w].put(args)
 
+    print('Done')
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
@@ -1328,7 +1329,7 @@ def load_config(env_name):
     parser.add_argument('--save-frames', type=int, default=0)
     parser.add_argument('--gif-path', type=str, default='eval.gif')
     parser.add_argument('--fps', type=float, default=15)
-    parser.add_argument('--max-runs', type=int, default=200, help='Max number of sweep runs')
+    parser.add_argument('--max-runs', type=int, default=1200, help='Max number of sweep runs')
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='pufferlib')
     parser.add_argument('--wandb-group', type=str, default='debug')

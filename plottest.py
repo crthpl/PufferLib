@@ -238,7 +238,7 @@ def load_sweep_data(path):
         if score < 20:
             continue
 
-        if score > 20 and cost < 15 and step > 20e6:
+        if score > 20 and cost < 15 and step < 2e6:
             for kk, vv in exp.items():
                 if isinstance(vv, dict):
                     for k, v in vv.items():
