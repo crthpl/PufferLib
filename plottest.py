@@ -230,9 +230,22 @@ def load_sweep_data(path):
             exp = json.load(f)
 
         cost = exp['cost']
+        #cost = exp['train/num_minibatches']
+        #cost = exp['env/frameskip']
         #step = exp['total_timesteps']
         step = exp['data'][-1]['agent_steps']
         score = exp['data'][-1]['environment/score']
+        if score < 20:
+            continue
+
+        if score > 20 and cost < 15 and step > 20e6:
+            for kk, vv in exp.items():
+                if isinstance(vv, dict):
+                    for k, v in vv.items():
+                        print(kk, k, '=', v)
+                else:
+                    print(kk, '=', vv)
+
         costs.append(cost)
         steps.append(step)
         scores.append(score)
@@ -256,12 +269,13 @@ def layout():
     #plot_group(fig2, all_uptime, all_perf, legend='Connect4', i=2)
 
     #fig3 = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-    fig3 = figure(title='Sweep', xlabel='Steps', ylabel='Score', legend='Trial')
+    fig3 = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
     steps, costs, scores = load_sweep_data('experiments/logs/puffer_pong/*.json')
     #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
     #plot_lines(fig3, [pareto_steps], [pareto_costs])
     #scatter(fig3, steps, costs, scores, legend='Pong')
-    scatter(fig3, steps, scores, costs, legend='Pong')
+    #scatter(fig3, steps, scores, costs, legend='Pong')
+    scatter(fig3, steps, costs, scores, legend='Pong')
     layout = html.Div([
         html.H1('The Puffer Frontier Project', style={'textAlign': 'center'}),
         dcc.Graph(figure=fig1),
@@ -279,4 +293,4 @@ app = Dash()
 # Set layout with static graph
 app.layout = layout
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8090)
+    app.run(host='0.0.0.0', port=8000)
