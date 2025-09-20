@@ -103,15 +103,7 @@ def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0):
 
     colors = []
     for e in c:
-        if e > 0.95*mmax:
-            v = 1.0
-        elif e > 0.9*mmax:
-            v = 0.6
-        elif e > 0.5*mmax:
-            v = 0.3
-        else:
-            v = 0
-
+        v = (e - mmin)/(mmax - mmin)
         colors.append(f'rgb(0, 0.5, {v})')
 
     #c = (np.array(c) - min(c))/(max(c) - min(c))
@@ -222,45 +214,31 @@ def load_hyper_data(filename):
 
 def load_sweep_data(path):
     import glob
-    costs = []
-    steps = []
-    scores = []
+    experiments = []
     for fpath in glob.glob(path):
         with open(fpath, 'r') as f:
             exp = json.load(f)
 
-        cost = exp['cost']
-        #cost = exp['train/num_minibatches']
-        #cost = exp['env/frameskip']
-        #step = exp['total_timesteps']
-        step = exp['data'][-1]['agent_steps']
-        score = exp['data'][-1]['environment/score']
-        if score < 20:
-            continue
+        data = {}
+        for kk, vv in exp.items():
+            if kk == 'data':
+                for k, v in exp[kk][-1].items():
+                    data[k] = v
+            else:
+                data[kk] = vv
 
-        if score > 20 and cost < 15 and step < 2e6:
-            for kk, vv in exp.items():
-                if isinstance(vv, dict):
-                    for k, v in vv.items():
-                        print(kk, k, '=', v)
-                else:
-                    print(kk, '=', vv)
+        experiments.append(data)
 
-        costs.append(cost)
-        steps.append(step)
-        scores.append(score)
-
-    return steps, costs, scores
-
+    return experiments
 
 def layout():
-    fig1 = figure(title='Hyperparameter Ablation', xlabel='Learning Rate', legend='Ablate', xaxis_type='log')
+    #fig1 = figure(title='Hyperparameter Ablation', xlabel='Learning Rate', legend='Ablate', xaxis_type='log')
     #all_hyper, all_perf = load_hyper_data('puffer_pong_learning_rate.npz')
     #plot_group(fig1, all_hyper, all_perf, legend='Pong')
     #all_hyper, all_perf = load_hyper_data('puffer_breakout_learning_rate.npz')
     #plot_group(fig1, all_hyper, all_perf, legend='Breakout', i=1)
 
-    fig2 = figure(title='Seed Sensitivity', xlabel='Uptime', legend='Ablate')
+    #fig2 = figure(title='Seed Sensitivity', xlabel='Uptime', legend='Ablate')
     #all_uptime, all_perf = load_seed_data('puffer_pong_seeds.npz')
     #plot_group(fig2, all_uptime, all_perf, legend='Pong')
     #all_uptime, all_perf = load_seed_data('puffer_breakout_seeds.npz')
@@ -268,20 +246,62 @@ def layout():
     #all_uptime, all_perf = load_seed_data('puffer_connect4_seeds.npz')
     #plot_group(fig2, all_uptime, all_perf, legend='Connect4', i=2)
 
-    #fig3 = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-    fig3 = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-    steps, costs, scores = load_sweep_data('experiments/logs/puffer_pong/*.json')
+    experiments = load_sweep_data('experiments/logs/puffer_pong/*.json')
+    steps = [e['agent_steps'] for e in experiments]
+    costs = [e['cost'] for e in experiments]
+    scores = [e['environment/score'] for e in experiments]
+
+    # Filter outliers
+    idxs = [i for i, s in enumerate(steps) if s < 1e6]
+    experiments = [experiments[i] for i in idxs]
+    steps = [steps[i] for i in idxs]
+    costs = [costs[i] for i in idxs]
+    scores = [scores[i] for i in idxs]
+
+    # Adjust steps
+    has_skip = ['env/frameskip' in e for e in experiments]
+    if any(has_skip):
+        experiments = [e for e, s in zip(experiments, has_skip) if s]
+        steps = [e['env/frameskip']*e['agent_steps'] for e, s
+            in zip(experiments, has_skip) if s]
+        costs = [e['cost'] for e, s in zip(experiments, has_skip) if s]
+        scores = [e['environment/score'] for e, s in zip(experiments, has_skip) if s]
+
+    # Filter by score
+    max_score = max(scores)
+    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
+    filtered_steps = [steps[i] for i in idxs]
+    filtered_costs = [costs[i] for i in idxs]
+    filtered_scores = [scores[i] for i in idxs]
+
+    # Header plot
+    frontier = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
+    scatter(frontier, filtered_steps, filtered_costs, filtered_scores, legend='Pong')
+
+    figs = []
+    hypers = [
+        'train/learning_rate',
+        'train/num_minibatches',
+        'policy/hidden_size',
+        'env/frameskip',
+    ]
+    for hyper in hypers:
+        f = figure(title=hyper, xlabel=hyper, ylabel='Score', legend='Ablate')
+        idxs = [i for i, e in enumerate(experiments) if hyper in e]
+        v = [experiments[i][hyper] for i in idxs]
+        s = [scores[i] for i in idxs]
+        ss = [np.log(steps[i]) for i in idxs]
+        c = [costs[i] for i in idxs]
+        scatter(f, v, s, ss, legend='Pong')
+        figs.append(f)
+
     #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
     #plot_lines(fig3, [pareto_steps], [pareto_costs])
-    #scatter(fig3, steps, costs, scores, legend='Pong')
-    #scatter(fig3, steps, scores, costs, legend='Pong')
-    scatter(fig3, steps, costs, scores, legend='Pong')
     layout = html.Div([
         html.H1('The Puffer Frontier Project', style={'textAlign': 'center'}),
-        dcc.Graph(figure=fig1),
+        dcc.Graph(figure=frontier),
         html.Br(),
-        dcc.Graph(figure=fig2),
-        dcc.Graph(figure=fig3)
+        *[dcc.Graph(figure=f) for f in figs]
     ])
     return layout
 
