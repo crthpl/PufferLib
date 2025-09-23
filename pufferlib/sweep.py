@@ -338,7 +338,7 @@ class Protein:
             seed_with_search_center = True,
             expansion_rate = 0.25,
             buffer_size = 5,
-            max_cost = 30,
+            max_cost = -1,
         ):
         self.hyperparameters = Hyperparameters(sweep_config)
         self.num_random_samples = num_random_samples
@@ -349,6 +349,8 @@ class Protein:
         self.resample_frequency = resample_frequency
         self.max_suggestion_cost = max_suggestion_cost
         self.expansion_rate = expansion_rate
+        self.max_cost = max_cost
+
         self.buffer_size = buffer_size
         self.buffer = []
 
@@ -455,8 +457,12 @@ class Protein:
 
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
                 gp_y_norm*weight)
-        mask = gp_c > 30
-        suggestion_scores[mask.squeeze()] = -1e8
+
+        # Mask out high cost samples
+        # These tend to correlate with overconfident predictions
+        if self.max_cost > 0:
+            mask = gp_c > self.max_cost
+            suggestion_scores[mask.squeeze()] = -1e8
 
         idxs = np.argsort(suggestion_scores)[::-1][:self.buffer_size]
         best_idx = idxs[0]
