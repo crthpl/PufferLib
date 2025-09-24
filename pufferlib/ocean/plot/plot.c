@@ -3,6 +3,11 @@
 #include <string.h>
 #include "raylib.h"
 
+const Color PUFF_RED = (Color){187, 0, 0, 255};
+const Color PUFF_CYAN = (Color){0, 187, 187, 255};
+const Color PUFF_WHITE = (Color){241, 241, 241, 241};
+const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
+
 int main(void) {
     // Read CSV file
     FILE *fp = fopen("pufferlib/ocean/plot/data.csv", "r");
@@ -70,11 +75,11 @@ int main(void) {
 
     while (!WindowShouldClose()) {
         BeginDrawing();
-        ClearBackground(RAYWHITE);
+        ClearBackground(PUFF_BACKGROUND);
 
         // Draw axes
-        DrawLine(margin, margin, margin, screenHeight - margin, BLACK);  // Y-axis
-        DrawLine(margin, screenHeight - margin, screenWidth - margin, screenHeight - margin, BLACK);  // X-axis
+        DrawLine(margin, margin, margin, screenHeight - margin, PUFF_WHITE);  // Y-axis
+        DrawLine(margin, screenHeight - margin, screenWidth - margin, screenHeight - margin, PUFF_WHITE);  // X-axis
 
         // Plot lines
         for (int j = 0; j < num_points - 1; j++) {
@@ -82,7 +87,7 @@ int main(void) {
             float py1 = (screenHeight - margin) - (y[j] - min_y) / dy * (screenHeight - 2 * margin);
             float px2 = margin + (x[j + 1] - min_x) / dx * (screenWidth - 2 * margin);
             float py2 = (screenHeight - margin) - (y[j + 1] - min_y) / dy * (screenHeight - 2 * margin);
-            DrawLine(px1, py1, px2, py2, BLUE);
+            DrawLine(px1, py1, px2, py2, PUFF_CYAN);
         }
 
         EndDrawing();
