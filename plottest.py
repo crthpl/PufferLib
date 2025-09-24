@@ -104,6 +104,8 @@ def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0):
     colors = []
     for e in c:
         v = (e - mmin)/(mmax - mmin)
+        if v < 0.001:
+            v = 0.001
         colors.append(f'rgb(0, 0.5, {v})')
 
     #c = (np.array(c) - min(c))/(max(c) - min(c))
