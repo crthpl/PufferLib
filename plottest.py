@@ -246,7 +246,9 @@ def layout():
     #all_uptime, all_perf = load_seed_data('puffer_connect4_seeds.npz')
     #plot_group(fig2, all_uptime, all_perf, legend='Connect4', i=2)
 
-    experiments = load_sweep_data('experiments/logs/puffer_breakout/*.json')
+    env_name = 'pong'
+
+    experiments = load_sweep_data(f'experiments/logs/puffer_{env_name}/*.json')
     steps = [e['agent_steps'] for e in experiments]
     costs = [e['cost'] for e in experiments]
     scores = [e['environment/score'] for e in experiments]
@@ -271,38 +273,44 @@ def layout():
 
     # Filter by score
     max_score = max(scores)
-    idxs = [i for i, s in enumerate(scores) if s > 0.0*max_score]
+    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
     filtered_steps = [steps[i] for i in idxs]
     filtered_costs = [costs[i] for i in idxs]
     filtered_scores = [scores[i] for i in idxs]
 
     # Header plot
-    frontier = figure(title='Sweep', xlabel='Costs', ylabel='Scores', legend='Trial')
-    scatter(frontier, filtered_costs, filtered_scores, filtered_steps, legend='Breakout')
+    step_cost = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
+    scatter(step_cost, filtered_steps, filtered_costs, filtered_scores, legend=env_name)
+
+    step_score = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
+    scatter(step_score, steps, scores, costs, legend=env_name)
+
+    cost_score = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
+    scatter(cost_score, costs, scores, steps, legend=env_name)
 
     figs = []
     hypers = [
-        'train/learning_rate',
-        'train/ent_coef',
-        'train/gamma',
-        'train/gae_lambda',
-        'train/vtrace_rho_clip',
-        'train/vtrace_c_clip',
-        'train/clip_coef',
-        'train/vf_clip_coef',
-        'train/vf_coef',
-        'train/max_grad_norm',
-        'train/adam_beta1',
-        'train/adam_beta2',
-        'train/adam_eps',
-        'train/prio_alpha',
-        'train/prio_beta0',
-        'train/bptt_horizon',
-        'train/num_minibatches',
-        'train/minibatch_size',
-        'policy/hidden_size',
-        'env/frameskip',
-        'env/num_envs',
+        #'train/learning_rate',
+        #'train/ent_coef',
+        #'train/gamma',
+        #'train/gae_lambda',
+        #'train/vtrace_rho_clip',
+        #'train/vtrace_c_clip',
+        #'train/clip_coef',
+        #'train/vf_clip_coef',
+        #'train/vf_coef',
+        #'train/max_grad_norm',
+        #'train/adam_beta1',
+        #'train/adam_beta2',
+        #'train/adam_eps',
+        #'train/prio_alpha',
+        #'train/prio_beta0',
+        #'train/bptt_horizon',
+        #'train/num_minibatches',
+        #'train/minibatch_size',
+        #'policy/hidden_size',
+        #'env/frameskip',
+        #'env/num_envs',
     ]
     for hyper in hypers:
         f = figure(title=hyper, xlabel=hyper, ylabel='Score', legend='Ablate')
@@ -311,14 +319,16 @@ def layout():
         s = [scores[i] for i in idxs]
         ss = [np.log(steps[i]) for i in idxs]
         c = [costs[i] for i in idxs]
-        scatter(f, v, s, ss, legend='Breakout')
+        scatter(f, v, s, ss, legend=env_name)
         figs.append(f)
 
     #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
     #plot_lines(fig3, [pareto_steps], [pareto_costs])
     layout = html.Div([
         html.H1('The Puffer Frontier Project', style={'textAlign': 'center'}),
-        dcc.Graph(figure=frontier),
+        dcc.Graph(figure=step_cost),
+        dcc.Graph(figure=step_score),
+        dcc.Graph(figure=cost_score),
         html.Br(),
         *[dcc.Graph(figure=f) for f in figs]
     ])
