@@ -67,8 +67,28 @@ HYPERS = [
     'env/num_envs',
 ]
 
+ALL_KEYS = [
+    'agent_steps',
+    'cost',
+    'environment/score'
+] + HYPERS
+
 def rgba(hex, alpha):
     return f"rgba({int(hex[1:3], 16)}, {int(hex[3:5], 16)}, {int(hex[5:7], 16)}, {alpha})"
+
+def band(experiments, key, qmin=0.0, qmax=1.0):
+    mmax = np.array(experiments[key]).max()
+    top = qmax * mmax
+    bot = qmin * mmax
+    filtered = {k: [] for k in experiments}
+    for i, score in enumerate(experiments[key]):
+        if score < bot or score > top:
+            continue
+
+        for k, v in experiments.items():
+            filtered[k].append(v[i])
+
+    return filtered
 
 def mean_conf(xx, yy):
     x_min = min([min(x) for x in xx])
@@ -107,14 +127,14 @@ def figure(title='The Puffer Frontier Project',
     fig.update_yaxes(showgrid=False)
     return fig
 
-def plot_lines(fig, xx, yy):
+def plot_lines(fig, xx, yy, name='Trial'):
     for i, (x, y) in enumerate(zip(xx, yy)):
         fig.add_trace(
             go.Scatter(
                 x=x,
                 y=y,
                 mode='lines',
-                name=f'Trial {i+1}',
+                name=name,
                 line=dict(
                     color=LINE_COLORS[i % len(LINE_COLORS)],
                     width=LINE_WIDTH
@@ -122,7 +142,7 @@ def plot_lines(fig, xx, yy):
             )
          )
 
-def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0):
+def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0, showlegend=True):
     mmin = min(c)
     mmax = max(c)
     #vals = [(c - mmin)/(mmax - mmin) for c in c]
@@ -149,6 +169,7 @@ def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0):
             y=y,
             mode='markers',
             name=legend,
+            showlegend=showlegend,
             marker=dict(
                 color=colors,
                 size=10
@@ -184,43 +205,26 @@ def plot_group(fig, xx, yy, xlabel='Performance', legend='Trial', log_x=False, i
         )
     )
 
-def plot_quantiles(fig, x, y, s, xlabel='Performance', legend='Trial', log_x=False, i=0):
-    # Ensure inputs are numpy arrays
-    x = np.array(x)
-    y = np.array(y)
-    s = np.array(s)
-
-    # Sort data by x for smooth plotting
-    sort_idx = np.argsort(x)
-    x = x[sort_idx]
-    y = y[sort_idx]
-    s = s[sort_idx]
-
+def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial', log_x=False, i=0):
     # Define quantile thresholds (in descending order for proper range filtering)
-    quantile_thresholds = [0.95, 0.9, 0.75, 0.5, 0.25, 0.0]
-    quantile_thresholds = [e*s.max() for e in quantile_thresholds]
-    colors = ['blue', 'green', 'orange', 'red']
+    #quantile_thresholds = [1.0, 0.95, 0.9, 0.75, 0.5, 0.25, 0.05]
+    quantile_thresholds = [1.0, thresh]
+    colors = [['indigo', 'blue', 'green', 'yellow', 'orange', 'red'][i]]
 
-    # Plot center lines and scatter for each quantile range
-    for j, (q, color) in enumerate(zip(quantile_thresholds, colors)):
-        # Define the range for this quantile
-        if j == 0:
-            # Highest quantile: s >= q
-            mask = s >= q
-        else:
-            # Other quantiles: q <= s < previous_q
-            prev_q = quantile_thresholds[j - 1]
-            mask = (s >= q) & (s < prev_q)
+    for i in range(len(quantile_thresholds) - 1):
+        qmin = quantile_thresholds[i + 1]
+        qmax = quantile_thresholds[i]
 
-        if np.sum(mask) <= 5:
+        filtered = band(experiments, 'environment/score', qmin, qmax)
+
+        if len(filtered['environment/score']) < 5:
             continue  # Skip
 
-        fx = x[mask]
-        fy = y[mask]
-        fs = np.ones_like(fx) # More robust to bin scores into quantiles
+        x = filtered['agent_steps']
+        y = filtered['cost']
+        s = np.ones_like(x)
 
-        #px, py, ps = pareto_points(fx, fy, fs)
-        fx, fy, fs = pareto_points(fx, fy, fs, 0.1)
+        fx, fy, fs = pareto_points(x, y, s, 0.1)
 
         fx = np.array(fx)
         fy = np.array(fy)
@@ -246,9 +250,9 @@ def plot_quantiles(fig, x, y, s, xlabel='Performance', legend='Trial', log_x=Fal
                 x=px,
                 y=py,
                 mode='lines',
-                name=f'{legend} Q{q:.2f}',
+                name=f'{legend} Q{qmin:.2f}',
                 line=dict(
-                    color=color,
+                    color=colors[i],
                     width=LINE_WIDTH
                 )
             )
@@ -260,9 +264,9 @@ def plot_quantiles(fig, x, y, s, xlabel='Performance', legend='Trial', log_x=Fal
                 x=fx,
                 y=fy,
                 mode='markers',
-                name=f'{legend} Q{q:.2f} Points',
+                name=f'{legend} Q{qmin:.2f} Points',
                 marker=dict(
-                    color=color,
+                    color=colors[i],
                     size=5
                 ),
                 showlegend=False  # Hide scatter legend to avoid clutter
@@ -536,8 +540,11 @@ def loess_fit(x, s, y, n_bins=20, frac=0.4):
 #all_uptime, all_perf = load_seed_data('puffer_connect4_seeds.npz')
 #plot_group(fig2, all_uptime, all_perf, legend='Connect4', i=2)
 
-env_name = 'breakout'
-EXPERIMENTS = cached_sweep_load(f'experiments/logs/puffer_{env_name}')
+env_names = ['breakout', 'pong']
+EXPERIMENTS = {
+    name: cached_sweep_load(f'experiments/logs/puffer_{name}')
+    for name in env_names
+}
 
 # Initialize Dash app
 app = Dash()
@@ -547,17 +554,24 @@ app.layout = html.Div([
     #dcc.Graph(figure=step_score),
     #dcc.Graph(figure=cost_score),
     html.Br(),
-    dcc.Dropdown(
-        id="pareto-dropdown",
-        options=[
-            {"label": 'front', "value": 'front'},
-            {"label": 'cost', "value": 'cost'},
-            {"label": 'score', "value": 'score'},
-        ],
-        value="front",
-        style={"width": "50%"}
+    dcc.Slider(
+        id='pareto-slider',
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        value=0.95,
+        marks={i: str(0.05*i) for i in range(0, 21)}
     ),
     dcc.Graph(id='pareto'),
+    dcc.Slider(
+        id='hyper-stable-slider',
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        value=0.95,
+        marks={i: str(0.05*i) for i in range(0, 21)}
+    ),
+    dcc.Graph(id='hyper-stable'),
     dcc.Slider(
         id='hyper-agg-slider',
         min=0.0,
@@ -568,117 +582,186 @@ app.layout = html.Div([
     ),
     dcc.Graph(id='hyper-agg'),
     dcc.Dropdown(
-        id="hyper-dropdown",
-        options=[{"label": key, "value": key} for key in HYPERS],
-        value="train/learning_rate",
+        id="scatter-dropdown-x",
+        options=[{"label": key, "value": key} for key in ALL_KEYS],
+        value="agent_steps",
         style={"width": "50%"}
     ),
-    dcc.Graph(id='hyper')
+    dcc.Dropdown(
+        id="scatter-dropdown-y",
+        options=[{"label": key, "value": key} for key in ALL_KEYS],
+        value="environment/score",
+        style={"width": "50%"}
+    ),
+    dcc.Graph(id='scatter')
 ])
 
 @app.callback(
     Output("pareto", "figure"),
-    Input("pareto-dropdown", "value")
+    Input("pareto-slider", "value")
 )
-def update_pareto_plot(key):
-    steps = EXPERIMENTS['agent_steps']
-    costs = EXPERIMENTS['cost']
-    scores = EXPERIMENTS['environment/score']
+def update_pareto_plot(thresh):
+    f = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
 
-    # Filter outliers
-    '''
-    idxs = [i for i, s in enumerate(steps) if s < 1e6]
-    experiments = [experiments[i] for i in idxs]
-    steps = [steps[i] for i in idxs]
-    costs = [costs[i] for i in idxs]
-    scores = [scores[i] for i in idxs]
-    '''
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
+
+        # Adjust steps
+        if 'env/frameskip' in EXPERIMENTS[env]:
+            skip = EXPERIMENTS[env]['env/frameskip']
+            steps = [n*m for n, m in zip(steps, skip)]
+
+        # Header plot
+        #if key == 'front':
+        plot_quantiles(f, EXPERIMENTS[env], thresh, xlabel='Steps', legend=env, log_x=False, i=i)
+        '''
+        elif key == 'score':
+            f = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
+            scatter(f, steps, scores, costs, legend=env_name)
+        elif key == 'cost':
+            f = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
+            scatter(f, costs, scores, steps, legend=env_name)
+        '''
+
+    return f
+
+@app.callback(
+    Output("scatter", "figure"),
+    Input("scatter-dropdown-x", "value"),
+    Input("scatter-dropdown-y", "value")
+)
+def update_scatter(xkey, ykey):
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
 
     # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS:
-        skip = EXPERIMENTS['env/frameskip']
+    if 'env/frameskip' in EXPERIMENTS[env]:
+        skip = EXPERIMENTS[env]['env/frameskip']
         steps = [n*m for n, m in zip(steps, skip)]
 
-    # Filter by score
+    f = figure(title='Scatter', xlabel='Steps', ylabel='Hyper', legend='Ablate')
+    f.update_yaxes(type='log')
+
+    x = EXPERIMENTS[env][xkey]
+    y = EXPERIMENTS[env][ykey]
+    c = scores
+    scatter(f, x, y, c, showlegend=False)
+
     '''
+    # Filter by score
     max_score = max(scores)
     idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
     filtered_steps = [steps[i] for i in idxs]
     filtered_costs = [costs[i] for i in idxs]
     filtered_scores = [scores[i] for i in idxs]
+
+    f = figure(title='Hyper Stability', xlabel='Steps', ylabel='Hyper', legend='Ablate')
+    f.update_yaxes(type='log')
+
+    for j, hyper in enumerate(HYPERS):
+        c = LINE_COLORS[j % len(LINE_COLORS)]
+        s = [scores[i] for i in idxs]
+        x = [steps[i] for i in idxs]
+        y = [EXPERIMENTS[env][hyper][i] for i in idxs]
+
+        x, y, s = pareto_points(x, y, s, 0.1)
+        scatter(f, x, y, c, showlegend=False)
+
+        x = np.array(x)
+        s = np.array(s)
+        y = np.array(y)
+        x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
+        s = np.ones_like(x_smooth)
+
+        f.add_trace(
+            go.Scatter(
+                x=x_smooth,
+                y=y_smooth,
+                mode='lines',
+                name=hyper,
+                line=dict(
+                    color=c,
+                    width=LINE_WIDTH
+                )
+            )
+         )
     '''
 
-    #filtered_steps, filtered_costs, filtered_scores = pareto_points(steps, costs, scores)
-
-    # Header plot
-    if key == 'front':
-        f = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-        plot_quantiles(f, steps, costs, scores,
-            xlabel='Steps', legend='Trial', log_x=False, i=0)
-        #scatter(f, filtered_steps, filtered_costs, filtered_scores, legend=env_name)
-    elif key == 'score':
-        f = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
-        scatter(f, steps, scores, costs, legend=env_name)
-    elif key == 'cost':
-        f = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
-        scatter(f, costs, scores, steps, legend=env_name)
-
-    return f
-
-    figs = []
-
-    f = figure(title=hyper, xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    #idxs = [i for i, e in enumerate(experiments) if hyper in e]
-    y = [EXPERIMENTS[i][hyper] for i in idxs]
-    s = [scores[i] for i in idxs]
-    #ss = [np.log(steps[i]) for i in idxs]
-    x = [steps[i] for i in idxs]
-    #c = [costs[i] for i in idxs]
-
-    scatter(f, x, y, s, legend=env_name)
-
-    x = np.array(x)
-    s = np.array(s)
-    y = np.array(y)
-    x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
-    s = np.ones_like(x_smooth)
-    scatter(f, x_smooth, y_smooth, 'red', legend=env_name)
-
-    #scatter(f, v, s, ss, legend=env_name)
-    #scatter(f, x, y, s, legend=env_name)
-    #figs.append(f)
-
-    #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
-    #plot_lines(fig3, [pareto_steps], [pareto_costs])
     return f
 
 
-    df = data_options[selected_dataset]
-    fig = px.scatter(df, x="x", y="y", title=f"Scatter Plot for {selected_dataset}")
-    return fig
+@app.callback(
+    Output("hyper-stable", "figure"),
+    Input("hyper-stable-slider", "value")
+)
+def update_hyper_stable(thresh):
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
 
+    # Adjust steps
+    if 'env/frameskip' in EXPERIMENTS[env]:
+        skip = EXPERIMENTS[env]['env/frameskip']
+        steps = [n*m for n, m in zip(steps, skip)]
+
+    # Filter by score
+    max_score = max(scores)
+    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
+    filtered_steps = [steps[i] for i in idxs]
+    filtered_costs = [costs[i] for i in idxs]
+    filtered_scores = [scores[i] for i in idxs]
+
+    f = figure(title='Hyper Stability', xlabel='Steps', ylabel='Hyper', legend='Ablate')
+    f.update_yaxes(type='log')
+
+    for j, hyper in enumerate(HYPERS):
+        c = LINE_COLORS[j % len(LINE_COLORS)]
+        s = [scores[i] for i in idxs]
+        x = [steps[i] for i in idxs]
+        y = [EXPERIMENTS[env][hyper][i] for i in idxs]
+
+        x, y, s = pareto_points(x, y, s, 0.1)
+        scatter(f, x, y, c, showlegend=False)
+
+        x = np.array(x)
+        s = np.array(s)
+        y = np.array(y)
+        x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
+        s = np.ones_like(x_smooth)
+
+        f.add_trace(
+            go.Scatter(
+                x=x_smooth,
+                y=y_smooth,
+                mode='lines',
+                name=hyper,
+                line=dict(
+                    color=c,
+                    width=LINE_WIDTH
+                )
+            )
+         )
+
+    return f
 
 @app.callback(
     Output("hyper", "figure"),
     Input("hyper-dropdown", "value")
 )
 def update_hyper_plot(hyper):
-    steps = EXPERIMENTS['agent_steps']
-    costs = EXPERIMENTS['cost']
-    scores = EXPERIMENTS['environment/score']
-
-    # Filter outliers
-    '''
-    idxs = [i for i, s in enumerate(steps) if s < 1e6]
-    experiments = [experiments[i] for i in idxs]
-    steps = [steps[i] for i in idxs]
-    costs = [costs[i] for i in idxs]
-    scores = [scores[i] for i in idxs]
-    '''
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
 
     # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS:
-        skip = EXPERIMENTS['env/frameskip']
+    if 'env/frameskip' in EXPERIMENTS[env]:
+        skip = EXPERIMENTS[env]['env/frameskip']
         steps = [n*m for n, m in zip(steps, skip)]
 
     # Filter by score
@@ -688,28 +771,12 @@ def update_hyper_plot(hyper):
     filtered_costs = [costs[i] for i in idxs]
     filtered_scores = [scores[i] for i in idxs]
 
-    # Header plot
-    '''
-    step_cost = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-    scatter(step_cost, filtered_steps, filtered_costs, filtered_scores, legend=env_name)
-
-    step_score = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
-    scatter(step_score, steps, scores, costs, legend=env_name)
-
-    cost_score = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
-    scatter(cost_score, costs, scores, steps, legend=env_name)
-    '''
-
-    figs = []
-
     f = figure(title=hyper, xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    #idxs = [i for i, e in enumerate(experiments) if hyper in e]
-    y = [EXPERIMENTS[hyper][i] for i in idxs]
+    y = [EXPERIMENTS[env][hyper][i] for i in idxs]
     s = [scores[i] for i in idxs]
-    #ss = [np.log(steps[i]) for i in idxs]
     x = [steps[i] for i in idxs]
-    #c = [costs[i] for i in idxs]
 
+    x, y, s = pareto_points(x, y, s, 0.1)
     scatter(f, x, y, s, legend=env_name)
 
     x = np.array(x)
@@ -719,112 +786,78 @@ def update_hyper_plot(hyper):
     s = np.ones_like(x_smooth)
 
     plot_lines(f, [x_smooth], [y_smooth])
-    #scatter(f, x_smooth, y_smooth, 'red', legend=env_name)
-
-    #scatter(f, v, s, ss, legend=env_name)
-    #scatter(f, x, y, s, legend=env_name)
-    #figs.append(f)
-
-    #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
-    #plot_lines(fig3, [pareto_steps], [pareto_costs])
     return f
 
-
-    df = data_options[selected_dataset]
-    fig = px.scatter(df, x="x", y="y", title=f"Scatter Plot for {selected_dataset}")
-    return fig
+from plotly import graph_objects as go
+from dash import Output, Input
 
 @app.callback(
     Output("hyper-agg", "figure"),
     Input("hyper-agg-slider", "value")
 )
 def update_hyper_agg_plot(thresh):
-    steps = EXPERIMENTS['agent_steps']
-    costs = EXPERIMENTS['cost']
-    scores = EXPERIMENTS['environment/score']
-
-    # Filter outliers
-    '''
-    idxs = [i for i, s in enumerate(steps) if s < 1e6]
-    experiments = [experiments[i] for i in idxs]
-    steps = [steps[i] for i in idxs]
-    costs = [costs[i] for i in idxs]
-    scores = [scores[i] for i in idxs]
-    '''
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
 
     # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS:
-        skip = EXPERIMENTS['env/frameskip']
+    if 'env/frameskip' in EXPERIMENTS[env]:
+        skip = EXPERIMENTS[env]['env/frameskip']
         steps = [n*m for n, m in zip(steps, skip)]
+
+    # Initialize figure
+    f = go.Figure()
+    f.update_layout(
+        title=dict(text='Bar', font=TITLE_FONT),
+        xaxis=dict(title=dict(text='Hyper', font=AXIS_FONT), tickfont=TICK_FONT),
+        yaxis=dict(title=dict(text='Value', font=AXIS_FONT), tickfont=TICK_FONT),
+        showlegend=True,
+        legend=dict(font=LEGEND_FONT),
+        plot_bgcolor=PLOT_BG_COLOR,
+        paper_bgcolor=PAPER_BG_COLOR,
+        width=1280,
+        height=720,
+        autosize=False,
+        yaxis_type='log',
+        barmode='overlay',  # Overlay bars instead of stacking
+        xaxis_tickangle=45  # Rotate x-axis labels for readability
+    )
+    f.update_xaxes(showgrid=False)
+    f.update_yaxes(showgrid=False)
 
     # Filter by score
     max_score = max(scores)
-    idxs = [i for i, s in enumerate(scores) if s > thresh*max_score]
-    filtered_steps = [steps[i] for i in idxs]
-    filtered_costs = [costs[i] for i in idxs]
-    filtered_scores = [scores[i] for i in idxs]
+    thresholds = [0.95, 0.9, 0.75, 0.5, 0.25, 0.05][::-1]  # Reversed for 0.95 on top
+    colors = ['indigo', 'blue', 'green', 'yellow', 'orange', 'red'][::-1]
+    widths = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3][::-1]  # Narrower bars for higher thresholds
 
-    # Header plot
-    '''
-    step_cost = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
-    scatter(step_cost, filtered_steps, filtered_costs, filtered_scores, legend=env_name)
+    for j, t in enumerate(thresholds):
+        idxs = [i for i, s in enumerate(scores) if s > t*max_score]
+        
+        if idxs:  # Only add traces if there are valid indices
+            for k, hyper in enumerate(HYPERS):
+                try:
+                    y = [EXPERIMENTS[env][hyper][i] for i in idxs]
+                except:
+                    breakpoint()
+                if y:  # Ensure y is not empty
+                    ymin = min(y)
+                    ymax = max(y)
+                    f.add_trace(
+                        go.Bar(
+                            x=[hyper],  # Hyperparameter as x-axis
+                            y=[ymax - ymin],
+                            base=ymin,
+                            name=f"{hyper} (Thresh {t})" if j == 0 else "",  # Legend only for first threshold
+                            showlegend=(j == 0),
+                            marker_color=colors[j],
+                            opacity=0.8,
+                            width=1.0
+                        )
+                    )
 
-    step_score = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
-    scatter(step_score, steps, scores, costs, legend=env_name)
-
-    cost_score = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
-    scatter(cost_score, costs, scores, steps, legend=env_name)
-    '''
-
-    figs = []
-
-    f = figure(title='bar', xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    f.update_yaxes(type='log')
-    for hyper in HYPERS:
-        #idxs = [i for i, e in enumerate(experiments) if hyper in e]
-        y = [EXPERIMENTS[hyper][i] for i in idxs]
-        s = [scores[i] for i in idxs]
-        #ss = [np.log(steps[i]) for i in idxs]
-        x = [steps[i] for i in idxs]
-        #c = [costs[i] for i in idxs]
-
-
-        ymin = min(y)
-        ymax = max(y)
-        f.add_trace(
-            go.Bar(
-                x=[0],
-                y=[ymax - ymin],
-                base=ymin,
-                name=hyper
-            )
-        )
-
-    #scatter(f, x, y, s, legend=env_name)
-
-    x = np.array(x)
-    s = np.array(s)
-    y = np.array(y)
-    x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
-    s = np.ones_like(x_smooth)
-
-    #plot_lines(f, [x_smooth], [y_smooth])
-    #scatter(f, x_smooth, y_smooth, 'red', legend=env_name)
-
-    #scatter(f, v, s, ss, legend=env_name)
-    #scatter(f, x, y, s, legend=env_name)
-    #figs.append(f)
-
-    #pareto_steps, pareto_costs, pareto_scores = pareto_points(steps, costs, scores)
-    #plot_lines(fig3, [pareto_steps], [pareto_costs])
     return f
-
-
-    df = data_options[selected_dataset]
-    fig = px.scatter(df, x="x", y="y", title=f"Scatter Plot for {selected_dataset}")
-    return fig
-
-
 
 # Set layout with static graph
 #app.layout = layout
