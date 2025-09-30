@@ -220,11 +220,17 @@ def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial
         if len(filtered['environment/score']) < 5:
             continue  # Skip
 
-        x = filtered['agent_steps']
+        steps  = filtered['agent_steps']
+        # Adjust steps
+        if 'env/frameskip' in experiments:
+            skip = experiments['env/frameskip']
+            steps = [n*m for n, m in zip(steps, skip)]
+
+        x = steps
         y = filtered['cost']
         s = np.ones_like(x)
 
-        fx, fy, fs = pareto_points(x, y, s, 0.1)
+        fx, fy, fs = pareto_points(x, y, s, 0.05)
 
         fx = np.array(fx)
         fy = np.array(fy)
@@ -368,7 +374,15 @@ def load_sweep_data(path):
 
         for kk in list(data.keys()):
             if kk in exp:
-                data[kk].append(exp[kk])
+                v = exp[kk]
+                sweep_key = f'sweep/{kk}/distribution'
+                if sweep_key in data and exp[sweep_key] == 'logit_normal':
+                    v = 1 - v
+                elif kk in ('train/vtrace_rho_clip', 'train/vtrace_c_clip'):
+                    # Temporary hack for bad bounds
+                    v = max(v, 0.1)
+
+                data[kk].append(v)
             else:
                 data[kk].append(exp['data'][-1][kk])
 
@@ -548,70 +562,122 @@ EXPERIMENTS = {
 
 # Initialize Dash app
 app = Dash()
+app.css.append_css({'external_stylesheets': 'dash.css'})
 app.layout = html.Div([
     html.H1('The Puffer Frontier Project', style={'textAlign': 'center'}),
-    #dcc.Graph(figure=step_cost),
-    #dcc.Graph(figure=step_score),
-    #dcc.Graph(figure=cost_score),
     html.Br(),
-    dcc.Slider(
-        id='pareto-slider',
-        min=0.0,
-        max=1.0,
-        step=0.05,
-        value=0.95,
-        marks={i: str(0.05*i) for i in range(0, 21)}
-    ),
+    html.Label([
+        "Score Threshold %: ",
+        dcc.Slider(
+            id='pareto-slider',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=0.95,
+            marks={i: str(0.05*i) for i in range(0, 21)},
+        )
+    ]),
     dcc.Graph(id='pareto'),
-    dcc.Slider(
-        id='hyper-stable-slider',
-        min=0.0,
-        max=1.0,
-        step=0.05,
-        value=0.95,
-        marks={i: str(0.05*i) for i in range(0, 21)}
-    ),
-    dcc.Graph(id='hyper-stable'),
-    dcc.Slider(
-        id='hyper-agg-slider',
-        min=0.0,
-        max=1.0,
-        step=0.05,
-        value=0.95,
-        marks={i: str(0.05*i) for i in range(0, 21)}
-    ),
+    html.Br(),
+    html.Label([
+        "Score Threshold %: ",
+        dcc.Slider(
+            id='hyper-box-thresh',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=0.95,
+            marks={i: str(0.05*i) for i in range(0, 21)}
+        )
+    ]),
+    html.Label([
+        "Bins: ",
+        dcc.Slider(
+            id='hyper-box-buckets',
+            min=1,
+            max=10,
+            step=1,
+            value=5,
+            marks={i: str(i) for i in range(0, 11)}
+        )
+    ]),
+    html.Label([
+        "X Axis: ",
+        dcc.Dropdown(
+            id="hyper-box-x",
+            options=[{"label": key, "value": key} for key in ['cost', 'agent_steps']],
+            value="agent_steps",
+            style={"width": "50%"}
+        )
+    ]),
+    dcc.Graph(id='hyper-box'),
+    html.Br(),
+    html.Label([
+        "Score Threshold %: ",
+        dcc.Slider(
+            id='hyper-agg-slider',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=0.95,
+            marks={i: str(0.05*i) for i in range(0, 21)}
+        )
+    ]),
+    html.Label([
+        "Steps Interval: ",
+        dcc.RangeSlider(
+            id='hyper-agg-range',
+            min=0.0,
+            max=1.0,
+            step=0.1,
+            value=[0.0, 1.0]
+        )
+    ]),
     dcc.Graph(id='hyper-agg'),
-    dcc.Dropdown(
-        id="scatter-dropdown-x",
-        options=[{"label": key, "value": key} for key in ALL_KEYS],
-        value="agent_steps",
-        style={"width": "50%"}
-    ),
-    dcc.Dropdown(
-        id="scatter-dropdown-y",
-        options=[{"label": key, "value": key} for key in ALL_KEYS],
-        value="environment/score",
-        style={"width": "50%"}
-    ),
+    html.Br(),
+    html.Label([
+        "Environment: ",
+        dcc.Dropdown(
+            id="scatter-dropdown-env",
+            options=[{"label": key, "value": key} for key in env_names],
+            value="breakout",
+            style={"width": "50%"}
+        )
+    ]),
+    html.Label([
+        "X: ",
+        dcc.Dropdown(
+            id="scatter-dropdown-x",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="agent_steps",
+            style={"width": "50%"}
+        )
+    ]),
+    html.Label([
+        "Y: ",
+        dcc.Dropdown(
+            id="scatter-dropdown-y",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="environment/score",
+            style={"width": "50%"}
+        )
+    ]),
     dcc.Graph(id='scatter')
-])
+],
+style={"width": 1280}
+)
 
 @app.callback(
     Output("pareto", "figure"),
     Input("pareto-slider", "value")
 )
 def update_pareto_plot(thresh):
-    f = figure(title='Sweep', xlabel='Steps', ylabel='Cost', legend='Trial')
+    f = figure(title='Compute/Data Pareto Front', xlabel='Steps', ylabel='Cost', legend='Trial')
 
     for i, env in enumerate(EXPERIMENTS):
         steps = EXPERIMENTS[env]['agent_steps']
         costs = EXPERIMENTS[env]['cost']
         scores = EXPERIMENTS[env]['environment/score']
-
-        # Adjust steps
-        if 'env/frameskip' in EXPERIMENTS[env]:
-            skip = EXPERIMENTS[env]['env/frameskip']
-            steps = [n*m for n, m in zip(steps, skip)]
 
         # Header plot
         #if key == 'front':
@@ -629,22 +695,23 @@ def update_pareto_plot(thresh):
 
 @app.callback(
     Output("scatter", "figure"),
+    Input("scatter-dropdown-env", "value"),
     Input("scatter-dropdown-x", "value"),
     Input("scatter-dropdown-y", "value")
 )
-def update_scatter(xkey, ykey):
-    for i, env in enumerate(EXPERIMENTS):
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
+def update_scatter(env, xkey, ykey):
+    steps = EXPERIMENTS[env]['agent_steps']
+    costs = EXPERIMENTS[env]['cost']
+    scores = EXPERIMENTS[env]['environment/score']
 
+    # TODO: This is not applying frameskip 
     # Adjust steps
     if 'env/frameskip' in EXPERIMENTS[env]:
         skip = EXPERIMENTS[env]['env/frameskip']
         steps = [n*m for n, m in zip(steps, skip)]
 
-    f = figure(title='Scatter', xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    f.update_yaxes(type='log')
+    f = figure(title='Experiments', xlabel=xkey, ylabel=ykey, legend='Ablate')
+    #f.update_yaxes(type='log')
 
     x = EXPERIMENTS[env][xkey]
     y = EXPERIMENTS[env][ykey]
@@ -750,6 +817,93 @@ def update_hyper_stable(thresh):
     return f
 
 @app.callback(
+    Output("hyper-box", "figure"),
+    Input("hyper-box-thresh", "value"),
+    Input("hyper-box-buckets", "value"),
+    Input("hyper-box-x", "value")
+)
+def update_hyper_box(thresh, buckets, x):
+    # Initialize data storage
+    env_data = {}
+
+    # Process each environment
+    for env in EXPERIMENTS:
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
+
+        # Adjust steps if frameskip exists
+        if 'env/frameskip' in EXPERIMENTS[env]:
+            skip = EXPERIMENTS[env]['env/frameskip']
+            steps = [n*m for n, m in zip(steps, skip)]
+
+        # Filter by score threshold
+        max_score = max(scores)
+        idxs = [i for i, s in enumerate(scores) if s > thresh*max_score]
+
+        # Select x-axis data based on input
+        x_data = costs if x == 'cost' else steps
+        filtered_x = [x_data[i] for i in idxs]
+
+        # Get all hyperparameters
+
+        # Store filtered data for this environment
+        hyper_data = {}
+        env_data[env] = {'x': filtered_x, 'hypers': hyper_data}
+        for h in HYPERS:
+            hyper_data[h] = [EXPERIMENTS[env][h][i] for i in idxs]
+
+    # Create buckets
+    all_x = [x for env in env_data for x in env_data[env]['x']]
+    x_min, x_max = min(all_x), max(all_x)
+    bucket_edges = np.linspace(x_min, x_max, buckets + 1)
+    bucket_centers = (bucket_edges[:-1] + bucket_edges[1:]) / 2
+
+    # Initialize heatmap data
+    heatmap_data = np.zeros((len(HYPERS), buckets))
+
+    # Compute means for each bucket and hyperparameter
+    for i, hyper in enumerate(HYPERS):
+        for j in range(buckets):
+            bucket_means = []
+            for env in env_data:
+                if hyper not in env_data[env]['hypers']:
+                    continue
+
+                x_vals = np.array(env_data[env]['x'])
+                hyper_vals = np.array(env_data[env]['hypers'][hyper])
+                # Find indices in current bucket
+                idxs = (x_vals >= bucket_edges[j]) & (x_vals < bucket_edges[j+1])
+                if np.any(idxs):
+                    bucket_means.append(np.mean(hyper_vals[idxs]))
+
+            # Average across environments
+            heatmap_data[i, j] = np.mean(bucket_means) if bucket_means else np.nan
+
+    heatmap_data = np.log(heatmap_data)
+
+    # Create heatmap
+    f = figure(title="Hyperparameter Drift",
+        xlabel=x.capitalize(),
+        ylabel="Hyperparameters"
+    )
+
+    f.add_trace(
+        go.Heatmap(
+            x=bucket_centers,
+            y=HYPERS,
+            z=heatmap_data,
+            colorscale='Viridis',
+            showscale=True,
+            zmin=np.nanmin(heatmap_data),
+            zmax=np.nanmax(heatmap_data),
+            colorbar=dict(title="Value")
+        )
+    )
+
+    return f
+
+@app.callback(
     Output("hyper", "figure"),
     Input("hyper-dropdown", "value")
 )
@@ -793,25 +947,16 @@ from dash import Output, Input
 
 @app.callback(
     Output("hyper-agg", "figure"),
-    Input("hyper-agg-slider", "value")
+    Input("hyper-agg-slider", "value"),
+    Input("hyper-agg-range", "value")
 )
-def update_hyper_agg_plot(thresh):
-    for i, env in enumerate(EXPERIMENTS):
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
-
-    # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS[env]:
-        skip = EXPERIMENTS[env]['env/frameskip']
-        steps = [n*m for n, m in zip(steps, skip)]
-
+def update_hyper_agg_plot(thresh, step_range):
     # Initialize figure
     f = go.Figure()
     f.update_layout(
-        title=dict(text='Bar', font=TITLE_FONT),
-        xaxis=dict(title=dict(text='Hyper', font=AXIS_FONT), tickfont=TICK_FONT),
-        yaxis=dict(title=dict(text='Value', font=AXIS_FONT), tickfont=TICK_FONT),
+        title=dict(text='Hyperparameter Stable Range', font=TITLE_FONT),
+        xaxis=dict(title=dict(text='Value', font=AXIS_FONT), tickfont=TICK_FONT),
+        yaxis=dict(title=dict(text='Hyper', font=AXIS_FONT), tickfont=TICK_FONT),
         showlegend=True,
         legend=dict(font=LEGEND_FONT),
         plot_bgcolor=PLOT_BG_COLOR,
@@ -819,43 +964,47 @@ def update_hyper_agg_plot(thresh):
         width=1280,
         height=720,
         autosize=False,
-        yaxis_type='log',
+        xaxis_type='log',
         barmode='overlay',  # Overlay bars instead of stacking
-        xaxis_tickangle=45  # Rotate x-axis labels for readability
     )
     f.update_xaxes(showgrid=False)
     f.update_yaxes(showgrid=False)
 
-    # Filter by score
-    max_score = max(scores)
-    thresholds = [0.95, 0.9, 0.75, 0.5, 0.25, 0.05][::-1]  # Reversed for 0.95 on top
-    colors = ['indigo', 'blue', 'green', 'yellow', 'orange', 'red'][::-1]
-    widths = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3][::-1]  # Narrower bars for higher thresholds
+    for i, env in enumerate(EXPERIMENTS):
+        steps = EXPERIMENTS[env]['agent_steps']
+        costs = EXPERIMENTS[env]['cost']
+        scores = EXPERIMENTS[env]['environment/score']
 
-    for j, t in enumerate(thresholds):
-        idxs = [i for i, s in enumerate(scores) if s > t*max_score]
+        # Adjust steps
+        if 'env/frameskip' in EXPERIMENTS[env]:
+            skip = EXPERIMENTS[env]['env/frameskip']
+            steps = [n*m for n, m in zip(steps, skip)]
+
+        max_score = max(scores)
+        max_steps = max(steps)
+        n = len(scores)
+        idxs = [i for i in range(n) if scores[i] > thresh*max_score and
+            step_range[0]<steps[i]/max_steps<step_range[1]]
+
+        if len(idxs) < 2:
+            continue
         
-        if idxs:  # Only add traces if there are valid indices
-            for k, hyper in enumerate(HYPERS):
-                try:
-                    y = [EXPERIMENTS[env][hyper][i] for i in idxs]
-                except:
-                    breakpoint()
-                if y:  # Ensure y is not empty
-                    ymin = min(y)
-                    ymax = max(y)
-                    f.add_trace(
-                        go.Bar(
-                            x=[hyper],  # Hyperparameter as x-axis
-                            y=[ymax - ymin],
-                            base=ymin,
-                            name=f"{hyper} (Thresh {t})" if j == 0 else "",  # Legend only for first threshold
-                            showlegend=(j == 0),
-                            marker_color=colors[j],
-                            opacity=0.8,
-                            width=1.0
-                        )
-                    )
+        for k, hyper in enumerate(HYPERS):
+            y = [EXPERIMENTS[env][hyper][i] for i in idxs]
+            ymin = min(y)
+            ymax = max(y)
+            f.add_trace(
+                go.Bar(
+                    x=[ymax - ymin],
+                    y=[hyper],  # Hyperparameter as x-axis
+                    base=ymin,
+                    showlegend=False,
+                    marker_color='blue',
+                    opacity=0.5,
+                    width=1.0,
+                    orientation='h'
+                )
+            )
 
     return f
 
