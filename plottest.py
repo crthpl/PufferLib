@@ -17,32 +17,26 @@ PLOT_BG_COLOR = '#061a1a'
 PAPER_BG_COLOR = '#061a1a'
 LINE_WIDTH = 4
 LINE_COLORS = ["#0000b3", "#0010d9", "#0020ff", "#0040ff", "#0060ff", "#0080ff", "#009fff", "#00bfff", "#00ffff"][::-1]
-#['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-
 TITLE_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_TITLE,
     color=FONT_COLOR
 )
-
 AXIS_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_AXIS,
     color=FONT_COLOR
 )
-
 TICK_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_TICK,
     color=FONT_COLOR
 )
-
 LEGEND_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_LEGEND,
     color=FONT_COLOR
 )
-
 HYPERS = [
     'train/learning_rate',
     'train/ent_coef',
@@ -66,45 +60,11 @@ HYPERS = [
     'env/frameskip',
     'env/num_envs',
 ]
-
 ALL_KEYS = [
     'agent_steps',
     'cost',
     'environment/score'
 ] + HYPERS
-
-def rgba(hex, alpha):
-    return f"rgba({int(hex[1:3], 16)}, {int(hex[3:5], 16)}, {int(hex[5:7], 16)}, {alpha})"
-
-def band(experiments, key, qmin=0.0, qmax=1.0):
-    mmax = np.array(experiments[key]).max()
-    top = qmax * mmax
-    bot = qmin * mmax
-    filtered = {k: [] for k in experiments}
-    for i, score in enumerate(experiments[key]):
-        if score < bot or score > top:
-            continue
-
-        for k, v in experiments.items():
-            filtered[k].append(v[i])
-
-    return filtered
-
-def mean_conf(xx, yy):
-    x_min = min([min(x) for x in xx])
-    x_max = max([max(x) for x in xx])
-    y_min = min([min(y) for y in yy])
-    y_max = max([max(y) for y in yy])
-
-    x = np.linspace(x_min, x_max, 100)
-    y_interps = np.stack([
-        np.interp(x, x_, y_) for x_, y_ in zip(xx, yy)])
-
-    mean = np.mean(y_interps, axis=0)
-    std = np.std(y_interps, axis=0)
-    conf = 1.96 * std / np.sqrt(len(xx))
-
-    return x, mean, conf
 
 def figure(title='The Puffer Frontier Project',
            xlabel='Uptime', ylabel='Score',
@@ -127,26 +87,9 @@ def figure(title='The Puffer Frontier Project',
     fig.update_yaxes(showgrid=False)
     return fig
 
-def plot_lines(fig, xx, yy, name='Trial'):
-    for i, (x, y) in enumerate(zip(xx, yy)):
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=y,
-                mode='lines',
-                name=name,
-                line=dict(
-                    color=LINE_COLORS[i % len(LINE_COLORS)],
-                    width=LINE_WIDTH
-                )
-            )
-         )
-
 def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0, showlegend=True):
     mmin = min(c)
     mmax = max(c)
-    #vals = [(c - mmin)/(mmax - mmin) for c in c]
-    #vals = [max(0.01, v) for v in vals]
 
     if isinstance(c, str):
         colors = c
@@ -162,7 +105,6 @@ def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0, showlegend=True):
                 v = 0.001
             colors.append(f'rgb(0, 0.5, {v})')
 
-    #c = (np.array(c) - min(c))/(max(c) - min(c))
     fig.add_trace(
         go.Scatter(
             x=x,
@@ -177,37 +119,21 @@ def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0, showlegend=True):
         )
     )
 
-def plot_group(fig, xx, yy, xlabel='Performance', legend='Trial', log_x=False, i=0):
-    x, mean, conf = mean_conf(xx, yy)
-    fig.add_trace(
-        go.Scatter(
-            x=np.concatenate([x, x[::-1]]),
-            y=np.concatenate([mean + conf, (mean - conf)[::-1]]),
-            fill='toself',
-            fillcolor=rgba(LINE_COLORS[i], 0.2),
-            line=dict(
-                color='rgba(255,255,255,0)',
-                width=LINE_WIDTH
-            ),
-            showlegend=False
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=mean,
-            mode='lines',
-            name=legend,
-            line=dict(
-                color=LINE_COLORS[i],
-                width=LINE_WIDTH
-            )
-        )
-    )
+def band(experiments, key, qmin=0.0, qmax=1.0):
+    mmax = np.array(experiments[key]).max()
+    top = qmax * mmax
+    bot = qmin * mmax
+    filtered = {k: [] for k in experiments}
+    for i, score in enumerate(experiments[key]):
+        if score < bot or score > top:
+            continue
+
+        for k, v in experiments.items():
+            filtered[k].append(v[i])
+
+    return filtered
 
 def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial', log_x=False, i=0):
-    # Define quantile thresholds (in descending order for proper range filtering)
-    #quantile_thresholds = [1.0, 0.95, 0.9, 0.75, 0.5, 0.25, 0.05]
     quantile_thresholds = [1.0, thresh]
     colors = [['indigo', 'blue', 'green', 'yellow', 'orange', 'red'][i]]
 
@@ -228,33 +154,16 @@ def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial
 
         x = steps
         y = filtered['cost']
-        s = np.ones_like(x)
+        s = filtered['environment/score']
 
-        fx, fy, fs = pareto_points(x, y, s, 0.05)
-
-        fx = np.array(fx)
-        fy = np.array(fy)
-        fs = np.array(fs)
-
-        px, py, y_lower, y_upper = loess_fit(fx, fs, fy, n_bins=10, frac=0.4)
-
-        #x_q = x[mask]
-        #y_q = y[mask]
-
-        # Compute moving average for center line
-        #y_mean = np.convolve(y_q, np.ones(window_size)/window_size, mode='valid')
-        # Adjust x_q to match the length of y_mean (trim edges due to convolution)
-        #trim = (window_size - 1) // 2
-        #x_mean = x_q[trim:len(x_q)-trim]
-
-        #if len(x_mean) <= 1:
-        #    continue  # Skip if not enough points after trimming
+        s_one = np.ones_like(x)
+        fx, fy, fs = pareto_points(x, y, s_one, 0.00)
 
         # Plot center line
         fig.add_trace(
             go.Scatter(
-                x=px,
-                y=py,
+                x=fx,
+                y=fy,
                 mode='lines',
                 name=f'{legend} Q{qmin:.2f}',
                 line=dict(
@@ -267,8 +176,8 @@ def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial
         # Plot scatter for points in this quantile range
         fig.add_trace(
             go.Scatter(
-                x=fx,
-                y=fy,
+                x=x,
+                y=y,
                 mode='markers',
                 name=f'{legend} Q{qmin:.2f} Points',
                 marker=dict(
@@ -308,45 +217,6 @@ def pareto_points(steps, costs, scores, soft=0.0):
     pareto_costs = [pareto_costs[i] for i in idxs]
     pareto_scores = [pareto_scores[i] for i in idxs]
     return pareto_steps, pareto_costs, pareto_scores
-
-def load_seed_data(filename):
-    with open(filename, 'r') as f:
-        experiments = json.load(f)
-
-    all_uptime = []
-    all_perf = []
-    for trial in experiments:
-        uptime = []
-        perf = []
-        for e in trial:
-            u = e['uptime']
-            if 'environment/perf' not in e:
-                continue
-
-            uptime.append(u)
-            perf.append(e['environment/perf'])
-
-        all_uptime.append(uptime)
-        all_perf.append(perf)
-
-    return all_uptime, all_perf
-
-def load_hyper_data(filename):
-    with open(filename, 'r') as f:
-        experiments = json.load(f)
-
-    all_hyper = []
-    all_perf = []
-    for trial in experiments:
-        hyper = trial[-1]['learning_rate']
-        perf = trial[-1]['environment/perf']
-        all_hyper.append(hyper)
-        all_perf.append(perf)
-
-    all_hyper = np.array(all_hyper).reshape(3, -1)
-    all_perf = np.array(all_perf).reshape(3, -1)
-    return all_hyper, all_perf
-
 
 def load_sweep_data(path):
     data = {}
@@ -399,160 +269,6 @@ def cached_sweep_load(path):
         data = json.load(f)
 
     return data
-
-    '''
-    # Step 1: Check if cache exists; if not, create it using load_sweep_data
-    if not os.path.exists(cache_file):
-        experiments = load_sweep_data(os.path.join(path, '*.json'))
-        # Create cache as list of [filename, data] pairs
-        cache_data = [
-            [os.path.basename(fpath), exp]
-            for fpath, exp in zip(glob.glob(os.path.join(path, '*.json')), experiments)
-            if not fpath.endswith('cache.json')  # Exclude cache file itself
-        ]
-        # Write cache
-        with open(cache_file, 'w') as f:
-            json.dump(cache_data, f)
-
-    # Step 2: Load existing cache
-    with open(cache_file, 'r') as f:
-        cache_data = json.load(f)
-
-    # Convert cache to dict: {filename: data}
-    cache_dict = {item[0]: item[1] for item in cache_data}
-
-    # Get current files in directory (excluding cache.json)
-    current_files = set(
-        os.path.basename(f) for f in glob.glob(os.path.join(path, '*.json'))
-        if not f.endswith('cache.json')
-    )
-    cached_files = set(cache_dict.keys())
-
-    # Step 3: Check for new files not in cache
-    new_files = current_files - cached_files
-    if new_files:
-        # Load only new files using a modified load_sweep_data
-        new_experiments = []
-        new_file_paths = [os.path.join(path, fname) for fname in new_files]
-        for fpath in new_file_paths:
-            with open(fpath, 'r') as f:
-                exp = json.load(f)
-            data = {}
-            for kk, vv in exp.items():
-                if kk == 'data':
-                    for k, v in exp[kk][-1].items():
-                        data[k] = v
-                else:
-                    data[kk] = vv
-            new_experiments.append([os.path.basename(fpath), data])
-
-        # Update cache with new experiments
-        cache_data.extend(new_experiments)
-        # Write updated cache
-        with open(cache_file, 'w') as f:
-            json.dump(cache_data, f)
-
-    return [e[1] for e in cache_data]
-    return cache_data
-
-    # Rebuild cache_dict to include any new files
-    cache_dict = {item[0]: item[1] for item in cache_data}
-
-    # Return cached data as a dictionary
-    return cache_dict
-    '''
-
-
-from statsmodels.nonparametric.smoothers_lowess import lowess
-def compute_bin_stats(x, s, y, n_bins=20, overlap=0.5, score_threshold=0.95):
-    """
-    Bin data, select high-performing points, and compute weighted stats.
-    x: steps (log-scaled compute/samples), s: scores, y: hyperparameter values
-    """
-    # Log-scale x to handle compute/samples range
-    x_log = np.log10(x)
-    x_min, x_max = x_log.min(), x_log.max()
-    bin_width = (x_max - x_min) / (n_bins * (1 - overlap))
-    bin_centers = np.linspace(x_min, x_max, n_bins)
-
-    y_weighted = []
-    y_lower = []
-    y_upper = []
-
-    for center in bin_centers:
-        # Define bin boundaries with overlap
-        bin_start = center - bin_width / 2
-        bin_end = center + bin_width / 2
-        mask = (x_log >= bin_start) & (x_log <= bin_end)
-
-        # Select high-performing points (scores within 95% of max in bin)
-        bin_s = s[mask]
-        if len(bin_s) == 0:
-            y_weighted.append(np.nan)
-            y_lower.append(np.nan)
-            y_upper.append(np.nan)
-            continue
-        s_max = bin_s.max()
-        high_perf_mask = bin_s >= score_threshold * s_max
-
-        # Compute weighted mean and quantiles for y
-        bin_y = y[mask][high_perf_mask]
-        bin_s = bin_s[high_perf_mask]
-        if len(bin_y) == 0:
-            y_weighted.append(np.nan)
-            y_lower.append(np.nan)
-            y_upper.append(np.nan)
-            continue
-        weights = bin_s / bin_s.sum()  # Normalize scores as weights
-        y_mean = np.average(bin_y, weights=weights)
-        y_quantiles = np.percentile(bin_y, [25, 75])  # IQR for stability range
-
-        y_weighted.append(y_mean)
-        y_lower.append(y_quantiles[0])
-        y_upper.append(y_quantiles[1])
-
-    return bin_centers, np.array(y_weighted), np.array(y_lower), np.array(y_upper)
-
-def loess_fit(x, s, y, n_bins=20, frac=0.4):
-    """
-    Perform LOESS fit on binned data for smoothed curve and ribbons.
-    """
-    # Compute bin statistics
-    bin_centers, y_weighted, y_lower, y_upper = compute_bin_stats(x, s, y, n_bins=n_bins)
-
-    # Remove NaNs for LOESS
-    valid_mask = ~np.isnan(y_weighted)
-    bin_centers = bin_centers[valid_mask]
-    y_weighted = y_weighted[valid_mask]
-    y_lower = y_lower[valid_mask]
-    y_upper = y_upper[valid_mask]
-
-    # Apply LOESS to weighted mean, lower, and upper bounds
-    smoothed_y = lowess(y_weighted, bin_centers, frac=frac, return_sorted=True)
-    smoothed_lower = lowess(y_lower, bin_centers, frac=frac, return_sorted=True)
-    smoothed_upper = lowess(y_upper, bin_centers, frac=frac, return_sorted=True)
-
-    # Convert back to original x scale
-    x_smooth = 10 ** smoothed_y[:, 0]  # Undo log-scale
-    y_smooth = smoothed_y[:, 1]
-    y_smooth_lower = smoothed_lower[:, 1]
-    y_smooth_upper = smoothed_upper[:, 1]
-
-    return x_smooth, y_smooth, y_smooth_lower, y_smooth_upper
-
-#fig1 = figure(title='Hyperparameter Ablation', xlabel='Learning Rate', legend='Ablate', xaxis_type='log')
-#all_hyper, all_perf = load_hyper_data('puffer_pong_learning_rate.npz')
-#plot_group(fig1, all_hyper, all_perf, legend='Pong')
-#all_hyper, all_perf = load_hyper_data('puffer_breakout_learning_rate.npz')
-#plot_group(fig1, all_hyper, all_perf, legend='Breakout', i=1)
-
-#fig2 = figure(title='Seed Sensitivity', xlabel='Uptime', legend='Ablate')
-#all_uptime, all_perf = load_seed_data('puffer_pong_seeds.npz')
-#plot_group(fig2, all_uptime, all_perf, legend='Pong')
-#all_uptime, all_perf = load_seed_data('puffer_breakout_seeds.npz')
-#plot_group(fig2, all_uptime, all_perf, legend='Breakout', i=1)
-#all_uptime, all_perf = load_seed_data('puffer_connect4_seeds.npz')
-#plot_group(fig2, all_uptime, all_perf, legend='Connect4', i=2)
 
 env_names = ['breakout', 'pong']
 EXPERIMENTS = {
@@ -672,7 +388,8 @@ style={"width": 1280}
     Input("pareto-slider", "value")
 )
 def update_pareto_plot(thresh):
-    f = figure(title='Compute/Data Pareto Front', xlabel='Steps', ylabel='Cost', legend='Trial')
+    f = figure(title='Compute/Data Pareto Front',
+        xlabel='Steps', ylabel='Cost', legend='Trial')
 
     for i, env in enumerate(EXPERIMENTS):
         steps = EXPERIMENTS[env]['agent_steps']
@@ -680,16 +397,8 @@ def update_pareto_plot(thresh):
         scores = EXPERIMENTS[env]['environment/score']
 
         # Header plot
-        #if key == 'front':
-        plot_quantiles(f, EXPERIMENTS[env], thresh, xlabel='Steps', legend=env, log_x=False, i=i)
-        '''
-        elif key == 'score':
-            f = figure(title='Sweep', xlabel='Steps', ylabel='Scores', legend='Trial')
-            scatter(f, steps, scores, costs, legend=env_name)
-        elif key == 'cost':
-            f = figure(title='Sweep', xlabel='Cost', ylabel='Scores', legend='Trial')
-            scatter(f, costs, scores, steps, legend=env_name)
-        '''
+        plot_quantiles(f, EXPERIMENTS[env], thresh,
+            xlabel='Steps', legend=env, log_x=False, i=i)
 
     return f
 
@@ -711,108 +420,11 @@ def update_scatter(env, xkey, ykey):
         steps = [n*m for n, m in zip(steps, skip)]
 
     f = figure(title='Experiments', xlabel=xkey, ylabel=ykey, legend='Ablate')
-    #f.update_yaxes(type='log')
 
     x = EXPERIMENTS[env][xkey]
     y = EXPERIMENTS[env][ykey]
     c = scores
     scatter(f, x, y, c, showlegend=False)
-
-    '''
-    # Filter by score
-    max_score = max(scores)
-    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
-    filtered_steps = [steps[i] for i in idxs]
-    filtered_costs = [costs[i] for i in idxs]
-    filtered_scores = [scores[i] for i in idxs]
-
-    f = figure(title='Hyper Stability', xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    f.update_yaxes(type='log')
-
-    for j, hyper in enumerate(HYPERS):
-        c = LINE_COLORS[j % len(LINE_COLORS)]
-        s = [scores[i] for i in idxs]
-        x = [steps[i] for i in idxs]
-        y = [EXPERIMENTS[env][hyper][i] for i in idxs]
-
-        x, y, s = pareto_points(x, y, s, 0.1)
-        scatter(f, x, y, c, showlegend=False)
-
-        x = np.array(x)
-        s = np.array(s)
-        y = np.array(y)
-        x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
-        s = np.ones_like(x_smooth)
-
-        f.add_trace(
-            go.Scatter(
-                x=x_smooth,
-                y=y_smooth,
-                mode='lines',
-                name=hyper,
-                line=dict(
-                    color=c,
-                    width=LINE_WIDTH
-                )
-            )
-         )
-    '''
-
-    return f
-
-
-@app.callback(
-    Output("hyper-stable", "figure"),
-    Input("hyper-stable-slider", "value")
-)
-def update_hyper_stable(thresh):
-    for i, env in enumerate(EXPERIMENTS):
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
-
-    # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS[env]:
-        skip = EXPERIMENTS[env]['env/frameskip']
-        steps = [n*m for n, m in zip(steps, skip)]
-
-    # Filter by score
-    max_score = max(scores)
-    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
-    filtered_steps = [steps[i] for i in idxs]
-    filtered_costs = [costs[i] for i in idxs]
-    filtered_scores = [scores[i] for i in idxs]
-
-    f = figure(title='Hyper Stability', xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    f.update_yaxes(type='log')
-
-    for j, hyper in enumerate(HYPERS):
-        c = LINE_COLORS[j % len(LINE_COLORS)]
-        s = [scores[i] for i in idxs]
-        x = [steps[i] for i in idxs]
-        y = [EXPERIMENTS[env][hyper][i] for i in idxs]
-
-        x, y, s = pareto_points(x, y, s, 0.1)
-        scatter(f, x, y, c, showlegend=False)
-
-        x = np.array(x)
-        s = np.array(s)
-        y = np.array(y)
-        x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
-        s = np.ones_like(x_smooth)
-
-        f.add_trace(
-            go.Scatter(
-                x=x_smooth,
-                y=y_smooth,
-                mode='lines',
-                name=hyper,
-                line=dict(
-                    color=c,
-                    width=LINE_WIDTH
-                )
-            )
-         )
 
     return f
 
@@ -904,48 +516,6 @@ def update_hyper_box(thresh, buckets, x):
     return f
 
 @app.callback(
-    Output("hyper", "figure"),
-    Input("hyper-dropdown", "value")
-)
-def update_hyper_plot(hyper):
-    for i, env in enumerate(EXPERIMENTS):
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
-
-    # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS[env]:
-        skip = EXPERIMENTS[env]['env/frameskip']
-        steps = [n*m for n, m in zip(steps, skip)]
-
-    # Filter by score
-    max_score = max(scores)
-    idxs = [i for i, s in enumerate(scores) if s > 0.95*max_score]
-    filtered_steps = [steps[i] for i in idxs]
-    filtered_costs = [costs[i] for i in idxs]
-    filtered_scores = [scores[i] for i in idxs]
-
-    f = figure(title=hyper, xlabel='Steps', ylabel='Hyper', legend='Ablate')
-    y = [EXPERIMENTS[env][hyper][i] for i in idxs]
-    s = [scores[i] for i in idxs]
-    x = [steps[i] for i in idxs]
-
-    x, y, s = pareto_points(x, y, s, 0.1)
-    scatter(f, x, y, s, legend=env_name)
-
-    x = np.array(x)
-    s = np.array(s)
-    y = np.array(y)
-    x_smooth, y_smooth, y_lower, y_upper = loess_fit(x, s, y, n_bins=20, frac=0.4)
-    s = np.ones_like(x_smooth)
-
-    plot_lines(f, [x_smooth], [y_smooth])
-    return f
-
-from plotly import graph_objects as go
-from dash import Output, Input
-
-@app.callback(
     Output("hyper-agg", "figure"),
     Input("hyper-agg-slider", "value"),
     Input("hyper-agg-range", "value")
@@ -1008,7 +578,5 @@ def update_hyper_agg_plot(thresh, step_range):
 
     return f
 
-# Set layout with static graph
-#app.layout = layout
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8000)
