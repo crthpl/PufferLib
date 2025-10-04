@@ -1,13 +1,13 @@
 from dash import Dash, html, dcc
 from dash.dependencies import Input, Output
+import pandas as pd
 import plotly.graph_objects as go
-#import plotly.express as px
+import plotly.express as px
 import numpy as np
 import json
 import glob
 import os
 
-# Global styling variables
 FONT_FAMILY = 'Arial'
 FONT_SIZE_TITLE = 28
 FONT_SIZE_AXIS = 22
@@ -66,7 +66,6 @@ HYPERS = [
     'train/num_minibatches',
     'train/minibatch_size',
     'policy/hidden_size',
-    #'env/frameskip',
     'env/num_envs',
 ]
 ALL_KEYS = [
@@ -76,100 +75,10 @@ ALL_KEYS = [
     'environment/perf'
 ] + HYPERS
 
-def figure(title='The Puffer Frontier Project',
-           xlabel='Uptime', ylabel='Score', zlabel='Score',
-           legend='Trial', log_x=False, log_y=False, log_z=False,
-           is_3d=False):
-    fig = go.Figure()
-    
-    # Common layout settings
-    layout_dict = {
-        'title': dict(text=title, font=TITLE_FONT),
-        'showlegend': True,
-        'legend': dict(font=LEGEND_FONT),
-        'plot_bgcolor': PLOT_BG_COLOR,
-        'paper_bgcolor': PAPER_BG_COLOR,
-        'width': 1280,
-        'height': 720,
-        'autosize': False
-    }
-    
-    if is_3d:
-        # 3D-specific scene configuration
-        layout_dict['scene'] = dict(
-            xaxis=dict(
-                title=dict(text=xlabel, font=AXIS_FONT),
-                tickfont=TICK_FONT_3D,
-                type='log' if log_x else 'linear',
-                showgrid=True,
-                gridcolor=GRID_COLOR,
-                backgroundcolor=PLOT_BG_COLOR,
-                zeroline=False
-            ),
-            yaxis=dict(
-                title=dict(text=ylabel, font=AXIS_FONT),
-                tickfont=TICK_FONT_3D,
-                type='log' if log_y else 'linear',
-                showgrid=True,
-                gridcolor=GRID_COLOR,
-                backgroundcolor=PLOT_BG_COLOR,
-                zeroline=False
-            ),
-            zaxis=dict(
-                title=dict(text=zlabel, font=AXIS_FONT),
-                tickfont=TICK_FONT_3D,
-                type='log' if log_z else 'linear',
-                showgrid=True,
-                gridcolor=GRID_COLOR,
-                backgroundcolor=PLOT_BG_COLOR,
-                zeroline=False
-            ),
-            bgcolor=PLOT_BG_COLOR,
-        )
-    else:
-        # 2D-specific axis configuration
-        layout_dict.update({
-            'xaxis': dict(
-                title=dict(text=xlabel, font=AXIS_FONT),
-                tickfont=TICK_FONT,
-                #type='log' if log_x else 'linear',
-                showgrid=False  # Keep grid off for 2D
-            ),
-            'yaxis': dict(
-                title=dict(text=ylabel, font=AXIS_FONT),
-                tickfont=TICK_FONT,
-                #type='log' if log_y else 'linear',
-                showgrid=False
-            )
-        })
-    
-    fig.update_layout(**layout_dict)
-    return fig
-
-def pareto_points(steps, costs, scores, soft=0.0):
-    pareto_steps = []
-    pareto_costs = []
-    pareto_scores = []
-    max_score = max(scores)
-    for i in range(len(steps)):
-        better = [scores[j] >= scores[i] and 
-            costs[j] < costs[i]*(1 - soft) and steps[j] < steps[i]*(1 - soft)
-            for j in range(len(scores))]
-        if not any(better):
-            pareto_steps.append(steps[i])
-            pareto_costs.append(costs[i])
-            pareto_scores.append(scores[i])
-
-    idxs = np.argsort(pareto_steps)
-    pareto_steps = [pareto_steps[i] for i in idxs]
-    pareto_costs = [pareto_costs[i] for i in idxs]
-    pareto_scores = [pareto_scores[i] for i in idxs]
-    return pareto_steps, pareto_costs, pareto_scores
-
 def pareto_idx(steps, costs, scores):
     idxs = []
     for i in range(len(steps)):
-        better = [scores[j] >= scores[i] and 
+        better = [scores[j] >= scores[i] and
             costs[j] < costs[i] and steps[j] < steps[i]
             for j in range(len(scores))]
         if not any(better):
@@ -208,7 +117,6 @@ def load_sweep_data(path):
                 if sweep_key in data and exp[sweep_key] == 'logit_normal':
                     v = 1 - v
                 elif kk in ('train/vtrace_rho_clip', 'train/vtrace_c_clip'):
-                    # Temporary hack for bad bounds
                     v = max(v, 0.1)
 
                 data[kk].append(v)
@@ -249,11 +157,10 @@ EXPERIMENTS = {
     for name in env_names
 }
 
-# Initialize Dash app
 app = Dash()
 app.css.append_css({'external_stylesheets': 'dash.css'})
 app.layout = html.Div([
-    html.H1('The Puffer Frontier Project', style={'textAlign': 'center'}),
+    html.H1('Puffer Constellation', style={'textAlign': 'center'}),
     html.Br(),
 
     html.Label([
@@ -370,29 +277,57 @@ style={"width": 1280}
     Input("optimal-dropdown-z", "value")
 )
 def update_optimal_plot(xkey, ykey, zkey):
-    f = figure(title='Pareto',
-        xlabel=xkey, ylabel=ykey, zlabel=zkey,
-        log_x=True, log_y=True, is_3d=True)
-
-    for i, env in enumerate(EXPERIMENTS):
-        x = EXPERIMENTS[env][xkey]
-        y = EXPERIMENTS[env][ykey]
-        z = EXPERIMENTS[env][zkey]
-
-        f.add_trace(
-            go.Scatter3d(
-                x=x,
-                y=y,
-                z=z,
-                mode='markers',
-                name=env,
-                line=dict(
-                    color=roygbiv[i],
-                    width=LINE_WIDTH
-                ),
-            )
+    all_x = []
+    all_y = []
+    all_z = []
+    all_env = []
+    for env in EXPERIMENTS:
+        all_x += EXPERIMENTS[env][xkey]
+        all_y += EXPERIMENTS[env][ykey]
+        all_z += EXPERIMENTS[env][zkey]
+        all_env += [env] * len(EXPERIMENTS[env][xkey])
+    f = px.scatter_3d(x=all_x, y=all_y, z=all_z, color=all_env, log_x=True, log_y=True, log_z=False, color_discrete_sequence=roygbiv)
+    layout_dict = {
+        'title': dict(text='Pareto', font=TITLE_FONT),
+        'showlegend': True,
+        'legend': dict(font=LEGEND_FONT),
+        'plot_bgcolor': PLOT_BG_COLOR,
+        'paper_bgcolor': PAPER_BG_COLOR,
+        'width': 1280,
+        'height': 720,
+        'autosize': False,
+        'scene': dict(
+            xaxis=dict(
+                title=dict(text=xkey, font=AXIS_FONT),
+                tickfont=TICK_FONT_3D,
+                type='log',
+                showgrid=True,
+                gridcolor=GRID_COLOR,
+                backgroundcolor=PLOT_BG_COLOR,
+                zeroline=False
+            ),
+            yaxis=dict(
+                title=dict(text=ykey, font=AXIS_FONT),
+                tickfont=TICK_FONT_3D,
+                type='log',
+                showgrid=True,
+                gridcolor=GRID_COLOR,
+                backgroundcolor=PLOT_BG_COLOR,
+                zeroline=False
+            ),
+            zaxis=dict(
+                title=dict(text=zkey, font=AXIS_FONT),
+                tickfont=TICK_FONT_3D,
+                type='linear',
+                showgrid=True,
+                gridcolor=GRID_COLOR,
+                backgroundcolor=PLOT_BG_COLOR,
+                zeroline=False
+            ),
+            bgcolor=PLOT_BG_COLOR,
         )
-
+    }
+    f.update_layout(**layout_dict)
     return f
 
 
@@ -404,43 +339,47 @@ def update_optimal_plot(xkey, ykey, zkey):
     Input("scatter-dropdown-z", "value")
 )
 def update_scatter(env, xkey, ykey, zkey):
-    steps = EXPERIMENTS[env]['agent_steps']
-    costs = EXPERIMENTS[env]['cost']
-    scores = EXPERIMENTS[env]['environment/score']
-
-    f = figure(title='Experiments', xlabel=xkey, ylabel=ykey, legend='Ablate')
-
-    steps = EXPERIMENTS[env]['agent_steps']
     x = EXPERIMENTS[env][xkey]
     y = EXPERIMENTS[env][ykey]
     z = EXPERIMENTS[env][zkey]
-
     mmin = min(z)
     mmax = max(z)
     thresh = np.geomspace(mmin, mmax, 8)
+    all_fx = []
+    all_fy = []
+    bin_label = []
     for j in range(7):
-        idxs = [i for i, e in enumerate(z)
-            if thresh[j] < e  and e < thresh[j+1]]
+        idxs = [i for i, e in enumerate(z) if thresh[j] < e < thresh[j+1]]
+        if len(idxs) <= 2:
+            continue
         fx = [x[i] for i in idxs]
         fy = [y[i] for i in idxs]
-        fz = [z[i] for i in idxs]
-
-        if len(fx) <= 2:
-            continue
-
-        f.add_trace(
-            go.Scatter(
-                x=fx,
-                y=fy,
-                mode='markers',
-                showlegend=False,
-                marker=dict(
-                    color=roygbiv[j],
-                    size=10
-                )
-            )
+        all_fx += fx
+        all_fy += fy
+        bin_label += [str(j)] * len(fx)
+    f = px.scatter(x=all_fx, y=all_fy, color=bin_label, color_discrete_sequence=roygbiv)
+    f.update_traces(marker_size=10)
+    layout_dict = {
+        'title': dict(text='Experiments', font=TITLE_FONT),
+        'showlegend': False,
+        'legend': dict(font=LEGEND_FONT),
+        'plot_bgcolor': PLOT_BG_COLOR,
+        'paper_bgcolor': PAPER_BG_COLOR,
+        'width': 1280,
+        'height': 720,
+        'autosize': False,
+        'xaxis': dict(
+            title=dict(text=xkey, font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
+        ),
+        'yaxis': dict(
+            title=dict(text=ykey, font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
         )
-
+    }
+    f.update_layout(**layout_dict)
     return f
 
 @app.callback(
@@ -448,75 +387,57 @@ def update_scatter(env, xkey, ykey, zkey):
     Input("hyper-box-x", "value")
 )
 def update_hyper_box(x):
-    # Initialize data storage
     buckets = 8
     env_data = {}
-
-    # Process each environment
     for env in EXPERIMENTS:
         steps = EXPERIMENTS[env]['agent_steps']
         costs = EXPERIMENTS[env]['cost']
         scores = EXPERIMENTS[env]['environment/score']
-
-        # Select x-axis data based on input
         x_data = costs if x == 'cost' else steps
-
-        # Get all hyperparameters
-
-        # Store filtered data for this environment
         hyper_data = {}
         env_data[env] = {'x': x_data, 'hypers': hyper_data}
         for h in HYPERS:
             hyper_data[h] = EXPERIMENTS[env][h]
-
-    # Create buckets
     all_x = [x for env in env_data for x in env_data[env]['x']]
     x_min, x_max = min(all_x), max(all_x)
     bucket_edges = np.linspace(x_min, x_max, buckets + 1)
     bucket_centers = (bucket_edges[:-1] + bucket_edges[1:]) / 2
-
-    # Initialize heatmap data
     heatmap_data = np.zeros((len(HYPERS), buckets))
-
-    # Compute means for each bucket and hyperparameter
     for i, hyper in enumerate(HYPERS):
         for j in range(buckets):
             bucket_means = []
             for env in env_data:
                 if hyper not in env_data[env]['hypers']:
                     continue
-
                 x_vals = np.array(env_data[env]['x'])
                 hyper_vals = np.array(env_data[env]['hypers'][hyper])
-                # Find indices in current bucket
                 idxs = (x_vals >= bucket_edges[j]) & (x_vals < bucket_edges[j+1])
                 if np.any(idxs):
                     bucket_means.append(np.mean(hyper_vals[idxs]))
-
-            # Average across environments
             heatmap_data[i, j] = np.mean(bucket_means) if bucket_means else np.nan
-
     heatmap_data = np.log(heatmap_data)
-
-    # Create heatmap
-    f = figure(title="Hyperparameter Drift",
-        xlabel=x.capitalize(),
-        ylabel="Hyperparameters"
-    )
-
-    f.add_trace(
-        go.Heatmap(
-            x=bucket_centers,
-            y=HYPERS,
-            z=heatmap_data,
-            colorscale='Viridis',
-            showscale=True,
-            zmin=np.nanmin(heatmap_data),
-            zmax=np.nanmax(heatmap_data),
-            colorbar=dict(title="Value")
+    f = px.imshow(heatmap_data, x=bucket_centers, y=HYPERS, color_continuous_scale='Viridis', zmin=np.nanmin(heatmap_data), zmax=np.nanmax(heatmap_data), labels=dict(color="Value"))
+    layout_dict = {
+        'title': dict(text="Hyperparameter Drift", font=TITLE_FONT),
+        'showlegend': True,
+        'legend': dict(font=LEGEND_FONT),
+        'plot_bgcolor': PLOT_BG_COLOR,
+        'paper_bgcolor': PAPER_BG_COLOR,
+        'width': 1280,
+        'height': 720,
+        'autosize': False,
+        'xaxis': dict(
+            title=dict(text=x.capitalize(), font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
+        ),
+        'yaxis': dict(
+            title=dict(text="Hyperparameters", font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
         )
-    )
-
+    }
+    f.update_layout(**layout_dict)
     return f
 
 @app.callback(
@@ -569,8 +490,8 @@ def update_hyper_agg_plot(thresh, step_range):
                     y=[hyper],  # Hyperparameter as x-axis
                     base=ymin,
                     showlegend=False,
-                    marker_color='blue',
-                    opacity=0.5,
+                    marker_color='#00f1f1',
+                    opacity=0.25,
                     width=1.0,
                     orientation='h'
                 )
