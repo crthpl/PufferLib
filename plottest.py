@@ -146,138 +146,12 @@ def figure(title='The Puffer Frontier Project',
     fig.update_layout(**layout_dict)
     return fig
 
-def scatter(fig, x, y, c, legend='Trial', log_x=False, i=0, showlegend=True):
-    mmin = min(c)
-    mmax = max(c)
-
-    if isinstance(c, str):
-        colors = c
-    else:
-        colors = []
-        for e in c:
-            if mmin != mmax:
-                v = (e - mmin)/(mmax - mmin)
-            else:
-                v = e
-
-            if v < 0.001:
-                v = 0.001
-            colors.append(f'rgb(0, 0.5, {v})')
-
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=y,
-            mode='markers',
-            name=legend,
-            showlegend=showlegend,
-            marker=dict(
-                color=colors,
-                size=10
-            )
-        )
-    )
-
-def band(experiments, key, qmin=0.0, qmax=1.0):
-    mmax = np.array(experiments[key]).max()
-    top = qmax * mmax
-    bot = qmin * mmax
-    filtered = {k: [] for k in experiments}
-    for i, score in enumerate(experiments[key]):
-        if score < bot or score > top:
-            continue
-
-        for k, v in experiments.items():
-            filtered[k].append(v[i])
-
-    return filtered
-
-def plot_quantiles(fig, experiments, thresh, xlabel='Performance', legend='Trial', log_x=False, i=0):
-    quantile_thresholds = [1.0, thresh]
-    colors = [['indigo', 'blue', 'green', 'yellow', 'orange', 'red'][i]]
-
-    for i in range(len(quantile_thresholds) - 1):
-        qmin = quantile_thresholds[i + 1]
-        qmax = quantile_thresholds[i]
-
-        filtered = band(experiments, 'environment/score', qmin, qmax)
-
-        steps  = filtered['agent_steps']
-        # Adjust steps
-        if 'env/frameskip' in experiments:
-            skip = experiments['env/frameskip']
-            steps = [n*m for n, m in zip(steps, skip)]
-
-        x = steps
-        y = filtered['cost']
-        s = filtered['environment/score']
-
-        s_one = np.ones_like(x)
-        fx, fy, fs = pareto_points(x, y, s_one, 0.00)
-
-        if len(fx) > 1:
-            fig.add_trace(
-                go.Scatter(
-                    x=fx,
-                    y=fy,
-                    mode='lines',
-                    name=f'{legend} Q{qmin:.2f}',
-                    line=dict(
-                        color=colors[i],
-                        width=LINE_WIDTH
-                    ),
-                    showlegend=False
-                )
-            )
-
-        # Plot scatter for points in this quantile range
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=y,
-                mode='markers',
-                name=f'{legend} Q{qmin:.2f} Points',
-                marker=dict(
-                    color=colors[i],
-                    size=5
-                ),
-            )
-        )
-
-    # Update axes
-    fig.update_xaxes(title_text=xlabel)
-    if log_x:
-        fig.update_xaxes(type='log')
-
-    return fig
-
-def lim_pareto(costs, scores, soft=0.0):
-    pareto_costs = []
-    pareto_scores = []
-    max_score = max(scores)
-    for i in range(len(scores)):
-        better = [scores[j] >= scores[i] and 
-            costs[j] < costs[i]
-            for j in range(len(scores))]
-        if not any(better):
-            pareto_costs.append(costs[i])
-            pareto_scores.append(scores[i])
-
-    idxs = np.argsort(pareto_scores)
-    pareto_costs = [pareto_costs[i] for i in idxs]
-    pareto_scores = [pareto_scores[i] for i in idxs]
-    return pareto_costs, pareto_scores
-
-
 def pareto_points(steps, costs, scores, soft=0.0):
     pareto_steps = []
     pareto_costs = []
     pareto_scores = []
     max_score = max(scores)
     for i in range(len(steps)):
-        #if scores[i] < 0.25*max_score:
-        #    continue 
-
         better = [scores[j] >= scores[i] and 
             costs[j] < costs[i]*(1 - soft) and steps[j] < steps[i]*(1 - soft)
             for j in range(len(scores))]
@@ -362,7 +236,11 @@ def cached_sweep_load(path):
         data[k] = [data[k][i] for i in idxs]
 
     data['environment/perf'] = [min(e, 1.0) for e in data['environment/perf']]
-    
+
+    if 'env/frameskip' in data:
+        skip = data['env/frameskip']
+        data['agent_steps'] = [n*m for n, m in zip(data['agent_steps'], skip)]
+
     return data
 
 env_names = ['grid', 'tetris', 'breakout', 'pong']
@@ -530,12 +408,6 @@ def update_scatter(env, xkey, ykey, zkey):
     costs = EXPERIMENTS[env]['cost']
     scores = EXPERIMENTS[env]['environment/score']
 
-    # TODO: This is not applying frameskip 
-    # Adjust steps
-    if 'env/frameskip' in EXPERIMENTS[env]:
-        skip = EXPERIMENTS[env]['env/frameskip']
-        steps = [n*m for n, m in zip(steps, skip)]
-
     f = figure(title='Experiments', xlabel=xkey, ylabel=ykey, legend='Ablate')
 
     steps = EXPERIMENTS[env]['agent_steps']
@@ -556,8 +428,18 @@ def update_scatter(env, xkey, ykey, zkey):
         if len(fx) <= 2:
             continue
 
-        scatter(f, fx, fy, roygbiv[j], showlegend=False)
-
+        f.add_trace(
+            go.Scatter(
+                x=fx,
+                y=fy,
+                mode='markers',
+                showlegend=False,
+                marker=dict(
+                    color=roygbiv[j],
+                    size=10
+                )
+            )
+        )
 
     return f
 
@@ -575,11 +457,6 @@ def update_hyper_box(x):
         steps = EXPERIMENTS[env]['agent_steps']
         costs = EXPERIMENTS[env]['cost']
         scores = EXPERIMENTS[env]['environment/score']
-
-        # Adjust steps if frameskip exists
-        if 'env/frameskip' in EXPERIMENTS[env]:
-            skip = EXPERIMENTS[env]['env/frameskip']
-            steps = [n*m for n, m in zip(steps, skip)]
 
         # Select x-axis data based on input
         x_data = costs if x == 'cost' else steps
@@ -671,11 +548,6 @@ def update_hyper_agg_plot(thresh, step_range):
         steps = EXPERIMENTS[env]['agent_steps']
         costs = EXPERIMENTS[env]['cost']
         scores = EXPERIMENTS[env]['environment/score']
-
-        # Adjust steps
-        if 'env/frameskip' in EXPERIMENTS[env]:
-            skip = EXPERIMENTS[env]['env/frameskip']
-            steps = [n*m for n, m in zip(steps, skip)]
 
         max_score = max(scores)
         max_steps = max(steps)
