@@ -526,8 +526,8 @@ class TrashPickup(nn.Module):
         return action, value
 
 class TowerClimbLSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, input_size = 256, hidden_size = 256):
-        super().__init__(env, policy, input_size, hidden_size)
+    def __init__(self, env, policy, hidden_size = 256):
+        super().__init__(env, policy, hidden_size)
 
 class TowerClimb(nn.Module):
     def __init__(self, env, cnn_channels=16, hidden_size = 256, **kwargs):
