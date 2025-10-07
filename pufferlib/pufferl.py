@@ -50,7 +50,7 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None):
+    def __init__(self, config, vecenv, policy, logger=None, verbose=True):
         # Backend perf optimization
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.deterministic = config['torch_deterministic']
@@ -185,10 +185,11 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
+        self.verbose = verbose
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        #self.print_dashboard(clear=True)
+        self.print_dashboard(clear=True)
 
     @property
     def uptime(self):
@@ -434,7 +435,7 @@ class PuffeRL:
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
             self.losses = losses
-            #self.print_dashboard()
+            self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
@@ -526,6 +527,9 @@ class PuffeRL:
 
     def print_dashboard(self, clear=False, idx=[0],
             c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
+        if not self.verbose:
+            return
+
         config = self.config
         sps = dist_sum(self.sps, config['device'])
         agent_steps = dist_sum(self.global_step, config['device'])
@@ -880,7 +884,7 @@ class WandbLogger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
  
-def train(env_name, args=None, vecenv=None, policy=None, logger=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -917,7 +921,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logger = WandbLogger(args)
 
     train_config = dict(**args['train'], env=env_name)
-    pufferl = PuffeRL(train_config, vecenv, policy, logger)
+    pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
     pufferl.logger.init(args)
 
     all_logs = []
@@ -953,7 +957,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     if logs is not None:
         all_logs.append(logs)
 
-    #pufferl.print_dashboard()
+    pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path)
@@ -1026,7 +1030,7 @@ def _sweep_worker(env_name, q_host, q_worker, device):
         np.random.seed(seed)
         torch.manual_seed(seed)
         try:
-            all_logs = train(env_name, args=args)
+            all_logs = train(env_name, args=args, verbose=False)
         except Exception:
             import traceback
             traceback.print_exc()
