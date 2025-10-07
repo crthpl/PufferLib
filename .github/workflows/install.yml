@@ -8,6 +8,9 @@ jobs:
   test:
     name: test ${{ matrix.py }} - ${{ matrix.os }} - ${{ matrix.env }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -el {0}
     strategy:
       fail-fast: false
       matrix:
