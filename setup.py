@@ -257,7 +257,7 @@ if not NO_TRAIN:
         'rich',
         'rich_argparse',
         'imageio',
-        'pyro-ppl',
+        'gpytorch',
         'heavyball<2.0.0',
         'neptune',
         'wandb',

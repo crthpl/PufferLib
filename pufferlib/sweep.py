@@ -8,11 +8,15 @@ from copy import deepcopy
 import pufferlib
 
 import torch
-import pyro
-from pyro.contrib import gp as gp
-from pyro.contrib.gp.kernels import Kernel
-from pyro.contrib.gp.models import GPRegression
+import gpytorch
+from gpytorch.models import ExactGP
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.kernels import MaternKernel, PolynomialKernel, ScaleKernel, AdditiveKernel
+from gpytorch.means import ConstantMean
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from gpytorch.priors import LogNormalPrior
 
+from scipy.stats.qmc import Sobol
 
 class Space:
     def __init__(self, min, max, scale, mean, is_integer=False):
@@ -310,20 +314,35 @@ class ParetoGenetic:
         ))
 
 
-def create_gp(x_dim, scale_length=1.0):
-    # Dummy data
-    X = scale_length * torch.ones((1, x_dim))
-    y = torch.zeros((1,))
+class ExactGPModel(ExactGP):
+    def __init__(self, train_x, train_y, likelihood, x_dim):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = ConstantMean()
+        # Matern 3/2 kernel (equivalent to Pyro's Matern32)
+        matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim)
+        linear_kernel = PolynomialKernel(power=1)
+        self.covar_module = ScaleKernel(AdditiveKernel(linear_kernel, matern_kernel))
 
-    matern_kernel = gp.kernels.Matern32(input_dim=x_dim, lengthscale=X)
-    linear_kernel = gp.kernels.Polynomial(x_dim, degree=1)
-    kernel = gp.kernels.Sum(linear_kernel, matern_kernel)
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-    # Params taken from HEBO: https://arxiv.org/abs/2012.03826
-    model = gp.models.GPRegression(X, y, kernel=kernel, jitter=1.0e-4)
-    model.noise = pyro.nn.PyroSample(pyro.distributions.LogNormal(math.log(1e-2), 0.5))
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    return model, optimizer
+def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=50):
+    model.train()
+    likelihood.train()
+    model.set_train_data(inputs=train_x, targets=train_y, strict=False)
+
+    for _ in range(training_iter):
+        optimizer.zero_grad()
+        output = model(train_x)
+        loss = -mll(output, train_y)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    likelihood.eval()
+
 
 # TODO: Eval defaults
 class Protein:
@@ -352,19 +371,42 @@ class Protein:
         self.failure_observations = []
         self.suggestion_idx = 0
 
-        self.gp_score, self.score_opt = create_gp(self.hyperparameters.num)
-        self.gp_cost, self.cost_opt = create_gp(self.hyperparameters.num)
+        # Use Sobel seq for structured random exploration
+        self.sobol = Sobol(d=self.hyperparameters.num, scramble=True)
+        # Create dummy data for model initialization
+        dummy_x = torch.ones((1, self.hyperparameters.num), dtype=torch.float64)
+        dummy_y = torch.zeros(1, dtype=torch.float64)
+        
+        # Params taken from HEBO: https://arxiv.org/abs/2012.03826
+        noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
+
+        # Score GP
+        self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
+        self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num)
+        self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score)
+        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=0.01)
+
+        # Cost GP
+        self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
+        self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num)
+        self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost)
+        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=0.01)
+
+        # Use double precision for better accuracy
+        for model in (self.gp_score, self.likelihood_score, self.gp_cost, self.likelihood_cost):
+            model.double()
 
     def suggest(self, fill):
         # TODO: Clip random samples to bounds so we don't get bad high cost samples
         info = {}
         self.suggestion_idx += 1
         if len(self.success_observations) == 0 and self.seed_with_search_center:
-            best = self.hyperparameters.search_centers
-            return self.hyperparameters.to_dict(best, fill), info
-        elif not self.seed_with_search_center and len(self.success_observations) < self.num_random_samples:
-            suggestions = self.hyperparameters.sample(self.random_suggestions)
-            self.suggestion = random.choice(suggestions)
+            suggestion = self.hyperparameters.search_centers
+            return self.hyperparameters.to_dict(suggestion, fill), info
+        elif len(self.success_observations) < self.num_random_samples:
+            # Suggest the next point in the Sobol sequence
+            suggestion = self.sobol.random(1)[0]
+            self.suggestion = 2 * suggestion - 1  # Scale from [0, 1) to [-1, 1)
             return self.hyperparameters.to_dict(self.suggestion, fill), info
         elif self.resample_frequency and self.suggestion_idx % self.resample_frequency == 0:
             candidates, _ = pareto_points(self.success_observations)
@@ -374,36 +416,27 @@ class Protein:
             return self.hyperparameters.to_dict(best, fill), info
 
         params = np.array([e['input'] for e in self.success_observations])
-        params = torch.from_numpy(params)
+        params_tensor = torch.from_numpy(params).to(torch.float64)
 
         # Scores variable y
         y = np.array([e['output'] for e in self.success_observations])
 
         # Transformed scores
-        min_score = np.min(y)
-        max_score = np.max(y)
+        min_score, max_score = np.min(y), np.max(y)
         y_norm = (y - min_score) / (np.abs(max_score - min_score) + 1e-6)
-
-        self.gp_score.set_data(params, torch.from_numpy(y_norm))
-        self.gp_score.train()
-        gp.util.train(self.gp_score, self.score_opt)
-        self.gp_score.eval()
+        y_norm_tensor = torch.from_numpy(y_norm).to(torch.float64)
+        train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor)
 
         # Log costs
         c = np.array([e['cost'] for e in self.success_observations])
 
         log_c = np.log(c)
 
-        # Linear input norm creates clean 1 mean fn
-        log_c_min = np.min(log_c)
-        log_c_max = np.max(log_c)
+        # Normalize log costs for the cost GP
+        log_c_min, log_c_max = np.min(log_c), np.max(log_c)
         log_c_norm = (log_c - log_c_min) / (log_c_max - log_c_min + 1e-6)
-
-        self.gp_cost.mean_function = lambda x: 1
-        self.gp_cost.set_data(params, torch.from_numpy(log_c_norm))
-        self.gp_cost.train()
-        gp.util.train(self.gp_cost, self.cost_opt)
-        self.gp_cost.eval()
+        log_c_norm_tensor = torch.from_numpy(log_c_norm).to(torch.float64)
+        train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor)
 
         candidates, pareto_idxs = pareto_points(self.success_observations)
         pareto_costs = np.array([e['cost'] for e in candidates])
@@ -414,13 +447,13 @@ class Protein:
             len(candidates)*self.suggestions_per_pareto, mu=search_centers)
 
         ### Predict scores and costs
-        suggestions = torch.from_numpy(suggestions)
-        with torch.no_grad():
-            gp_y_norm, gp_y_norm_var = self.gp_score(suggestions)
-            gp_log_c_norm, gp_log_c_norm_var = self.gp_cost(suggestions)
-
-        gp_y_norm = gp_y_norm.numpy()
-        gp_log_c_norm = gp_log_c_norm.numpy()
+        suggestions_tensor = torch.from_numpy(suggestions).to(torch.float64)
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            pred_y = self.likelihood_score(self.gp_score(suggestions_tensor))
+            pred_c = self.likelihood_cost(self.gp_cost(suggestions_tensor))
+        
+        gp_y_norm = pred_y.mean.numpy()
+        gp_log_c_norm = pred_c.mean.numpy()
 
         # Unlinearize
         gp_y = gp_y_norm*(max_score - min_score) + min_score
@@ -428,8 +461,7 @@ class Protein:
         gp_log_c = gp_log_c_norm*(log_c_max - log_c_min) + log_c_min
         gp_c = np.exp(gp_log_c)
 
-        gp_c_min = np.min(gp_c)
-        gp_c_max = np.max(gp_c)
+        gp_c_min, gp_c_max = np.min(gp_c), np.max(gp_c)
         gp_c_norm = (gp_c - gp_c_min) / (gp_c_max - gp_c_min + 1e-6)
 
         pareto_y = y[pareto_idxs]
@@ -528,7 +560,7 @@ class Protein:
             show(p)
         '''
 
-        best = suggestions[best_idx].numpy()
+        best = suggestions[best_idx]
         return self.hyperparameters.to_dict(best, fill), info
 
     def observe(self, hypers, score, cost, is_failure=False):
