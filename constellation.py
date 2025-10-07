@@ -19,7 +19,7 @@ PLOT_BG_COLOR = '#061a1a'
 PAPER_BG_COLOR = '#061a1a'
 LINE_WIDTH = 4
 LINE_COLORS = ["#0000b3", "#0010d9", "#0020ff", "#0040ff", "#0060ff", "#0080ff", "#009fff", "#00bfff", "#00ffff"][::-1]
-roygbiv = ['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'violet']
+roygbiv = ['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'violet', 'white', 'gray']
 TITLE_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_TITLE,
@@ -151,7 +151,7 @@ def cached_sweep_load(path):
 
     return data
 
-env_names = ['grid', 'tetris', 'breakout', 'pong']
+env_names = ['grid', 'moba', 'tower_climb', 'tetris', 'breakout', 'pong', 'g2048', 'snake', 'pacman']
 EXPERIMENTS = {
     name: cached_sweep_load(f'experiments/logs/puffer_{name}')
     for name in env_names
