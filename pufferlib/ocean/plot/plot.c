@@ -1,7 +1,9 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "raylib.h"
+
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -17,6 +19,7 @@ const float EMPTY = -4242.0f;
 
 #define SEP 4
 #define SETTINGS_HEIGHT 20
+#define TOGGLE_WIDTH 60
 #define DROPDOWN_WIDTH 200
 
 typedef struct PlotArgs {
@@ -40,6 +43,7 @@ typedef struct PlotArgs {
     Color axis_color;
     char* x_label;
     char* y_label;
+    char* z_label;
     Font font;
 } PlotArgs;
 
@@ -64,11 +68,8 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .axis_color = PUFF_WHITE,
     .x_label = "Cost",
     .y_label = "Score",
+    .z_label = "Train/Learning Rate",
 };
-
-#include <stdio.h>
-#include <math.h>
-#include <string.h>
 
 const char* format_tick_label(double value) {
     static char buffer[32];
@@ -180,6 +181,24 @@ void draw_axes(PlotArgs args) {
     }
 }
 
+void draw_axes3(PlotArgs args) {
+    DrawLine3D(
+        (Vector3){-10.0f, 0, 0},
+        (Vector3){10.0f, 0, 0},
+        RED
+    );
+    DrawLine3D(
+        (Vector3){0, -10.0f, 0},
+        (Vector3){0, 10.0f, 0},
+        GREEN
+    );
+    DrawLine3D(
+        (Vector3){0, 0, -10.0f},
+        (Vector3){0, 0, 10.0f},
+        BLUE
+    );
+}
+
 float ary_min(float* ary, int num) {
     float min = ary[0];
     for (int i=1; i<num; i++) {
@@ -230,6 +249,40 @@ void plot(float* x, float* y, int num_points, PlotArgs args) {
         DrawCircle(x1, y1, args.line_width, PUFF_CYAN);
     }
 }
+
+void plot3(float* x, float* y, float* z, bool log_x, bool log_y, bool log_z, int num_points, PlotArgs args) {
+    int width = args.width;
+    int height = args.height;
+
+    float x_min = args.x_min;
+    float x_max = args.x_max;
+    float y_min = args.y_min;
+    float y_max = args.y_max;
+    float z_min = args.z_min;
+    float z_max = args.z_max;
+
+    float dx = x_max - x_min;
+    float dy = y_max - y_min;
+    float dz = z_max - z_min;
+    if (dx == 0) dx = 1.0f;
+    if (dy == 0) dy = 1.0f;
+    if (dz == 0) dz = 1.0f;
+    x_min -= 0.1f * dx; x_max += 0.1f * dx;
+    y_min -= 0.1f * dy; y_max += 0.1f * dy;
+    z_min -= 0.1f * dz; z_max += 0.1f * dz;
+    dx = x_max - x_min;
+    dy = y_max - y_min;
+    dz = z_max - z_min;
+
+    // Plot lines
+    for (int j = 0; j < num_points - 1; j++) {
+        float xj = (log_x) ? log10(x[j]) : x[j];
+        float yj = (log_y) ? log10(y[j]) : y[j];
+        float zj = (log_z) ? log10(z[j]) : z[j];
+        DrawSphere((Vector3){xj, yj, zj}, 0.1f, PUFF_CYAN);
+    }
+}
+
 
 typedef struct {
     char *key;
@@ -346,6 +399,9 @@ int main(void) {
     }
 
     // Create items as an array of strings
+    if (map_count > 20) {
+        map_count = 20;
+    }
     char **items = malloc(map_count * sizeof(char *));
     if (!items) {
         printf("Memory allocation error\n");
@@ -389,25 +445,34 @@ int main(void) {
     
   
     // Initialize Raylib
-
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
-
+    Camera3D camera = (Camera3D){ 0 };
+    camera.position = (Vector3){ 10.0f, 10.0f, 10.0f };
+    camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
+    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
     PlotArgs args1 = DEFAULT_PLOT_ARGS;
     args1.font = GetFontDefault();
     RenderTexture2D fig1 = LoadRenderTexture(args1.width, args1.height);
     bool fig1_x_active = false;
-    int fig1_x_idx = 1;
+    int fig1_x_idx = 2;
+    bool fig1_x_log = true;
     bool fig1_y_active = false;
-    int fig1_y_idx = 0;
+    int fig1_y_idx = 6;
+    bool fig1_y_log = false;
+    bool fig1_z_active = false;
+    int fig1_z_idx = 1;
+    bool fig1_z_log = true;
 
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     args2.font = GetFontDefault();
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
     bool fig2_x_active = false;
-    int fig2_x_idx = 2;
+    int fig2_x_idx = 1;
     bool fig2_y_active = false;
     int fig2_y_idx = 0;
 
@@ -432,9 +497,11 @@ int main(void) {
 
     float* x;
     float* y;
+    float* z;
     int num_points;
     char* x_label;
     char* y_label;
+    char* z_label;
 
     while (!WindowShouldClose()) {
         BeginDrawing();
@@ -442,32 +509,54 @@ int main(void) {
 
         x_label = items[fig1_x_idx];
         y_label = items[fig1_y_idx];
+        z_label = items[fig1_z_idx];
         args1.x_label = x_label;
         args1.y_label = y_label;
+        args1.z_label = z_label;
         x = get_values(map, map_count, x_label, &num_points);
         y = get_values(map, map_count, y_label, &num_points);
+        z = get_values(map, map_count, z_label, &num_points);
         args1.x_min = ary_min(x, num_points);
         args1.x_max = ary_max(x, num_points);
         args1.y_min = ary_min(y, num_points);
         args1.y_max = ary_max(y, num_points);
+        args1.z_min = ary_min(z, num_points);
+        args1.z_max = ary_max(z, num_points);
+        float x_mid = fig1_x_log ? (log10(args1.x_max) + log10(args1.x_min))/2.0f : (args1.x_max + args1.x_min)/2.0f;
+        float y_mid = fig1_y_log ? (log10(args1.y_max) + log10(args1.y_min))/2.0f : (args1.y_max + args1.y_min)/2.0f;
+        float z_mid = fig1_z_log ? (log10(args1.z_max) + log10(args1.z_min))/2.0f : (args1.z_max + args1.z_min)/2.0f;
+        camera.target = (Vector3){x_mid, y_mid, z_mid};
         BeginTextureMode(fig1);
         ClearBackground(PUFF_BACKGROUND);
-        plot(x, y, num_points, args1);
-        draw_axes(args1);
+        BeginMode3D(camera);
+        UpdateCamera(&camera, CAMERA_ORBITAL);
+        plot3(x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, num_points, args1);
+        draw_axes3(args1);
+        EndMode3D();
         EndTextureMode();
         DrawTextureRec(
             fig1.texture,
-            (Rectangle){ 0, 0, fig1.texture.width, -fig1.texture.height },
+            (Rectangle){0, 0, fig1.texture.width, -fig1.texture.height },
             (Vector2){ 0, SETTINGS_HEIGHT }, WHITE
         );
         Rectangle fig1_x_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig1_x_rect, options, &fig1_x_idx, fig1_x_active)){
             fig1_x_active = !fig1_x_active;
         }
-        Rectangle fig1_y_rect = {DROPDOWN_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig1_x_check_rect = {DROPDOWN_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig1_x_check_rect, "Log X", &fig1_x_log);
+        Rectangle fig1_y_rect = {DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig1_y_rect, options, &fig1_y_idx, fig1_y_active)){
             fig1_y_active = !fig1_y_active;
         }
+        Rectangle fig1_y_check_rect = {2*DROPDOWN_WIDTH+TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig1_y_check_rect, "Log Y", &fig1_y_log);
+        Rectangle fig1_z_rect = {2*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig1_z_rect, options, &fig1_z_idx, fig1_z_active)){
+            fig1_z_active = !fig1_z_active;
+        }
+        Rectangle fig1_z_check_rect = {3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig1_z_check_rect, "Log Z", &fig1_z_log);
 
         x_label = items[fig2_x_idx];
         y_label = items[fig2_y_idx];
@@ -486,7 +575,7 @@ int main(void) {
         EndTextureMode();
         DrawTextureRec(
             fig2.texture,
-            (Rectangle){0, 0, fig2.texture.width, -fig2.texture.height },
+            (Rectangle){ 0, 0, fig2.texture.width, -fig2.texture.height },
             (Vector2){ fig1.texture.width, SETTINGS_HEIGHT }, WHITE
         );
         Rectangle fig2_x_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
