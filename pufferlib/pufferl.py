@@ -837,6 +837,12 @@ class NeptuneLogger:
         for k, v in pufferlib.unroll_nested_dict(args):
             neptune[k].append(v)
 
+    def init(self, args):
+        pass
+
+    def log_cost(self, cost):
+        pass
+
     def log(self, logs, step):
         for k, v in logs.items():
             self.neptune[k].append(v, step=step)
