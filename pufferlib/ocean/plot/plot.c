@@ -345,6 +345,33 @@ int main(void) {
         item = item->next;
     }
 
+    // Create items as an array of strings
+    char **items = malloc(map_count * sizeof(char *));
+    if (!items) {
+        printf("Memory allocation error\n");
+        return cleanup(map, map_count, root, json_str);
+    }
+    for (int i = 0; i < map_count; i++) {
+        items[i] = map[i].key;  // Or strdup if you need copies
+    }
+
+    // Create options as a semicolon-separated string
+    size_t options_len = 0;
+    for (int i = 0; i < map_count; i++) {
+        options_len += strlen(map[i].key) + 1;  // +1 for semicolon or null
+    }
+    char *options = malloc(options_len);
+    if (!options) {
+        printf("Memory allocation error\n");
+        free(items);
+        return cleanup(map, map_count, root, json_str);
+    }
+    options[0] = '\0';
+    for (int i = 0; i < map_count; i++) {
+        if (i > 0) strcat(options, ";");
+        strcat(options, map[i].key);
+    }
+
 
     // Example usage: Print the arrays
     // Cleanup
@@ -400,19 +427,25 @@ int main(void) {
     bool fig4_y_active = false;
     int fig4_y_idx = 0;
 
-    char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
-    char options[] = "environment/score;cost;train/learning_rate;train/gamma;train/gae_lambda";
+    //char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
+    //char options[] = "environment/score;cost;train/learning_rate;train/gamma;train/gae_lambda";
 
     float* x;
     float* y;
     int num_points;
+    char* x_label;
+    char* y_label;
 
     while (!WindowShouldClose()) {
         BeginDrawing();
         ClearBackground(PUFF_BACKGROUND);
 
-        x = get_values(map, map_count, items[fig1_x_idx], &num_points);
-        y = get_values(map, map_count, items[fig1_y_idx], &num_points);
+        x_label = items[fig1_x_idx];
+        y_label = items[fig1_y_idx];
+        args1.x_label = x_label;
+        args1.y_label = y_label;
+        x = get_values(map, map_count, x_label, &num_points);
+        y = get_values(map, map_count, y_label, &num_points);
         args1.x_min = ary_min(x, num_points);
         args1.x_max = ary_max(x, num_points);
         args1.y_min = ary_min(y, num_points);
@@ -436,8 +469,12 @@ int main(void) {
             fig1_y_active = !fig1_y_active;
         }
 
-        x = get_values(map, map_count, items[fig2_x_idx], &num_points);
-        y = get_values(map, map_count, items[fig2_y_idx], &num_points);
+        x_label = items[fig2_x_idx];
+        y_label = items[fig2_y_idx];
+        args2.x_label = x_label;
+        args2.y_label = y_label;
+        x = get_values(map, map_count, x_label, &num_points);
+        y = get_values(map, map_count, y_label, &num_points);
         args2.x_min = ary_min(x, num_points);
         args2.x_max = ary_max(x, num_points);
         args2.y_min = ary_min(y, num_points);
@@ -461,8 +498,12 @@ int main(void) {
             fig2_y_active = !fig2_y_active;
         }
 
-        x = get_values(map, map_count, items[fig3_x_idx], &num_points);
-        y = get_values(map, map_count, items[fig3_y_idx], &num_points);
+        x_label = items[fig3_x_idx];
+        y_label = items[fig3_y_idx];
+        args3.x_label = x_label;
+        args3.y_label = y_label;
+        x = get_values(map, map_count, x_label, &num_points);
+        y = get_values(map, map_count, y_label, &num_points);
         args3.x_min = ary_min(x, num_points);
         args3.x_max = ary_max(x, num_points);
         args3.y_min = ary_min(y, num_points);
@@ -486,8 +527,12 @@ int main(void) {
             fig3_y_active = !fig3_y_active;
         }
 
-        x = get_values(map, map_count, items[fig4_x_idx], &num_points);
-        y = get_values(map, map_count, items[fig4_y_idx], &num_points);
+        x_label = items[fig4_x_idx];
+        y_label = items[fig4_y_idx];
+        args4.x_label = x_label;
+        args4.y_label = y_label;
+        x = get_values(map, map_count, x_label, &num_points);
+        y = get_values(map, map_count, y_label, &num_points);
         args4.x_min = ary_min(x, num_points);
         args4.x_max = ary_max(x, num_points);
         args4.y_min = ary_min(y, num_points);
