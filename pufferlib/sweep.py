@@ -384,13 +384,13 @@ class Protein:
         self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
         self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num)
         self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score)
-        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=0.01)
+        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=0.0001)
 
         # Cost GP
         self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
         self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num)
         self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost)
-        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=0.01)
+        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=0.0001)
 
         # Use double precision for better accuracy
         for model in (self.gp_score, self.likelihood_score, self.gp_cost, self.likelihood_cost):
