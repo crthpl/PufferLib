@@ -50,7 +50,6 @@ jobs:
         run: pip install --upgrade "setuptools>=69.0.0" "numpy<2.0" wheel
 
       - name: Install PyTorch CPU  
-        if: matrix.env == 'pip'
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       
       - name: Install pufferlib
