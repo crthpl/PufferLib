@@ -19,7 +19,7 @@ def make(name, render_mode='rgb_array', buf=None, seed=0):
     from cogames import game
 
     # Load a game configuration
-    config = game.get_game(name)
+    config = game.get_mission(name)[0]
 
     # Create environment
     env = PufferMettaGridEnv(env_cfg=config)
