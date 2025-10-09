@@ -343,7 +343,7 @@ void handleWallProximity(iwEnv *e, const droneEntity *drone, const wallEntity *w
 
 // charge burst until we're close enough to a death wall to burst off
 // of it
-void wallBurst(iwEnv *e, const droneEntity *drone, const float speed, const float distance, agentActions *actions) {
+void wallBurst(iwEnv *e, const droneEntity *drone, const float distance, agentActions *actions) {
     if (distance < DRONE_BURST_RADIUS_MIN) {
         scriptedAgentBurst(drone, actions);
         return;
@@ -432,7 +432,7 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
             if (entityTypeIsWall(ent->type) && ent->type == DEATH_WALL_ENTITY) {
                 actions.brake = true;
                 if (drone->shield == NULL) {
-                    wallBurst(e, drone, droneSpeed, b2Distance(drone->pos, ctx.point), &actions);
+                    wallBurst(e, drone, b2Distance(drone->pos, ctx.point), &actions);
                 }
 
                 const b2Vec2 droneDirection = b2Normalize(drone->velocity);
