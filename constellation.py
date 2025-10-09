@@ -19,7 +19,8 @@ PLOT_BG_COLOR = '#061a1a'
 PAPER_BG_COLOR = '#061a1a'
 LINE_WIDTH = 4
 LINE_COLORS = ["#0000b3", "#0010d9", "#0020ff", "#0040ff", "#0060ff", "#0080ff", "#009fff", "#00bfff", "#00ffff"][::-1]
-roygbiv = ['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'violet', 'white', 'gray']
+roygbiv = np.random.permutation(['aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque', 'black', 'blanchedalmond', 'blue', 'blueviolet', 'brown', 'burlywood', 'cadetblue', 'chartreuse', 'chocolate', 'coral', 'cornflowerblue', 'cornsilk', 'crimson', 'cyan', 'darkblue', 'darkcyan', 'darkgoldenrod', 'darkgray', 'darkgrey', 'darkgreen', 'darkkhaki', 'darkmagenta', 'darkolivegreen', 'darkorange', 'darkorchid', 'darkred', 'darksalmon', 'darkseagreen', 'darkslateblue', 'darkslategray', 'darkslategrey', 'darkturquoise', 'darkviolet', 'deeppink', 'deepskyblue', 'dimgray', 'dimgrey', 'dodgerblue', 'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro', 'ghostwhite', 'gold', 'goldenrod', 'gray', 'grey', 'green', 'greenyellow', 'honeydew', 'hotpink', 'indianred', 'indigo', 'ivory', 'khaki', 'lavender', 'lavenderblush', 'lawngreen', 'lemonchiffon', 'lightblue', 'lightcoral', 'lightcyan', 'lightgoldenrodyellow', 'lightgray', 'lightgrey', 'lightgreen', 'lightpink', 'lightsalmon', 'lightseagreen', 'lightskyblue', 'lightslategray', 'lightslategrey', 'lightsteelblue', 'lightyellow', 'lime', 'limegreen', 'linen', 'magenta', 'maroon', 'mediumaquamarine', 'mediumblue', 'mediumorchid', 'mediumpurple', 'mediumseagreen', 'mediumslateblue', 'mediumspringgreen', 'mediumturquoise', 'mediumvioletred', 'midnightblue', 'mintcream', 'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace', 'olive', 'olivedrab', 'orange', 'orangered', 'orchid', 'palegoldenrod', 'palegreen', 'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff', 'peru', 'pink', 'plum', 'powderblue', 'purple', 'red', 'rosybrown', 'royalblue', 'saddlebrown', 'salmon', 'sandybrown', 'seagreen', 'seashell', 'sienna', 'silver', 'skyblue', 'slateblue', 'slategray', 'slategrey', 'snow', 'springgreen', 'steelblue', 'tan', 'teal', 'thistle', 'tomato', 'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow', 'yellowgreen'])
+#roygbiv = ['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'violet']
 TITLE_FONT = dict(
     family=FONT_FAMILY,
     size=FONT_SIZE_TITLE,
@@ -125,7 +126,7 @@ def load_sweep_data(path):
 
     return data
 
-def cached_sweep_load(path):
+def cached_sweep_load(path, env_name):
     cache_file = os.path.join(path, 'cache.json')
     if not os.path.exists(cache_file):
         data = load_sweep_data(os.path.join(path, '*.json'))
@@ -140,22 +141,35 @@ def cached_sweep_load(path):
     scores = data['environment/score']
 
     idxs = pareto_idx(steps, costs, scores)
+    
+    # Create a DataFrame for this environment
+    df_data = {}
     for k in data:
-        data[k] = [data[k][i] for i in idxs]
+        df_data[k] = [data[k][i] for i in idxs]
+    
+    # Apply performance cap
+    df_data['environment/perf'] = [min(e, 1.0) for e in df_data['environment/perf']]
+    
+    # Adjust steps by frameskip if present
+    if 'env/frameskip' in df_data:
+        skip = df_data['env/frameskip']
+        df_data['agent_steps'] = [n*m for n, m in zip(df_data['agent_steps'], skip)]
+    
+    # Add environment name
+    df_data['env_name'] = [env_name] * len(idxs)
+    
+    return pd.DataFrame(df_data)
 
-    data['environment/perf'] = [min(e, 1.0) for e in data['environment/perf']]
+env_names = ['tripletriad', 'grid', 'moba', 'tower_climb', 'tetris', 'breakout', 'pong', 'g2048', 'snake', 'pacman']
+#env_names = ['grid', 'breakout', 'g2048']
+#env_names = ['grid']
 
-    if 'env/frameskip' in data:
-        skip = data['env/frameskip']
-        data['agent_steps'] = [n*m for n, m in zip(data['agent_steps'], skip)]
+# Create a list of DataFrames for each environment
+dfs = [cached_sweep_load(f'experiments/logs/puffer_{name}', name) for name in env_names]
 
-    return data
-
-env_names = ['grid', 'moba', 'tower_climb', 'tetris', 'breakout', 'pong', 'g2048', 'snake', 'pacman']
-EXPERIMENTS = {
-    name: cached_sweep_load(f'experiments/logs/puffer_{name}')
-    for name in env_names
-}
+# Concatenate all DataFrames into a single DataFrame
+EXPERIMENTS = pd.concat(dfs, ignore_index=True)
+EXPERIMENTS.set_index('env_name', inplace=True)
 
 app = Dash()
 app.css.append_css({'external_stylesheets': 'dash.css'})
@@ -266,6 +280,21 @@ app.layout = html.Div([
     ]),
     dcc.Graph(id='hyper-agg'),
 
+
+    html.Br(),
+    html.Label([
+        "Threshold: ",
+        dcc.Slider(
+            id='pca-slider',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=0.5,
+            marks={i: str(0.05*i) for i in range(0, 21)}
+        )
+    ]),
+    dcc.Graph(id='pca'),
+
 ],
 style={"width": 1280}
 )
@@ -281,11 +310,16 @@ def update_optimal_plot(xkey, ykey, zkey):
     all_y = []
     all_z = []
     all_env = []
-    for env in EXPERIMENTS:
-        all_x += EXPERIMENTS[env][xkey]
-        all_y += EXPERIMENTS[env][ykey]
-        all_z += EXPERIMENTS[env][zkey]
-        all_env += [env] * len(EXPERIMENTS[env][xkey])
+    for env in env_names:
+        env_data = EXPERIMENTS.loc[env]
+        all_x.append(env_data[xkey].copy())
+        all_y.append(env_data[ykey].copy())
+        all_z.append(env_data[zkey].copy())
+        all_env += [env] * len(env_data[xkey])
+
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    all_z = np.concatenate(all_z)
     f = px.scatter_3d(x=all_x, y=all_y, z=all_z, color=all_env, log_x=True, log_y=True, log_z=False, color_discrete_sequence=roygbiv)
     layout_dict = {
         'title': dict(text='Pareto', font=TITLE_FONT),
@@ -339,12 +373,13 @@ def update_optimal_plot(xkey, ykey, zkey):
     Input("scatter-dropdown-z", "value")
 )
 def update_scatter(env, xkey, ykey, zkey):
-    x = EXPERIMENTS[env][xkey]
-    y = EXPERIMENTS[env][ykey]
-    z = EXPERIMENTS[env][zkey]
+    env_data = EXPERIMENTS.loc[env]
+    x = env_data[xkey]
+    y = env_data[ykey]
+    z = env_data[zkey]
     mmin = min(z)
     mmax = max(z)
-    thresh = np.geomspace(mmin, mmax, 8)
+    thresh = np.linspace(mmin, mmax, 8)
     all_fx = []
     all_fy = []
     bin_label = []
@@ -356,12 +391,12 @@ def update_scatter(env, xkey, ykey, zkey):
         fy = [y[i] for i in idxs]
         all_fx += fx
         all_fy += fy
-        bin_label += [str(j)] * len(fx)
+        bin_label += [str(thresh[j])] * len(fx)
     f = px.scatter(x=all_fx, y=all_fy, color=bin_label, color_discrete_sequence=roygbiv)
     f.update_traces(marker_size=10)
     layout_dict = {
         'title': dict(text='Experiments', font=TITLE_FONT),
-        'showlegend': False,
+        'showlegend': True,
         'legend': dict(font=LEGEND_FONT),
         'plot_bgcolor': PLOT_BG_COLOR,
         'paper_bgcolor': PAPER_BG_COLOR,
@@ -387,17 +422,18 @@ def update_scatter(env, xkey, ykey, zkey):
     Input("hyper-box-x", "value")
 )
 def update_hyper_box(x):
-    buckets = 8
+    buckets = 4
     env_data = {}
-    for env in EXPERIMENTS:
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
+    for env in env_names:
+        data = EXPERIMENTS.loc[env]
+        steps = data['agent_steps']
+        costs = data['cost']
+        scores = data['environment/score']
         x_data = costs if x == 'cost' else steps
         hyper_data = {}
         env_data[env] = {'x': x_data, 'hypers': hyper_data}
         for h in HYPERS:
-            hyper_data[h] = EXPERIMENTS[env][h]
+            hyper_data[h] = data[h]
     all_x = [x for env in env_data for x in env_data[env]['x']]
     x_min, x_max = min(all_x), max(all_x)
     bucket_edges = np.linspace(x_min, x_max, buckets + 1)
@@ -416,6 +452,7 @@ def update_hyper_box(x):
                     bucket_means.append(np.mean(hyper_vals[idxs]))
             heatmap_data[i, j] = np.mean(bucket_means) if bucket_means else np.nan
     heatmap_data = np.log(heatmap_data)
+    heatmap_data -= heatmap_data[:, 0, None] # Normalize
     f = px.imshow(heatmap_data, x=bucket_centers, y=HYPERS, color_continuous_scale='Viridis', zmin=np.nanmin(heatmap_data), zmax=np.nanmax(heatmap_data), labels=dict(color="Value"))
     layout_dict = {
         'title': dict(text="Hyperparameter Drift", font=TITLE_FONT),
@@ -465,10 +502,11 @@ def update_hyper_agg_plot(thresh, step_range):
     f.update_xaxes(showgrid=False)
     f.update_yaxes(showgrid=False)
 
-    for i, env in enumerate(EXPERIMENTS):
-        steps = EXPERIMENTS[env]['agent_steps']
-        costs = EXPERIMENTS[env]['cost']
-        scores = EXPERIMENTS[env]['environment/score']
+    for i, env in enumerate(env_names):
+        env_data = EXPERIMENTS.loc[env]
+        steps = env_data['agent_steps']
+        costs = env_data['cost']
+        scores = env_data['environment/score']
 
         max_score = max(scores)
         max_steps = max(steps)
@@ -480,7 +518,7 @@ def update_hyper_agg_plot(thresh, step_range):
             continue
         
         for k, hyper in enumerate(HYPERS):
-            y = [EXPERIMENTS[env][hyper][i] for i in idxs]
+            y = [env_data[hyper][i] for i in idxs]
 
             ymin = min(y)
             ymax = max(y)
@@ -498,6 +536,101 @@ def update_hyper_agg_plot(thresh, step_range):
             )
 
     return f
+
+@app.callback(
+    Output("pca", "figure"),
+    Input("pca-slider", "value"),
+)
+def update_pca_plot(thresh):
+    # Initialize figure
+    f = go.Figure()
+    f.update_layout(
+        title=dict(text='Hyperparameter Stable Range', font=TITLE_FONT),
+        xaxis=dict(title=dict(text='Value', font=AXIS_FONT), tickfont=TICK_FONT),
+        yaxis=dict(title=dict(text='Hyper', font=AXIS_FONT), tickfont=TICK_FONT),
+        showlegend=True,
+        legend=dict(font=LEGEND_FONT),
+        plot_bgcolor=PLOT_BG_COLOR,
+        paper_bgcolor=PAPER_BG_COLOR,
+        width=1280,
+        height=720,
+        autosize=False,
+        xaxis_type='log',
+        barmode='overlay',  # Overlay bars instead of stacking
+    )
+    f.update_xaxes(showgrid=False)
+    f.update_yaxes(showgrid=False)
+
+    filtered = {env: [] for env in env_names}
+    for env in env_names:
+        env_data = EXPERIMENTS.loc[env]
+        perf = env_data['environment/perf']
+        idxs = [i for i in range(len(perf)) if perf[i] > thresh]
+        for hyper in HYPERS:
+            filt = np.array([env_data[hyper][i] for i in idxs])
+            mmin = np.array(env_data[f'sweep/{hyper}/min'])
+            mmin = [mmin[i] for i in idxs]
+            mmax = env_data[f'sweep/{hyper}/max']
+            mmax = np.array([mmax[i] for i in idxs])
+            distribution = env_data[f'sweep/{hyper}/distribution'][0]
+            #if 'uniform' in distribution:
+            #    #filt = (filt - mmin) / (mmax - mmin)
+            #    pass
+            if 'log' in distribution or 'pow2' in distribution:
+                filt = np.log(filt)
+                #filt = (np.log(filt) - np.log(mmin)) / (np.log(mmax) - np.log(mmin))
+
+            filtered[env].append(filt)
+
+        filtered[env] = np.array(filtered[env]).T
+
+    training = np.concatenate(list(filtered.values()), axis=0)
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=2)
+    pca.fit(training)
+
+    all_x = []
+    all_y = []
+    all_z = []
+    for i, env in enumerate(filtered):
+        if filtered[env].shape[0] == 0:
+            continue
+
+        reduced = pca.transform(filtered[env])
+        x, y = reduced[:, 0], reduced[:, 1]
+        all_x.append(x)
+        all_y.append(y)
+        all_z.append([env]*len(x))
+
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    all_z = np.concatenate(all_z)
+    f = px.scatter(x=all_x, y=all_y, color=all_z, color_discrete_sequence=roygbiv)
+ 
+    f.update_traces(marker_size=10)
+    layout_dict = {
+        'title': dict(text='Experiments', font=TITLE_FONT),
+        'showlegend': True,
+        'legend': dict(font=LEGEND_FONT),
+        'plot_bgcolor': PLOT_BG_COLOR,
+        'paper_bgcolor': PAPER_BG_COLOR,
+        'width': 1280,
+        'height': 720,
+        'autosize': False,
+        'xaxis': dict(
+            title=dict(text='principal component 1', font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
+        ),
+        'yaxis': dict(
+            title=dict(text='principal component 2', font=AXIS_FONT),
+            tickfont=TICK_FONT,
+            showgrid=False
+        )
+    }
+    f.update_layout(**layout_dict)
+    return f
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
