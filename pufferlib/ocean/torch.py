@@ -53,11 +53,11 @@ class Boids(nn.Module):
         return action, value
 
 class NMMO3LSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, hidden_size=512):
-        super().__init__(env, policy, hidden_size)
+    def __init__(self, env, policy, input_size=512, hidden_size=512):
+        super().__init__(env, policy, input_size, hidden_size)
 
 class NMMO3(nn.Module):
-    def __init__(self, env, hidden_size=512, **kwargs):
+    def __init__(self, env, hidden_size=512, output_size=512, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         #self.dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
@@ -88,8 +88,8 @@ class NMMO3(nn.Module):
 
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.actor = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, self.num_actions), std=0.01)
-        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
+            nn.Linear(output_size, self.num_actions), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(output_size, 1), std=1)
 
     def forward(self, x, state=None):
         hidden = self.encode_observations(x)
@@ -526,8 +526,8 @@ class TrashPickup(nn.Module):
         return action, value
 
 class TowerClimbLSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, hidden_size = 256):
-        super().__init__(env, policy, hidden_size)
+    def __init__(self, env, policy, input_size = 256, hidden_size = 256):
+        super().__init__(env, policy, input_size, hidden_size)
 
 class TowerClimb(nn.Module):
     def __init__(self, env, cnn_channels=16, hidden_size = 256, **kwargs):
@@ -582,7 +582,7 @@ class TowerClimb(nn.Module):
 
 
 class ImpulseWarsLSTM(Recurrent):
-    def __init__(self, env, policy, hidden_size=512, **kwargs):
+    def __init__(self, env, policy, hidden_size: int = 512, **kwargs):
         super().__init__(env, policy, hidden_size)
 
 
@@ -597,7 +597,6 @@ class ImpulseWarsPolicy(nn.Module):
         num_drones: int = 2,
         continuous: bool = False,
         is_training: bool = True,
-        device: str = "cuda",
         **kwargs,
     ):
         super().__init__()
@@ -615,13 +614,13 @@ class ImpulseWarsPolicy(nn.Module):
             + [self.obsInfo.wallTypes + 1] * self.obsInfo.numFloatingWallObs
             + [self.numDrones + 1] * self.obsInfo.numProjectileObs,
         )
-        discreteOffsets = torch.tensor([0] + list(np.cumsum(self.discreteFactors)[:-1]), device=device).view(
+        discreteOffsets = torch.tensor([0] + list(np.cumsum(self.discreteFactors)[:-1])).view(
             1, -1
         )
         self.register_buffer("discreteOffsets", discreteOffsets, persistent=False)
         self.discreteMultihotDim = self.discreteFactors.sum()
 
-        multihotBuffer = torch.zeros(batch_size, self.discreteMultihotDim, device=device)
+        multihotBuffer = torch.zeros(batch_size, self.discreteMultihotDim)
         self.register_buffer("multihotOutput", multihotBuffer, persistent=False)
 
         # most of the observation is a 2D array of bytes, but the end
