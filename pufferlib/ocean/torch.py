@@ -53,8 +53,8 @@ class Boids(nn.Module):
         return action, value
 
 class NMMO3LSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, input_size=512, hidden_size=512):
-        super().__init__(env, policy, input_size, hidden_size)
+    def __init__(self, env, policy, hidden_size=512):
+        super().__init__(env, policy, hidden_size)
 
 class NMMO3(nn.Module):
     def __init__(self, env, hidden_size=512, output_size=512, **kwargs):
