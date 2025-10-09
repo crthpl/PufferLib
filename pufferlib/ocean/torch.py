@@ -57,7 +57,7 @@ class NMMO3LSTM(pufferlib.models.LSTMWrapper):
         super().__init__(env, policy, hidden_size)
 
 class NMMO3(nn.Module):
-    def __init__(self, env, hidden_size=512, output_size=512, **kwargs):
+    def __init__(self, env, hidden_size=512, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         #self.dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
@@ -88,8 +88,8 @@ class NMMO3(nn.Module):
 
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.actor = pufferlib.pytorch.layer_init(
-            nn.Linear(output_size, self.num_actions), std=0.01)
-        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(output_size, 1), std=1)
+            nn.Linear(hidden_size, self.num_actions), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
 
     def forward(self, x, state=None):
         hidden = self.encode_observations(x)
