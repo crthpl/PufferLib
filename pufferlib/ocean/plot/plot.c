@@ -22,6 +22,12 @@ const float EMPTY = -4242.0f;
 #define TOGGLE_WIDTH 60
 #define DROPDOWN_WIDTH 200
 
+typedef struct {
+    char *key;
+    float *values;
+    int size;
+} KeyValue;
+
 typedef struct PlotArgs {
     float x_min;
     float x_max;
@@ -37,7 +43,8 @@ typedef struct PlotArgs {
     int legend_font_size;
     int line_width;
     int tick_length;
-    int margin;
+    int x_margin;
+    int y_margin;
     Color font_color;
     Color background_color;
     Color axis_color;
@@ -62,7 +69,8 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .legend_font_size = 12,
     .line_width = 2,
     .tick_length = 8,
-    .margin = 70,
+    .x_margin = 70,
+    .y_margin = 70,
     .font_color = PUFF_WHITE,
     .background_color = PUFF_BACKGROUND,
     .axis_color = PUFF_WHITE,
@@ -98,10 +106,10 @@ void draw_axes(PlotArgs args) {
     int height = args.height;
 
     // Draw axes
-    DrawLine(args.margin, args.margin,
-        args.margin, height - args.margin, PUFF_WHITE);
-    DrawLine(args.margin, height - args.margin,
-        width - args.margin, height - args.margin, PUFF_WHITE);
+    DrawLine(args.x_margin, args.y_margin,
+        args.x_margin, height - args.y_margin, PUFF_WHITE);
+    DrawLine(args.x_margin, height - args.y_margin,
+        width - args.x_margin, height - args.y_margin, PUFF_WHITE);
 
     // X label
     Vector2 x_font_size = MeasureTextEx(args.font, args.x_label, args.axis_font_size, 0);
@@ -131,19 +139,19 @@ void draw_axes(PlotArgs args) {
 
     // Autofit number of ticks
     Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
-    int num_x_ticks = (width - 2*args.margin)/tick_label_size.x;
-    int num_y_ticks = (height - 2*args.margin)/tick_label_size.x;
+    int num_x_ticks = (width - 2*args.x_margin)/tick_label_size.x;
+    int num_y_ticks = (height - 2*args.y_margin)/tick_label_size.x;
 
     // X ticks
     for (int i=0; i<num_x_ticks; i++) {
         float val = args.x_min + i*(args.x_max - args.x_min)/(float)num_x_ticks;
         char* label = format_tick_label(val);
-        float x_pos = args.margin + i*(width - 2*args.margin)/num_x_ticks;
+        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/num_x_ticks;
         DrawLine(
             x_pos,
-            height - args.margin - args.tick_length,
+            height - args.y_margin - args.tick_length,
             x_pos,
-            height - args.margin + args.tick_length,
+            height - args.y_margin + args.tick_length,
             args.axis_color
         );
 
@@ -151,7 +159,7 @@ void draw_axes(PlotArgs args) {
         DrawText(
             label,
             x_pos - this_tick_size.x/2,
-            height - args.margin + args.tick_length,
+            height - args.y_margin + args.tick_length,
             args.axis_tick_font_size,
             PUFF_WHITE
         );
@@ -161,18 +169,18 @@ void draw_axes(PlotArgs args) {
     for (int i=0; i<num_y_ticks; i++) {
         float val = args.y_min + i*(args.y_max - args.y_min)/(float)num_y_ticks;
         char* label = format_tick_label(val);
-        float y_pos = height - args.margin - i*(height - 2*args.margin)/num_y_ticks;
+        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/num_y_ticks;
         DrawLine(
-            args.margin - args.tick_length,
+            args.x_margin - args.tick_length,
             y_pos,
-            args.margin + args.tick_length,
+            args.x_margin + args.tick_length,
             y_pos,
             args.axis_color
         );
         Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
         DrawText(
             label,
-            args.margin - this_tick_size.x - args.tick_length,
+            args.x_margin - this_tick_size.x - args.tick_length,
             y_pos,
             args.axis_tick_font_size,
             PUFF_WHITE
@@ -180,6 +188,94 @@ void draw_axes(PlotArgs args) {
  
     }
 }
+
+void draw_box_axes(KeyValue *hypers, int hyper_count, PlotArgs args) {
+    int width = args.width;
+    int height = args.height;
+
+    // Draw axes
+    DrawLine(args.x_margin, args.y_margin,
+        args.x_margin, height - args.y_margin, PUFF_WHITE);
+    DrawLine(args.x_margin, height - args.y_margin,
+        width - args.x_margin, height - args.y_margin, PUFF_WHITE);
+
+    // X label
+    Vector2 x_font_size = MeasureTextEx(args.font, args.x_label, args.axis_font_size, 0);
+    DrawText(
+        args.x_label,
+        width/2 - x_font_size.x/2,
+        height - x_font_size.y,
+        args.axis_font_size,
+        PUFF_WHITE
+    );
+
+    // Y label
+    Vector2 y_font_size = MeasureTextEx(args.font, args.y_label, args.axis_font_size, 0);
+    DrawTextPro(
+        args.font,
+        args.y_label,
+        (Vector2){
+            0,
+            height/2 + y_font_size.x/2
+        },
+        (Vector2){ 0, 0 },
+        -90,
+        args.axis_font_size,
+        0,
+        PUFF_WHITE
+    );
+
+    // Autofit number of ticks
+    Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
+    int num_x_ticks = (width - 2*args.x_margin)/tick_label_size.x;
+    int num_y_ticks = (height - 2*args.y_margin)/tick_label_size.x;
+
+    // X ticks
+    for (int i=0; i<num_x_ticks; i++) {
+        float val = args.x_min + i*(args.x_max - args.x_min)/(float)num_x_ticks;
+        char* label = format_tick_label(val);
+        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/num_x_ticks;
+        DrawLine(
+            x_pos,
+            height - args.y_margin - args.tick_length,
+            x_pos,
+            height - args.y_margin + args.tick_length,
+            args.axis_color
+        );
+
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        DrawText(
+            label,
+            x_pos - this_tick_size.x/2,
+            height - args.y_margin + args.tick_length,
+            args.axis_tick_font_size,
+            PUFF_WHITE
+        );
+    }
+
+    // Y ticks
+    for (int i=0; i<hyper_count; i++) {
+        char* label = hypers[i].key;
+        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/hyper_count;
+        DrawLine(
+            args.x_margin - args.tick_length,
+            y_pos,
+            args.x_margin + args.tick_length,
+            y_pos,
+            args.axis_color
+        );
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        DrawText(
+            label,
+            args.x_margin - this_tick_size.x - args.tick_length,
+            y_pos,
+            args.axis_tick_font_size,
+            PUFF_WHITE
+        );
+ 
+    }
+}
+
 
 void draw_axes3(PlotArgs args) {
     DrawLine3D(
@@ -215,6 +311,45 @@ float ary_max(float* ary, int num) {
     return max;
 }
 
+void boxplot(float* mmin, float* mmax, bool log_x, int num_points, PlotArgs args) {
+    int width = args.width;
+    int height = args.height;
+
+    // Find min/max for scaling
+    //float z_min = args.z_min == EMPTY ? ary_min(z, num_points) : args.z_min;
+    //float z_max = args.z_max == EMPTY ? ary_max(z, num_points) : args.z_max;
+
+    float x_min = args.x_min;
+    float x_max = args.x_max;
+
+    if (log_x) {
+        x_min = x_min<=1e-8 ? -8 : log10(x_min);
+        x_max = x_max<=1e-8 ? -8 : log10(x_max);
+    }
+
+    float dx = x_max - x_min;
+    if (dx == 0) dx = 1.0f;
+    x_min -= 0.1f * dx; x_max += 0.1f * dx;
+    dx = x_max - x_min;
+    float dy = (height - 2*args.y_margin)/((float)num_points);
+
+    // Plot lines
+    for (int j=0; j<num_points; j++) {
+        float x1 = mmin[j];
+        float x2 = mmax[j];
+
+        if (log_x) {
+            x1 = x1 <= 0 ? 0 : log10(x1);
+            x2 = x2 <= 0 ? 0 : log10(x2);
+        }
+
+        float left = args.x_margin + (x1 - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+        float right = args.x_margin + (x2 - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+        DrawRectangle(left, args.y_margin + j*dy, right - left, dy, PUFF_CYAN);
+    }
+}
+
+
 void plot(float* x, float* y, int num_points, PlotArgs args) {
     int width = args.width;
     int height = args.height;
@@ -239,8 +374,8 @@ void plot(float* x, float* y, int num_points, PlotArgs args) {
 
     // Plot lines
     for (int j = 0; j < num_points - 1; j++) {
-        float x1 = args.margin + (x[j] - x_min) / dx * (width - 2*args.margin);
-        float y1 = (height - args.margin) - (y[j] - y_min) / dy * (height - 2*args.margin);
+        float x1 = args.x_margin + (x[j] - x_min) / dx * (width - 2*args.x_margin);
+        float y1 = (height - args.y_margin) - (y[j] - y_min) / dy * (height - 2*args.y_margin);
         /*
         float x2 = args.margin + (x[j + 1] - x_min) / dx * (width - 2*args.margin);
         float y2 = (height - args.margin) - (y[j + 1] - y_min) / dy * (height - 2*args.margin);
@@ -284,12 +419,6 @@ void plot3(float* x, float* y, float* z, bool log_x, bool log_y, bool log_z, int
 }
 
 
-typedef struct {
-    char *key;
-    float *values;
-    int size;
-} KeyValue;
-
 float* get_values(KeyValue *map, int map_count, char *search_key, int *out_size) {
     for (int i = 0; i < map_count; i++) {
         if (map[i].key && strcmp(map[i].key, search_key) == 0) {
@@ -302,16 +431,35 @@ float* get_values(KeyValue *map, int map_count, char *search_key, int *out_size)
 
 int cleanup(KeyValue *map, int map_count, cJSON *root, char *json_str) {
     if (map) {
-        for (int i = 0; i < map_count; i++) {
+        for (int i=0; i<map_count; i++) {
             if (map[i].key) free(map[i].key);
             if (map[i].values) free(map[i].values);
         }
-        free(map);
     }
     if (root) cJSON_Delete(root);
     if (json_str) free(json_str);
     return 1;
 }
+
+void compute_boxplot_data(KeyValue *hypers, float *box_mmin, float *box_mmax, int hyper_count, PlotArgs *args) {
+    args->x_min = 1e-8;
+    args->x_max = 1e8;
+
+    for (int i=0; i<hyper_count; i++) {
+        float* values = hypers[i].values;
+        box_mmin[i] = values[0];
+        box_mmax[i] = values[0];
+
+        for (int j=0; j<hypers[i].size; j++) {
+            box_mmin[i] = fmin(box_mmin[i], values[j]);
+            box_mmax[i] = fmax(box_mmax[i], values[j]);
+            //args->x_min = fmin(args->x_min, values[j]);
+            //args->x_max = fmax(args->x_max, values[j]);
+        }
+    }
+}
+
+
 
 int main(void) {
     FILE *file = fopen("pufferlib/ocean/plot/data.json", "r");
@@ -360,10 +508,14 @@ int main(void) {
     }
 
     // Load all keys and their float arrays
+    int hyper_count = 0;
     int idx = 0;
     item = root->child;
     while (item) {
         map[idx].key = strdup(item->string);
+        if (strncmp(map[idx].key, "train", 5) == 0) {
+            hyper_count++;
+        }
         if (!map[idx].key) {
             printf("Memory allocation error for key\n");
             return cleanup(map, map_count, root, json_str);
@@ -399,9 +551,9 @@ int main(void) {
     }
 
     // Create items as an array of strings
-    if (map_count > 20) {
-        map_count = 20;
-    }
+    //if (map_count > 100) {
+    //    map_count = 100;
+    //}
     char **items = malloc(map_count * sizeof(char *));
     if (!items) {
         printf("Memory allocation error\n");
@@ -428,6 +580,17 @@ int main(void) {
         strcat(options, map[i].key);
     }
 
+    // Hypers
+
+    hyper_count = 5;
+    char *hyper_key[5] = {"train/learning_rate", "train/gamma", "train/gae_lambda", "train/ent_coef", "train/vf_coef"};
+    KeyValue hypers[5];
+    for (int i=0; i<5; i++) {
+        hypers[i].key = hyper_key[i];
+        hypers[i].values = get_values(map, map_count, hyper_key[i], &hypers[i].size);
+    }
+    float *box_mmin = malloc(hyper_count * sizeof(float));
+    float *box_mmax = malloc(hyper_count * sizeof(float));
 
     // Example usage: Print the arrays
     // Cleanup
@@ -477,10 +640,12 @@ int main(void) {
     int fig2_y_idx = 0;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
+    args3.x_margin = 250;
     args3.font = GetFontDefault();
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
     bool fig3_x_active = false;
     int fig3_x_idx = 3;
+    bool fig3_x_log = true;
     bool fig3_y_active = false;
     int fig3_y_idx = 0;
 
@@ -587,20 +752,14 @@ int main(void) {
             fig2_y_active = !fig2_y_active;
         }
 
-        x_label = items[fig3_x_idx];
-        y_label = items[fig3_y_idx];
-        args3.x_label = x_label;
-        args3.y_label = y_label;
-        x = get_values(map, map_count, x_label, &num_points);
-        y = get_values(map, map_count, y_label, &num_points);
-        args3.x_min = ary_min(x, num_points);
-        args3.x_max = ary_max(x, num_points);
-        args3.y_min = ary_min(y, num_points);
-        args3.y_max = ary_max(y, num_points);
+        compute_boxplot_data(hypers, box_mmin, box_mmax, hyper_count, &args3);
+        args3.x_label = "Value";
+        args3.y_label = "Hyperparameter";
         BeginTextureMode(fig3);
         ClearBackground(PUFF_BACKGROUND);
-        plot(x, y, num_points, args3);
-        draw_axes(args3);
+        boxplot(box_mmin, box_mmax, fig3_x_log, hyper_count, args3);
+        //draw_axes(args3);
+        draw_box_axes(hypers, hyper_count, args3);
         EndTextureMode();
         DrawTextureRec(
             fig3.texture,
