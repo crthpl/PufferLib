@@ -1,7 +1,8 @@
-# puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full details
+## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
 # This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
 # Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
 
+import contextlib
 import warnings
 warnings.filterwarnings('error', category=RuntimeWarning)
 
@@ -135,7 +136,9 @@ class PuffeRL:
         self.uncompiled_policy = policy
         self.policy = policy
         if config['compile']:
-            self.policy = torch.compile(policy, mode=config['compile_mode'], fullgraph=config['compile_fullgraph'])
+            self.policy = torch.compile(policy, mode=config['compile_mode'])
+            self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+            pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         # Optimizer
         if config['optimizer'] == 'adam':
@@ -173,7 +176,9 @@ class PuffeRL:
 
         # Automatic mixed precision
         precision = config['precision']
-        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
+        self.amp_context = contextlib.nullcontext()
+        if config.get('amp', True) and config['device'] == 'cuda':
+            self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
         if precision not in ('float32', 'bfloat16'):
             raise pufferlib.APIUsageError(f'Invalid precision: {precision}: use float32 or bfloat16')
 
@@ -217,8 +222,8 @@ class PuffeRL:
 
         if config['use_rnn']:
             for k in self.lstm_h:
-                self.lstm_h[k].zero_()
-                self.lstm_c[k].zero_()
+                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
+                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
 
         self.full_rows = 0
         while self.full_rows < self.segments:
@@ -522,7 +527,7 @@ class PuffeRL:
         }
         state_path = os.path.join(path, 'trainer_state.pt')
         torch.save(state, state_path + '.tmp')
-        os.rename(state_path + '.tmp', state_path)
+        os.replace(state_path + '.tmp', state_path)
         return model_path
 
     def print_dashboard(self, clear=False, idx=[0],
@@ -904,7 +909,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     all_logs = []
     while pufferl.global_step < train_config['total_timesteps']:
+        if train_config['device'] == 'cuda':
+            torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
+        if train_config['device'] == 'cuda':
+            torch.compiler.cudagraph_mark_step_begin()
         logs = pufferl.train()
 
         if logs is not None:

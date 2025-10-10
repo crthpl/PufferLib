@@ -5,9 +5,9 @@ import struct
 import os
 import random
 import pufferlib
-from pufferlib.ocean.gpudrive import binding
+from pufferlib.ocean.drive import binding
 
-class GPUDrive(pufferlib.PufferEnv):
+class Drive(pufferlib.PufferEnv):
     def __init__(self, render_mode=None, report_interval=1,
             width=1280, height=1024,
             human_agent_idx=0,
@@ -33,14 +33,17 @@ class GPUDrive(pufferlib.PufferEnv):
         self.spawn_immunity_timer = spawn_immunity_timer
         self.human_agent_idx = human_agent_idx
         self.resample_frequency = resample_frequency
-        self.num_obs = 6 + 63*7 + 200*7
+        self.num_obs = 7 + 63*7 + 200*7
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1,
             shape=(self.num_obs,), dtype=np.float32)
         self.single_action_space = gymnasium.spaces.MultiDiscrete([7, 13])
+        # self.single_action_space = gymnasium.spaces.Box(
+        #     low=-1, high=1, shape=(2,), dtype=np.float32
+        # )
         # Check if resources directory exists
-        binary_path = "resources/gpudrive/binaries/map_000.bin"
+        binary_path = "resources/drive/binaries/map_000.bin"
         if not os.path.exists(binary_path):
-            raise FileNotFoundError(f"Required directory {binary_path} not found. Please ensure the GPUDrive maps are downloaded and installed correctly per docs.")
+            raise FileNotFoundError(f"Required directory {binary_path} not found. Please ensure the Drive maps are downloaded and installed correctly per docs.")
         agent_offsets, map_ids, num_envs = binding.shared(num_agents=num_agents, num_maps=num_maps)
         self.num_agents = num_agents
         self.agent_offsets = agent_offsets
@@ -86,7 +89,7 @@ class GPUDrive(pufferlib.PufferEnv):
             log = binding.vec_log(self.c_envs)
             if log:
                 info.append(log)
-                # print(log)
+                #print(log)
         if(self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0):
             self.tick = 0
             will_resample = 1
@@ -195,7 +198,7 @@ def save_map_binary(map_data, output_file):
             elif(obj_type == 'cyclist'):
                 obj_type = 3;
             f.write(struct.pack('i', obj_type))  # type
-            f.write(struct.pack('i', obj.get('id', 0)))   # id  
+            # f.write(struct.pack('i', obj.get('id', 0)))   # id  
             f.write(struct.pack('i', trajectory_length))                  # array_size
             # Write position arrays
             positions = obj.get('position', [])
@@ -208,7 +211,7 @@ def save_map_binary(map_data, output_file):
             for i in range(trajectory_length):
                 pos = positions[i] if i < len(positions) else {'x': 0.0, 'y': 0.0, 'z': 0.0}
                 f.write(struct.pack('f', float(pos.get('z', 0.0))))
-            
+
             # Write velocity arrays
             velocities = obj.get('velocity', [])
             for arr, key in [(velocities, 'x'), (velocities, 'y'), (velocities, 'z')]:
@@ -263,7 +266,7 @@ def save_map_binary(map_data, output_file):
                 road_type = 10
             # Write base entity data
             f.write(struct.pack('i', road_type))  # type
-            f.write(struct.pack('i', road.get('id', 0)))    # id
+            # f.write(struct.pack('i', road.get('id', 0)))    # id
             f.write(struct.pack('i', size))                 # array_size
             
             # Write position arrays
@@ -294,11 +297,11 @@ def process_all_maps():
     from pathlib import Path
 
     # Create the binaries directory if it doesn't exist
-    binary_dir = Path("resources/gpudrive/binaries")
+    binary_dir = Path("resources/drive/binaries")
     binary_dir.mkdir(parents=True, exist_ok=True)
 
     # Path to the training data
-    data_dir = Path("data/processed/training")
+    data_dir = Path("data/processed_big/training")
     
     # Get all JSON files in the training directory
     json_files = sorted(data_dir.glob("*.json"))
@@ -306,20 +309,20 @@ def process_all_maps():
     print(f"Found {len(json_files)} JSON files")
     
     # Process each JSON file
-    for i, map_path in enumerate(json_files):
+    for i, map_path in enumerate(json_files[:10000]):
         binary_file = f"map_{i:03d}.bin"  # Use zero-padded numbers for consistent sorting
         binary_path = binary_dir / binary_file
         
         print(f"Processing {map_path.name} -> {binary_file}")
-        try:
-            load_map(str(map_path), str(binary_path))
-        except Exception as e:
-            print(f"Error processing {map_path.name}: {e}")
+        # try:
+        load_map(str(map_path), str(binary_path))
+        # except Exception as e:
+        #     print(f"Error processing {map_path.name}: {e}")
 
 def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
     import time
 
-    env = GPUDrive(num_agents=num_agents)
+    env = Drive(num_agents=num_agents)
     env.reset()
     tick = 0
     num_agents = 1024
