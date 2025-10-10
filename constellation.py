@@ -76,6 +76,38 @@ ALL_KEYS = [
     'environment/perf'
 ] + HYPERS
 
+SCATTER_COLOR = ['env_name'] + ALL_KEYS
+
+import colorsys
+import numpy as np
+
+def rgb_to_hex(rgb):
+    """Convert RGB tuple to hex string."""
+    return '#%02x%02x%02x' % (int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+
+def generate_distinct_palette(n):
+    """
+    Generate a palette with n maximally distinct colors across the hue spectrum.
+    
+    Parameters:
+    n (int): Number of colors to generate.
+    
+    Returns:
+    list: List of hex color strings.
+    """
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    
+    # Generate hues evenly spaced across the spectrum (0 to 1)
+    hues = np.linspace(0, 1, n, endpoint=False)
+    colors = []
+    for hue in hues:
+        # Use full saturation and value for vivid colors
+        rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        colors.append(rgb)
+    hex_colors = [rgb_to_hex(color) for color in colors]
+    return hex_colors
+
 def pareto_idx(steps, costs, scores):
     idxs = []
     for i in range(len(steps)):
@@ -86,6 +118,16 @@ def pareto_idx(steps, costs, scores):
             idxs.append(i)
 
     return idxs
+
+def build_dataset(dataframe):
+    dataset = []
+    for hyper in HYPERS:
+        dat = dataframe[hyper]
+        #mmin = dataframe[f'sweep/{hyper}/min']
+        #mmax = dataframe[f'sweep/{hyper}/max']
+        #distribution = dataframe[f'sweep/{hyper}/distribution']
+
+
 
 def load_sweep_data(path):
     data = {}
@@ -160,16 +202,52 @@ def cached_sweep_load(path, env_name):
     
     return pd.DataFrame(df_data)
 
+def compute_tsne():
+    dataset = EXPERIMENTS[HYPERS].copy()  # Create a copy to avoid modifying the original
+
+    # Normalize each hyperparameter column using its corresponding min and max columns
+    for hyper in HYPERS:
+        min_col = f'sweep/{hyper}/min'
+        max_col = f'sweep/{hyper}/max'
+
+        mmin = min(EXPERIMENTS[min_col])
+        mmax = max(EXPERIMENTS[max_col])
+
+        distribution = EXPERIMENTS[f'sweep/{hyper}/distribution']
+        if 'log' in distribution or 'pow2' in distribution:
+            mmin = np.log(mmin)
+            mmax = np.log(mmax)
+            normed = np.log(dataset[hyper])
+        else:
+            normed = dataset[hyper]
+
+        dataset[hyper] = (normed - mmin) / (mmax - mmin)
+        # Normalize: (value - min) / (max - min) for each row
+
+        #dataset[hyper] = (dataset[hyper] - EXPERIMENTS[min_col]) / (EXPERIMENTS[max_col] - EXPERIMENTS[min_col])
+
+    # Filter dataset based on performance threshold
+    # Apply TSNE
+    from sklearn.manifold import TSNE
+    proj = TSNE(n_components=2)
+    reduced = proj.fit_transform(dataset)
+    EXPERIMENTS['tsne1'] = reduced[:, 0]
+    EXPERIMENTS['tsne2'] = reduced[:, 1]
+
 env_names = ['tripletriad', 'grid', 'moba', 'tower_climb', 'tetris', 'breakout', 'pong', 'g2048', 'snake', 'pacman']
+env_all = ['all'] + env_names
 #env_names = ['grid', 'breakout', 'g2048']
 #env_names = ['grid']
+
+roygbiv = generate_distinct_palette(len(env_names))
 
 # Create a list of DataFrames for each environment
 dfs = [cached_sweep_load(f'experiments/logs/puffer_{name}', name) for name in env_names]
 
 # Concatenate all DataFrames into a single DataFrame
 EXPERIMENTS = pd.concat(dfs, ignore_index=True)
-EXPERIMENTS.set_index('env_name', inplace=True)
+#EXPERIMENTS.set_index('env_name', inplace=True)
+compute_tsne()
 
 app = Dash()
 app.css.append_css({'external_stylesheets': 'dash.css'})
@@ -211,93 +289,188 @@ app.layout = html.Div([
         "Environment: ",
         dcc.Dropdown(
             id="scatter-dropdown-env",
-            options=[{"label": key, "value": key} for key in env_names],
-            value="breakout",
+            options=[{"label": key, "value": key} for key in env_all],
+            value="all",
             style={"width": "50%"}
         )
     ]),
+    html.Br(),
     html.Label([
         "X: ",
         dcc.Dropdown(
             id="scatter-dropdown-x",
             options=[{"label": key, "value": key} for key in ALL_KEYS],
-            value="cost",
+            value="train/learning_rate",
             style={"width": "50%"}
-        )
+        ),
+        dcc.Checklist(
+            id="scatter-checkbox-logx",
+            options=[{"label": "Log", "value": "log"}],
+            value=["log"],
+            style={"display": "inline-block", "margin-left": "10px"}
+        ),
     ]),
+    html.Br(),
     html.Label([
         "Y: ",
         dcc.Dropdown(
             id="scatter-dropdown-y",
             options=[{"label": key, "value": key} for key in ALL_KEYS],
-            value="environment/score",
+            value="environment/perf",
+            style={"width": "50%"}
+        ),
+        dcc.Checklist(
+            id="scatter-checkbox-logy",
+            options=[{"label": "Log", "value": "log"}],
+            value=[],
+            style={"display": "inline-block", "margin-left": "10px"}
+        ),
+       
+    ]),
+    html.Br(),
+    html.Label([
+        "Color: ",
+        dcc.Dropdown(
+            id="scatter-dropdown-color",
+            options=[{"label": key, "value": key} for key in SCATTER_COLOR],
+            value="env_name",
             style={"width": "50%"}
         )
     ]),
+    html.Br(),
     html.Label([
-        "Z: ",
+        "Range 1: ",
         dcc.Dropdown(
-            id="scatter-dropdown-z",
+            id="scatter-dropdown-range-1",
             options=[{"label": key, "value": key} for key in ALL_KEYS],
             value="agent_steps",
             style={"width": "50%"}
-        )
+        ),
+        dcc.RangeSlider(
+            id='scatter-range-1',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=[0.0, 0.25]
+        ),
+    ]),
+    html.Br(),
+    html.Label([
+        "Range 2: ",
+        dcc.Dropdown(
+            id="scatter-dropdown-range-2",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="cost",
+            style={"width": "50%"}
+        ),
+        dcc.RangeSlider(
+            id='scatter-range-2',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=[0.0, 0.95]
+        ),
     ]),
     dcc.Graph(id='scatter'),
     html.Br(),
 
+    #html.Label([
+    #    "X Axis: ",
+    #    dcc.Dropdown(
+    #        id="hyper-box-x",
+    #        options=[{"label": key, "value": key} for key in ['cost', 'agent_steps']],
+    #        value="agent_steps",
+    #        style={"width": "50%"}
+    #    )
+    #]),
+    #dcc.Graph(id='hyper-box'),
+
+    html.Br(),
     html.Label([
-        "X Axis: ",
+        "Range 1: ",
         dcc.Dropdown(
-            id="hyper-box-x",
-            options=[{"label": key, "value": key} for key in ['cost', 'agent_steps']],
+            id="hyper-dropdown-range-1",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="environment/perf",
+            style={"width": "50%"}
+        ),
+        dcc.RangeSlider(
+            id='hyper-range-1',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=[0.8, 1.0]
+        ),
+    ]),
+    html.Br(),
+    html.Label([
+        "Range 2: ",
+        dcc.Dropdown(
+            id="hyper-dropdown-range-2",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
             value="agent_steps",
             style={"width": "50%"}
-        )
-    ]),
-    dcc.Graph(id='hyper-box'),
-    html.Br(),
-    html.Label([
-        "Score Threshold %: ",
-        dcc.Slider(
-            id='hyper-agg-slider',
-            min=0.0,
-            max=1.0,
-            step=0.05,
-            value=0.95,
-            marks={i: str(0.05*i) for i in range(0, 21)}
-        )
-    ]),
-    html.Label([
-        "Steps Interval: ",
+        ),
         dcc.RangeSlider(
-            id='hyper-agg-range',
+            id='hyper-range-2',
             min=0.0,
             max=1.0,
-            step=0.1,
+            step=0.05,
             value=[0.0, 1.0]
-        )
+        ),
     ]),
-    dcc.Graph(id='hyper-agg'),
+    dcc.Graph(id='hyper'),
 
 
     html.Br(),
     html.Label([
-        "Threshold: ",
-        dcc.Slider(
-            id='pca-slider',
+        "Range 1: ",
+        dcc.Dropdown(
+            id="tsnee-dropdown-range-1",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="environment/perf",
+            style={"width": "50%"}
+        ),
+        dcc.RangeSlider(
+            id='tsnee-range-1',
             min=0.0,
             max=1.0,
             step=0.05,
-            value=0.5,
-            marks={i: str(0.05*i) for i in range(0, 21)}
-        )
+            value=[0.5, 1.0]
+        ),
     ]),
-    dcc.Graph(id='pca'),
+    html.Br(),
+    html.Label([
+        "Range 2: ",
+        dcc.Dropdown(
+            id="tsnee-dropdown-range-2",
+            options=[{"label": key, "value": key} for key in ALL_KEYS],
+            value="cost",
+            style={"width": "50%"}
+        ),
+        dcc.RangeSlider(
+            id='tsnee-range-2',
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            value=[0.0, 1.0]
+        ),
+    ]),
+    dcc.Graph(id='tsnee'),
 
 ],
 style={"width": 1280}
 )
+
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+from scipy.spatial.distance import cdist
+
+# Assuming EXPERIMENTS is your pandas DataFrame, and xkey, ykey, zkey are defined.
+# Also assuming percentages for cutoffs, e.g.:
+percentage1 = 5.0  # Percentage for XYZ distance threshold relative to plot diagonal in transformed space
+percentage2 = 0.5  # Percentage for PCA distance threshold relative to PCA diagonal
 
 @app.callback(
     Output("optimal", "figure"),
@@ -306,21 +479,84 @@ style={"width": 1280}
     Input("optimal-dropdown-z", "value")
 )
 def update_optimal_plot(xkey, ykey, zkey):
-    all_x = []
-    all_y = []
-    all_z = []
-    all_env = []
-    for env in env_names:
-        env_data = EXPERIMENTS.loc[env]
-        all_x.append(env_data[xkey].copy())
-        all_y.append(env_data[ykey].copy())
-        all_z.append(env_data[zkey].copy())
-        all_env += [env] * len(env_data[xkey])
+    all_x = EXPERIMENTS[xkey].values
+    all_y = EXPERIMENTS[ykey].values
+    all_z = EXPERIMENTS[zkey].values
+    all_pca1 = EXPERIMENTS['tsne1'].values
+    all_pca2 = EXPERIMENTS['tsne2'].values
+    all_env = EXPERIMENTS['env_name'].values# Handle transformed coordinates for XYZ (accounting for log axes)
+    trans_x = np.log10(all_x)  # Assuming all_x > 0
+    trans_y = np.log10(all_y)  # Assuming all_y > 0
+    trans_z = all_z
+    points_trans_xyz = np.column_stack((trans_x, trans_y, trans_z))
 
-    all_x = np.concatenate(all_x)
-    all_y = np.concatenate(all_y)
-    all_z = np.concatenate(all_z)
-    f = px.scatter_3d(x=all_x, y=all_y, z=all_z, color=all_env, log_x=True, log_y=True, log_z=False, color_discrete_sequence=roygbiv)
+    # Compute ranges in transformed space
+    range_tx = np.max(trans_x) - np.min(trans_x)
+    range_ty = np.max(trans_y) - np.min(trans_y)
+    range_tz = np.max(trans_z) - np.min(trans_z)
+    diagonal_xyz = np.sqrt(range_tx**2 + range_ty**2 + range_tz**2)
+    delta1 = (percentage1 / 100.0) * diagonal_xyz
+
+    # For PCA (assuming linear scales)
+    points_pca = np.column_stack((all_pca1, all_pca2))
+    range_p1 = np.max(all_pca1) - np.min(all_pca1)
+    range_p2 = np.max(all_pca2) - np.min(all_pca2)
+    diagonal_pca = np.sqrt(range_p1**2 + range_p2**2)
+    delta2 = (percentage2 / 100.0) * diagonal_pca
+
+    # Create the base scatter plot
+    f = px.scatter_3d(
+        x=all_x,
+        y=all_y,
+        z=all_z,
+        color=all_env,
+        log_x=True,
+        log_y=True,
+        log_z=False,
+        color_discrete_sequence=roygbiv
+    )
+
+    # Compute pairwise L2 distances in transformed spaces
+    dists_xyz = cdist(points_trans_xyz, points_trans_xyz)
+    dists_pca = cdist(points_pca, points_pca)
+
+    # Create boolean masks
+    xyz_mask = dists_xyz < delta1
+    pca_mask = dists_pca < delta2
+    # Use boolean array for upper triangle to avoid type mismatch
+    triu_mask = np.triu(np.ones_like(dists_xyz, dtype=bool), k=1)
+
+    # Combine masks with boolean operations
+    mask = xyz_mask & pca_mask & triu_mask
+
+    # Get indices of valid pairs
+    i, j = np.where(mask)
+
+    # Collect line segment coordinates (in original space)
+    line_x = []
+    line_y = []
+    line_z = []
+    for k in range(len(i)):
+        line_x.extend([all_x[i[k]], all_x[j[k]], None])
+        line_y.extend([all_y[i[k]], all_y[j[k]], None])
+        line_z.extend([all_z[i[k]], all_z[j[k]], None])
+
+    # Add the lines as a single trace
+    if line_x:
+        f.add_trace(
+            go.Scatter3d(
+                x=line_x,
+                y=line_y,
+                z=line_z,
+                mode='lines',
+                line=dict(color='rgba(255,255,255,0.25)', width=2),
+                showlegend=False
+            )
+        )
+
+    # Show the figure
+    f.show()
+
     layout_dict = {
         'title': dict(text='Pareto', font=TITLE_FONT),
         'showlegend': True,
@@ -369,30 +605,60 @@ def update_optimal_plot(xkey, ykey, zkey):
     Output("scatter", "figure"),
     Input("scatter-dropdown-env", "value"),
     Input("scatter-dropdown-x", "value"),
+    Input("scatter-checkbox-logx", "value"),
     Input("scatter-dropdown-y", "value"),
-    Input("scatter-dropdown-z", "value")
+    Input("scatter-checkbox-logy", "value"),
+    Input("scatter-dropdown-color", "value"),
+    Input("scatter-dropdown-range-1", "value"),
+    Input("scatter-range-1", "value"),
+    Input("scatter-dropdown-range-2", "value"),
+    Input("scatter-range-2", "value"),
 )
-def update_scatter(env, xkey, ykey, zkey):
-    env_data = EXPERIMENTS.loc[env]
+def update_scatter(env, xkey, logx, ykey, logy, zkey, range1_key, range1, range2_key, range2):
+    #env_data = EXPERIMENTS.loc[env]
+    if env == 'all':
+        env_data = EXPERIMENTS
+    else:
+        env_data = EXPERIMENTS[EXPERIMENTS['env_name'] == env]
+
+    range1_mmin = min(EXPERIMENTS[range1_key])
+    range1_mmax = max(EXPERIMENTS[range1_key])
+    norm_range1 = (EXPERIMENTS[range1_key] - range1_mmin) / (range1_mmax - range1_mmin)
+
+    range2_mmin = min(EXPERIMENTS[range2_key])
+    range2_mmax = max(EXPERIMENTS[range2_key])
+    norm_range2 = (EXPERIMENTS[range2_key] - range2_mmin) / (range2_mmax - range2_mmin)
+
+    mask = (norm_range1 >= range1[0]) & (norm_range1 <= range1[1]) & (norm_range2 >= range2[0]) & (norm_range2 <= range2[1])
+
+    env_data = env_data[mask]
+
     x = env_data[xkey]
     y = env_data[ykey]
     z = env_data[zkey]
-    mmin = min(z)
-    mmax = max(z)
-    thresh = np.linspace(mmin, mmax, 8)
-    all_fx = []
-    all_fy = []
-    bin_label = []
-    for j in range(7):
-        idxs = [i for i, e in enumerate(z) if thresh[j] < e < thresh[j+1]]
-        if len(idxs) <= 2:
-            continue
-        fx = [x[i] for i in idxs]
-        fy = [y[i] for i in idxs]
-        all_fx += fx
-        all_fy += fy
-        bin_label += [str(thresh[j])] * len(fx)
-    f = px.scatter(x=all_fx, y=all_fy, color=bin_label, color_discrete_sequence=roygbiv)
+
+    if zkey == 'env_name':
+        f = px.scatter(x=x, y=y, color=z, color_discrete_sequence=roygbiv)
+    else:
+        mmin = min(z)
+        mmax = max(z)
+        thresh = np.geomspace(mmin, mmax, 8)
+        all_fx = []
+        all_fy = []
+        bin_label = []
+        for j in range(7):
+            filter = (thresh[j] < z) & (z < thresh[j+1])
+            if filter.sum() <= 2:
+                continue
+
+            fx = x[filter]
+            fy = y[filter]
+            all_fx += fx.tolist()
+            all_fy += fy.tolist()
+            bin_label += [str(thresh[j])] * len(fx)
+
+        f = px.scatter(x=all_fx, y=all_fy, color=bin_label, color_discrete_sequence=roygbiv)
+
     f.update_traces(marker_size=10)
     layout_dict = {
         'title': dict(text='Experiments', font=TITLE_FONT),
@@ -406,12 +672,14 @@ def update_scatter(env, xkey, ykey, zkey):
         'xaxis': dict(
             title=dict(text=xkey, font=AXIS_FONT),
             tickfont=TICK_FONT,
-            showgrid=False
+            showgrid=False,
+            type='log' if 'log' in logx else 'linear',
         ),
         'yaxis': dict(
             title=dict(text=ykey, font=AXIS_FONT),
             tickfont=TICK_FONT,
-            showgrid=False
+            showgrid=False,
+            type='log' if 'log' in logy else 'linear',
         )
     }
     f.update_layout(**layout_dict)
@@ -425,7 +693,8 @@ def update_hyper_box(x):
     buckets = 4
     env_data = {}
     for env in env_names:
-        data = EXPERIMENTS.loc[env]
+        #data = EXPERIMENTS.loc[env]
+        data = EXPERIMENTS[EXPERIMENTS['env_name'] == env]
         steps = data['agent_steps']
         costs = data['cost']
         scores = data['environment/score']
@@ -478,11 +747,13 @@ def update_hyper_box(x):
     return f
 
 @app.callback(
-    Output("hyper-agg", "figure"),
-    Input("hyper-agg-slider", "value"),
-    Input("hyper-agg-range", "value")
+    Output("hyper", "figure"),
+    Input("hyper-dropdown-range-1", "value"),
+    Input("hyper-range-1", "value"),
+    Input("hyper-dropdown-range-2", "value"),
+    Input("hyper-range-2", "value"),
 )
-def update_hyper_agg_plot(thresh, step_range):
+def update_hyper_plot(xkey, range1, ykey, range2):
     # Initialize figure
     f = go.Figure()
     f.update_layout(
@@ -502,8 +773,21 @@ def update_hyper_agg_plot(thresh, step_range):
     f.update_xaxes(showgrid=False)
     f.update_yaxes(showgrid=False)
 
+    range1_mmin = min(EXPERIMENTS[xkey])
+    range1_mmax = max(EXPERIMENTS[xkey])
+    norm_x = (EXPERIMENTS[xkey] - range1_mmin) / (range1_mmax - range1_mmin)
+    range2_mmin = min(EXPERIMENTS[ykey])
+    range2_mmax = max(EXPERIMENTS[ykey])
+    norm_y = (EXPERIMENTS[ykey] - range2_mmin) / (range2_mmax - range2_mmin)
+    mask = (norm_x >= range1[0]) & (norm_x <= range1[1]) & (norm_y >= range2[0]) & (norm_y <= range2[1])
+    filtered = EXPERIMENTS[mask]
+
     for i, env in enumerate(env_names):
-        env_data = EXPERIMENTS.loc[env]
+        #env_data = EXPERIMENTS.loc[env]
+        env_data = filtered[filtered['env_name'] == env]
+        if len(env_data) < 2:
+            continue
+
         steps = env_data['agent_steps']
         costs = env_data['cost']
         scores = env_data['environment/score']
@@ -511,14 +795,10 @@ def update_hyper_agg_plot(thresh, step_range):
         max_score = max(scores)
         max_steps = max(steps)
         n = len(scores)
-        idxs = [i for i in range(n) if scores[i] > thresh*max_score and
-            step_range[0]<steps[i]/max_steps<step_range[1]]
 
-        if len(idxs) < 2:
-            continue
-        
+       
         for k, hyper in enumerate(HYPERS):
-            y = [env_data[hyper][i] for i in idxs]
+            y = env_data[hyper]
 
             ymin = min(y)
             ymax = max(y)
@@ -537,11 +817,15 @@ def update_hyper_agg_plot(thresh, step_range):
 
     return f
 
+
 @app.callback(
-    Output("pca", "figure"),
-    Input("pca-slider", "value"),
+    Output("tsnee", "figure"),
+    Input("tsnee-dropdown-range-1", "value"),
+    Input("tsnee-range-1", "value"),
+    Input("tsnee-dropdown-range-2", "value"),
+    Input("tsnee-range-2", "value"),
 )
-def update_pca_plot(thresh):
+def update_pca_plot(xkey, range1, ykey, range2):
     # Initialize figure
     f = go.Figure()
     f.update_layout(
@@ -561,51 +845,21 @@ def update_pca_plot(thresh):
     f.update_xaxes(showgrid=False)
     f.update_yaxes(showgrid=False)
 
-    filtered = {env: [] for env in env_names}
-    for env in env_names:
-        env_data = EXPERIMENTS.loc[env]
-        perf = env_data['environment/perf']
-        idxs = [i for i in range(len(perf)) if perf[i] > thresh]
-        for hyper in HYPERS:
-            filt = np.array([env_data[hyper][i] for i in idxs])
-            mmin = np.array(env_data[f'sweep/{hyper}/min'])
-            mmin = [mmin[i] for i in idxs]
-            mmax = env_data[f'sweep/{hyper}/max']
-            mmax = np.array([mmax[i] for i in idxs])
-            distribution = env_data[f'sweep/{hyper}/distribution'][0]
-            #if 'uniform' in distribution:
-            #    #filt = (filt - mmin) / (mmax - mmin)
-            #    pass
-            if 'log' in distribution or 'pow2' in distribution:
-                filt = np.log(filt)
-                #filt = (np.log(filt) - np.log(mmin)) / (np.log(mmax) - np.log(mmin))
+    range1_mmin = min(EXPERIMENTS[xkey])
+    range1_mmax = max(EXPERIMENTS[xkey])
+    norm_x = (EXPERIMENTS[xkey] - range1_mmin) / (range1_mmax - range1_mmin)
+    range2_mmin = min(EXPERIMENTS[ykey])
+    range2_mmax = max(EXPERIMENTS[ykey])
+    norm_y = (EXPERIMENTS[ykey] - range2_mmin) / (range2_mmax - range2_mmin)
+    mask = (norm_x >= range1[0]) & (norm_x <= range1[1]) & (norm_y >= range2[0]) & (norm_y <= range2[1])
+    filtered = EXPERIMENTS[mask]
 
-            filtered[env].append(filt)
-
-        filtered[env] = np.array(filtered[env]).T
-
-    training = np.concatenate(list(filtered.values()), axis=0)
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=2)
-    pca.fit(training)
-
-    all_x = []
-    all_y = []
-    all_z = []
-    for i, env in enumerate(filtered):
-        if filtered[env].shape[0] == 0:
-            continue
-
-        reduced = pca.transform(filtered[env])
-        x, y = reduced[:, 0], reduced[:, 1]
-        all_x.append(x)
-        all_y.append(y)
-        all_z.append([env]*len(x))
-
-    all_x = np.concatenate(all_x)
-    all_y = np.concatenate(all_y)
-    all_z = np.concatenate(all_z)
-    f = px.scatter(x=all_x, y=all_y, color=all_z, color_discrete_sequence=roygbiv)
+    f = px.scatter(
+        x=filtered['tsne1'],
+        y=filtered['tsne2'],
+        color=filtered['env_name'],
+        color_discrete_sequence=roygbiv
+    )
  
     f.update_traces(marker_size=10)
     layout_dict = {
@@ -618,12 +872,12 @@ def update_pca_plot(thresh):
         'height': 720,
         'autosize': False,
         'xaxis': dict(
-            title=dict(text='principal component 1', font=AXIS_FONT),
+            title=dict(text='TSNE-1', font=AXIS_FONT),
             tickfont=TICK_FONT,
             showgrid=False
         ),
         'yaxis': dict(
-            title=dict(text='principal component 2', font=AXIS_FONT),
+            title=dict(text='TSNE-2', font=AXIS_FONT),
             tickfont=TICK_FONT,
             showgrid=False
         )
