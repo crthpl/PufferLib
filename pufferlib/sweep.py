@@ -15,8 +15,8 @@ from gpytorch.kernels import MaternKernel, PolynomialKernel, ScaleKernel, Additi
 from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import LogNormalPrior
-
 from scipy.stats.qmc import Sobol
+
 
 class Space:
     def __init__(self, min, max, scale, mean, is_integer=False):
@@ -328,17 +328,27 @@ class ExactGPModel(ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=50):
+def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=100, patience=10, tol=1e-4):
     model.train()
     likelihood.train()
     model.set_train_data(inputs=train_x, targets=train_y, strict=False)
 
+    best_loss = math.inf
+    patience_counter = 0
     for _ in range(training_iter):
         optimizer.zero_grad()
         output = model(train_x)
         loss = -mll(output, train_y)
         loss.backward()
         optimizer.step()
+
+        if best_loss - loss.item() > tol:
+            best_loss = loss.item()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
 
     model.eval()
     likelihood.eval()
@@ -356,6 +366,8 @@ class Protein:
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
             expansion_rate = 0.25,
+            gp_training_iter = 100,
+            gp_learning_rate = 0.01,
         ):
         self.hyperparameters = Hyperparameters(sweep_config)
         self.num_random_samples = num_random_samples
@@ -366,6 +378,8 @@ class Protein:
         self.resample_frequency = resample_frequency
         self.max_suggestion_cost = max_suggestion_cost
         self.expansion_rate = expansion_rate
+        self.gp_training_iter = gp_training_iter
+        self.gp_learning_rate = gp_learning_rate
 
         self.success_observations = []
         self.failure_observations = []
@@ -384,13 +398,13 @@ class Protein:
         self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
         self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num)
         self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score)
-        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=0.0001)
+        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate)
 
         # Cost GP
         self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
         self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num)
         self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost)
-        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=0.0001)
+        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate)
 
         # Use double precision for better accuracy
         for model in (self.gp_score, self.likelihood_score, self.gp_cost, self.likelihood_cost):
@@ -425,7 +439,7 @@ class Protein:
         min_score, max_score = np.min(y), np.max(y)
         y_norm = (y - min_score) / (np.abs(max_score - min_score) + 1e-6)
         y_norm_tensor = torch.from_numpy(y_norm).to(torch.float64)
-        train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor)
+        train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
 
         # Log costs
         c = np.array([e['cost'] for e in self.success_observations])
@@ -436,7 +450,7 @@ class Protein:
         log_c_min, log_c_max = np.min(log_c), np.max(log_c)
         log_c_norm = (log_c - log_c_min) / (log_c_max - log_c_min + 1e-6)
         log_c_norm_tensor = torch.from_numpy(log_c_norm).to(torch.float64)
-        train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor)
+        train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
 
         candidates, pareto_idxs = pareto_points(self.success_observations)
         pareto_costs = np.array([e['cost'] for e in candidates])
