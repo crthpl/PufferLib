@@ -357,13 +357,16 @@ void draw_axes3(PlotArgs args) {
 float hyper_min(Dataset *data, char* key) {
     float mmin = FLT_MAX;
     for (int env=0; env<data->n; env++) {
-        for (int hyper=0; hyper<data->envs[env].n; hyper++) {
-            if (strcmp(data->envs[env].hypers[hyper].key, key) != 0) {
+        for (int i=0; i<data->envs[env].n; i++) {
+            Hyper* hyper = &data->envs[env].hypers[i];
+            if (strcmp(hyper->key, key) != 0) {
                 continue;
             }
-            float val = data->envs[env].hypers[hyper].ary[0];
-            if (val < mmin){
-                mmin = val;
+            for (int j=0; j<hyper->n; j++) {
+                float val = hyper->ary[j];
+                if (val < mmin){
+                    mmin = val;
+                }
             }
         }
     }
@@ -371,20 +374,24 @@ float hyper_min(Dataset *data, char* key) {
 }
 
 float hyper_max(Dataset *data, char* key) {
-    float mmax = FLT_MIN;
-    for (int env=0; env<data->n; env++) {
-        for (int hyper=0; hyper<data->envs[env].n; hyper++) {
-            if (strcmp(data->envs[env].hypers[hyper].key, key) != 0) {
+    float mmax = -FLT_MAX;
+    for (int i=0; i<data->n; i++) {
+        for (int j=0; j<data->envs[i].n; j++) {
+            Hyper* hyper = &data->envs[i].hypers[j];
+            if (strcmp(hyper->key, key) != 0) {
                 continue;
             }
-            float val = data->envs[env].hypers[hyper].ary[0];
-            if (val > mmax){
-                mmax = val;
+            for (int k=0; k<hyper->n; k++) {
+                float val = hyper->ary[k];
+                if (val > mmax){
+                    mmax = val;
+                }
             }
         }
     }
     return mmax;
 }
+
 
 /*
 float hyper_max(Hyper *hyper) {
@@ -412,7 +419,8 @@ float ary_max(float* ary, int num) {
 
 */
 
-void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_count, PlotArgs args, Color color) {
+void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_count, PlotArgs args, Color color,
+        Hyper* filter1, float f1min, float f1max, Hyper* filter2, float f2min, float f2max) {
     int width = args.width;
     int height = args.height;
 
@@ -438,6 +446,15 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
         float mmin = ary[0];
         float mmax = ary[0];
         for (int j=0; j<hyper->n; j++) {
+            float f1 = filter1->ary[j];
+            if (f1 < f1min || f1 > f1max) {
+                continue;
+            }
+            float f2 = filter2->ary[j];
+            if (f2 < f2min || f2 > f2max) {
+                continue;
+            }
+
             mmin = fmin(mmin, ary[j]);
             mmax = fmax(mmax, ary[j]);
         }
@@ -453,16 +470,11 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
     }
 }
 
-void plot(Hyper* x, Hyper* y, PlotArgs args, Color color) {
+void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color) {
     assert(x->n == y->n);
 
     int width = args.width;
     int height = args.height;
-
-    // Find min/max for scaling
-    //float z_min = args.z_min == EMPTY ? ary_min(z, num_points) : args.z_min;
-    //float z_max = args.z_max == EMPTY ? ary_max(z, num_points) : args.z_max;
-
     float x_min = args.x_min;
     float x_max = args.x_max;
     float y_min = args.y_min;
@@ -470,25 +482,53 @@ void plot(Hyper* x, Hyper* y, PlotArgs args, Color color) {
 
     float dx = x_max - x_min;
     float dy = y_max - y_min;
-    if (dx == 0) dx = 1.0f;
-    if (dy == 0) dy = 1.0f;
-    x_min -= 0.1f * dx; x_max += 0.1f * dx;
-    y_min -= 0.1f * dy; y_max += 0.1f * dy;
-    dx = x_max - x_min;
-    dy = y_max - y_min;
-
-    // Plot lines
     for (int i=0; i<x->n; i++) {
-        float xi = args.x_margin + (x->ary[i] - x_min) / dx * (width - 2*args.x_margin);
-        float yi = (height - args.y_margin) - (y->ary[i] - y_min) / dy * (height - 2*args.y_margin);
+        float xi = log_x ? log10(x->ary[i]) : x->ary[i];
+        float yi = log_y ? log10(y->ary[i]) : y->ary[i];
+        xi = args.x_margin + (xi - x_min) / dx * (width - 2*args.x_margin);
+        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2*args.y_margin);
+        if (xi < args.x_margin) {
+            int s = 2;
+        }
         DrawCircle(xi, yi, args.line_width, color);
-        /*
-        float x2 = args.margin + (x[j + 1] - x_min) / dx * (width - 2*args.margin);
-        float y2 = (height - args.margin) - (y[j + 1] - y_min) / dy * (height - 2*args.margin);
-        DrawLine(x1, y1, x2, y2, PUFF_CYAN);
-        */
     }
 }
+
+void plot_filtered(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color,
+        Hyper* filter1, float f1min, float f1max, Hyper* filter2, float f2min, float f2max) {
+    assert(x->n == y->n);
+
+    int width = args.width;
+    int height = args.height;
+    float x_min = args.x_min;
+    float x_max = args.x_max;
+    float y_min = args.y_min;
+    float y_max = args.y_max;
+
+    float dx = x_max - x_min;
+    float dy = y_max - y_min;
+
+    for (int i=0; i<x->n; i++) {
+        float f1 = filter1->ary[i];
+        if (f1 < f1min || f1 > f1max) {
+            continue;
+        }
+        float f2 = filter2->ary[i];
+        if (f2 < f2min || f2 > f2max) {
+            continue;
+        }
+
+        float xi = log_x ? log10(x->ary[i]) : x->ary[i];
+        float yi = log_y ? log10(y->ary[i]) : y->ary[i];
+        xi = args.x_margin + (xi - x_min) / dx * (width - 2*args.x_margin);
+        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2*args.y_margin);
+        if (xi < args.x_margin) {
+            int s = 2;
+        }
+        DrawCircle(xi, yi, args.line_width, color);
+    }
+}
+
 
 void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, PlotArgs args, Color color) {
     assert(x->n == y->n  && x->n == z->n);
@@ -640,7 +680,7 @@ int main(void) {
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/Montserrat-Regular.ttf", 12, NULL, 255);
 
     Camera3D camera = (Camera3D){ 0 };
-    camera.position = (Vector3){ 10.0f, 10.0f, 10.0f };
+    camera.position = (Vector3){ 5.0f, 5.0f, 5.0f };
     camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
     camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
@@ -661,27 +701,43 @@ int main(void) {
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
     bool fig2_x_active = false;
     int fig2_x_idx = 1;
+    bool fig2_x_log = true;
     bool fig2_y_active = false;
     int fig2_y_idx = 2;
+    bool fig2_y_log = false;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
-    args3.x_margin = 250;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
-    bool fig3_x_active = false;
-    int fig3_x_idx = 3;
-    bool fig3_x_log = true;
-    bool fig3_y_active = false;
-    int fig3_y_idx = 0;
+    bool fig3_range1_active = false;
+    int fig3_range1_idx = 2;
+    char fig3_range1_min[32];
+    char fig3_range1_max[32];
+    float fig3_range1_min_val = 0;
+    float fig3_range1_max_val = 1;
+    bool fig3_range2_active = false;
+    int fig3_range2_idx = 1;
+    char fig3_range2_min[32];
+    char fig3_range2_max[32];
+    float fig3_range2_min_val = 0;
+    float fig3_range2_max_val = 10000;
 
     PlotArgs args4 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig4 = LoadRenderTexture(args4.width, args4.height);
     float *box_mmin = malloc(hyper_count * sizeof(float));
     float *box_mmax = malloc(hyper_count * sizeof(float));
-    bool fig4_x_active = false;
-    int fig4_x_idx = 4;
     bool fig4_x_log = true;
-    bool fig4_y_active = false;
-    int fig4_y_idx = 0;
+    bool fig4_range1_active = false;
+    int fig4_range1_idx = 2;
+    char fig4_range1_min[32];
+    char fig4_range1_max[32];
+    float fig4_range1_min_val = 0;
+    float fig4_range1_max_val = 1;
+    bool fig4_range2_active = false;
+    int fig4_range2_idx = 1;
+    char fig4_range2_min[32];
+    char fig4_range2_max[32];
+    float fig4_range2_min_val = 0;
+    float fig4_range2_max_val = 10000;
 
     Hyper* x;
     Hyper* y;
@@ -691,9 +747,15 @@ int main(void) {
     char* y_label;
     char* z_label;
 
+    Vector2 focus = {0, 0};
+
     while (!WindowShouldClose()) {
         BeginDrawing();
         ClearBackground(PUFF_BACKGROUND);
+
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            focus = GetMousePosition();
+        }
 
         x_label = hyper_key[fig1_x_idx];
         y_label = hyper_key[fig1_y_idx];
@@ -760,6 +822,10 @@ int main(void) {
         args2.x_max = hyper_max(&data, hyper_key[fig2_x_idx]);
         args2.y_min = hyper_min(&data, hyper_key[fig2_y_idx]);
         args2.y_max = hyper_max(&data, hyper_key[fig2_y_idx]);
+        args2.x_min = (fig2_x_log) ? log10(args2.x_min) : args2.x_min;
+        args2.x_max = (fig2_x_log) ? log10(args2.x_max) : args2.x_max;
+        args2.y_min = (fig2_y_log) ? log10(args2.y_min) : args2.y_min;
+        args2.y_max = (fig2_y_log) ? log10(args2.y_max) : args2.y_max;
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
 
@@ -767,7 +833,7 @@ int main(void) {
             char* env = data.envs[i].key;
             x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
             y = get_hyper(&data, env, hyper_key[fig2_y_idx]);
-            plot(x, y, args2, COLORS[i]);
+            plot(x, y, fig2_x_log, fig2_y_log, args2, COLORS[i]);
         }
         draw_axes(args2);
         EndTextureMode();
@@ -780,15 +846,18 @@ int main(void) {
         if (GuiDropdownBox(fig2_x_rect, options, &fig2_x_idx, fig2_x_active)){
             fig2_x_active = !fig2_x_active;
         }
-        Rectangle fig2_y_rect = {fig1.texture.width + DROPDOWN_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig2_x_check_rect = {fig1.texture.width + DROPDOWN_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig2_x_check_rect, "Log X", &fig2_x_log);
+        Rectangle fig2_y_rect = {fig1.texture.width + DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig2_y_rect, options, &fig2_y_idx, fig2_y_active)){
             fig2_y_active = !fig2_y_active;
         }
+        Rectangle fig2_y_check_rect = {fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig2_y_check_rect, "Log Y", &fig2_y_log);
 
         // Figure 3
         args3.x_label = "tsne1";
         args3.y_label = "tsne2";
-        args3.y_label = y_label;
         args3.x_min = hyper_min(&data, "tsne1");
         args3.x_max = hyper_max(&data, "tsne1");
         args3.y_min = hyper_min(&data, "tsne2");
@@ -800,7 +869,13 @@ int main(void) {
             char* env = data.envs[i].key;
             x = get_hyper(&data, env, "tsne1");
             y = get_hyper(&data, env, "tsne2");
-            plot(x, y, args3, COLORS[i]);
+            //plot(x, y, false, false, args3, COLORS[i]);
+            Hyper* filter1 = get_hyper(&data, env, hyper_key[fig3_range1_idx]);
+            Hyper* filter2 = get_hyper(&data, env, hyper_key[fig3_range2_idx]);
+            plot_filtered(x, y, false, false, args3, COLORS[i],
+                filter1, fig3_range1_min_val, fig3_range1_max_val,
+                filter2, fig3_range2_min_val, fig3_range2_max_val
+            );
         }
         draw_axes(args3);
         EndTextureMode();
@@ -809,6 +884,36 @@ int main(void) {
             (Rectangle){ 0, 0, fig3.texture.width, -fig3.texture.height },
             (Vector2){ 0, SETTINGS_HEIGHT + fig1.texture.height }, WHITE
         );
+        Rectangle fig3_range1_rect = {0, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig3_range1_rect, options, &fig3_range1_idx, fig3_range1_active)){
+            fig3_range1_active = !fig3_range1_active;
+        }
+        Rectangle fig3_range1_min_rect = {DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        bool active = CheckCollisionPointRec(focus, fig3_range1_min_rect);
+        if (GuiTextBox(fig3_range1_min_rect, fig3_range1_min, 32, active)) {
+            fig3_range1_min_val = atof(fig3_range1_min);
+        }
+        Rectangle fig3_range1_max_rect = {1.5*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig3_range1_max_rect);
+        if (GuiTextBox(fig3_range1_max_rect, fig3_range1_max, 32, active)) {
+            fig3_range1_max_val = atof(fig3_range1_max);
+        }
+        Rectangle fig3_range2_rect = {2*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig3_range2_rect, options, &fig3_range2_idx, fig3_range2_active)){
+            fig3_range2_active = !fig3_range2_active;
+        }
+        Rectangle fig3_range2_min_rect = {3*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig3_range2_min_rect);
+        if (GuiTextBox(fig3_range2_min_rect, fig3_range2_min, 32, active)) {
+            fig3_range2_min_val = atof(fig3_range2_min);
+        }
+        Rectangle fig3_range2_max_rect = {3.5*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig3_range2_max_rect);
+        if (GuiTextBox(fig3_range2_max_rect, fig3_range2_max, 32, active)) {
+            fig3_range2_max_val = atof(fig3_range2_max);
+        }
+
+
 
         // Figure 4
         args4.x_label = "Value";
@@ -818,7 +923,12 @@ int main(void) {
         BeginTextureMode(fig4);
         ClearBackground(PUFF_BACKGROUND);
         for (int i=0; i<data.n; i++) {
-            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, COLORS[i]);
+            Hyper* filter1 = get_hyper(&data, data.envs[i].key, hyper_key[fig4_range1_idx]);
+            Hyper* filter2 = get_hyper(&data, data.envs[i].key, hyper_key[fig4_range2_idx]);
+            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, COLORS[i],
+                filter1, fig4_range1_min_val, fig4_range1_max_val,
+                filter2, fig4_range2_min_val, fig4_range2_max_val
+            );
         }
         draw_box_axes(hyper_key, hyper_count, args4);
         EndTextureMode();
@@ -827,13 +937,33 @@ int main(void) {
             (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
             (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
         );
-        Rectangle fig4_x_rect = {0, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig4_x_rect, options, &fig4_x_idx, fig4_x_active)){
-            fig4_x_active = !fig4_x_active;
+        Rectangle fig4_range1_rect = {fig1.texture.width, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig4_range1_rect, options, &fig4_range1_idx, fig4_range1_active)){
+            fig4_range1_active = !fig4_range1_active;
         }
-        Rectangle fig4_y_rect = {DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig4_y_rect, options, &fig4_y_idx, fig4_y_active)){
-            fig4_y_active = !fig4_y_active;
+        Rectangle fig4_range1_min_rect = {fig1.texture.width + DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig4_range1_min_rect);
+        if (GuiTextBox(fig4_range1_min_rect, fig4_range1_min, 32, active)) {
+            fig4_range1_min_val = atof(fig4_range1_min);
+        }
+        Rectangle fig4_range1_max_rect = {fig1.texture.width + 1.5*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig4_range1_max_rect);
+        if (GuiTextBox(fig4_range1_max_rect, fig4_range1_max, 32, active)) {
+            fig4_range1_max_val = atof(fig4_range1_max);
+        }
+        Rectangle fig4_range2_rect = {fig1.texture.width + 2*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig4_range2_rect, options, &fig4_range2_idx, fig4_range2_active)){
+            fig4_range2_active = !fig4_range2_active;
+        }
+        Rectangle fig4_range2_min_rect = {fig1.texture.width + 3*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig4_range2_min_rect);
+        if (GuiTextBox(fig4_range2_min_rect, fig4_range2_min, 32, active)) {
+            fig4_range2_min_val = atof(fig4_range2_min);
+        }
+        Rectangle fig4_range2_max_rect = {fig1.texture.width + 3.5*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+        active = CheckCollisionPointRec(focus, fig4_range2_max_rect);
+        if (GuiTextBox(fig4_range2_max_rect, fig4_range2_max, 32, active)) {
+            fig4_range2_max_val = atof(fig4_range2_max);
         }
 
         /*
