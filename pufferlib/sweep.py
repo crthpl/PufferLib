@@ -586,6 +586,11 @@ class Protein:
             is_failure=is_failure,
         )
 
+        if is_failure or not np.isfinite(score) or np.isnan(score):
+            new_observation['is_failure'] = True
+            self.failure_observations.append(new_observation)
+            return
+
         if len(self.success_observations) == 0:
             self.success_observations.append(new_observation)
             return
