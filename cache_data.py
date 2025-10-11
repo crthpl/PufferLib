@@ -167,10 +167,14 @@ def compute_tsne():
 
     row = 0
     for env in env_names:
+        '''
         for i, hyper in enumerate(HYPERS):
             sz = len(data[env][hyper])
             data[env][hyper] = normed[row:row+sz, i].tolist()
+        '''
+        sz = len(data[env]['agent_steps'])
 
+        data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
         data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
         data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
         row += sz

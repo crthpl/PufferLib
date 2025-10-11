@@ -1,9 +1,10 @@
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #include "raylib.h"
-
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -15,6 +16,12 @@ const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 
+Color COLORS[] = {
+    DARKGRAY, MAROON, ORANGE, DARKGREEN, DARKBLUE, DARKPURPLE, DARKBROWN,
+    GRAY, RED, GOLD, LIME, BLUE, VIOLET, BROWN, LIGHTGRAY, PINK, YELLOW,
+    GREEN, SKYBLUE, PURPLE, BEIGE
+};
+
 const float EMPTY = -4242.0f;
 
 #define SEP 4
@@ -24,10 +31,36 @@ const float EMPTY = -4242.0f;
 
 typedef struct {
     char *key;
-    float *values;
-    int size;
-} KeyValue;
+    float *ary;
+    int n;
+} Hyper;
 
+typedef struct {
+    char *key;
+    Hyper *hypers;
+    int n;
+} Env;
+
+typedef struct {
+    Env *envs;
+    int n;
+} Dataset;
+
+Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
+    for (int i = 0; i < data->n; i++) {
+        if (strcmp(data->envs[i].key, env) != 0) {
+            continue;
+        }
+        for (int j = 0; j < data->envs[i].n; j++) {
+            if (strcmp(data->envs[i].hypers[j].key, hyper) == 0) {
+                return &data->envs[i].hypers[j];
+            }
+        }
+    }
+    printf("Error: hyper %s not found in env %s\n", hyper, env);
+    exit(1);
+    return NULL;
+}
 
 typedef struct PlotArgs {
     float x_min;
@@ -203,7 +236,7 @@ void draw_axes(PlotArgs args) {
     }
 }
 
-void draw_box_axes(KeyValue *hypers, int hyper_count, PlotArgs args) {
+void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
     int width = args.width;
     int height = args.height;
 
@@ -277,7 +310,7 @@ void draw_box_axes(KeyValue *hypers, int hyper_count, PlotArgs args) {
 
     // Y ticks
     for (int i=0; i<hyper_count; i++) {
-        char* label = hypers[i].key;
+        char* label = hypers[i];
         float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/hyper_count;
         DrawLine(
             args.x_margin - args.tick_length,
@@ -321,6 +354,47 @@ void draw_axes3(PlotArgs args) {
     );
 }
 
+float hyper_min(Dataset *data, char* key) {
+    float mmin = FLT_MAX;
+    for (int env=0; env<data->n; env++) {
+        for (int hyper=0; hyper<data->envs[env].n; hyper++) {
+            if (strcmp(data->envs[env].hypers[hyper].key, key) != 0) {
+                continue;
+            }
+            float val = data->envs[env].hypers[hyper].ary[0];
+            if (val < mmin){
+                mmin = val;
+            }
+        }
+    }
+    return mmin;
+}
+
+float hyper_max(Dataset *data, char* key) {
+    float mmax = FLT_MIN;
+    for (int env=0; env<data->n; env++) {
+        for (int hyper=0; hyper<data->envs[env].n; hyper++) {
+            if (strcmp(data->envs[env].hypers[hyper].key, key) != 0) {
+                continue;
+            }
+            float val = data->envs[env].hypers[hyper].ary[0];
+            if (val > mmax){
+                mmax = val;
+            }
+        }
+    }
+    return mmax;
+}
+
+/*
+float hyper_max(Hyper *hyper) {
+    float max = hyper->ary[0];
+    for (int i=1; i<hyper->n; i++) {
+        if (hyper->ary[i] > max) max = hyper->ary[i];
+    }
+    return max;
+}
+
 float ary_min(float* ary, int num) {
     float min = ary[0];
     for (int i=1; i<num; i++) {
@@ -328,7 +402,6 @@ float ary_min(float* ary, int num) {
     }
     return min;
 }
-
 float ary_max(float* ary, int num) {
     float max = ary[0];
     for (int i=1; i<num; i++) {
@@ -337,13 +410,11 @@ float ary_max(float* ary, int num) {
     return max;
 }
 
-void boxplot(float* mmin, float* mmax, bool log_x, int num_points, PlotArgs args) {
+*/
+
+void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_count, PlotArgs args, Color color) {
     int width = args.width;
     int height = args.height;
-
-    // Find min/max for scaling
-    //float z_min = args.z_min == EMPTY ? ary_min(z, num_points) : args.z_min;
-    //float z_max = args.z_max == EMPTY ? ary_max(z, num_points) : args.z_max;
 
     float x_min = args.x_min;
     float x_max = args.x_max;
@@ -357,26 +428,34 @@ void boxplot(float* mmin, float* mmax, bool log_x, int num_points, PlotArgs args
     if (dx == 0) dx = 1.0f;
     x_min -= 0.1f * dx; x_max += 0.1f * dx;
     dx = x_max - x_min;
-    float dy = (height - 2*args.y_margin)/((float)num_points);
+    float dy = (height - 2*args.y_margin)/((float)hyper_count);
 
-    for (int j=0; j<num_points; j++) {
-        float x1 = mmin[j];
-        float x2 = mmax[j];
+    //Color faded = Fade(color, 0.25f);
 
-        if (log_x) {
-            x1 = x1 <= 0 ? 0 : log10(x1);
-            x2 = x2 <= 0 ? 0 : log10(x2);
+    for (int i=0; i<hyper_count; i++) {
+        Hyper* hyper = get_hyper(data, env, hyper_key[i]);
+        float* ary = hyper->ary;
+        float mmin = ary[0];
+        float mmax = ary[0];
+        for (int j=0; j<hyper->n; j++) {
+            mmin = fmin(mmin, ary[j]);
+            mmax = fmax(mmax, ary[j]);
         }
 
-        float left = args.x_margin + (x1 - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-        float right = args.x_margin + (x2 - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-        DrawRectangle(left, args.y_margin + j*dy, right - left, dy, PUFF_CYAN);
+        if (log_x) {
+            mmin = mmin <= 0 ? 0 : log10(mmin);
+            mmax = mmax <= 0 ? 0 : log10(mmax);
+        }
+
+        float left = args.x_margin + (mmin - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+        float right = args.x_margin + (mmax - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+        DrawRectangle(left, args.y_margin + i*dy, right - left, dy, color);
     }
 }
-//void drift_plot(KeyValue *hypers, int hyper_count, PlotArgs args) {
 
+void plot(Hyper* x, Hyper* y, PlotArgs args, Color color) {
+    assert(x->n == y->n);
 
-void plot(float* x, float* y, int num_points, PlotArgs args) {
     int width = args.width;
     int height = args.height;
 
@@ -399,19 +478,20 @@ void plot(float* x, float* y, int num_points, PlotArgs args) {
     dy = y_max - y_min;
 
     // Plot lines
-    for (int j = 0; j < num_points - 1; j++) {
-        float x1 = args.x_margin + (x[j] - x_min) / dx * (width - 2*args.x_margin);
-        float y1 = (height - args.y_margin) - (y[j] - y_min) / dy * (height - 2*args.y_margin);
+    for (int i=0; i<x->n; i++) {
+        float xi = args.x_margin + (x->ary[i] - x_min) / dx * (width - 2*args.x_margin);
+        float yi = (height - args.y_margin) - (y->ary[i] - y_min) / dy * (height - 2*args.y_margin);
+        DrawCircle(xi, yi, args.line_width, color);
         /*
         float x2 = args.margin + (x[j + 1] - x_min) / dx * (width - 2*args.margin);
         float y2 = (height - args.margin) - (y[j + 1] - y_min) / dy * (height - 2*args.margin);
         DrawLine(x1, y1, x2, y2, PUFF_CYAN);
         */
-        DrawCircle(x1, y1, args.line_width, PUFF_CYAN);
     }
 }
 
-void plot3(float* x, float* y, float* z, bool log_x, bool log_y, bool log_z, int num_points, PlotArgs args) {
+void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, PlotArgs args, Color color) {
+    assert(x->n == y->n  && x->n == z->n);
     int width = args.width;
     int height = args.height;
 
@@ -436,30 +516,21 @@ void plot3(float* x, float* y, float* z, bool log_x, bool log_y, bool log_z, int
     dz = z_max - z_min;
 
     // Plot lines
-    for (int j = 0; j < num_points - 1; j++) {
-        float xj = (log_x) ? log10(x[j]) : x[j];
-        float yj = (log_y) ? log10(y[j]) : y[j];
-        float zj = (log_z) ? log10(z[j]) : z[j];
-        DrawSphere((Vector3){xj, yj, zj}, 0.1f, PUFF_CYAN);
+    for (int j = 0; j < x->n; j++) {
+        float xj = (log_x) ? log10(x->ary[j]) : x->ary[j];
+        float yj = (log_y) ? log10(y->ary[j]) : y->ary[j];
+        float zj = (log_z) ? log10(z->ary[j]) : z->ary[j];
+        //DrawSphere((Vector3){xj, yj, zj}, 0.1f, color);
+        DrawCube((Vector3){xj, yj, zj}, 0.1f, 0.1f, 0.1f, color);
     }
 }
 
 
-float* get_values(KeyValue *map, int map_count, char *search_key, int *out_size) {
-    for (int i = 0; i < map_count; i++) {
-        if (map[i].key && strcmp(map[i].key, search_key) == 0) {
-            *out_size = map[i].size;
-            return map[i].values;
-        }
-    }
-    return NULL;
-}
-
-int cleanup(KeyValue *map, int map_count, cJSON *root, char *json_str) {
+int cleanup(Hyper *map, int map_count, cJSON *root, char *json_str) {
     if (map) {
         for (int i=0; i<map_count; i++) {
             if (map[i].key) free(map[i].key);
-            if (map[i].values) free(map[i].values);
+            if (map[i].ary) free(map[i].ary);
         }
     }
     if (root) cJSON_Delete(root);
@@ -467,172 +538,99 @@ int cleanup(KeyValue *map, int map_count, cJSON *root, char *json_str) {
     return 1;
 }
 
-void compute_boxplot_data(KeyValue *hypers, float *box_mmin, float *box_mmax, int hyper_count, PlotArgs *args) {
-    args->x_min = 1e-8;
-    args->x_max = 1e8;
-
-    for (int i=0; i<hyper_count; i++) {
-        float* values = hypers[i].values;
-        box_mmin[i] = values[0];
-        box_mmax[i] = values[0];
-
-        for (int j=0; j<hypers[i].size; j++) {
-            box_mmin[i] = fmin(box_mmin[i], values[j]);
-            box_mmax[i] = fmax(box_mmax[i], values[j]);
-            //args->x_min = fmin(args->x_min, values[j]);
-            //args->x_max = fmax(args->x_max, values[j]);
-        }
-    }
-}
-
-
 
 int main(void) {
-    FILE *file = fopen("pufferlib/ocean/constellation/data.json", "r");
+    FILE *file = fopen("pufferlib/ocean/constellation/all_cache.json", "r");
     if (!file) {
         printf("Error opening file\n");
         return 1;
     }
 
+    // Read in file
     fseek(file, 0, SEEK_END);
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
     char *json_str = malloc(file_size + 1);
-    if (!json_str) {
-        printf("Memory allocation error\n");
-        fclose(file);
-        return 1;
-    }
-
-    // Read file into buffer
     fread(json_str, 1, file_size, file);
     json_str[file_size] = '\0';
     fclose(file);
-
     cJSON *root = cJSON_Parse(json_str);
     if (!root) {
         printf("JSON parse error: %s\n", cJSON_GetErrorPtr());
         free(json_str);
         return 1;
     }
-
     if (!cJSON_IsObject(root)) {
         printf("Error: Root is not an object\n");
         return cleanup(NULL, 0, root, json_str);
     }
 
-    int map_count = 0;
-    cJSON *item = root->child;
-    while (item) {
-        map_count++;
-        item = item->next;
-    }
-    KeyValue *map = calloc(map_count, sizeof(KeyValue));
-    if (!map) {
-        printf("Memory allocation error\n");
-        return cleanup(NULL, 0, root, json_str);
+    // Load in dataset
+    Dataset data = {NULL, 0};
+    cJSON *json_env = root->child;
+    while (json_env) {
+        data.n++;
+        json_env = json_env->next;
     }
 
-    // Load all keys and their float arrays
-    int hyper_count = 0;
-    int idx = 0;
-    item = root->child;
-    while (item) {
-        map[idx].key = strdup(item->string);
-        if (strncmp(map[idx].key, "train", 5) == 0) {
-            hyper_count++;
-        }
-        if (!map[idx].key) {
-            printf("Memory allocation error for key\n");
-            return cleanup(map, map_count, root, json_str);
-        }
-
-        if (!cJSON_IsArray(item)) {
-            printf("Error: Value for key '%s' is not an array\n", map[idx].key);
-            return cleanup(map, map_count, root, json_str);
-        }
-
-        int array_size = cJSON_GetArraySize(item);
-        map[idx].values = malloc(array_size * sizeof(float));
-        if (!map[idx].values) {
-            printf("Memory allocation error for values\n");
-            return cleanup(map, map_count, root, json_str);
-        }
-
-        map[idx].size = array_size;
-
-        for (int j = 0; j < array_size; j++) {
-            cJSON *sub = cJSON_GetArrayItem(item, j);
-            if (cJSON_IsNumber(sub)) {
-                map[idx].values[j] = (float)sub->valuedouble;
+    Env *envs = calloc(data.n, sizeof(Env));
+    data.envs = envs;
+    json_env = root->child;
+    for (int i=0; i<data.n; i++) {
+        json_env = cJSON_GetArrayItem(root, i);
+        cJSON *json_hyper = json_env->child;
+        int hyper_points = 0;
+        while (json_hyper) {
+            envs[i].n++;
+            envs[i].key = strdup(json_env->string);
+            int nxt_hyper_points = cJSON_GetArraySize(json_hyper);
+            if (hyper_points == 0) {
+                hyper_points = nxt_hyper_points;
             } else {
-                continue;
-                printf("Error: Non-number in array for key '%s' at index %d\n", map[idx].key, j);
-                return cleanup(map, map_count, root, json_str);
+                assert(hyper_points == nxt_hyper_points);
+            }
+            json_hyper = json_hyper->next;
+        }
+        envs[i].hypers = calloc(envs[i].n, sizeof(Hyper));
+        for (int j=0; j<envs[i].n; j++) {
+            cJSON *json_hyper = cJSON_GetArrayItem(json_env, j);
+            envs[i].hypers[j].key = strdup(json_hyper->string);
+            envs[i].hypers[j].ary = calloc(hyper_points, sizeof(float));
+            int n = cJSON_GetArraySize(json_hyper);
+            envs[i].hypers[j].n = n;
+            for (int k = 0; k < n; k++) {
+                cJSON *sub = cJSON_GetArrayItem(json_hyper, k);
+                if (cJSON_IsNumber(sub)) {
+                    envs[i].hypers[j].ary[k] = (float)sub->valuedouble;
+                } else {
+                    continue;
+                    //printf("Error: Non-number in array for key '%s' at index %d\n", map[idx].key, j);
+                }
             }
         }
-
-        idx++;
-        item = item->next;
     }
 
-    // Create items as an array of strings
-    //if (map_count > 100) {
-    //    map_count = 100;
-    //}
-    char **items = malloc(map_count * sizeof(char *));
-    if (!items) {
-        printf("Memory allocation error\n");
-        return cleanup(map, map_count, root, json_str);
-    }
-    for (int i = 0; i < map_count; i++) {
-        items[i] = map[i].key;  // Or strdup if you need copies
-    }
+    int hyper_count = 9;
+    char *hyper_key[9] = {
+        "agent_steps", "cost", "environment/perf", "environment/score",
+        "train/learning_rate", "train/gamma", "train/gae_lambda", "train/ent_coef", "train/vf_coef"
+    };
 
+    //char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
+    //char options[] = "environment/score;cost;train/learning_rate;train/gamma;train/gae_lambda";
+          
     // Create options as a semicolon-separated string
     size_t options_len = 0;
-    for (int i = 0; i < map_count; i++) {
-        options_len += strlen(map[i].key) + 1;  // +1 for semicolon or null
+    for (int i = 0; i < hyper_count; i++) {
+        options_len += strlen(hyper_key[i]) + 1;
     }
     char *options = malloc(options_len);
-    if (!options) {
-        printf("Memory allocation error\n");
-        free(items);
-        return cleanup(map, map_count, root, json_str);
-    }
     options[0] = '\0';
-    for (int i = 0; i < map_count; i++) {
+    for (int i = 0; i < hyper_count; i++) {
         if (i > 0) strcat(options, ";");
-        strcat(options, map[i].key);
+        strcat(options, hyper_key[i]);
     }
 
-    // Hypers
-
-    hyper_count = 5;
-    char *hyper_key[5] = {"train/learning_rate", "train/gamma", "train/gae_lambda", "train/ent_coef", "train/vf_coef"};
-    KeyValue hypers[5];
-    for (int i=0; i<5; i++) {
-        hypers[i].key = hyper_key[i];
-        hypers[i].values = get_values(map, map_count, hyper_key[i], &hypers[i].size);
-    }
-    float *box_mmin = malloc(hyper_count * sizeof(float));
-    float *box_mmax = malloc(hyper_count * sizeof(float));
-
-    // Example usage: Print the arrays
-    // Cleanup
-    //free(cost_array);
-    //free(score_array);
-    //cJSON_Delete(root);
-    //free(json_str);
-
-    //float *x = cost_array;
-    //float *y = score_array;
-    //float num_points = cost_size;
-
-    //float *x = malloc(num_points * sizeof(float));
-    //float *y = malloc(num_points * sizeof(float));
-    
-  
     // Initialize Raylib
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
     ClearBackground(PUFF_BACKGROUND);
@@ -650,10 +648,10 @@ int main(void) {
     PlotArgs args1 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig1 = LoadRenderTexture(args1.width, args1.height);
     bool fig1_x_active = false;
-    int fig1_x_idx = 2;
+    int fig1_x_idx = 0;
     bool fig1_x_log = true;
     bool fig1_y_active = false;
-    int fig1_y_idx = 6;
+    int fig1_y_idx = 2;
     bool fig1_y_log = false;
     bool fig1_z_active = false;
     int fig1_z_idx = 1;
@@ -664,7 +662,7 @@ int main(void) {
     bool fig2_x_active = false;
     int fig2_x_idx = 1;
     bool fig2_y_active = false;
-    int fig2_y_idx = 0;
+    int fig2_y_idx = 2;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     args3.x_margin = 250;
@@ -677,17 +675,17 @@ int main(void) {
 
     PlotArgs args4 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig4 = LoadRenderTexture(args4.width, args4.height);
+    float *box_mmin = malloc(hyper_count * sizeof(float));
+    float *box_mmax = malloc(hyper_count * sizeof(float));
     bool fig4_x_active = false;
     int fig4_x_idx = 4;
+    bool fig4_x_log = true;
     bool fig4_y_active = false;
     int fig4_y_idx = 0;
 
-    //char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
-    //char options[] = "environment/score;cost;train/learning_rate;train/gamma;train/gae_lambda";
-
-    float* x;
-    float* y;
-    float* z;
+    Hyper* x;
+    Hyper* y;
+    Hyper* z;
     int num_points;
     char* x_label;
     char* y_label;
@@ -697,21 +695,18 @@ int main(void) {
         BeginDrawing();
         ClearBackground(PUFF_BACKGROUND);
 
-        x_label = items[fig1_x_idx];
-        y_label = items[fig1_y_idx];
-        z_label = items[fig1_z_idx];
+        x_label = hyper_key[fig1_x_idx];
+        y_label = hyper_key[fig1_y_idx];
+        z_label = hyper_key[fig1_z_idx];
         args1.x_label = x_label;
         args1.y_label = y_label;
         args1.z_label = z_label;
-        x = get_values(map, map_count, x_label, &num_points);
-        y = get_values(map, map_count, y_label, &num_points);
-        z = get_values(map, map_count, z_label, &num_points);
-        args1.x_min = ary_min(x, num_points);
-        args1.x_max = ary_max(x, num_points);
-        args1.y_min = ary_min(y, num_points);
-        args1.y_max = ary_max(y, num_points);
-        args1.z_min = ary_min(z, num_points);
-        args1.z_max = ary_max(z, num_points);
+        args1.x_min = hyper_min(&data, hyper_key[fig1_x_idx]);
+        args1.x_max = hyper_max(&data, hyper_key[fig1_x_idx]);
+        args1.y_min = hyper_min(&data, hyper_key[fig1_y_idx]);
+        args1.y_max = hyper_max(&data, hyper_key[fig1_y_idx]);
+        args1.z_min = hyper_min(&data, hyper_key[fig1_z_idx]);
+        args1.z_max = hyper_max(&data, hyper_key[fig1_z_idx]);
         float x_mid = fig1_x_log ? (log10(args1.x_max) + log10(args1.x_min))/2.0f : (args1.x_max + args1.x_min)/2.0f;
         float y_mid = fig1_y_log ? (log10(args1.y_max) + log10(args1.y_min))/2.0f : (args1.y_max + args1.y_min)/2.0f;
         float z_mid = fig1_z_log ? (log10(args1.z_max) + log10(args1.z_min))/2.0f : (args1.z_max + args1.z_min)/2.0f;
@@ -720,7 +715,15 @@ int main(void) {
         ClearBackground(PUFF_BACKGROUND);
         BeginMode3D(camera);
         UpdateCamera(&camera, CAMERA_ORBITAL);
-        plot3(x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, num_points, args1);
+
+        for (int i=0; i<data.n; i++) {
+            char* env = data.envs[i].key;
+            x = get_hyper(&data, env, hyper_key[fig1_x_idx]);
+            y = get_hyper(&data, env, hyper_key[fig1_y_idx]);
+            z = get_hyper(&data, env, hyper_key[fig1_z_idx]);
+            plot3(x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, COLORS[i]);
+        }
+
         draw_axes3(args1);
         EndMode3D();
         EndTextureMode();
@@ -748,19 +751,24 @@ int main(void) {
         Rectangle fig1_z_check_rect = {3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
         GuiCheckBox(fig1_z_check_rect, "Log Z", &fig1_z_log);
 
-        x_label = items[fig2_x_idx];
-        y_label = items[fig2_y_idx];
+        // Figure 2
+        x_label = hyper_key[fig2_x_idx];
+        y_label = hyper_key[fig2_y_idx];
         args2.x_label = x_label;
         args2.y_label = y_label;
-        x = get_values(map, map_count, x_label, &num_points);
-        y = get_values(map, map_count, y_label, &num_points);
-        args2.x_min = ary_min(x, num_points);
-        args2.x_max = ary_max(x, num_points);
-        args2.y_min = ary_min(y, num_points);
-        args2.y_max = ary_max(y, num_points);
+        args2.x_min = hyper_min(&data, hyper_key[fig2_x_idx]);
+        args2.x_max = hyper_max(&data, hyper_key[fig2_x_idx]);
+        args2.y_min = hyper_min(&data, hyper_key[fig2_y_idx]);
+        args2.y_max = hyper_max(&data, hyper_key[fig2_y_idx]);
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
-        plot(x, y, num_points, args2);
+
+        for (int i=0; i<data.n; i++) {
+            char* env = data.envs[i].key;
+            x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
+            y = get_hyper(&data, env, hyper_key[fig2_y_idx]);
+            plot(x, y, args2, COLORS[i]);
+        }
         draw_axes(args2);
         EndTextureMode();
         DrawTextureRec(
@@ -777,31 +785,60 @@ int main(void) {
             fig2_y_active = !fig2_y_active;
         }
 
-        compute_boxplot_data(hypers, box_mmin, box_mmax, hyper_count, &args3);
-        args3.x_label = "Value";
-        args3.y_label = "Hyperparameter";
+        // Figure 3
+        args3.x_label = "tsne1";
+        args3.y_label = "tsne2";
+        args3.y_label = y_label;
+        args3.x_min = hyper_min(&data, "tsne1");
+        args3.x_max = hyper_max(&data, "tsne1");
+        args3.y_min = hyper_min(&data, "tsne2");
+        args3.y_max = hyper_max(&data, "tsne2");
         BeginTextureMode(fig3);
         ClearBackground(PUFF_BACKGROUND);
-        boxplot(box_mmin, box_mmax, fig3_x_log, hyper_count, args3);
-        //draw_axes(args3);
-        draw_box_axes(hypers, hyper_count, args3);
+
+        for (int i=0; i<data.n; i++) {
+            char* env = data.envs[i].key;
+            x = get_hyper(&data, env, "tsne1");
+            y = get_hyper(&data, env, "tsne2");
+            plot(x, y, args3, COLORS[i]);
+        }
+        draw_axes(args3);
         EndTextureMode();
         DrawTextureRec(
             fig3.texture,
             (Rectangle){ 0, 0, fig3.texture.width, -fig3.texture.height },
-            (Vector2){ 0, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
+            (Vector2){ 0, SETTINGS_HEIGHT + fig1.texture.height }, WHITE
         );
-        Rectangle fig3_x_rect = {0, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig3_x_rect, options, &fig3_x_idx, fig3_x_active)){
-            fig3_x_active = !fig3_x_active;
+
+        // Figure 4
+        args4.x_label = "Value";
+        args4.y_label = "Hyperparameter";
+        args4.x_min = 1e-8;
+        args4.x_max = 1e8;
+        BeginTextureMode(fig4);
+        ClearBackground(PUFF_BACKGROUND);
+        for (int i=0; i<data.n; i++) {
+            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, COLORS[i]);
         }
-        Rectangle fig3_y_rect = {DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig3_y_rect, options, &fig3_y_idx, fig3_y_active)){
-            fig3_y_active = !fig3_y_active;
+        draw_box_axes(hyper_key, hyper_count, args4);
+        EndTextureMode();
+        DrawTextureRec(
+            fig4.texture,
+            (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
+            (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
+        );
+        Rectangle fig4_x_rect = {0, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig4_x_rect, options, &fig4_x_idx, fig4_x_active)){
+            fig4_x_active = !fig4_x_active;
+        }
+        Rectangle fig4_y_rect = {DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig4_y_rect, options, &fig4_y_idx, fig4_y_active)){
+            fig4_y_active = !fig4_y_active;
         }
 
-        x_label = items[fig4_x_idx];
-        y_label = items[fig4_y_idx];
+        /*
+        x_label = hyper_key[fig4_x_idx];
+        y_label = hyper_key[fig4_y_idx];
         args4.x_label = x_label;
         args4.y_label = y_label;
         x = get_values(map, map_count, x_label, &num_points);
@@ -828,6 +865,7 @@ int main(void) {
         if (GuiDropdownBox(fig4_y_rect, options, &fig4_y_idx, fig4_y_active)){
             fig4_y_active = !fig4_y_active;
         }
+        */
 
         DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
