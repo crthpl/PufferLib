@@ -17,8 +17,8 @@ const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 
 Color COLORS[] = {
-    DARKGRAY, MAROON, ORANGE, DARKGREEN, DARKBLUE, DARKPURPLE, DARKBROWN,
-    GRAY, RED, GOLD, LIME, BLUE, VIOLET, BROWN, LIGHTGRAY, PINK, YELLOW,
+    BLUE, DARKGRAY, MAROON, ORANGE, DARKGREEN, DARKBLUE, DARKPURPLE, DARKBROWN,
+    GRAY, RED, GOLD, LIME, VIOLET, BROWN, LIGHTGRAY, PINK, YELLOW,
     GREEN, SKYBLUE, PURPLE, BEIGE
 };
 
@@ -27,7 +27,7 @@ const float EMPTY = -4242.0f;
 #define SEP 4
 #define SETTINGS_HEIGHT 20
 #define TOGGLE_WIDTH 60
-#define DROPDOWN_WIDTH 200
+#define DROPDOWN_WIDTH 150
 
 typedef struct {
     char *key;
@@ -470,7 +470,7 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
     }
 }
 
-void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color) {
+void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color, Hyper* color_param, bool log_color) {
     assert(x->n == y->n);
 
     int width = args.width;
@@ -482,6 +482,25 @@ void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color
 
     float dx = x_max - x_min;
     float dy = y_max - y_min;
+
+    // Thresholded color
+    float threshold[8];
+    if (color_param != NULL) {
+        float color_min = color_param->ary[0];
+        float color_max = color_param->ary[1];
+        for (int i=0; i<color_param->n; i++) {
+            color_min = fmin(color_min, color_param->ary[i]);
+            color_max = fmax(color_max, color_param->ary[i]);
+        }
+        for (int i=0; i<8; i++) {
+            if (log_color) {
+                threshold[i] = pow(10, log10(color_min) + (log10(color_max) - log10(color_min))*i/7.0f);
+            } else {
+                threshold[i] = color_min + (color_max - color_min)*i/7.0f;
+            }
+        }
+    }
+
     for (int i=0; i<x->n; i++) {
         float xi = log_x ? log10(x->ary[i]) : x->ary[i];
         float yi = log_y ? log10(y->ary[i]) : y->ary[i];
@@ -490,7 +509,20 @@ void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color
         if (xi < args.x_margin) {
             int s = 2;
         }
-        DrawCircle(xi, yi, args.line_width, color);
+        if (color_param == NULL) {
+            DrawCircle(xi, yi, args.line_width, color);
+            continue;
+        }
+
+        // Thresholded color
+        int c = 0;
+        for (int j=0; j<8; j++) {
+            float fi = color_param->ary[i];
+            if (fi > threshold[j]) {
+                c = j;
+            }
+        }
+        DrawCircle(xi, yi, args.line_width, COLORS[c]);
     }
 }
 
@@ -671,8 +703,28 @@ int main(void) {
         strcat(options, hyper_key[i]);
     }
 
+    // Options with extra "env_name;"
+    char* extra = "env_name;";
+    char *env_hyper_options = malloc(options_len + strlen(extra));
+    strcpy(env_hyper_options, extra);
+    strcat(env_hyper_options, options);
+
+    // Env names as semi-colon-separated string
+    size_t env_options_len = 4;
+    for (int i = 0; i < data.n; i++) {
+        env_options_len += strlen(data.envs[i].key) + 1;
+    }
+    char *env_options = malloc(env_options_len);
+    strcpy(env_options, "all;");
+    env_options[4] = '\0';
+    for (int i = 0; i < data.n; i++) {
+        if (i > 0) strcat(env_options, ";");
+        strcat(env_options, data.envs[i].key);
+    }
+
     // Initialize Raylib
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
+    GuiLoadStyle("pufferlib/ocean/constellation/style_cyber.rgs");
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
@@ -699,12 +751,17 @@ int main(void) {
 
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
+    int fig2_env_idx = 1;
+    bool fig2_env_active = false;
     bool fig2_x_active = false;
     int fig2_x_idx = 1;
     bool fig2_x_log = true;
     bool fig2_y_active = false;
     int fig2_y_idx = 2;
     bool fig2_y_log = false;
+    int fig2_color_idx = 1;
+    bool fig2_color_active = false;
+    bool fig2_log_color = true;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
@@ -829,12 +886,32 @@ int main(void) {
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
 
-        for (int i=0; i<data.n; i++) {
-            char* env = data.envs[i].key;
+        if (fig2_env_idx == 0) {
+            for (int i=0; i<data.n; i++) {
+                char* env = data.envs[i].key;
+                x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
+                y = get_hyper(&data, env, hyper_key[fig2_y_idx]);
+
+                Hyper* color_param = NULL;
+                if (fig2_color_idx != 0) {
+                    color_param = get_hyper(&data, env, hyper_key[fig2_color_idx - 1]);
+                }
+
+                plot(x, y, fig2_x_log, fig2_y_log, args2, COLORS[i], color_param, fig2_log_color);
+            }
+        } else {
+            char* env = data.envs[fig2_env_idx - 1].key;
             x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
             y = get_hyper(&data, env, hyper_key[fig2_y_idx]);
-            plot(x, y, fig2_x_log, fig2_y_log, args2, COLORS[i]);
+
+            Hyper* color_param = NULL;
+            if (fig2_color_idx != 0) {
+                color_param = get_hyper(&data, env, hyper_key[fig2_color_idx - 1]);
+            }
+
+            plot(x, y, fig2_x_log, fig2_y_log, args2, COLORS[0], color_param, fig2_log_color);
         }
+
         draw_axes(args2);
         EndTextureMode();
         DrawTextureRec(
@@ -842,18 +919,28 @@ int main(void) {
             (Rectangle){ 0, 0, fig2.texture.width, -fig2.texture.height },
             (Vector2){ fig1.texture.width, SETTINGS_HEIGHT }, WHITE
         );
-        Rectangle fig2_x_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig2_env_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig2_env_rect, env_options, &fig2_env_idx, fig2_env_active)){
+            fig2_env_active = !fig2_env_active;
+        }
+        Rectangle fig2_x_rect = {fig1.texture.width + DROPDOWN_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig2_x_rect, options, &fig2_x_idx, fig2_x_active)){
             fig2_x_active = !fig2_x_active;
         }
-        Rectangle fig2_x_check_rect = {fig1.texture.width + DROPDOWN_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        Rectangle fig2_x_check_rect = {fig1.texture.width + 2*DROPDOWN_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
         GuiCheckBox(fig2_x_check_rect, "Log X", &fig2_x_log);
-        Rectangle fig2_y_rect = {fig1.texture.width + DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig2_y_rect = {fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig2_y_rect, options, &fig2_y_idx, fig2_y_active)){
             fig2_y_active = !fig2_y_active;
         }
-        Rectangle fig2_y_check_rect = {fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        Rectangle fig2_y_check_rect = {fig1.texture.width + 3*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
         GuiCheckBox(fig2_y_check_rect, "Log Y", &fig2_y_log);
+        Rectangle fig2_color_rect = {fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig2_color_rect, env_hyper_options, &fig2_color_idx, fig2_color_active)){
+            fig2_color_active = !fig2_color_active;
+        }
+        Rectangle fig2_color_check_rect = {fig1.texture.width + 4*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, SETTINGS_HEIGHT, SETTINGS_HEIGHT};
+        GuiCheckBox(fig2_color_check_rect, "Log Color", &fig2_log_color);
 
         // Figure 3
         args3.x_label = "tsne1";
@@ -966,43 +1053,10 @@ int main(void) {
             fig4_range2_max_val = atof(fig4_range2_max);
         }
 
-        /*
-        x_label = hyper_key[fig4_x_idx];
-        y_label = hyper_key[fig4_y_idx];
-        args4.x_label = x_label;
-        args4.y_label = y_label;
-        x = get_values(map, map_count, x_label, &num_points);
-        y = get_values(map, map_count, y_label, &num_points);
-        args4.x_min = ary_min(x, num_points);
-        args4.x_max = ary_max(x, num_points);
-        args4.y_min = ary_min(y, num_points);
-        args4.y_max = ary_max(y, num_points);
-        BeginTextureMode(fig4);
-        ClearBackground(PUFF_BACKGROUND);
-        plot(x, y, num_points, args4);
-        draw_axes(args4);
-        EndTextureMode();
-        DrawTextureRec(
-            fig4.texture,
-            (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
-            (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
-        );
-        Rectangle fig4_x_rect = {fig1.texture.width, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig4_x_rect, options, &fig4_x_idx, fig4_x_active)){
-            fig4_x_active = !fig4_x_active;
-        }
-        Rectangle fig4_y_rect = {fig1.texture.width + DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig4_y_rect, options, &fig4_y_idx, fig4_y_active)){
-            fig4_y_active = !fig4_y_active;
-        }
-        */
-
         DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
     }
 
-    //free(x);
-    //free(y);
     CloseWindow();
     return 0;
 }
