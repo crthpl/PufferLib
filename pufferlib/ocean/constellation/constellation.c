@@ -5,6 +5,7 @@
 #include <string.h>
 #include <assert.h>
 #include "raylib.h"
+#include "rlgl.h"
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -98,13 +99,13 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .z_max = EMPTY,
     .width = 960,
     .height = 540 - SETTINGS_HEIGHT,
-    .title_font_size = 24,
-    .axis_font_size = 24,
-    .axis_tick_font_size = 12,
+    .title_font_size = 32,
+    .axis_font_size = 32,
+    .axis_tick_font_size = 16,
     .legend_font_size = 12,
     .line_width = 2,
     .tick_length = 8,
-    .x_margin = 70,
+    .x_margin = 100,
     .y_margin = 70,
     .font_color = PUFF_WHITE,
     .background_color = PUFF_BACKGROUND,
@@ -194,7 +195,7 @@ void draw_axes(PlotArgs args) {
             args.axis_color
         );
 
-        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
         DrawTextEx(
             args.font_small,
             label,
@@ -220,7 +221,7 @@ void draw_axes(PlotArgs args) {
             y_pos,
             args.axis_color
         );
-        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
         DrawTextEx(
             args.font_small,
             label,
@@ -294,7 +295,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             args.axis_color
         );
 
-        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
         DrawTextEx(
             args.font_small,
             label,
@@ -319,7 +320,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             y_pos,
             args.axis_color
         );
-        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_font_size, 0);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
         DrawTextEx(
             args.font_small,
             label,
@@ -336,20 +337,32 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
 }
 
 
-void draw_axes3(PlotArgs args) {
+void draw_axes3(PlotArgs args, bool log_x, bool log_y, bool log_z) {
+    float extent = 1.0f;
+    float dx = log_x ? log10(args.x_max) - log10(args.x_min) : args.x_max - args.x_min;
+    float dy = log_y ? log10(args.y_max) - log10(args.y_min) : args.y_max - args.y_min;
+    float dz = log_z ? log10(args.z_max) - log10(args.z_min) : args.z_max - args.z_min;
+    extent = fmax(extent, dx);
+    extent = fmax(extent, dy);
+    extent = fmax(extent, dz);
+
+    float x = log_x ? log10(args.x_min) : args.x_min;
+    float y = log_y ? log10(args.y_min) : args.y_min;
+    float z = log_z ? log10(args.z_min) : args.z_min;
+
     DrawLine3D(
-        (Vector3){-10.0f, 0, 0},
-        (Vector3){10.0f, 0, 0},
+        (Vector3){x, y, z},
+        (Vector3){x + extent, y, z},
         RED
     );
     DrawLine3D(
-        (Vector3){0, -10.0f, 0},
-        (Vector3){0, 10.0f, 0},
+        (Vector3){x, y, z},
+        (Vector3){x, y + extent, z},
         GREEN
     );
     DrawLine3D(
-        (Vector3){0, 0, -10.0f},
-        (Vector3){0, 0, 10.0f},
+        (Vector3){x, y, z},
+        (Vector3){x, y, z + extent},
         BLUE
     );
 }
@@ -438,7 +451,7 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
     dx = x_max - x_min;
     float dy = (height - 2*args.y_margin)/((float)hyper_count);
 
-    //Color faded = Fade(color, 0.25f);
+    Color faded = Fade(color, 0.15f);
 
     for (int i=0; i<hyper_count; i++) {
         Hyper* hyper = get_hyper(data, env, hyper_key[i]);
@@ -466,7 +479,7 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
 
         float left = args.x_margin + (mmin - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
         float right = args.x_margin + (mmax - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-        DrawRectangle(left, args.y_margin + i*dy, right - left, dy, color);
+        DrawRectangle(left, args.y_margin + i*dy, right - left, dy, faded);
     }
 }
 
@@ -593,7 +606,8 @@ void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, Plo
         float yj = (log_y) ? log10(y->ary[j]) : y->ary[j];
         float zj = (log_z) ? log10(z->ary[j]) : z->ary[j];
         //DrawSphere((Vector3){xj, yj, zj}, 0.1f, color);
-        DrawCube((Vector3){xj, yj, zj}, 0.1f, 0.1f, 0.1f, color);
+        DrawCube((Vector3){xj, yj, zj}, 0.02f, 0.02f, 0.02f, color);
+        //DrawPoint3D((Vector3){xj, yj, zj}, color);
     }
 }
 
@@ -724,15 +738,15 @@ int main(void) {
 
     // Initialize Raylib
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
-    GuiLoadStyle("pufferlib/ocean/constellation/style_cyber.rgs");
+    GuiLoadStyle("pufferlib/ocean/constellation/puffer.rgs");
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
-    DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/Montserrat-Regular.ttf", 24, NULL, 255);
-    DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/Montserrat-Regular.ttf", 12, NULL, 255);
+    DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
+    DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
 
     Camera3D camera = (Camera3D){ 0 };
-    camera.position = (Vector3){ 5.0f, 5.0f, 5.0f };
+    camera.position = (Vector3){ 5.0f, 2.0f, 5.0f };
     camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
     camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
@@ -751,6 +765,7 @@ int main(void) {
 
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
+    //SetTextureFilter(fig2.texture, TEXTURE_FILTER_POINT);
     int fig2_env_idx = 1;
     bool fig2_env_active = false;
     bool fig2_x_active = false;
@@ -843,7 +858,7 @@ int main(void) {
             plot3(x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, COLORS[i]);
         }
 
-        draw_axes3(args1);
+        draw_axes3(args1, fig1_x_log, fig1_y_log, fig1_z_log);
         EndMode3D();
         EndTextureMode();
         DrawTextureRec(
@@ -1005,18 +1020,22 @@ int main(void) {
         // Figure 4
         args4.x_label = "Value";
         args4.y_label = "Hyperparameter";
+        args4.x_margin = 200;
         args4.x_min = 1e-8;
         args4.x_max = 1e8;
         BeginTextureMode(fig4);
         ClearBackground(PUFF_BACKGROUND);
+        rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
+        BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         for (int i=0; i<data.n; i++) {
             Hyper* filter1 = get_hyper(&data, data.envs[i].key, hyper_key[fig4_range1_idx]);
             Hyper* filter2 = get_hyper(&data, data.envs[i].key, hyper_key[fig4_range2_idx]);
-            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, COLORS[i],
+            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, PUFF_CYAN,
                 filter1, fig4_range1_min_val, fig4_range1_max_val,
                 filter2, fig4_range2_min_val, fig4_range2_max_val
             );
         }
+        EndBlendMode();
         draw_box_axes(hyper_key, hyper_count, args4);
         EndTextureMode();
         DrawTextureRec(
