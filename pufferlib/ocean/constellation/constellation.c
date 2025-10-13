@@ -514,41 +514,6 @@ void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap
     }
 }
 
-void plot_filtered(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, Color color,
-        Hyper* filter1, float f1min, float f1max, Hyper* filter2, float f2min, float f2max) {
-    assert(x->n == y->n);
-
-    int width = args.width;
-    int height = args.height;
-    float x_min = args.x_min;
-    float x_max = args.x_max;
-    float y_min = args.y_min;
-    float y_max = args.y_max;
-
-    float dx = x_max - x_min;
-    float dy = y_max - y_min;
-
-    for (int i=0; i<x->n; i++) {
-        float f1 = filter1->ary[i];
-        if (f1 < f1min || f1 > f1max) {
-            continue;
-        }
-        float f2 = filter2->ary[i];
-        if (f2 < f2min || f2 > f2max) {
-            continue;
-        }
-
-        float xi = log_x ? log10(x->ary[i]) : x->ary[i];
-        float yi = log_y ? log10(y->ary[i]) : y->ary[i];
-        xi = args.x_margin + (xi - x_min) / dx * (width - 2*args.x_margin);
-        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2*args.y_margin);
-        if (xi < args.x_margin) {
-            int s = 2;
-        }
-        DrawCircle(xi, yi, args.line_width, color);
-    }
-}
-
 void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, PlotArgs args, float* cmap, bool* filter) {
     assert(x->n == y->n  && x->n == z->n);
     int width = args.width;
