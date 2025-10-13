@@ -796,7 +796,7 @@ class Utilization(Thread):
         self.stopped = True
 
 def downsample(arr, m):
-    if len(arr) < m:
+    if len(arr) <= (m + 1):
         return arr
 
     if m == 0:
