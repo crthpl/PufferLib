@@ -46,8 +46,13 @@ rich.traceback.install(show_locals=False)
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
-# Assume advantage kernel has been built if CUDA compiler is available
-ADVANTAGE_CUDA = shutil.which("nvcc") is not None
+from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    ROCM_HOME
+)
+# Assume advantage kernel has been built if torch has been compiled with CUDA or HIP support
+# and can find CUDA or HIP in the system
+ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
