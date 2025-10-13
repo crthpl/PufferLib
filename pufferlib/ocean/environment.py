@@ -149,15 +149,19 @@ MAKE_FUNCTIONS = {
     'trash_pickup': 'TrashPickupEnv',
     'tower_climb': 'TowerClimb',
     'grid': 'Grid',
-    'cpr': 'PyCPR',
+    'shared_pool': 'PyCPR',
     'impulse_wars': 'ImpulseWars',
     'drive': 'Drive',
     'pacman': 'Pacman',
+    'tmaze': 'TMaze',
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',
     'whisker_racer': 'WhiskerRacer',
+    'onestateworld': 'World',
+    'chain_mdp': 'Chain',
     'spaces': make_spaces,
     'multiagent': make_multiagent,
+    'slimevolley': 'SlimeVolley',
 }
 
 def env_creator(name='squared', *args, **kwargs):
