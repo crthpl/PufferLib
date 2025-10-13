@@ -1,24 +1,21 @@
 import time
 import random
-import argparse
-import configparser
-import ast
 
 import numpy as np
 import torch
 
-from rich_argparse import RichHelpFormatter
-from rich.console import Console
 from rich.traceback import install
 install(show_locals=False) # Rich tracebacks
 
 import pufferlib
 import pufferlib.sweep
 
-from bokeh.models import ColumnDataSource, LinearColorMapper
-from bokeh.plotting import figure, show
-from bokeh.palettes import Turbo256
-
+try:
+    from bokeh.models import ColumnDataSource, LinearColorMapper
+    from bokeh.plotting import figure, show
+    from bokeh.palettes import Turbo256
+except:
+    pass
 
 def synthetic_basic_task(args):
     train_args = args['train']
@@ -154,45 +151,16 @@ def visualize(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description=f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]'
-        ' demo options. Shows valid args for your env and policy',
-        formatter_class=RichHelpFormatter, add_help=False)
+    from pufferlib import pufferl
+
+    parser = pufferl.make_parser()
     parser.add_argument('--task', type=str, default='linear', help='Task to optimize')
     parser.add_argument('--vis-path', type=str, default='',
         help='Set to visualize a saved sweep')
     parser.add_argument('--data-path', type=str, default='sweep',
         help='Used for testing hparam algorithms')
-    parser.add_argument('--max-runs', type=int, default=100, help='Max number of sweep runs')
-    parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    parser.add_argument('--wandb', action='store_true', help='Track on WandB')
-    parser.add_argument('--neptune', action='store_true', help='Track on Neptune')
-    args = parser.parse_known_args()[0]
 
-    p = configparser.ConfigParser()
-    p.read('config/default.ini')
-    for section in p.sections():
-        for key in p[section]:
-            argparse_key = f'--{section}.{key}'.replace('_', '-')
-            parser.add_argument(argparse_key, default=p[section][key])
-
-    # Late add help so you get a dynamic menu based on the env
-    parser.add_argument('-h', '--help', default=argparse.SUPPRESS,
-        action='help', help='Show this help message and exit')
-
-    parsed = parser.parse_args().__dict__
-    args = {'env': {}, 'policy': {}, 'rnn': {}}
-    for key, value in parsed.items():
-        next = args
-        for subkey in key.split('.'):
-            if subkey not in next:
-                next[subkey] = {}
-            prev = next
-            next = next[subkey]
-        try:
-            prev[subkey] = ast.literal_eval(value)
-        except:
-            prev[subkey] = value
+    args = pufferl.load_config('default', parser=parser)
 
     if args['vis_path']:
         visualize(args)

@@ -17,6 +17,7 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import LogNormalPrior
 from scipy.stats.qmc import Sobol
 
+EPSILON = 1e-6
 
 class Space:
     def __init__(self, min, max, scale, mean, is_integer=False):
@@ -221,14 +222,14 @@ class Hyperparameters:
         return idx
 
 
-def pareto_points(observations, eps=1e-6):
+def pareto_points(observations):
     scores = np.array([e['output'] for e in observations])
     costs = np.array([e['cost'] for e in observations])
     pareto = []
     idxs = []
     for idx, obs in enumerate(observations):
-        higher_score = scores + eps > scores[idx]
-        lower_cost = costs - eps < costs[idx]
+        higher_score = scores + EPSILON > scores[idx]
+        lower_cost = costs - EPSILON < costs[idx]
         better = higher_score & lower_cost
         better[idx] = False
         if not better.any():
@@ -328,13 +329,15 @@ class ExactGPModel(ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=100, patience=10, tol=1e-4):
+def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=100):
     model.train()
     likelihood.train()
     model.set_train_data(inputs=train_x, targets=train_y, strict=False)
 
-    best_loss = math.inf
-    patience_counter = 0
+    loss = None
+    # best_loss = math.inf
+    # patience_counter = 0
+
     for _ in range(training_iter):
         optimizer.zero_grad()
         output = model(train_x)
@@ -342,16 +345,18 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
         loss.backward()
         optimizer.step()
 
-        if best_loss - loss.item() > tol:
-            best_loss = loss.item()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
+        # TODO: Test early termination? requires tol and patience args
+        # if best_loss - loss.item() > tol:
+        #     best_loss = loss.item()
+        #     patience_counter = 0
+        # else:
+        #     patience_counter += 1
+        #     if patience_counter >= patience:
+        #         break
 
     model.eval()
     likelihood.eval()
+    return loss.item() if loss is not None else 0
 
 
 # TODO: Eval defaults
@@ -367,7 +372,7 @@ class Protein:
             seed_with_search_center = True,
             expansion_rate = 0.25,
             gp_training_iter = 100,
-            gp_learning_rate = 0.01,
+            gp_learning_rate = 0.00046,  # got from a simple LR sweep
         ):
         self.hyperparameters = Hyperparameters(sweep_config)
         self.num_random_samples = num_random_samples
@@ -384,16 +389,18 @@ class Protein:
         self.success_observations = []
         self.failure_observations = []
         self.suggestion_idx = 0
+        self.min_score, self.max_score = math.inf, -math.inf
+        self.log_c_min, self.log_c_max = math.inf, -math.inf
 
         # Use Sobel seq for structured random exploration
         self.sobol = Sobol(d=self.hyperparameters.num, scramble=True)
-        # Create dummy data for model initialization
-        dummy_x = torch.ones((1, self.hyperparameters.num), dtype=torch.float64)
-        dummy_y = torch.zeros(1, dtype=torch.float64)
-        
+
         # Params taken from HEBO: https://arxiv.org/abs/2012.03826
         noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
 
+        # Create dummy data for model initialization
+        dummy_x = torch.ones((1, self.hyperparameters.num), dtype=torch.float64)
+        dummy_y = torch.zeros(1, dtype=torch.float64)
         # Score GP
         self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
         self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num)
@@ -409,6 +416,53 @@ class Protein:
         # Use double precision for better accuracy
         for model in (self.gp_score, self.likelihood_score, self.gp_cost, self.likelihood_cost):
             model.double()
+
+    # NOTE: This is a simple Heuristic. Consider sparse/scalable GP if necessary.
+    def _sample_observations(self, max_size=1000, recent_ratio=0.5):
+        # Update the stats using the full data
+        y = np.array([e['output'] for e in self.success_observations])
+        self.min_score, self.max_score = y.min(), y.max()
+
+        c = np.array([e['cost'] for e in self.success_observations])
+        log_c = np.log(np.maximum(c, EPSILON))
+        self.log_c_min, self.log_c_max = log_c.min(), log_c.max()
+
+        # Sample the training data
+        num_obs = len(self.success_observations)
+        if num_obs <= max_size:
+            return self.success_observations
+
+        recent_size = int(recent_ratio*max_size)
+        recent_obs = self.success_observations[-recent_size:]
+        older_obs = self.success_observations[:-recent_size]
+
+        num_to_sample = max_size - recent_size
+        random_sample_obs = random.sample(older_obs, num_to_sample)
+
+        return random_sample_obs + recent_obs
+
+    def _train_gp_models(self):
+        if not self.success_observations:
+            return 0, 0
+        
+        sampled_observations = self._sample_observations()
+        params = np.array([e['input'] for e in sampled_observations])
+        params_tensor = torch.from_numpy(params).to(torch.float64)
+
+        # Train the score model using normalized scores
+        y = np.array([e['output'] for e in sampled_observations])
+        y_norm = (y - self.min_score) / (np.abs(self.max_score - self.min_score) + EPSILON)
+        y_norm_tensor = torch.from_numpy(y_norm).to(torch.float64)
+        score_loss = train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
+
+        # Train the cost gp using normalized log costs
+        c = np.array([e['cost'] for e in sampled_observations])
+        log_c = np.log(np.maximum(c, EPSILON))
+        log_c_norm = (log_c - self.log_c_min) / (self.log_c_max - self.log_c_min + EPSILON)
+        log_c_norm_tensor = torch.from_numpy(log_c_norm).to(torch.float64)
+        cost_loss = train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
+
+        return score_loss, cost_loss
 
     def suggest(self, fill):
         # TODO: Clip random samples to bounds so we don't get bad high cost samples
@@ -429,29 +483,8 @@ class Protein:
             best = suggestions[best_idx]
             return self.hyperparameters.to_dict(best, fill), info
 
-        params = np.array([e['input'] for e in self.success_observations])
-        params_tensor = torch.from_numpy(params).to(torch.float64)
-
-        # Scores variable y
-        y = np.array([e['output'] for e in self.success_observations])
-
-        # Transformed scores
-        min_score, max_score = np.min(y), np.max(y)
-        y_norm = (y - min_score) / (np.abs(max_score - min_score) + 1e-6)
-        y_norm_tensor = torch.from_numpy(y_norm).to(torch.float64)
-        train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
-
-        # Log costs
-        c = np.array([e['cost'] for e in self.success_observations])
-
-        log_c = np.log(c)
-
-        # Normalize log costs for the cost GP
-        log_c_min, log_c_max = np.min(log_c), np.max(log_c)
-        log_c_norm = (log_c - log_c_min) / (log_c_max - log_c_min + 1e-6)
-        log_c_norm_tensor = torch.from_numpy(log_c_norm).to(torch.float64)
-        train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
-
+        score_loss, cost_loss = self._train_gp_models()
+        
         candidates, pareto_idxs = pareto_points(self.success_observations)
         pareto_costs = np.array([e['cost'] for e in candidates])
 
@@ -470,20 +503,19 @@ class Protein:
         gp_log_c_norm = pred_c.mean.numpy()
 
         # Unlinearize
-        gp_y = gp_y_norm*(max_score - min_score) + min_score
-
-        gp_log_c = gp_log_c_norm*(log_c_max - log_c_min) + log_c_min
+        gp_y = gp_y_norm*(self.max_score - self.min_score) + self.min_score
+        gp_log_c = gp_log_c_norm*(self.log_c_max - self.log_c_min) + self.log_c_min
         gp_c = np.exp(gp_log_c)
 
-        gp_c_min, gp_c_max = np.min(gp_c), np.max(gp_c)
-        gp_c_norm = (gp_c - gp_c_min) / (gp_c_max - gp_c_min + 1e-6)
+        # gp_c_min, gp_c_max = np.min(gp_c), np.max(gp_c)
+        # gp_c_norm = (gp_c - gp_c_min) / (gp_c_max - gp_c_min + EPSILON)
 
-        pareto_y = y[pareto_idxs]
-        pareto_c = c[pareto_idxs]
-        pareto_log_c_norm = log_c_norm[pareto_idxs]
+        # pareto_y = y[pareto_idxs]
+        # pareto_c = c[pareto_idxs]
+        # pareto_log_c_norm = log_c_norm[pareto_idxs]
 
-        max_c = np.max(c)
-        min_c = np.min(c)
+        # max_c = np.max(c)
+        # min_c = np.min(c)
 
         max_c_mask = gp_c < self.max_suggestion_cost
 
@@ -498,81 +530,14 @@ class Protein:
             cost = gp_c[best_idx].item(),
             score = gp_y[best_idx].item(),
             rating = suggestion_scores[best_idx].item(),
+            score_loss = score_loss,
+            cost_loss = cost_loss,
         )
         print('Predicted -- ',
             f'Score: {info["score"]:.3f}',
             f'Cost: {info["cost"]:.3f}',
             f'Rating: {info["rating"]:.3f}',
         )
-        '''
-        if info['rating'] < 10:
-            from bokeh.models import ColumnDataSource, LinearColorMapper
-            from bokeh.plotting import figure, show
-            from bokeh.palettes import Turbo256
-
-            source = ColumnDataSource(data=dict(
-                x=c,
-                y=y,
-                order=np.argsort(c),
-            ))
-            mapper = LinearColorMapper(
-                palette=Turbo256,
-                low=0,
-                high=len(c)
-            )
-
-            idxs = np.argsort(pareto_c)
-            pareto_source = ColumnDataSource(data=dict(
-                x=pareto_c[idxs],
-                y=pareto_y[idxs],
-            ))
-
-            c_sorted = sorted(c)
-            cost_source = ColumnDataSource(data=dict(
-                x = c_sorted,
-                y = np.cumsum(c_sorted) / np.sum(c_sorted),
-            ))
-
-            #gp_pareto_source = ColumnDataSource(data=dict(
-            #    x=gp_c,
-            #    y=gp_y,
-            #    order=np.argsort(gp_c),
-            #))
-
-            preds = [{
-                'output': gp_y[i],
-                'cost': gp_c[i],
-            } for i in range(len(gp_c))]
-            _, pareto_idxs = pareto_points(preds)
-
-            gp_c_pareto = gp_c[pareto_idxs]
-            gp_y_pareto = gp_y[pareto_idxs]
-            idxs = np.argsort(gp_c_pareto)
-            gp_source = ColumnDataSource(data=dict(
-                x=gp_c_pareto[idxs],
-                y=gp_y_pareto[idxs],
-            ))
-
-            p = figure(title='Hyperparam Test', 
-                       x_axis_label='Cost', 
-                       y_axis_label='Score')
-
-            # Original data
-            p.scatter(
-                x='x', 
-                y='y', 
-                color={'field': 'order', 'transform': mapper}, 
-                size=10, 
-                source=source
-            )
-
-            p.line(x='x', y='y', color='red', source=pareto_source)
-            p.line(x='x', y='y', color='blue', source=gp_source)
-            p.line(x='x', y='y', color='green', source=cost_source)
-            #p.line(x='x', y='y', color='green', source=gp_pareto_source)
-
-            show(p)
-        '''
 
         best = suggestions[best_idx]
         return self.hyperparameters.to_dict(best, fill), info
@@ -591,17 +556,15 @@ class Protein:
             self.failure_observations.append(new_observation)
             return
 
-        if len(self.success_observations) == 0:
-            self.success_observations.append(new_observation)
-            return
+        if self.success_observations:
+            success_params = np.stack([e['input'] for e in self.success_observations])
+            dist = np.linalg.norm(params - success_params, axis=1)
+            same = np.where(dist < EPSILON)[0]
+            if len(same) > 0:
+                self.success_observations[same[0]] = new_observation
+                return
 
-        success_params = np.stack([e['input'] for e in self.success_observations])
-        dist = np.linalg.norm(params - success_params, axis=1)
-        same = np.where(dist < 1e-6)[0]
-        if len(same) > 0:
-            self.success_observations[same[0]] = new_observation
-        else:
-            self.success_observations.append(new_observation)
+        self.success_observations.append(new_observation)
 
 def _carbs_params_from_puffer_sweep(sweep_config):
     from carbs import (
