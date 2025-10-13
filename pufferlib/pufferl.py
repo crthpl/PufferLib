@@ -222,8 +222,8 @@ class PuffeRL:
 
         if config['use_rnn']:
             for k in self.lstm_h:
-                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
-                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
+                self.lstm_h[k].zero_()
+                self.lstm_c[k].zero_()
 
         self.full_rows = 0
         while self.full_rows < self.segments:
@@ -318,6 +318,7 @@ class PuffeRL:
         profile = self.profile
         epoch = self.epoch
         profile('train', epoch)
+        profile('train_misc', epoch, nest=True)
         losses = defaultdict(float)
         config = self.config
         device = config['device']
@@ -330,7 +331,7 @@ class PuffeRL:
         self.ratio[:] = 1
 
         for mb in range(self.total_minibatches):
-            profile('train_misc', epoch, nest=True)
+            profile('train_misc', epoch)
             self.amp_context.__enter__()
 
             shape = self.values.shape
@@ -339,12 +340,14 @@ class PuffeRL:
                 self.terminals, self.ratio, advantages, config['gamma'],
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
-            profile('train_copy', epoch)
+            # Prioritize experience by advantage magnitude
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
+
+            profile('train_copy', epoch)
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
@@ -380,10 +383,13 @@ class PuffeRL:
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
-            adv = advantages[idx]
-            adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
-                ratio, adv, config['gamma'], config['gae_lambda'],
-                config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            # NOTE: Commenting this out since adv is replaced below
+            # adv = advantages[idx]
+            # adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
+            #     ratio, adv, config['gamma'], config['gae_lambda'],
+            #     config['vtrace_rho_clip'], config['vtrace_c_clip'])
+
+            # Weight advantages by priority and normalize
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -1119,7 +1125,7 @@ def load_policy(args, vecenv, env_name=''):
 
     return policy
 
-def load_config(env_name):
+def load_config(env_name, parser=None):
     puffer_dir = os.path.dirname(os.path.realpath(__file__))
     puffer_config_dir = os.path.join(puffer_dir, 'config/**/*.ini')
     puffer_default_config = os.path.join(puffer_dir, 'config/default.ini')
@@ -1134,9 +1140,9 @@ def load_config(env_name):
         else:
             raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
 
-    return process_config(p)
+    return process_config(p, parser=parser)
 
-def load_config_file(file_path, fill_in_default=True):
+def load_config_file(file_path, fill_in_default=True, parser=None):
     if not os.path.exists(file_path):
         raise pufferlib.APIUsageError('No config file found')
 
@@ -1150,13 +1156,11 @@ def load_config_file(file_path, fill_in_default=True):
     p = configparser.ConfigParser()
     p.read(config_paths)
 
-    return process_config(p)
+    return process_config(p, parser=parser)
 
-def process_config(config):
-    parser = argparse.ArgumentParser(
-        description=f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]'
-        ' demo options. Shows valid args for your env and policy',
-        formatter_class=RichHelpFormatter, add_help=False)
+def make_parser():
+    '''Creates the argument parser with default PufferLib arguments.'''
+    parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
     parser.add_argument('--load-model-path', type=str, default=None,
         help='Path to a pretrained checkpoint')
     parser.add_argument('--load-id', type=str,
@@ -1175,22 +1179,33 @@ def process_config(config):
     parser.add_argument('--neptune-project', type=str, default='ablations')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    args = parser.parse_known_args()[0]
+    return parser
 
-    # Dynamic help menu from config
-    def puffer_type(value):
-        try:
-            return ast.literal_eval(value)
-        except:
-            return value
+def process_config(config, parser=None):
+    if parser is None:
+        parser = make_parser()
+
+    parser.description = f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]' \
+        ' demo options. Shows valid args for your env and policy'
+
+    def auto_type(value):
+        """Type inference for numeric args that use 'auto' as a default value"""
+        if value == 'auto': return value
+        if value.isnumeric(): return int(value)
+        return float(value)
 
     for section in config.sections():
         for key in config[section]:
+            try:
+                value = ast.literal_eval(config[section][key])
+            except:
+                value = config[section][key]
+
             fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
             parser.add_argument(
                 fmt.replace('_', '-'),
-                default=puffer_type(config[section][key]),
-                type=puffer_type
+                default=value,
+                type=auto_type if value == 'auto' else type(value)
             )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,
