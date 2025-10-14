@@ -31,6 +31,11 @@ def evaluate_gp(gp_model, likelihood, test_x, test_y):
     gp_model.eval()
     likelihood.eval()
 
+    # Move tensors to the same device as the model
+    device = next(gp_model.parameters()).device
+    test_x = test_x.float().to(device)
+    test_y = test_y.float().to(device)
+
     with torch.no_grad():
         # Get predictions from the model
         predictions = likelihood(gp_model(test_x))
@@ -280,6 +285,7 @@ if __name__ == "__main__":
         "--input-file",
         type=str,
         default="sweep_observations.pkl",
+        # default="sweep_obs_breakout_oct14.pkl",
         help="Path to the input sweep observations pickle file.",
     )
     parser.add_argument(
@@ -346,7 +352,7 @@ if __name__ == "__main__":
 
     # --- Define Hyperparameter Grid ---
     gp_iters_to_test = [50, 100, 200]
-    gp_lrs_to_test = np.logspace(-2, -4, 10).tolist()  # 10 rates from 0.01 to 0.0001
+    gp_lrs_to_test = np.logspace(-2, -4, 20).tolist()  # 20 rates from 0.01 to 0.0001
 
     for iters in gp_iters_to_test:
         for lr in gp_lrs_to_test:
