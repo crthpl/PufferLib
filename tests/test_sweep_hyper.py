@@ -81,7 +81,7 @@ def _validate_gp_model(
     return metrics
 
 
-def run_experiment(args, train_obs, val_obs, gp_iter, gp_lr):
+def run_experiment(args, train_obs, val_obs, gp_iter, gp_lr, use_gpu=False):
     """
     Trains and validates the GP models from the Protein sweep.
     """
@@ -92,6 +92,7 @@ def run_experiment(args, train_obs, val_obs, gp_iter, gp_lr):
         args["sweep"],
         gp_training_iter=gp_iter,
         gp_learning_rate=gp_lr,
+        use_gpu=use_gpu,
     )
 
     # --- Train GPs using the observe/suggest loop ---
@@ -261,6 +262,7 @@ def visualize_results(results_file):
 
 if __name__ == "__main__":
     parser = pufferl.make_parser()
+    # Use tests/test_custom_sweep.py to collect sweep obs pkl
     parser.add_argument(
         "-i",
         "--input-file",
@@ -347,6 +349,7 @@ if __name__ == "__main__":
                     validation_observations,
                     gp_iter=iters,
                     gp_lr=lr,
+                    use_gpu=True,
                 )
             )
             all_results.append(

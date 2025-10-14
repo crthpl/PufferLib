@@ -373,7 +373,15 @@ class Protein:
             expansion_rate = 0.25,
             gp_training_iter = 100,
             gp_learning_rate = 0.00046,  # got from a simple LR sweep
+            gp_max_obs = 700,  # gp train time jumps after 800
+            infer_batch_size = 4096,            
+            use_gpu=True,
         ):
+        
+        # NOTE: Check if this interfere with training. I put this to make gpytorch work with gpu
+        torch.set_default_dtype(torch.float32)
+
+        self.device = torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
         self.num_random_samples = num_random_samples
         self.global_search_scale = global_search_scale
@@ -398,27 +406,32 @@ class Protein:
         # Params taken from HEBO: https://arxiv.org/abs/2012.03826
         noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
 
-        # Create dummy data for model initialization
-        dummy_x = torch.ones((1, self.hyperparameters.num), dtype=torch.float64)
-        dummy_y = torch.zeros(1, dtype=torch.float64)
+        # Create dummy data for model initialization on the selected device
+        dummy_x = torch.ones((1, self.hyperparameters.num), device=self.device)
+        dummy_y = torch.zeros(1, device=self.device)
         # Score GP
-        self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
-        self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num)
-        self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score)
-        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate)
+        self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
+        self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num).to(self.device)
+        self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score).to(self.device)
+        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
 
         # Cost GP
-        self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior))
-        self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num)
-        self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost)
-        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate)
+        self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
+        self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num).to(self.device)
+        self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost).to(self.device)
+        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
 
-        # Use double precision for better accuracy
-        for model in (self.gp_score, self.likelihood_score, self.gp_cost, self.likelihood_cost):
-            model.double()
+        # Buffers for GP training data
+        self.gp_max_obs = gp_max_obs  # train time bumps after 800?
+        self.gp_params_buffer = torch.empty(self.gp_max_obs, self.hyperparameters.num, dtype=torch.float32, device=self.device)
+        self.gp_score_buffer = torch.empty(self.gp_max_obs, dtype=torch.float32, device=self.device)
+        self.gp_cost_buffer = torch.empty(self.gp_max_obs, dtype=torch.float32, device=self.device)
+
+        self.infer_batch_size = infer_batch_size
+        self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, dtype=torch.float32, device=self.device)
 
     # NOTE: This is a simple Heuristic. Consider sparse/scalable GP if necessary.
-    def _sample_observations(self, max_size=1000, recent_ratio=0.5):
+    def _sample_observations(self, max_size=None, recent_ratio=0.5):
         # Update the stats using the full data
         y = np.array([e['output'] for e in self.success_observations])
         self.min_score, self.max_score = y.min(), y.max()
@@ -426,6 +439,9 @@ class Protein:
         c = np.array([e['cost'] for e in self.success_observations])
         log_c = np.log(np.maximum(c, EPSILON))
         self.log_c_min, self.log_c_max = log_c.min(), log_c.max()
+
+        if max_size is None:
+            max_size = self.gp_max_obs
 
         # Sample the training data
         num_obs = len(self.success_observations)
@@ -445,21 +461,27 @@ class Protein:
         if not self.success_observations:
             return 0, 0
         
-        sampled_observations = self._sample_observations()
+        sampled_observations = self._sample_observations(max_size=self.gp_max_obs)
+        num_sampled = len(sampled_observations)
+
+        # Prepare tensors using pre-allocated buffers
         params = np.array([e['input'] for e in sampled_observations])
-        params_tensor = torch.from_numpy(params).to(torch.float64)
+        params_tensor = self.gp_params_buffer[:num_sampled]
+        params_tensor.copy_(torch.from_numpy(params))
 
         # Train the score model using normalized scores
         y = np.array([e['output'] for e in sampled_observations])
         y_norm = (y - self.min_score) / (np.abs(self.max_score - self.min_score) + EPSILON)
-        y_norm_tensor = torch.from_numpy(y_norm).to(torch.float64)
+        y_norm_tensor = self.gp_score_buffer[:num_sampled]
+        y_norm_tensor.copy_(torch.from_numpy(y_norm))
         score_loss = train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
 
         # Train the cost gp using normalized log costs
         c = np.array([e['cost'] for e in sampled_observations])
-        log_c = np.log(np.maximum(c, EPSILON))
+        log_c = np.log(np.maximum(c, EPSILON)) # Ensure log is not taken on zero
         log_c_norm = (log_c - self.log_c_min) / (self.log_c_max - self.log_c_min + EPSILON)
-        log_c_norm_tensor = torch.from_numpy(log_c_norm).to(torch.float64)
+        log_c_norm_tensor = self.gp_cost_buffer[:num_sampled]
+        log_c_norm_tensor.copy_(torch.from_numpy(log_c_norm))
         cost_loss = train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
 
         return score_loss, cost_loss
@@ -484,9 +506,9 @@ class Protein:
             return self.hyperparameters.to_dict(best, fill), info
 
         score_loss, cost_loss = self._train_gp_models()
-        
+       
         candidates, pareto_idxs = pareto_points(self.success_observations)
-        pareto_costs = np.array([e['cost'] for e in candidates])
+        # pareto_costs = np.array([e['cost'] for e in candidates])
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in candidates])
@@ -494,13 +516,30 @@ class Protein:
             len(candidates)*self.suggestions_per_pareto, mu=search_centers)
 
         ### Predict scores and costs
-        suggestions_tensor = torch.from_numpy(suggestions).to(torch.float64)
+        # Batch predictions to avoid GPU OOM for large number of suggestions
+        gp_y_norm_list, gp_log_c_norm_list = [], []
+
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            pred_y = self.likelihood_score(self.gp_score(suggestions_tensor))
-            pred_c = self.likelihood_cost(self.gp_cost(suggestions_tensor))
-        
-        gp_y_norm = pred_y.mean.numpy()
-        gp_log_c_norm = pred_c.mean.numpy()
+            # Create a reusable buffer on the device to avoid allocating a huge tensor
+            for i in range(0, len(suggestions), self.infer_batch_size):
+                batch_numpy = suggestions[i:i+self.infer_batch_size]
+                current_batch_size = len(batch_numpy)
+
+                # Use a slice of the buffer if the current batch is smaller
+                batch_tensor = self.infer_batch_buffer[:current_batch_size]
+                batch_tensor.copy_(torch.from_numpy(batch_numpy))
+
+                # Score prediction
+                pred_y = self.likelihood_score(self.gp_score(batch_tensor))
+                gp_y_norm_list.append(pred_y.mean.cpu())
+ 
+                # Cost prediction
+                pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
+                gp_log_c_norm_list.append(pred_c.mean.cpu())
+
+        # Concatenate results from all batches
+        gp_y_norm = torch.cat(gp_y_norm_list).numpy()
+        gp_log_c_norm = torch.cat(gp_log_c_norm_list).numpy()
 
         # Unlinearize
         gp_y = gp_y_norm*(self.max_score - self.min_score) + self.min_score

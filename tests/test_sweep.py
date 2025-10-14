@@ -57,6 +57,7 @@ def test_sweep(args):
         sweep = pufferlib.sweep.Protein(
             args['sweep'],
             expansion_rate = 1.0,
+            use_gpu=True
         )
     else:
         raise ValueError(f'Invalid sweep method {method} (random/pareto_genetic/protein)')
@@ -79,10 +80,16 @@ def test_sweep(args):
         np.random.seed(seed)
         torch.manual_seed(seed)
  
-        try:
-            _, info = sweep.suggest(args)
-        except:
-            break
+        start_time = time.time()
+        _, info = sweep.suggest(args)
+        suggestion_time = time.time() - start_time
+
+        info_str = f'{i}th sweep.suggest() took {suggestion_time:.4f}s'
+        if "score_loss" in info:
+            info_str += f', score_loss: {info["score_loss"]:.4f}'
+        if "cost_loss" in info:
+            info_str += f', cost_loss: {info["cost_loss"]:.4f}'
+        print(info_str)
 
         total_timesteps = args['train']['total_timesteps']
         for i in range(1, 6):

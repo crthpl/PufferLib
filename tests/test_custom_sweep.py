@@ -13,7 +13,7 @@ from pufferlib.sweep import Protein
 def sweep(env_name, args):
     start_time = time.time()
 
-    sweep_manager = Protein(args["sweep"])
+    sweep_manager = Protein(args["sweep"], use_gpu=True)
     points_per_run = args["sweep"]["downsample"]
     target_key = f"environment/{args['sweep']['metric']}"
 
@@ -86,6 +86,8 @@ def sweep(env_name, args):
 
     total_sweep_time = time.time() - start_time
     print(f"\n--- Total sweep time: {total_sweep_time:.2f} seconds ---")
+    total_suggest_time = sum(h["suggest_time"] for h in suggest_history)
+    print(f"--- Total suggest time: {total_suggest_time:.2f} seconds ---")
 
 
 if __name__ == "__main__":
@@ -102,5 +104,6 @@ if __name__ == "__main__":
 
     # Use wandb
     args["wandb"] = True
+    # args["train"]["optimizer"] = "adam"
 
     sweep(env_name, args)
