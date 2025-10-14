@@ -360,26 +360,30 @@ if __name__ == "__main__":
                 print(f"Skipping already completed run: gp_iter={iters}, gp_lr={lr}")
                 continue
 
-            score_metrics, cost_metrics, score_loss_hist, cost_loss_hist = (
-                run_experiment(
-                    args,
-                    train_observations,
-                    validation_observations,
-                    gp_iter=iters,
-                    gp_lr=lr,
-                    use_gpu=True,
+            try:
+                score_metrics, cost_metrics, score_loss_hist, cost_loss_hist = (
+                    run_experiment(
+                        args,
+                        train_observations,
+                        validation_observations,
+                        gp_iter=iters,
+                        gp_lr=lr,
+                        use_gpu=True,
+                    )
                 )
-            )
-            all_results.append(
-                {
-                    "gp_iter": iters,
-                    "gp_lr": lr,
-                    "score_metrics": score_metrics,
-                    "cost_metrics": cost_metrics,
-                    "score_loss_history": score_loss_hist,
-                    "cost_loss_history": cost_loss_hist,
-                }
-            )
+                all_results.append(
+                    {
+                        "gp_iter": iters,
+                        "gp_lr": lr,
+                        "score_metrics": score_metrics,
+                        "cost_metrics": cost_metrics,
+                        "score_loss_history": score_loss_hist,
+                        "cost_loss_history": cost_loss_hist,
+                        "success": True,
+                    }
+                )
+            except:
+                all_results.append({"gp_iter": iters, "gp_lr": lr, "success": False})
 
             # Save results after each experiment to avoid data loss on interruption
             with open(args["output_file"], "wb") as f:
