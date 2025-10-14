@@ -224,21 +224,57 @@ class Hyperparameters:
     def get_flat_idx(self, flat_key):
         return list(self.flat_spaces.keys()).index(flat_key)
 
+
 def pareto_points(observations):
+    if not observations:
+        return [], []
+
     scores = np.array([e['output'] for e in observations])
     costs = np.array([e['cost'] for e in observations])
-    pareto = []
-    idxs = []
-    for idx, obs in enumerate(observations):
-        higher_score = scores + EPSILON > scores[idx]
-        lower_cost = costs - EPSILON < costs[idx]
-        better = higher_score & lower_cost
-        better[idx] = False
-        if not better.any():
-            pareto.append(obs)
-            idxs.append(idx)
 
-    return pareto, idxs
+    # Sort by cost to find non-dominated points efficiently
+    sorted_indices = np.argsort(costs)
+    
+    pareto = []
+    pareto_idxs = []
+    max_score_so_far = -np.inf
+
+    for idx in sorted_indices:
+        if scores[idx] > max_score_so_far + EPSILON:
+            pareto.append(observations[idx])
+            pareto_idxs.append(idx)
+            max_score_so_far = scores[idx]
+
+    return pareto, pareto_idxs
+
+def prune_pareto_front(pareto, efficiency_threshold=0.5, pruning_stop_score_fraction=0.98):
+    if not pareto or len(pareto) < 2:
+        return pareto
+
+    sorted_pareto = sorted(pareto, key=lambda x: x['cost'])
+    scores = np.array([e['output'] for e in sorted_pareto])
+    costs = np.array([e['cost'] for e in sorted_pareto])
+    score_range = max(scores.max() - scores.min(), EPSILON)
+    cost_range = max(costs.max() - costs.min(), EPSILON)
+
+    max_pareto_score = scores[-1] if scores.size > 0 else -np.inf
+
+    for i in range(len(sorted_pareto) - 1, 0, -1):
+        if scores[i] < pruning_stop_score_fraction * max_pareto_score:
+            break
+
+        norm_score_gain = (scores[i] - scores[i-1]) / score_range
+        norm_cost_increase = (costs[i] - costs[i-1]) / cost_range
+        efficiency = norm_score_gain / (norm_cost_increase + EPSILON)
+
+        if efficiency < efficiency_threshold:
+            sorted_pareto.pop(i)
+        else:
+            # Stop pruning if we find an efficient point
+            break
+
+    return sorted_pareto
+
 
 class Random:
     def __init__(self,
@@ -376,8 +412,10 @@ class Protein:
             gp_learning_rate = 0.00046,  # got from a simple LR sweep
             gp_max_obs = 750,  # gp train time jumps after 800
             infer_batch_size = 4096,            
-            use_gpu=True,
-            cost_param="train/total_timesteps"
+            use_gpu = True,
+            cost_param = "train/total_timesteps",
+            prune_pareto = False,
+            ucb_beta = None,  # Exploration-exploitation trade-off for UCB
         ):
         
         # NOTE: Check if this interfere with training. I put this to make gpytorch work with gpu
@@ -393,6 +431,8 @@ class Protein:
         self.expansion_rate = expansion_rate
         self.gp_training_iter = gp_training_iter
         self.gp_learning_rate = gp_learning_rate
+        self.prune_pareto = prune_pareto
+        self.ucb_beta = ucb_beta
 
         self.success_observations = []
         self.failure_observations = []
@@ -517,6 +557,9 @@ class Protein:
         candidates, pareto_idxs = pareto_points(self.success_observations)
         # pareto_costs = np.array([e['cost'] for e in candidates])
 
+        if self.prune_pareto:
+            candidates = prune_pareto_front(candidates)
+
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in candidates])
         suggestions = self.hyperparameters.sample(
@@ -524,7 +567,7 @@ class Protein:
 
         ### Predict scores and costs
         # Batch predictions to avoid GPU OOM for large number of suggestions
-        gp_y_norm_list, gp_log_c_norm_list = [], []
+        gp_y_norm_list, gp_y_std_norm_list, gp_log_c_norm_list = [], [], []
 
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             # Create a reusable buffer on the device to avoid allocating a huge tensor
@@ -539,6 +582,7 @@ class Protein:
                 # Score prediction
                 pred_y = self.likelihood_score(self.gp_score(batch_tensor))
                 gp_y_norm_list.append(pred_y.mean.cpu())
+                gp_y_std_norm_list.append(pred_y.stddev.cpu())
  
                 # Cost prediction
                 pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
@@ -546,6 +590,7 @@ class Protein:
 
         # Concatenate results from all batches
         gp_y_norm = torch.cat(gp_y_norm_list).numpy()
+        gp_y_std_norm = torch.cat(gp_y_std_norm_list).numpy()
         gp_log_c_norm = torch.cat(gp_log_c_norm_list).numpy()
 
         # Unlinearize
@@ -568,8 +613,13 @@ class Protein:
         target = (1 + self.expansion_rate)*np.random.rand()
         weight = 1 - abs(target - gp_log_c_norm)
 
+        score = gp_y_norm
+        # Favor high-score and hign-uncertainty candidates for efficient exploration
+        if self.ucb_beta is not None:
+            score += self.ucb_beta * gp_y_std_norm
+
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
-                gp_y_norm*weight)
+                score*weight)
 
         best_idx = np.argmax(suggestion_scores)
         info = dict(
