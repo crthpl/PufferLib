@@ -403,7 +403,7 @@ class Protein:
             sweep_config,
             max_suggestion_cost = 3600,
             resample_frequency = 0,
-            num_random_samples = 50,
+            num_random_samples = 30,
             global_search_scale = 1,
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
