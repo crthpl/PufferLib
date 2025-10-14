@@ -807,9 +807,10 @@ def downsample(arr, m):
     arr = arr[:-1]
     arr = np.array(arr)
     n = len(arr)
+    m -= 1  # one down for the last one
     n = (n//m)*m
     arr = arr[-n:]
-    downsampled = arr.reshape(m-1, -1).mean(axis=1)
+    downsampled = arr.reshape(m, -1).mean(axis=1)
     return np.concatenate([downsampled, [last]])
 
 class NoLogger:
