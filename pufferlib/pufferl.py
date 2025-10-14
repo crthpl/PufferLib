@@ -796,7 +796,7 @@ class Utilization(Thread):
         self.stopped = True
 
 def downsample(arr, m):
-    if len(arr) <= (m + 1):
+    if len(arr) <= m:
         return arr
 
     if m == 0:
@@ -809,7 +809,7 @@ def downsample(arr, m):
     n = len(arr)
     n = (n//m)*m
     arr = arr[-n:]
-    downsampled = arr.reshape(m, -1).mean(axis=1)
+    downsampled = arr.reshape(m-1, -1).mean(axis=1)
     return np.concatenate([downsampled, [last]])
 
 class NoLogger:
