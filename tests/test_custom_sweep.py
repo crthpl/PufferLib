@@ -13,7 +13,11 @@ from pufferlib.sweep import Protein
 def sweep(env_name, args):
     start_time = time.time()
 
-    sweep_manager = Protein(args["sweep"], use_gpu=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    obs_file = f"sweep_observations_{env_name}_{timestamp}.pkl"
+    print(f"Sweep observations will be saved to: {obs_file}")
+
+    sweep_manager = Protein(args["sweep"], use_gpu=True, num_random_samples=0)
     points_per_run = args["sweep"]["downsample"]
     target_key = f"environment/{args['sweep']['metric']}"
 
@@ -70,7 +74,6 @@ def sweep(env_name, args):
 
         # Save observations to a fixed file every 10 runs and at the end
         if (i + 1) % 10 == 0 or (i + 1) >= args["max_runs"]:
-            obs_file = "sweep_observations.pkl"
             print(f"\n--- Saving sweep observations to {obs_file} (run {i + 1}) ---")
             with open(obs_file, "wb") as f:
                 pickle.dump(

@@ -5,8 +5,12 @@ import numpy as np
 import torch
 
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
 from pufferlib import pufferl
 from pufferlib.sweep import Protein
 
@@ -112,6 +116,10 @@ def run_experiment(args, train_obs, val_obs, gp_iter, gp_lr, use_gpu=False):
             hypers = sweep_manager.hyperparameters.to_dict(obs["input"])
             sweep_manager.observe(hypers, obs["output"], obs["cost"])
 
+        # Skip training until some data is in
+        if i < 10:
+            continue
+
         score_loss, cost_loss = sweep_manager._train_gp_models()
         score_loss_history.append(score_loss)
         cost_loss_history.append(cost_loss)
@@ -146,6 +154,10 @@ def visualize_results(results_file):
     """
     Loads GP evaluation results and creates visualizations.
     """
+    if not _MATPLOTLIB_AVAILABLE:
+        print("Install matplotlib to visualize results: pip install matplotlib")
+        return
+
     if not os.path.exists(results_file):
         print(f"Error: Results file not found at {results_file}")
         return
