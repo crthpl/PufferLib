@@ -221,6 +221,8 @@ class Hyperparameters:
 
         return idx
 
+    def get_flat_idx(self, flat_key):
+        return list(self.flat_spaces.keys()).index(flat_key)
 
 def pareto_points(observations):
     scores = np.array([e['output'] for e in observations])
@@ -365,17 +367,17 @@ class Protein:
             sweep_config,
             max_suggestion_cost = 3600,
             resample_frequency = 0,
-            num_random_samples = 50,
+            num_random_samples = None,
             global_search_scale = 1,
-            random_suggestions = 1024,
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
             expansion_rate = 0.25,
             gp_training_iter = 100,
             gp_learning_rate = 0.00046,  # got from a simple LR sweep
-            gp_max_obs = 700,  # gp train time jumps after 800
+            gp_max_obs = 750,  # gp train time jumps after 800
             infer_batch_size = 4096,            
             use_gpu=True,
+            cost_param="train/total_timesteps"
         ):
         
         # NOTE: Check if this interfere with training. I put this to make gpytorch work with gpu
@@ -383,9 +385,7 @@ class Protein:
 
         self.device = torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
-        self.num_random_samples = num_random_samples
         self.global_search_scale = global_search_scale
-        self.random_suggestions = random_suggestions
         self.suggestions_per_pareto = suggestions_per_pareto
         self.seed_with_search_center = seed_with_search_center
         self.resample_frequency = resample_frequency
@@ -402,6 +402,9 @@ class Protein:
 
         # Use Sobel seq for structured random exploration
         self.sobol = Sobol(d=self.hyperparameters.num, scramble=True)
+        self.num_random_samples = num_random_samples or (3 * self.hyperparameters.num)
+        self.cost_param_idx = self.hyperparameters.get_flat_idx(cost_param)
+        self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
 
         # Params taken from HEBO: https://arxiv.org/abs/2012.03826
         noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
@@ -469,35 +472,39 @@ class Protein:
         params_tensor = self.gp_params_buffer[:num_sampled]
         params_tensor.copy_(torch.from_numpy(params))
 
-        # Train the score model using normalized scores
+        # Normalized scores and costs
         y = np.array([e['output'] for e in sampled_observations])
         y_norm = (y - self.min_score) / (np.abs(self.max_score - self.min_score) + EPSILON)
         y_norm_tensor = self.gp_score_buffer[:num_sampled]
         y_norm_tensor.copy_(torch.from_numpy(y_norm))
-        score_loss = train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
 
-        # Train the cost gp using normalized log costs
         c = np.array([e['cost'] for e in sampled_observations])
         log_c = np.log(np.maximum(c, EPSILON)) # Ensure log is not taken on zero
         log_c_norm = (log_c - self.log_c_min) / (self.log_c_max - self.log_c_min + EPSILON)
         log_c_norm_tensor = self.gp_cost_buffer[:num_sampled]
         log_c_norm_tensor.copy_(torch.from_numpy(log_c_norm))
-        cost_loss = train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", gpytorch.utils.warnings.NumericalWarning)
+            score_loss = train_gp_model(self.gp_score, self.likelihood_score, self.mll_score, self.score_opt, params_tensor, y_norm_tensor, training_iter=self.gp_training_iter)
+            cost_loss = train_gp_model(self.gp_cost, self.likelihood_cost, self.mll_cost, self.cost_opt, params_tensor, log_c_norm_tensor, training_iter=self.gp_training_iter)
 
         return score_loss, cost_loss
 
     def suggest(self, fill):
-        # TODO: Clip random samples to bounds so we don't get bad high cost samples
         info = {}
         self.suggestion_idx += 1
         if len(self.success_observations) == 0 and self.seed_with_search_center:
             suggestion = self.hyperparameters.search_centers
             return self.hyperparameters.to_dict(suggestion, fill), info
+
         elif len(self.success_observations) < self.num_random_samples:
             # Suggest the next point in the Sobol sequence
-            suggestion = self.sobol.random(1)[0]
-            self.suggestion = 2 * suggestion - 1  # Scale from [0, 1) to [-1, 1)
-            return self.hyperparameters.to_dict(self.suggestion, fill), info
+            zero_one = self.sobol.random(1)[0]
+            suggestion = 2*zero_one - 1  # Scale from [0, 1) to [-1, 1)
+            suggestion[self.cost_param_idx] = self.cost_random_suggestion  # limit the cost
+            return self.hyperparameters.to_dict(suggestion, fill), info
+
         elif self.resample_frequency and self.suggestion_idx % self.resample_frequency == 0:
             candidates, _ = pareto_points(self.success_observations)
             suggestions = np.stack([e['input'] for e in candidates])
