@@ -178,6 +178,9 @@ def visualize_results(results_file):
     # Unpack nested metric dictionaries
     flat_results = []
     for res in results:
+        if not ("score_metrics" in res or res["success"]):
+            continue
+
         flat_res = {
             "gp_iter": res["gp_iter"],
             "gp_lr": res["gp_lr"],
@@ -285,7 +288,6 @@ if __name__ == "__main__":
         "--input-file",
         type=str,
         default="sweep_observations.pkl",
-        # default="sweep_obs_breakout_oct14.pkl",
         help="Path to the input sweep observations pickle file.",
     )
     parser.add_argument(

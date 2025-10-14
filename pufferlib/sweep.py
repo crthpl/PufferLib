@@ -403,13 +403,13 @@ class Protein:
             sweep_config,
             max_suggestion_cost = 3600,
             resample_frequency = 0,
-            num_random_samples = None,
+            num_random_samples = 50,
             global_search_scale = 1,
             suggestions_per_pareto = 256,
             seed_with_search_center = True,
             expansion_rate = 0.25,
-            gp_training_iter = 100,
-            gp_learning_rate = 0.00046,  # got from a simple LR sweep
+            gp_training_iter = 50,
+            gp_learning_rate = 0.001,
             gp_max_obs = 750,  # gp train time jumps after 800
             infer_batch_size = 4096,            
             use_gpu = True,
@@ -442,9 +442,13 @@ class Protein:
 
         # Use Sobel seq for structured random exploration
         self.sobol = Sobol(d=self.hyperparameters.num, scramble=True)
-        self.num_random_samples = num_random_samples or (3 * self.hyperparameters.num)
         self.cost_param_idx = self.hyperparameters.get_flat_idx(cost_param)
         self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
+
+        self.num_random_samples = num_random_samples
+        # NOTE: see if sobol sampling really helps
+        # points_per_run = sweep_config['downsample']
+        # self.num_random_samples = 3 * points_per_run * self.hyperparameters.num
 
         # Params taken from HEBO: https://arxiv.org/abs/2012.03826
         noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
@@ -615,6 +619,7 @@ class Protein:
 
         score = gp_y_norm
         # Favor high-score and hign-uncertainty candidates for efficient exploration
+        # NOTE: Score GP has large errors, so check the magnitude before setting ucb_beta
         if self.ucb_beta is not None:
             score += self.ucb_beta * gp_y_std_norm
 
