@@ -4,13 +4,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+#include "cJSON.h"
 #include "raylib.h"
-#include "rlgl.h"
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
 
-#include "cJSON.h"
+#if defined(PLATFORM_DESKTOP) || defined(PLATFORM_DESKTOP_SDL)
+    #if defined(GRAPHICS_API_OPENGL_ES2)
+        #include "glad_gles2.h"       // Required for: OpenGL functionality
+        #define glGenVertexArrays glGenVertexArraysOES
+        #define glBindVertexArray glBindVertexArrayOES
+        #define glDeleteVertexArrays glDeleteVertexArraysOES
+        #define GLSL_VERSION            100
+    #else
+        #if defined(__APPLE__)
+            #define GL_SILENCE_DEPRECATION // Silence Opengl API deprecation warnings
+            #include <OpenGL/gl3.h>     // OpenGL 3 library for OSX
+            #include <OpenGL/gl3ext.h>  // OpenGL 3 extensions library for OSX
+        #else
+            #include "glad.h"       // Required for: OpenGL functionality
+        #endif
+        #define GLSL_VERSION            330
+    #endif
+#else   // PLATFORM_ANDROID, PLATFORM_WEB
+    #define GLSL_VERSION            100
+#endif
+
+#include "rlgl.h"
+#include "raymath.h"
 
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
@@ -24,6 +47,23 @@ Color COLORS[] = {
 };
 
 const float EMPTY = -4242.0f;
+
+#define MAX_PARTICLES       1000
+
+typedef struct Particle {
+    float x;
+    float y;
+    float period;
+    float r;
+    float g;
+    float b;
+    float a;
+} Particle;
+
+typedef struct VertexBuffer {
+    float* vertices;
+    int n;
+} VertexBuffer;
 
 #define SEP 4
 #define SETTINGS_HEIGHT 20
@@ -89,6 +129,7 @@ typedef struct PlotArgs {
     int tick_length;
     int x_margin;
     int y_margin;
+    int tick_margin;
     Color font_color;
     Color background_color;
     Color axis_color;
@@ -114,6 +155,7 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .legend_font_size = 12,
     .line_width = 2,
     .tick_length = 8,
+    .tick_margin = 8,
     .x_margin = 100,
     .y_margin = 70,
     .font_color = PUFF_WHITE,
@@ -123,6 +165,16 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .y_label = "Score",
     .z_label = "Train/Learning Rate",
 };
+
+float signed_log10(float x) {
+    if (fabs(x) < 1e-8) {
+        return -8.0f;
+    }
+    if (x > 0) {
+        return log10(x);
+    }
+    return -log10(-x);
+}
 
 const char* format_tick_label(double value) {
     static char buffer[32];
@@ -188,14 +240,14 @@ void draw_axes(PlotArgs args) {
 
     // Autofit number of ticks
     Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
-    int num_x_ticks = (width - 2*args.x_margin)/tick_label_size.x;
-    int num_y_ticks = (height - 2*args.y_margin)/tick_label_size.x;
+    int num_x_ticks = 1 + (width - 2*args.x_margin)/tick_label_size.x;
+    int num_y_ticks = 1 + (height - 2*args.y_margin)/tick_label_size.y;
 
     // X ticks
     for (int i=0; i<num_x_ticks; i++) {
-        float val = args.x_min + i*(args.x_max - args.x_min)/(float)num_x_ticks;
+        float val = args.x_min + i*(args.x_max - args.x_min)/(num_x_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/num_x_ticks;
+        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/(num_x_ticks - 1.0f);
         DrawLine(
             x_pos,
             height - args.y_margin - args.tick_length,
@@ -210,7 +262,7 @@ void draw_axes(PlotArgs args) {
             label,
             (Vector2){
                 x_pos - this_tick_size.x/2,
-                height - args.y_margin + args.tick_length,
+                height - args.y_margin + args.tick_length + args.tick_margin,
             },
             args.axis_tick_font_size,
             0,
@@ -220,9 +272,9 @@ void draw_axes(PlotArgs args) {
 
     // Y ticks
     for (int i=0; i<num_y_ticks; i++) {
-        float val = args.y_min + i*(args.y_max - args.y_min)/(float)num_y_ticks;
+        float val = args.y_min + i*(args.y_max - args.y_min)/(num_y_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/num_y_ticks;
+        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/(num_y_ticks - 1.0f);
         DrawLine(
             args.x_margin - args.tick_length,
             y_pos,
@@ -235,8 +287,8 @@ void draw_axes(PlotArgs args) {
             args.font_small,
             label,
             (Vector2){
-                args.x_margin - this_tick_size.x - args.tick_length,
-                y_pos,
+                args.x_margin - this_tick_size.x - args.tick_length - args.tick_margin,
+                y_pos - this_tick_size.y/2,
             },
             args.axis_tick_font_size,
             0,
@@ -288,14 +340,13 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
 
     // Autofit number of ticks
     Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
-    int num_x_ticks = (width - 2*args.x_margin)/tick_label_size.x;
-    int num_y_ticks = (height - 2*args.y_margin)/tick_label_size.x;
+    int num_x_ticks = 1.0f + (width - 2*args.x_margin)/tick_label_size.x;
 
     // X ticks
     for (int i=0; i<num_x_ticks; i++) {
-        float val = args.x_min + i*(args.x_max - args.x_min)/(float)num_x_ticks;
+        float val = args.x_min + i*(args.x_max - args.x_min)/(num_x_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/num_x_ticks;
+        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/(num_x_ticks - 1.0f);
         DrawLine(
             x_pos,
             height - args.y_margin - args.tick_length,
@@ -310,7 +361,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             label,
             (Vector2){
                 x_pos - this_tick_size.x/2,
-                height - args.y_margin + args.tick_length,
+                height - args.y_margin + args.tick_length + args.tick_margin,
             },
             args.axis_tick_font_size,
             0,
@@ -321,7 +372,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
     // Y ticks
     for (int i=0; i<hyper_count; i++) {
         char* label = hypers[i];
-        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/hyper_count;
+        float y_pos = height - args.y_margin - (i + 0.5f)*(height - 2*args.y_margin)/hyper_count;
         DrawLine(
             args.x_margin - args.tick_length,
             y_pos,
@@ -334,8 +385,8 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             args.font_small,
             label,
             (Vector2){
-                args.x_margin - this_tick_size.x - args.tick_length,
-                y_pos,
+                args.x_margin - this_tick_size.x - args.tick_length - args.tick_margin,
+                y_pos - this_tick_size.y/2,
             },
             args.axis_tick_font_size,
             0,
@@ -358,6 +409,11 @@ void draw_axes3(PlotArgs args, bool log_x, bool log_y, bool log_z) {
     float x = log_x ? log10(args.x_min) : args.x_min;
     float y = log_y ? log10(args.y_min) : args.y_min;
     float z = log_z ? log10(args.z_min) : args.z_min;
+
+    x = 0.0f;
+    y = 0.0f;
+    z = 0.0f;
+    extent = 1.0f;
 
     DrawLine3D(
         (Vector3){x, y, z},
@@ -415,33 +471,7 @@ float hyper_max(Dataset *data, char* key, int start, int end) {
 }
 
 
-/*
-float hyper_max(Hyper *hyper) {
-    float max = hyper->ary[0];
-    for (int i=1; i<hyper->n; i++) {
-        if (hyper->ary[i] > max) max = hyper->ary[i];
-    }
-    return max;
-}
-
-float ary_min(float* ary, int num) {
-    float min = ary[0];
-    for (int i=1; i<num; i++) {
-        if (ary[i] < min) min = ary[i];
-    }
-    return min;
-}
-float ary_max(float* ary, int num) {
-    float max = ary[0];
-    for (int i=1; i<num; i++) {
-        if (ary[i] > max) max = ary[i];
-    }
-    return max;
-}
-
-*/
-
-void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_count, PlotArgs args, Color color, float* filter) {
+void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
     int width = args.width;
     int height = args.height;
 
@@ -461,30 +491,140 @@ void boxplot(Dataset* data, bool log_x, char* env, char* hyper_key[], int hyper_
 
     Color faded = Fade(color, 0.15f);
 
-    for (int i=0; i<hyper_count; i++) {
-        Hyper* hyper = get_hyper(data, env, hyper_key[i]);
-        float* ary = hyper->ary;
-        float mmin = ary[0];
-        float mmax = ary[0];
-        for (int j=0; j<hyper->n; j++) {
-            if (filter != NULL && !filter[j]) {
-                continue;
-            }
-            mmin = fmin(mmin, ary[j]);
-            mmax = fmax(mmax, ary[j]);
+    float* ary = hyper->ary;
+    float mmin = ary[0];
+    float mmax = ary[0];
+    for (int j=0; j<hyper->n; j++) {
+        if (filter != NULL && !filter[j]) {
+            continue;
         }
-
-        if (log_x) {
-            mmin = mmin <= 0 ? 0 : log10(mmin);
-            mmax = mmax <= 0 ? 0 : log10(mmax);
-        }
-
-        float left = args.x_margin + (mmin - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-        float right = args.x_margin + (mmax - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-        DrawRectangle(left, args.y_margin + i*dy, right - left, dy, faded);
+        mmin = fmin(mmin, ary[j]);
+        mmax = fmax(mmax, ary[j]);
     }
+
+    if (log_x) {
+        mmin = mmin <= 0 ? 0 : log10(mmin);
+        mmax = mmax <= 0 ? 0 : log10(mmax);
+    }
+
+    float left = args.x_margin + (mmin - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+    float right = args.x_margin + (mmax - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+
+    // TODO - rough patch
+    left = fmax(left, args.x_margin);
+    right = fmin(right, width - args.x_margin);
+    DrawRectangle(left, args.y_margin + i*dy, right - left, dy, faded);
 }
 
+// Struct for vertex data (screen-space position and color)
+typedef struct {
+    Vector2 pos; // Screen-space x, y
+    Color color; // RGBA color
+} PlotVertex;
+
+void plot_gl(Shader shader, VertexBuffer vertices) {
+    Particle* particles = vertices.vertices;
+    int n = vertices.n;
+
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, n*sizeof(Particle), particles, GL_STATIC_DRAW);
+        glVertexAttribPointer(shader.locs[SHADER_LOC_VERTEX_POSITION], 3, GL_FLOAT, GL_FALSE, sizeof(Particle), 0);
+        glEnableVertexAttribArray(shader.locs[SHADER_LOC_VERTEX_POSITION]);
+        int vertexColorLoc = shader.locs[SHADER_LOC_VERTEX_COLOR];
+        glVertexAttribPointer(vertexColorLoc, 4, GL_FLOAT, GL_FALSE, sizeof(Particle), (void*)(3*sizeof(float)));
+        glEnableVertexAttribArray(vertexColorLoc);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+
+
+    rlDrawRenderBatchActive();      // Draw iternal buffers data (previous draw calls)
+
+    int currentTimeLoc = GetShaderLocation(shader, "currentTime");
+    // Switch to plain OpenGL
+    //------------------------------------------------------------------------------
+    glUseProgram(shader.id);
+
+        glUniform1f(currentTimeLoc, GetTime());
+
+        // Get the current modelview and projection matrix so the particle system is displayed and transformed
+        Matrix modelViewProjection = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+
+        glUniformMatrix4fv(shader.locs[SHADER_LOC_MATRIX_MVP], 1, false, MatrixToFloat(modelViewProjection));
+
+        glBindVertexArray(vao);
+            glDrawArrays(GL_POINTS, 0, n);
+        glBindVertexArray(0);
+
+    glUseProgram(0);
+    //------------------------------------------------------------------------------
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+}
+
+void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
+    assert(x->n == y->n);
+
+    int width = args.width;
+    int height = args.height;
+
+    // Compute ranges and apply log scaling if needed
+    //float x_min = log_x ? log10f(args.x_min) : args.x_min;
+    //float x_max = log_x ? log10f(args.x_max) : args.x_max;
+    //float y_min = log_y ? log10f(args.y_min) : args.y_min;
+    //float y_max = log_y ? log10f(args.y_max) : args.y_max;
+    float x_min = args.x_min;
+    float x_max = args.x_max;
+    float y_min = args.y_min;
+    float y_max = args.y_max;
+
+    float dx = x_max - x_min;
+    float dy = y_max - y_min;
+
+    // Count valid points after filtering
+    int valid_count = 0;
+    for (int i = 0; i < x->n; i++) {
+        if (filter == NULL || filter[i]) valid_count++;
+    }
+
+    if (valid_count == 0) return; // Early exit if no points
+
+    // Allocate vertex array
+    PlotVertex* vertices = (PlotVertex*)malloc(valid_count * sizeof(PlotVertex));
+    int idx = 0;
+
+    // Preprocess points: transform and map to screen space
+    Particle particles[MAX_PARTICLES] = { 0 };
+    for (int i = 0; i < x->n; i++) {
+        if (filter != NULL && !filter[i]) continue;
+
+        // Apply log scaling
+        float xi = log_x ? log10f(x->ary[i]) : x->ary[i];
+        float yi = log_y ? log10f(y->ary[i]) : y->ary[i];
+
+        // Map to screen coordinates with margins
+        xi = args.x_margin + (xi - x_min) / dx * (width - 2 * args.x_margin);
+        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2 * args.y_margin);
+
+        particles[i].x = xi;
+        particles[i].y = yi;
+        particles[i].period = 10.0f;
+        Color c = rgb(cmap[i]);
+        particles[i].r = c.r/255.0f;
+        particles[i].g = c.g/255.0f;
+        particles[i].b = c.b/255.0f;
+        particles[i].a = c.a/255.0f;
+        idx++;
+    }
+
+    VertexBuffer buffer = {&particles, MAX_PARTICLES};
+    plot_gl(shader, buffer);
+}
+/*
 void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
     assert(x->n == y->n);
 
@@ -506,19 +646,15 @@ void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap
         float yi = log_y ? log10(y->ary[i]) : y->ary[i];
         xi = args.x_margin + (xi - x_min) / dx * (width - 2*args.x_margin);
         yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2*args.y_margin);
-        if (xi < args.x_margin) {
-            int s = 2;
-        }
         Color c = rgb(cmap[i]);
         DrawCircle(xi, yi, args.line_width, c);
     }
 }
+*/
 
-void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, PlotArgs args, float* cmap, bool* filter) {
+void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
+        bool log_x, bool log_y, bool log_z, PlotArgs args, float* cmap, bool* filter) {
     assert(x->n == y->n  && x->n == z->n);
-    int width = args.width;
-    int height = args.height;
-
     float x_min = args.x_min;
     float x_max = args.x_max;
     float y_min = args.y_min;
@@ -526,31 +662,69 @@ void plot3(Hyper* x, Hyper* y, Hyper* z, bool log_x, bool log_y, bool log_z, Plo
     float z_min = args.z_min;
     float z_max = args.z_max;
 
+    if (log_x) {
+        x_min = signed_log10(x_min);
+        x_max = signed_log10(x_max);
+    }
+    if (log_y) {
+        y_min = signed_log10(y_min);
+        y_max = signed_log10(y_max);
+    }
+    if (log_z) {
+        z_min = signed_log10(z_min);
+        z_max = signed_log10(z_max);
+    }
+
     float dx = x_max - x_min;
     float dy = y_max - y_min;
     float dz = z_max - z_min;
-    if (dx == 0) dx = 1.0f;
-    if (dy == 0) dy = 1.0f;
-    if (dz == 0) dz = 1.0f;
-    x_min -= 0.1f * dx; x_max += 0.1f * dx;
-    y_min -= 0.1f * dy; y_max += 0.1f * dy;
-    z_min -= 0.1f * dz; z_max += 0.1f * dz;
-    dx = x_max - x_min;
-    dy = y_max - y_min;
-    dz = z_max - z_min;
 
-
+    Particle particles[MAX_PARTICLES] = { 0 };
+    int idx = 0;
     // Plot lines
     for (int i = 0; i < x->n; i++) {
         if (filter != NULL && !filter[i]) {
             continue;
         }
-        float xi = (log_x) ? log10(x->ary[i]) : x->ary[i];
-        float yi = (log_y) ? log10(y->ary[i]) : y->ary[i];
-        float zi = (log_z) ? log10(z->ary[i]) : z->ary[i];
+        float xi = (log_x) ? signed_log10(x->ary[i]) : x->ary[i];
+        float yi = (log_y) ? signed_log10(y->ary[i]) : y->ary[i];
+        float zi = (log_z) ? signed_log10(z->ary[i]) : z->ary[i];
+
         Color c = rgb(cmap[i]);
-        DrawCube((Vector3){xi, yi, zi}, 0.02f, 0.02f, 0.02f, c);
+        Vector3 point = (Vector3){(xi - x_min)/dx, (yi - y_min)/dy, (zi - z_min)/dz};
+
+        /*
+        DrawCube(
+            (Vector3){(xi - x_min)/dx, (yi - y_min)/dy, (zi - z_min)/dz},
+            0.02f, 0.02f, 0.02f, c
+        );
+
+        DrawSphere(
+            (Vector3){(xi - x_min)/dx, (yi - y_min)/dy, (zi - z_min)/dz},
+            0.02f, c
+        );
+        */
+
+        // Project to screen space
+        Vector2 screen_pos = GetWorldToScreenEx(point, camera, 960, 520);
+ 
+        particles[i].x = screen_pos.x;
+        particles[i].y = screen_pos.y;
+        particles[i].period = 10.0f;
+        c = rgb(cmap[i]);
+        particles[i].r = c.r/255.0f;
+        particles[i].g = c.g/255.0f;
+        particles[i].b = c.b/255.0f;
+        particles[i].a = c.a/255.0f;
+        idx++;
+
+        //DrawBillboard(camera, whiteTexture, point, 0.1f, c);
+
     }
+    VertexBuffer buffer = {&particles, idx};
+    plot_gl(shader, buffer);
+
+
 }
 
 
@@ -595,23 +769,13 @@ void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdo
  
 
 
-void apply_filter(float* filter, Hyper* param, float min, float max) {
+void apply_filter(bool* filter, Hyper* param, float min, float max) {
     for (int i=0; i<param->n; i++) {
         float val = param->ary[i];
         if (val < min || val > max) {
-            filter[i] = 0.0f;
+            filter[i] = false;
         }
     }
-}
-
-float signed_log10(float x) {
-    if (fabs(x) < 1e-8) {
-        return -8.0f;
-    }
-    if (x > 0) {
-        return log10(x);
-    }
-    return -log10(-x);
 }
 
 void calc_cmap(float* cmap, Hyper* param, float c_min, float c_max, bool log) {
@@ -703,10 +867,32 @@ int main(void) {
         }
     }
 
-    int hyper_count = 9;
-    char *hyper_key[9] = {
-        "agent_steps", "cost", "environment/perf", "environment/score",
-        "train/learning_rate", "train/gamma", "train/gae_lambda", "train/ent_coef", "train/vf_coef"
+    int hyper_count = 24;
+    char *hyper_key[24] = {
+        "agent_steps",
+        "cost",
+        "environment/perf",
+        "environment/score",
+        "train/learning_rate",
+        "train/ent_coef",
+        "train/gamma",
+        "train/gae_lambda",
+        "train/vtrace_rho_clip",
+        "train/vtrace_c_clip",
+        "train/clip_coef",
+        "train/vf_clip_coef",
+        "train/vf_coef",
+        "train/max_grad_norm",
+        "train/adam_beta1",
+        "train/adam_beta2",
+        "train/adam_eps",
+        "train/prio_alpha",
+        "train/prio_beta0",
+        "train/bptt_horizon",
+        "train/num_minibatches",
+        "train/minibatch_size",
+        "policy/hidden_size",
+        "env/num_envs",
     };
 
     //char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
@@ -749,12 +935,20 @@ int main(void) {
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
+    Shader shader = LoadShader(TextFormat("pufferlib/ocean/constellation/point_particle.vs", GLSL_VERSION),
+                               TextFormat("pufferlib/ocean/constellation/point_particle.fs", GLSL_VERSION));
+
+    // Allows the vertex shader to set the point size of each particle individually
+    #ifndef GRAPHICS_API_OPENGL_ES2
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    #endif
+
     DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
 
     Camera3D camera = (Camera3D){ 0 };
-    camera.position = (Vector3){ 5.0f, 2.0f, 5.0f };
-    camera.target = (Vector3){ 0.0f, 0.0f, 0.0f };
+    camera.position = (Vector3){ 2.0f, 2.0f, 2.0f };
+    camera.target = (Vector3){ 0.5f, 0.5f, 0.5f };
     camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
@@ -807,8 +1001,6 @@ int main(void) {
 
     PlotArgs args4 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig4 = LoadRenderTexture(args4.width, args4.height);
-    float *box_mmin = malloc(hyper_count * sizeof(float));
-    float *box_mmax = malloc(hyper_count * sizeof(float));
     bool fig4_x_log = true;
     bool fig4_range1_active = false;
     int fig4_range1_idx = 2;
@@ -826,12 +1018,11 @@ int main(void) {
     Hyper* x;
     Hyper* y;
     Hyper* z;
-    int num_points;
     char* x_label;
     char* y_label;
     char* z_label;
 
-    float *filter = calloc(max_data_points, sizeof(float));
+    bool *filter = calloc(max_data_points, sizeof(bool));
     float *cmap = calloc(max_data_points, sizeof(float));
 
     Vector2 focus = {0, 0};
@@ -850,29 +1041,27 @@ int main(void) {
         args1.x_label = x_label;
         args1.y_label = y_label;
         args1.z_label = z_label;
-        args1.x_min = hyper_min(&data, hyper_key[fig1_x_idx], 0, data.n);
-        args1.x_max = hyper_max(&data, hyper_key[fig1_x_idx], 0, data.n);
-        args1.y_min = hyper_min(&data, hyper_key[fig1_y_idx], 0, data.n);
-        args1.y_max = hyper_max(&data, hyper_key[fig1_y_idx], 0, data.n);
-        args1.z_min = hyper_min(&data, hyper_key[fig1_z_idx], 0, data.n);
-        args1.z_max = hyper_max(&data, hyper_key[fig1_z_idx], 0, data.n);
-        float x_mid = fig1_x_log ? (log10(args1.x_max) + log10(args1.x_min))/2.0f : (args1.x_max + args1.x_min)/2.0f;
-        float y_mid = fig1_y_log ? (log10(args1.y_max) + log10(args1.y_min))/2.0f : (args1.y_max + args1.y_min)/2.0f;
-        float z_mid = fig1_z_log ? (log10(args1.z_max) + log10(args1.z_min))/2.0f : (args1.z_max + args1.z_min)/2.0f;
-        camera.target = (Vector3){x_mid, y_mid, z_mid};
-        BeginTextureMode(fig1);
-        ClearBackground(PUFF_BACKGROUND);
-        BeginMode3D(camera);
-        UpdateCamera(&camera, CAMERA_ORBITAL);
-
         int start = 0;
         int end = data.n;
         float c_min = 0.0f;
         float c_max = 1.0f;
         if (fig1_env_idx != 0) {
-            start = fig1_env_idx;
-            end = fig1_env_idx + 1;
+            start = fig1_env_idx - 1;
+            end = fig1_env_idx;
         }
+        args1.x_min = hyper_min(&data, hyper_key[fig1_x_idx], start, end);
+        args1.x_max = hyper_max(&data, hyper_key[fig1_x_idx], start, end);
+        args1.y_min = hyper_min(&data, hyper_key[fig1_y_idx], start, end);
+        args1.y_max = hyper_max(&data, hyper_key[fig1_y_idx], start, end);
+        args1.z_min = hyper_min(&data, hyper_key[fig1_z_idx], start, end);
+        args1.z_max = hyper_max(&data, hyper_key[fig1_z_idx], start, end);
+        float x_mid = fig1_x_log ? (log10(args1.x_max) + log10(args1.x_min))/2.0f : (args1.x_max + args1.x_min)/2.0f;
+        float y_mid = fig1_y_log ? (log10(args1.y_max) + log10(args1.y_min))/2.0f : (args1.y_max + args1.y_min)/2.0f;
+        float z_mid = fig1_z_log ? (log10(args1.z_max) + log10(args1.z_min))/2.0f : (args1.z_max + args1.z_min)/2.0f;
+        //camera.target = (Vector3){x_mid, y_mid, z_mid};
+        BeginTextureMode(fig1);
+        ClearBackground(PUFF_BACKGROUND);
+
         if (fig1_color_idx != 0) {
             c_min = hyper_min(&data, hyper_key[fig1_color_idx - 1], start, end);
             c_max = hyper_max(&data, hyper_key[fig1_color_idx - 1], start, end);
@@ -892,8 +1081,16 @@ int main(void) {
                     cmap[j] = i/(float)data.n;
                 }
             }
-            plot3(x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
+            //rlSetBlendMode(RL_BLEND_ADDITIVE);
+            //BeginShaderMode(shader);
+            plot3(camera, shader, x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
+            //EndShaderMode();
+            //rlSetBlendMode(RL_BLEND_ALPHA);
         }
+        BeginMode3D(camera);
+        UpdateCamera(&camera, CAMERA_ORBITAL);
+
+
         draw_axes3(args1, fig1_x_log, fig1_y_log, fig1_z_log);
         EndMode3D();
         EndTextureMode();
@@ -917,14 +1114,6 @@ int main(void) {
         y_label = hyper_key[fig2_y_idx];
         args2.x_label = x_label;
         args2.y_label = y_label;
-        args2.x_min = hyper_min(&data, hyper_key[fig2_x_idx], 0, data.n);
-        args2.x_max = hyper_max(&data, hyper_key[fig2_x_idx], 0, data.n);
-        args2.y_min = hyper_min(&data, hyper_key[fig2_y_idx], 0, data.n);
-        args2.y_max = hyper_max(&data, hyper_key[fig2_y_idx], 0, data.n);
-        args2.x_min = (fig2_x_log) ? log10(args2.x_min) : args2.x_min;
-        args2.x_max = (fig2_x_log) ? log10(args2.x_max) : args2.x_max;
-        args2.y_min = (fig2_y_log) ? log10(args2.y_min) : args2.y_min;
-        args2.y_max = (fig2_y_log) ? log10(args2.y_max) : args2.y_max;
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
 
@@ -933,15 +1122,28 @@ int main(void) {
         c_min = 0.0f;
         c_max = 1.0f;
         if (fig2_env_idx != 0) {
-            start = fig2_env_idx;
-            end = fig2_env_idx + 1;
+            start = fig2_env_idx - 1;
+            end = fig2_env_idx;
         }
+
+        args2.x_min = hyper_min(&data, hyper_key[fig2_x_idx], start, end);
+        args2.x_max = hyper_max(&data, hyper_key[fig2_x_idx], start, end);
+        args2.y_min = hyper_min(&data, hyper_key[fig2_y_idx], start, end);
+        args2.y_max = hyper_max(&data, hyper_key[fig2_y_idx], start, end);
+        args2.x_min = (fig2_x_log) ? log10(args2.x_min) : args2.x_min;
+        args2.x_max = (fig2_x_log) ? log10(args2.x_max) : args2.x_max;
+        args2.y_min = (fig2_y_log) ? log10(args2.y_min) : args2.y_min;
+        args2.y_max = (fig2_y_log) ? log10(args2.y_max) : args2.y_max;
+ 
         if (fig2_color_idx != 0) {
             c_min = hyper_min(&data, hyper_key[fig2_color_idx - 1], start, end);
             c_max = hyper_max(&data, hyper_key[fig2_color_idx - 1], start, end);
         }
         memset(cmap, 0.0f, data.n * sizeof(float));
         color_param = NULL;
+
+        //rlSetBlendMode(RL_BLEND_ADDITIVE);
+        //BeginShaderMode(shader);
         for (int i=start; i<end; i++) {
             char* env = data.envs[i].key;
             x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
@@ -954,8 +1156,11 @@ int main(void) {
                     cmap[j] = i/(float)data.n;
                 }
             }
-            plot(x, y, fig2_x_log, fig2_y_log, args2, cmap, NULL);
+            plot(shader, x, y, fig2_x_log, fig2_y_log, args2, cmap, NULL);
         }
+        //EndShaderMode();
+        //rlSetBlendMode(RL_BLEND_ALPHA);
+
         draw_axes(args2);
         EndTextureMode();
         DrawTextureRec(
@@ -990,13 +1195,13 @@ int main(void) {
                 cmap[j] = i/(float)data.n;
             }
             for (int j=0; j<x->n; j++) {
-                filter[j] = 1.0f;
+                filter[j] = true;
             }
             Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig3_range1_idx]);
             apply_filter(filter, filter_param_1, fig3_range1_min_val, fig3_range1_max_val);
             Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig3_range2_idx]);
             apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
-            plot(x, y, false, false, args3, cmap, filter);
+            plot(shader, x, y, false, false, args3, cmap, filter);
         }
         draw_axes(args3);
         EndTextureMode();
@@ -1021,11 +1226,18 @@ int main(void) {
         rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         for (int i=0; i<data.n; i++) {
-            //Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig3_range1_idx]);
-            //apply_filter(filter, filter_param_1, fig3_range1_min_val, fig3_range1_max_val);
-            //Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig3_range2_idx]);
-            //apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
-            boxplot(&data, fig4_x_log, data.envs[i].key, hyper_key, hyper_count, args4, PUFF_CYAN, filter);
+            Env* env = &data.envs[i];
+            Hyper* filter_param_1 = get_hyper(&data, env->key, hyper_key[fig4_range1_idx]);
+            Hyper* filter_param_2 = get_hyper(&data, env->key, hyper_key[fig4_range2_idx]);
+            for (int j=0; j<hyper_count; j++) {
+                Hyper* hyper = get_hyper(&data, env->key, hyper_key[j]);
+                for (int k=0; k<hyper->n; k++) {
+                    filter[k] = true;
+                }
+                apply_filter(filter, filter_param_1, fig4_range1_min_val, fig4_range1_max_val);
+                apply_filter(filter, filter_param_2, fig4_range2_min_val, fig4_range2_max_val);
+                boxplot(hyper, fig4_x_log, j, hyper_count, args4, PUFF_CYAN, filter);
+            }
         }
         EndBlendMode();
         draw_box_axes(hyper_key, hyper_count, args4);
@@ -1044,6 +1256,7 @@ int main(void) {
         EndDrawing();
     }
 
+    UnloadShader(shader);
     CloseWindow();
     return 0;
 }
