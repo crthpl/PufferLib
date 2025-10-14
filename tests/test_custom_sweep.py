@@ -17,7 +17,7 @@ def sweep(env_name, args):
     obs_file = f"sweep_observations_{env_name}_{timestamp}.pkl"
     print(f"Sweep observations will be saved to: {obs_file}")
 
-    sweep_manager = Protein(args["sweep"])
+    sweep_manager = Protein(args["sweep"], **args["sweep_extra"])
     points_per_run = args["sweep"]["downsample"]
     target_key = f"environment/{args['sweep']['metric']}"
 
@@ -96,7 +96,7 @@ def sweep(env_name, args):
 if __name__ == "__main__":
     import sys
 
-    env_name = sys.argv.pop(1) if len(sys.argv) > 1 else "puffer_breakout"
+    env_name = sys.argv.pop(1) if len(sys.argv) > 1 else "puffer_pong"
 
     # parser = None
     parser = pufferl.make_parser()
@@ -109,18 +109,19 @@ if __name__ == "__main__":
 
     # Use wandb
     args["wandb"] = True
-    args["train"]["optimizer"] = "adam"
+    # args["train"]["optimizer"] = "adam"
 
     # Custom sweep args
+    args["sweep_extra"] = {}
     if args["gp_iter"] is not None:
-        args["sweep"]["gp_training_iter"] = args["gp_iter"]
+        args["sweep_extra"]["gp_training_iter"] = args["gp_iter"]
     if args["gp_lr"] is not None:
-        args["sweep"]["gp_learning_rate"] = args["gp_lr"]
+        args["sweep_extra"]["gp_learning_rate"] = args["gp_lr"]
     # if args["use_gpu"]:
     #     args["sweep"]["use_gpu"] = True
     if args["prune_pareto"]:
-        args["sweep"]["prune_pareto"] = True
+        args["sweep_extra"]["prune_pareto"] = args["prune_pareto"]
     if args["ucb_beta"] is not None:
-        args["sweep"]["ucb_beta"] = args["ucb_beta"]
+        args["sweep_extra"]["ucb_beta"] = args["ucb_beta"]
 
     sweep(env_name, args)
