@@ -686,6 +686,10 @@ class Protein:
                 self.success_observations[same[0]] = new_observation
                 return
 
+        # Ignore obs that are below the minimum cost
+        if params[self.cost_param_idx] <= -1:
+            return
+
         self.success_observations.append(new_observation)
 
 def _carbs_params_from_puffer_sweep(sweep_config):
