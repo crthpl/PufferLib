@@ -249,6 +249,8 @@ def pareto_points(observations):
     return pareto, pareto_idxs
 
 def prune_pareto_front(pareto, efficiency_threshold=0.5, pruning_stop_score_fraction=0.98):
+    # Prune the high-cost long tail of a pareto front
+    # like (score 0.99, cost 100), (score 0.991, cost 200)
     if not pareto or len(pareto) < 2:
         return pareto
 
@@ -385,6 +387,7 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
         optimizer.step()
 
         # TODO: Test early termination? requires tol and patience args
+        # The default iter is 50, so might not be needed
         # if best_loss - loss.item() > tol:
         #     best_loss = loss.item()
         #     patience_counter = 0
@@ -447,7 +450,7 @@ class Protein:
         self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
 
         self.num_random_samples = num_random_samples
-        # NOTE: see if sobol sampling really helps
+        # NOTE: test if sobol sampling really helps
         # points_per_run = sweep_config['downsample']
         # self.num_random_samples = 3 * points_per_run * self.hyperparameters.num
 
@@ -602,7 +605,8 @@ class Protein:
                 # Score prediction
                 pred_y = self.likelihood_score(self.gp_score(batch_tensor))
                 gp_y_norm_list.append(pred_y.mean.cpu())
-                gp_y_std_norm_list.append(pred_y.stddev.cpu())
+                # NOTE: stddev had a numerical issue.
+                # gp_y_std_norm_list.append(pred_y.stddev.cpu())
  
                 # Cost prediction
                 pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
@@ -610,7 +614,7 @@ class Protein:
 
         # Concatenate results from all batches
         gp_y_norm = torch.cat(gp_y_norm_list).numpy()
-        gp_y_std_norm = torch.cat(gp_y_std_norm_list).numpy()
+        # gp_y_std_norm = torch.cat(gp_y_std_norm_list).numpy()
         gp_log_c_norm = torch.cat(gp_log_c_norm_list).numpy()
 
         # Unlinearize
