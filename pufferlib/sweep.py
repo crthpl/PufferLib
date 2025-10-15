@@ -565,7 +565,8 @@ class Protein:
             # Suggest the next point in the Sobol sequence
             zero_one = self.sobol.random(1)[0]
             suggestion = 2*zero_one - 1  # Scale from [0, 1) to [-1, 1)
-            suggestion[self.cost_param_idx] = self.cost_random_suggestion  # limit the cost
+            cost_suggestion = self.cost_random_suggestion + 0.1 * np.random.randn()
+            suggestion[self.cost_param_idx] = np.clip(cost_suggestion, -1, 1)  # limit the cost
             return self.hyperparameters.to_dict(suggestion, fill), info
 
         elif self.resample_frequency and self.suggestion_idx % self.resample_frequency == 0:
