@@ -103,7 +103,7 @@ typedef struct VertexBuffer {
 #define SEP 4
 #define SETTINGS_HEIGHT 20
 #define TOGGLE_WIDTH 60
-#define DROPDOWN_WIDTH 120
+#define DROPDOWN_WIDTH 136
 #define BUCKETS 8
 
 typedef struct {
@@ -938,7 +938,13 @@ int main(void) {
 
     // Initialize Raylib
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
+
+    DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
+    DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
+    Font gui_font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 14, NULL, 255);
+
     GuiLoadStyle("pufferlib/ocean/constellation/puffer.rgs");
+    GuiSetFont(gui_font);
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
@@ -949,9 +955,6 @@ int main(void) {
     #ifndef GRAPHICS_API_OPENGL_ES2
     glEnable(GL_PROGRAM_POINT_SIZE);
     #endif
-
-    DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
-    DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
 
     Camera3D camera = (Camera3D){ 0 };
     camera.position = (Vector3){ 1.5f, 1.25f, 1.5f };
@@ -1282,7 +1285,7 @@ int main(void) {
         GuiDropdownCheckbox(fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, env_hyper_options, &fig2_color_idx, &fig2_color_active, "Log Color", &fig2_log_color);
 
 
-        DrawFPS(GetScreenWidth() - 95, 10);
+        //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
     }
 
