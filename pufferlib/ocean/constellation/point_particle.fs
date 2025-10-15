@@ -3,25 +3,23 @@
 in vec4 fragColor;
 out vec4 finalColor;
 
+
 void main()
 {
-vec2 uv = gl_PointCoord - vec2(0.5); // center to edge
-float dist = length(uv); // distance from center (0.0–0.707)
 
-// Optional: discard hard edge for exact circular point
-if (dist > 0.5)
+vec2 uv = gl_PointCoord - vec2(0.5);
+float dist = length(uv); // distance from center of point
+
+// Soft radial falloff (tightens with higher number)
+float falloff = exp(-20.0 * dist * dist);
+
+// Kill pixels too dark to be visible — avoids black ring
+if (falloff < 0.01)
     discard;
 
-// Smooth exponential falloff
-float glow = exp(-24.0 * dist * dist); // steeper falloff = tighter glow
+// Final color, scaled by falloff
+vec3 color = fragColor.rgb * falloff * 5.0;
+finalColor = vec4(color, falloff);
 
-// Bright, saturated core color
-vec3 color = fragColor.rgb * glow * 5.0;
-
-// Only output color if visible — remove black halo
-if (glow < 0.01)
-    discard;
-
-finalColor = vec4(color, 1.0);
 
 }
