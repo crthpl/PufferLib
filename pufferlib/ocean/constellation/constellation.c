@@ -36,7 +36,7 @@
 #include "rlgl.h"
 #include "raymath.h"
 
-#define CAMERA_ORBITAL_SPEED 0.1f
+#define CAMERA_ORBITAL_SPEED 0.025f
 #define CAMERA_MOUSE_MOVE_SENSITIVITY 0.005f
 #define CAMERA_MOVE_SPEED 5.4f
 #define CAMERA_ROTATION_SPEED 0.03f
@@ -71,18 +71,16 @@ void CustomUpdateCamera(Camera *camera, int mode)
     if (IsKeyPressed(KEY_KP_ADD)) CameraMoveToTarget(camera, -2.0f);
 }
 
+#define SETTINGS_HEIGHT 20
+#define TOGGLE_WIDTH 60
+#define DROPDOWN_WIDTH 136
+
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 const Color TRANSPARENT = (Color){0, 0, 0, 0};
 const Color CONSTELLATION = (Color){255, 255, 255, 128};
-
-Color COLORS[] = {
-    BLUE, MAROON, ORANGE, DARKGREEN, DARKBLUE, DARKPURPLE, DARKBROWN,
-    GRAY, RED, GOLD, LIME, VIOLET, LIGHTGRAY, PINK, YELLOW,
-    GREEN, SKYBLUE, PURPLE, BEIGE
-};
 
 const float EMPTY = -4242.0f;
 
@@ -102,12 +100,6 @@ typedef struct VertexBuffer {
     float* vertices;
     int n;
 } VertexBuffer;
-
-#define SEP 4
-#define SETTINGS_HEIGHT 20
-#define TOGGLE_WIDTH 60
-#define DROPDOWN_WIDTH 136
-#define BUCKETS 8
 
 typedef struct {
     char *key;
@@ -142,22 +134,8 @@ Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
     return NULL;
 }
 
-// TODO: Slow as fuck
-/*
 Color rgb(float h) {
-    float r = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f, 6.f) - 3.f) - 1.f));
-    float g = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f + 4.f, 6.f) - 3.f) - 1.f));
-    float b = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f + 2.f, 6.f) - 3.f) - 1.f));
-    //return (Color){255.f, 255.f, 255.f, 255};
-    return (Color){r * 255.f + .5f, g * 255.f + .5f, b * 255.f + .5f, 255};
-}
-*/
-
-Color rgb(float h) {
-    //return ColorFromHSV(180, h, 1.0);
-    h = 120.0f * (1.0 + h);
-    //return ColorFromHSV(h, 1.0, 1.0);
-    return ColorFromHSV(h, 0.8f, 0.15f);
+    return ColorFromHSV(120*(1.0 + h), 0.8f, 0.15f);
 }
 
 typedef struct PlotArgs {
@@ -546,12 +524,6 @@ void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Co
     DrawRectangle(left, args.top_margin + i*dy, right - left, dy, faded);
 }
 
-// Struct for vertex data (screen-space position and color)
-typedef struct {
-    Vector2 pos; // Screen-space x, y
-    Color color; // RGBA color
-} PlotVertex;
-
 void plot_gl(Shader shader, VertexBuffer vertices) {
     Particle* particles = vertices.vertices;
     int n = vertices.n;
@@ -576,25 +548,14 @@ void plot_gl(Shader shader, VertexBuffer vertices) {
     rlSetBlendMode(RL_BLEND_ADDITIVE);
 
     int currentTimeLoc = GetShaderLocation(shader, "currentTime");
-    //float time = GetTime();
-    //SetShaderValue(shader, currentTimeLoc, &time, SHADER_UNIFORM_FLOAT);
-    // Switch to plain OpenGL
-    //------------------------------------------------------------------------------
     glUseProgram(shader.id);
-
         glUniform1f(currentTimeLoc, GetTime());
-
-        // Get the current modelview and projection matrix so the particle system is displayed and transformed
         Matrix modelViewProjection = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
-
         glUniformMatrix4fv(shader.locs[SHADER_LOC_MATRIX_MVP], 1, false, MatrixToFloat(modelViewProjection));
-
         glBindVertexArray(vao);
             glDrawArrays(GL_POINTS, 0, n);
         glBindVertexArray(0);
-
     glUseProgram(0);
-    //------------------------------------------------------------------------------
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
     rlSetBlendMode(RL_BLEND_ALPHA);
@@ -610,10 +571,6 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
     float plot_height = height - args.top_margin - args.bottom_margin;
 
     // Compute ranges and apply log scaling if needed
-    //float x_min = log_x ? log10f(args.x_min) : args.x_min;
-    //float x_max = log_x ? log10f(args.x_max) : args.x_max;
-    //float y_min = log_y ? log10f(args.y_min) : args.y_min;
-    //float y_max = log_y ? log10f(args.y_max) : args.y_max;
     float x_min = args.x_min;
     float x_max = args.x_max;
     float y_min = args.y_min;
@@ -631,7 +588,6 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
     if (valid_count == 0) return; // Early exit if no points
 
     // Allocate vertex array
-    PlotVertex* vertices = (PlotVertex*)malloc(valid_count * sizeof(PlotVertex));
     int idx = 0;
 
     // Preprocess points: transform and map to screen space
@@ -776,8 +732,6 @@ void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdo
     }
 }
  
-
-
 void apply_filter(bool* filter, Hyper* param, float min, float max) {
     for (int i=0; i<param->n; i++) {
         float val = param->ary[i];
