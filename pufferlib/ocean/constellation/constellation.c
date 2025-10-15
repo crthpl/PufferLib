@@ -42,6 +42,7 @@
 #define CAMERA_ROTATION_SPEED 0.03f
 #define CAMERA_PAN_SPEED 0.2f
 
+
 // Camera mouse movement sensitivity
 #define CAMERA_MOUSE_MOVE_SENSITIVITY                   0.003f
 void CustomUpdateCamera(Camera *camera, int mode)
@@ -74,6 +75,8 @@ const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
+const Color TRANSPARENT = (Color){0, 0, 0, 0};
+const Color CONSTELLATION = (Color){255, 255, 255, 128};
 
 Color COLORS[] = {
     BLUE, MAROON, ORANGE, DARKGREEN, DARKBLUE, DARKPURPLE, DARKBROWN,
@@ -731,7 +734,6 @@ void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
     VertexBuffer buffer = {&particles, idx};
     plot_gl(shader, buffer);
 
-
 }
 
 
@@ -937,6 +939,7 @@ int main(void) {
     }
 
     // Initialize Raylib
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
 
     DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
@@ -951,6 +954,10 @@ int main(void) {
     Shader shader = LoadShader(TextFormat("pufferlib/ocean/constellation/point_particle.vs", GLSL_VERSION),
                                TextFormat("pufferlib/ocean/constellation/point_particle.fs", GLSL_VERSION));
 
+    Shader blur_shader = LoadShader(
+            "pufferlib/ocean/constellation/blur.vs",
+            "pufferlib/ocean/constellation/blur.fs");
+
     // Allows the vertex shader to set the point size of each particle individually
     #ifndef GRAPHICS_API_OPENGL_ES2
     glEnable(GL_PROGRAM_POINT_SIZE);
@@ -964,6 +971,7 @@ int main(void) {
     camera.projection = CAMERA_PERSPECTIVE;
     PlotArgs args1 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig1 = LoadRenderTexture(args1.width, args1.height);
+    RenderTexture2D fig1_overlay = LoadRenderTexture(args1.width, args1.height);
     int fig1_env_idx = 0;
     bool fig1_env_active = false;
     bool fig1_x_active = false;
@@ -998,6 +1006,7 @@ int main(void) {
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
+    RenderTexture2D fig3_overlay = LoadRenderTexture(args1.width, args1.height);
     args3.left_margin = 10;
     args3.right_margin = 10;
     args3.top_margin = 10;
@@ -1030,6 +1039,18 @@ int main(void) {
     char fig4_range2_max[32];
     float fig4_range2_min_val = 0;
     float fig4_range2_max_val = 10000;
+
+    float perf_thresholds[4] = {0.5f, 0.75f, 0.9f, 0.95f};
+    int best_srci[4];
+    int best_n[4];
+    int* best_idx[4];
+    float* temp_dist[4];
+    int* temp_idx[4];
+    for (int i=0; i<4; i++) {
+        best_idx[i] = calloc(data.n, sizeof(int));
+        temp_dist[i] = calloc(data.n, sizeof(float));
+        temp_idx[i] = calloc(data.n, sizeof(int));
+    }
 
     Hyper* x;
     Hyper* y;
@@ -1102,12 +1123,87 @@ int main(void) {
             plot3(camera, shader, x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
             //EndShaderMode();
         }
+
+        // Find best hypers
+        float tsne_thresh = 100.0f;
+        memset(best_n, 0, sizeof(int)*4);
+        memset(best_srci, 0, sizeof(int)*4);
+        for (int env_i=0; env_i<data.n; env_i++) {
+            Env* src = &data.envs[env_i];
+            Hyper* src_perf = get_hyper(&data, src->key, "environment/perf");
+            Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
+            Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
+            for (int i=0; i<src_tsne1->n; i++) {
+                float perfi = src_perf->ary[i];
+                if (perfi < perf_thresholds[0]) {
+                    continue;
+                }
+                float t1i = src_tsne1->ary[i];
+                float t2i = src_tsne2->ary[i];
+                for (int ki=0; ki<4; ki++) {
+                    for (int kj=0; kj<data.n; kj++) {
+                        temp_idx[ki][kj] = -1;
+                        temp_dist[ki][kj] = FLT_MAX;
+                    }
+                }
+                for (int env_j=0; env_j<data.n; env_j++) {
+                    Env* dst = &data.envs[env_j];
+                    Hyper* dst_perf = get_hyper(&data, dst->key, "environment/perf");
+                    Hyper* dst_tsne1 = get_hyper(&data, dst->key, "tsne1");
+                    Hyper* dst_tsne2 = get_hyper(&data, dst->key, "tsne2");
+                    for (int j=0; j<dst_tsne1->n; j++) {
+                        float perfj = dst_perf->ary[j];
+                        if (perfj < perf_thresholds[0]) {
+                            continue;
+                        }
+                        float t1j = dst_tsne1->ary[j];
+                        float t2j = dst_tsne2->ary[j];
+                        float t1_dist = t1i - t1j;
+                        float t2_dist = t2i - t2j;
+                        float tsne_dist = t1_dist*t1_dist + t2_dist*t2_dist;
+                        if (tsne_dist > tsne_thresh) {
+                            continue;
+                        }
+                        for (int thresh_idx=0; thresh_idx<4; thresh_idx++) {
+                            float perf_thresh = perf_thresholds[thresh_idx];
+                            if (perfi < perf_thresh || perfj < perf_thresh) {
+                                break;
+                            }
+                            if (temp_idx[thresh_idx][env_j] == -1 || tsne_dist < temp_dist[thresh_idx][env_j]) {
+                                temp_idx[thresh_idx][env_j] = j;
+                                temp_dist[thresh_idx][env_j] = tsne_dist;
+                            }
+                        }
+                    }
+                }
+            
+                for (int ki=0; ki<4; ki++) {
+                    int temp_n = 0;
+                    for (int kj=0; kj<data.n; kj++) {
+                        if (temp_idx[ki][kj] != -1) {
+                            temp_n++;
+                        }
+                    }
+                    if (temp_n > best_n[ki]) {
+                        best_n[ki] = temp_n;
+                        best_srci[ki] = env_i;
+                        for (int kj=0; kj<data.n; kj++) {
+                            best_idx[ki][kj] = temp_idx[ki][kj];
+                        }
+                        if (best_idx[ki][env_i] == -1) {
+                            printf("Error: Best index not found\n");
+                            exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
         BeginMode3D(camera);
         CustomUpdateCamera(&camera, CAMERA_ORBITAL);
-        draw_axes3(args1, fig1_x_log, fig1_y_log, fig1_z_log);
+        //draw_axes3(args1, fig1_x_log, fig1_y_log, fig1_z_log);
         EndMode3D();
         EndTextureMode();
-
 
         // Figure 2
         x_label = hyper_key[fig2_x_idx];
@@ -1192,6 +1288,7 @@ int main(void) {
             apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
             plot(shader, x, y, false, false, args3, cmap, filter);
         }
+
         //draw_axes(args3);
         EndTextureMode();
 
@@ -1234,6 +1331,15 @@ int main(void) {
             (Rectangle){0, 0, fig1.texture.width, -fig1.texture.height },
             (Vector2){ 0, SETTINGS_HEIGHT }, WHITE
         );
+        BeginShaderMode(blur_shader);
+        rlSetBlendMode(RL_BLEND_ADDITIVE);
+        DrawTextureRec(
+            fig1_overlay.texture,
+            (Rectangle){0, 0, fig1_overlay.texture.width, -fig1_overlay.texture.height },
+            (Vector2){ 0, SETTINGS_HEIGHT }, WHITE
+        );
+        rlSetBlendMode(RL_BLEND_ALPHA);
+        EndShaderMode();
         DrawTextureRec(
             fig2.texture,
             (Rectangle){ 0, 0, fig2.texture.width, -fig2.texture.height },
@@ -1244,11 +1350,123 @@ int main(void) {
             (Rectangle){ 0, 0, fig3.texture.width, -fig3.texture.height },
             (Vector2){ 0, 2*SETTINGS_HEIGHT + fig1.texture.height }, WHITE
         );
+        BeginShaderMode(blur_shader);
+        rlSetBlendMode(RL_BLEND_ADDITIVE);
+        DrawTextureRec(
+            fig3_overlay.texture,
+            (Rectangle){0, 0, fig3_overlay.texture.width, -fig3_overlay.texture.height },
+            (Vector2){ 0, 2*SETTINGS_HEIGHT + fig1.texture.height }, WHITE
+        );
+        rlSetBlendMode(RL_BLEND_ALPHA);
+        EndShaderMode();
         DrawTextureRec(
             fig4.texture,
             (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
             (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
         );
+
+        // Figure 1 Overlay
+        float x_min = (fig1_x_log) ? log10(args1.x_min) : args1.x_min;
+        float x_max = (fig1_x_log) ? log10(args1.x_max) : args1.x_max;
+        float y_min = (fig1_y_log) ? log10(args1.y_min) : args1.y_min;
+        float y_max = (fig1_y_log) ? log10(args1.y_max) : args1.y_max;
+        float z_min = (fig1_z_log) ? log10(args1.z_min) : args1.z_min;
+        float z_max = (fig1_z_log) ? log10(args1.z_max) : args1.z_max;
+        for (int k=0; k<4; k++) {
+            int bsi = best_srci[k];
+            char* src_env = data.envs[bsi].key;
+            int src_idx = best_idx[k][bsi];
+            x = get_hyper(&data, src_env, hyper_key[fig1_x_idx]);
+            y = get_hyper(&data, src_env, hyper_key[fig1_y_idx]);
+            z = get_hyper(&data, src_env, hyper_key[fig1_z_idx]);
+            float xi = x->ary[src_idx];
+            float yi = y->ary[src_idx];
+            float zi = z->ary[src_idx];
+
+            xi = (fig1_x_log) ? signed_log10(xi) : xi;
+            yi = (fig1_y_log) ? signed_log10(yi) : yi;
+            zi = (fig1_z_log) ? signed_log10(zi) : zi;
+
+            Vector3 src_point = (Vector3){
+                (xi - x_min)/(x_max - x_min),
+                (yi - y_min)/(y_max - y_min),
+                (zi - z_min)/(z_max - z_min)
+            };
+
+            Vector2 screen_i = GetWorldToScreenEx(src_point, camera, 960, 520);
+
+            for (int i=0; i<data.n; i++) {
+                int bdi = best_idx[k][i];
+                if (bdi == -1 || i == bsi) {
+                    continue;
+                }
+                char* dst_env = data.envs[i].key;
+                x = get_hyper(&data, dst_env, hyper_key[fig1_x_idx]);
+                y = get_hyper(&data, dst_env, hyper_key[fig1_y_idx]);
+                z = get_hyper(&data, dst_env, hyper_key[fig1_z_idx]);
+                float xj = x->ary[bdi];
+                float yj = y->ary[bdi];
+                float zj = z->ary[bdi];
+
+                xj = (fig1_x_log) ? signed_log10(xj) : xj;
+                yj = (fig1_y_log) ? signed_log10(yj) : yj;
+                zj = (fig1_z_log) ? signed_log10(zj) : zj;
+
+                Vector3 dst_point = (Vector3){
+                    (xj - x_min)/(x_max - x_min),
+                    (yj - y_min)/(y_max - y_min),
+                    (zj - z_min)/(z_max - z_min)
+                };
+                Vector2 screen_j = GetWorldToScreenEx(dst_point, camera, 960, 520);
+                DrawLineEx(
+                    (Vector2){screen_i.x, screen_i.y},
+                    (Vector2){screen_j.x, screen_j.y},
+                    2,
+                    CONSTELLATION
+                );
+            }
+        }
+
+
+        // Figure 3 Overlay 
+        float offset = fig1.texture.height + 2*SETTINGS_HEIGHT;
+        for (int k=0; k<4; k++) {
+            int bsi = best_srci[k];
+            char* src_env = data.envs[bsi].key;
+            int src_idx = best_idx[k][bsi];
+            x = get_hyper(&data, src_env, "tsne1");
+            y = get_hyper(&data, src_env, "tsne2");
+            float xi = x->ary[src_idx];
+            float yi = y->ary[src_idx];
+
+            xi = args3.left_margin + args3.width*(xi - args3.x_min)/(args3.x_max - args3.x_min);
+            yi = offset + args3.height - args3.bottom_margin - args3.height*(yi - args3.y_min)/(args3.y_max - args3.y_min);
+
+            for (int i=0; i<data.n; i++) {
+                int bdi = best_idx[k][i];
+                if (bdi == -1 || i == bsi) {
+                    continue;
+                }
+                char* dst_env = data.envs[i].key;
+                x = get_hyper(&data, dst_env, "tsne1");
+                y = get_hyper(&data, dst_env, "tsne2");
+                float xj = x->ary[bdi];
+                float yj = y->ary[bdi];
+
+                xj = args3.left_margin + args3.width*(xj - args3.x_min)/(args3.x_max - args3.x_min);
+                yj = offset + args3.height - args3.bottom_margin - args3.height*(yj - args3.y_min)/(args3.y_max - args3.y_min);
+
+                DrawLineEx(
+                    (Vector2){xi, yi},
+                    (Vector2){xj, yj},
+                    2,
+                    CONSTELLATION
+                );
+            }
+
+            float tsne_thresh_px = sqrt(tsne_thresh)*args3.width/(args3.x_max - args3.x_min);
+            //DrawCircleLines(xi, yi, tsne_thresh_px, CONSTELLATION);
+        }
 
 
         // Figure 3 UI
