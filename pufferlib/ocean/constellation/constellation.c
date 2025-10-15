@@ -10,6 +10,7 @@
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
+#include "rcamera.h"
 
 #if defined(PLATFORM_DESKTOP) || defined(PLATFORM_DESKTOP_SDL)
     #if defined(GRAPHICS_API_OPENGL_ES2)
@@ -35,6 +36,40 @@
 #include "rlgl.h"
 #include "raymath.h"
 
+#define CAMERA_ORBITAL_SPEED 0.1f
+#define CAMERA_MOUSE_MOVE_SENSITIVITY 0.005f
+#define CAMERA_MOVE_SPEED 5.4f
+#define CAMERA_ROTATION_SPEED 0.03f
+#define CAMERA_PAN_SPEED 0.2f
+
+// Camera mouse movement sensitivity
+#define CAMERA_MOUSE_MOVE_SENSITIVITY                   0.003f
+void CustomUpdateCamera(Camera *camera, int mode)
+{
+    Vector2 mousePositionDelta = GetMouseDelta();
+
+    bool moveInWorldPlane = ((mode == CAMERA_FIRST_PERSON) || (mode == CAMERA_THIRD_PERSON));
+    bool rotateAroundTarget = ((mode == CAMERA_THIRD_PERSON) || (mode == CAMERA_ORBITAL));
+    bool lockView = ((mode == CAMERA_FREE) || (mode == CAMERA_FIRST_PERSON) || (mode == CAMERA_THIRD_PERSON) || (mode == CAMERA_ORBITAL));
+    bool rotateUp = false;
+
+    // Camera speeds based on frame time
+    float cameraMoveSpeed = CAMERA_MOVE_SPEED*GetFrameTime();
+    float cameraRotationSpeed = CAMERA_ROTATION_SPEED*GetFrameTime();
+    float cameraPanSpeed = CAMERA_PAN_SPEED*GetFrameTime();
+    float cameraOrbitalSpeed = CAMERA_ORBITAL_SPEED*GetFrameTime();
+
+    // Orbital can just orbit
+    Matrix rotation = MatrixRotate(GetCameraUp(camera), cameraOrbitalSpeed);
+    Vector3 view = Vector3Subtract(camera->position, camera->target);
+    view = Vector3Transform(view, rotation);
+    camera->position = Vector3Add(camera->target, view);
+    // Zoom target distance
+    CameraMoveToTarget(camera, -GetMouseWheelMove());
+    if (IsKeyPressed(KEY_KP_SUBTRACT)) CameraMoveToTarget(camera, 2.0f);
+    if (IsKeyPressed(KEY_KP_ADD)) CameraMoveToTarget(camera, -2.0f);
+}
+
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
@@ -53,7 +88,7 @@ const float EMPTY = -4242.0f;
 typedef struct Particle {
     float x;
     float y;
-    float period;
+    float i;
     float r;
     float g;
     float b;
@@ -105,11 +140,21 @@ Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
 }
 
 // TODO: Slow as fuck
+/*
 Color rgb(float h) {
     float r = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f, 6.f) - 3.f) - 1.f));
     float g = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f + 4.f, 6.f) - 3.f) - 1.f));
     float b = fmaxf(0.f, fminf(1.f, fabsf(fmodf(h * 6.f + 2.f, 6.f) - 3.f) - 1.f));
+    //return (Color){255.f, 255.f, 255.f, 255};
     return (Color){r * 255.f + .5f, g * 255.f + .5f, b * 255.f + .5f, 255};
+}
+*/
+
+Color rgb(float h) {
+    //return ColorFromHSV(180, h, 1.0);
+    h = 120.0f * (1.0 + h);
+    //return ColorFromHSV(h, 1.0, 1.0);
+    return ColorFromHSV(h, 0.8f, 0.15f);
 }
 
 typedef struct PlotArgs {
@@ -127,8 +172,10 @@ typedef struct PlotArgs {
     int legend_font_size;
     int line_width;
     int tick_length;
-    int x_margin;
-    int y_margin;
+    int top_margin;
+    int bottom_margin;
+    int left_margin;
+    int right_margin;
     int tick_margin;
     Color font_color;
     Color background_color;
@@ -156,8 +203,10 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .line_width = 2,
     .tick_length = 8,
     .tick_margin = 8,
-    .x_margin = 100,
-    .y_margin = 70,
+    .top_margin = 70,
+    .bottom_margin = 70,
+    .left_margin = 100,
+    .right_margin = 100,
     .font_color = PUFF_WHITE,
     .background_color = PUFF_BACKGROUND,
     .axis_color = PUFF_WHITE,
@@ -199,23 +248,21 @@ const char* format_tick_label(double value) {
 }
 
 void draw_axes(PlotArgs args) {
-    int width = args.width;
-    int height = args.height;
+    DrawLine(args.left_margin, args.top_margin,
+        args.left_margin, args.height - args.bottom_margin, PUFF_WHITE);
+    DrawLine(args.left_margin, args.height - args.bottom_margin,
+        args.width - args.right_margin, args.height - args.bottom_margin, PUFF_WHITE);
+}
 
-    // Draw axes
-    DrawLine(args.x_margin, args.y_margin,
-        args.x_margin, height - args.y_margin, PUFF_WHITE);
-    DrawLine(args.x_margin, height - args.y_margin,
-        width - args.x_margin, height - args.y_margin, PUFF_WHITE);
-
+void draw_labels(PlotArgs args) {
     // X label
     Vector2 x_font_size = MeasureTextEx(args.font, args.x_label, args.axis_font_size, 0);
     DrawTextEx(
         args.font,
         args.x_label,
         (Vector2){
-            width/2 - x_font_size.x/2,
-            height - x_font_size.y,
+            args.width/2 - x_font_size.x/2,
+            args.height - x_font_size.y,
         },
         args.axis_font_size,
         0,
@@ -229,7 +276,7 @@ void draw_axes(PlotArgs args) {
         args.y_label,
         (Vector2){
             0,
-            height/2 + y_font_size.x/2
+            args.height/2 + y_font_size.x/2
         },
         (Vector2){ 0, 0 },
         -90,
@@ -237,22 +284,31 @@ void draw_axes(PlotArgs args) {
         0,
         PUFF_WHITE
     );
+}
+
+
+void draw_ticks(PlotArgs args) {
+    int width = args.width;
+    int height = args.height;
+
+    float plot_width = width - args.left_margin - args.right_margin;
+    float plot_height = height - args.top_margin - args.bottom_margin;
 
     // Autofit number of ticks
     Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
-    int num_x_ticks = 1 + (width - 2*args.x_margin)/tick_label_size.x;
-    int num_y_ticks = 1 + (height - 2*args.y_margin)/tick_label_size.y;
+    int num_x_ticks = 1 + plot_width/tick_label_size.x;
+    int num_y_ticks = 1 + plot_height/tick_label_size.y;
 
     // X ticks
     for (int i=0; i<num_x_ticks; i++) {
         float val = args.x_min + i*(args.x_max - args.x_min)/(num_x_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/(num_x_ticks - 1.0f);
+        float x_pos = args.left_margin + i*plot_width/(num_x_ticks - 1.0f);
         DrawLine(
             x_pos,
-            height - args.y_margin - args.tick_length,
+            height - args.bottom_margin - args.tick_length,
             x_pos,
-            height - args.y_margin + args.tick_length,
+            height - args.bottom_margin + args.tick_length,
             args.axis_color
         );
 
@@ -262,7 +318,7 @@ void draw_axes(PlotArgs args) {
             label,
             (Vector2){
                 x_pos - this_tick_size.x/2,
-                height - args.y_margin + args.tick_length + args.tick_margin,
+                height - args.bottom_margin + args.tick_length + args.tick_margin,
             },
             args.axis_tick_font_size,
             0,
@@ -274,11 +330,11 @@ void draw_axes(PlotArgs args) {
     for (int i=0; i<num_y_ticks; i++) {
         float val = args.y_min + i*(args.y_max - args.y_min)/(num_y_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float y_pos = height - args.y_margin - i*(height - 2*args.y_margin)/(num_y_ticks - 1.0f);
+        float y_pos = height - args.bottom_margin - i*plot_height/(num_y_ticks - 1.0f);
         DrawLine(
-            args.x_margin - args.tick_length,
+            args.left_margin - args.tick_length,
             y_pos,
-            args.x_margin + args.tick_length,
+            args.left_margin + args.tick_length,
             y_pos,
             args.axis_color
         );
@@ -287,7 +343,7 @@ void draw_axes(PlotArgs args) {
             args.font_small,
             label,
             (Vector2){
-                args.x_margin - this_tick_size.x - args.tick_length - args.tick_margin,
+                args.left_margin - this_tick_size.x - args.tick_length - args.tick_margin,
                 y_pos - this_tick_size.y/2,
             },
             args.axis_tick_font_size,
@@ -298,60 +354,28 @@ void draw_axes(PlotArgs args) {
     }
 }
 
-void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
-    int width = args.width;
-    int height = args.height;
+void draw_box_ticks(char* hypers[], int hyper_count, PlotArgs args) {
+    float width = args.width;
+    float height = args.height;
 
-    // Draw axes
-    DrawLine(args.x_margin, args.y_margin,
-        args.x_margin, height - args.y_margin, PUFF_WHITE);
-    DrawLine(args.x_margin, height - args.y_margin,
-        width - args.x_margin, height - args.y_margin, PUFF_WHITE);
-
-    // X label
-    Vector2 x_font_size = MeasureTextEx(args.font, args.x_label, args.axis_font_size, 0);
-    DrawTextEx(
-        args.font,
-        args.x_label,
-        (Vector2){
-            width/2 - x_font_size.x/2,
-            height - x_font_size.y,
-        },
-        args.axis_font_size,
-        0,
-        PUFF_WHITE
-    );
-
-    // Y label
-    Vector2 y_font_size = MeasureTextEx(args.font, args.y_label, args.axis_font_size, 0);
-    DrawTextPro(
-        args.font,
-        args.y_label,
-        (Vector2){
-            0,
-            height/2 + y_font_size.x/2
-        },
-        (Vector2){ 0, 0 },
-        -90,
-        args.axis_font_size,
-        0,
-        PUFF_WHITE
-    );
+    float plot_width = width - args.left_margin - args.right_margin;
+    float plot_height = height - args.top_margin - args.bottom_margin;
 
     // Autofit number of ticks
     Vector2 tick_label_size = MeasureTextEx(args.font, "estimate", args.axis_font_size, 0);
-    int num_x_ticks = 1.0f + (width - 2*args.x_margin)/tick_label_size.x;
+    int num_x_ticks = 1 + plot_width/tick_label_size.x;
+    int num_y_ticks = 1 + plot_height/tick_label_size.y;
 
     // X ticks
     for (int i=0; i<num_x_ticks; i++) {
         float val = args.x_min + i*(args.x_max - args.x_min)/(num_x_ticks - 1.0f);
         char* label = format_tick_label(val);
-        float x_pos = args.x_margin + i*(width - 2*args.x_margin)/(num_x_ticks - 1.0f);
+        float x_pos = args.left_margin + i*plot_width/(num_x_ticks - 1.0f);
         DrawLine(
             x_pos,
-            height - args.y_margin - args.tick_length,
+            height - args.bottom_margin - args.tick_length,
             x_pos,
-            height - args.y_margin + args.tick_length,
+            height - args.bottom_margin + args.tick_length,
             args.axis_color
         );
 
@@ -361,7 +385,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             label,
             (Vector2){
                 x_pos - this_tick_size.x/2,
-                height - args.y_margin + args.tick_length + args.tick_margin,
+                height - args.bottom_margin + args.tick_length + args.tick_margin,
             },
             args.axis_tick_font_size,
             0,
@@ -372,11 +396,11 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
     // Y ticks
     for (int i=0; i<hyper_count; i++) {
         char* label = hypers[i];
-        float y_pos = height - args.y_margin - (i + 0.5f)*(height - 2*args.y_margin)/hyper_count;
+        float y_pos = height - args.bottom_margin - (i + 0.5f)*plot_height/hyper_count;
         DrawLine(
-            args.x_margin - args.tick_length,
+            args.left_margin - args.tick_length,
             y_pos,
-            args.x_margin + args.tick_length,
+            args.left_margin + args.tick_length,
             y_pos,
             args.axis_color
         );
@@ -385,7 +409,7 @@ void draw_box_axes(char* hypers[], int hyper_count, PlotArgs args) {
             args.font_small,
             label,
             (Vector2){
-                args.x_margin - this_tick_size.x - args.tick_length - args.tick_margin,
+                args.left_margin - this_tick_size.x - args.tick_length - args.tick_margin,
                 y_pos - this_tick_size.y/2,
             },
             args.axis_tick_font_size,
@@ -478,6 +502,9 @@ void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Co
     float x_min = args.x_min;
     float x_max = args.x_max;
 
+    float plot_width = width - args.left_margin - args.right_margin;
+    float plot_height = height - args.top_margin - args.bottom_margin;
+
     if (log_x) {
         x_min = x_min<=1e-8 ? -8 : log10(x_min);
         x_max = x_max<=1e-8 ? -8 : log10(x_max);
@@ -487,7 +514,7 @@ void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Co
     if (dx == 0) dx = 1.0f;
     x_min -= 0.1f * dx; x_max += 0.1f * dx;
     dx = x_max - x_min;
-    float dy = (height - 2*args.y_margin)/((float)hyper_count);
+    float dy = plot_height/((float)hyper_count);
 
     Color faded = Fade(color, 0.15f);
 
@@ -507,13 +534,13 @@ void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Co
         mmax = mmax <= 0 ? 0 : log10(mmax);
     }
 
-    float left = args.x_margin + (mmin - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
-    float right = args.x_margin + (mmax - x_min)/(x_max - x_min)*(width - 2*args.x_margin);
+    float left = args.left_margin + (mmin - x_min)/(x_max - x_min)*plot_width;
+    float right = args.left_margin + (mmax - x_min)/(x_max - x_min)*plot_width;
 
     // TODO - rough patch
-    left = fmax(left, args.x_margin);
-    right = fmin(right, width - args.x_margin);
-    DrawRectangle(left, args.y_margin + i*dy, right - left, dy, faded);
+    left = fmax(left, args.left_margin);
+    right = fmin(right, width - args.right_margin);
+    DrawRectangle(left, args.top_margin + i*dy, right - left, dy, faded);
 }
 
 // Struct for vertex data (screen-space position and color)
@@ -543,8 +570,11 @@ void plot_gl(Shader shader, VertexBuffer vertices) {
 
 
     rlDrawRenderBatchActive();      // Draw iternal buffers data (previous draw calls)
+    rlSetBlendMode(RL_BLEND_ADDITIVE);
 
     int currentTimeLoc = GetShaderLocation(shader, "currentTime");
+    //float time = GetTime();
+    //SetShaderValue(shader, currentTimeLoc, &time, SHADER_UNIFORM_FLOAT);
     // Switch to plain OpenGL
     //------------------------------------------------------------------------------
     glUseProgram(shader.id);
@@ -564,6 +594,7 @@ void plot_gl(Shader shader, VertexBuffer vertices) {
     //------------------------------------------------------------------------------
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
+    rlSetBlendMode(RL_BLEND_ALPHA);
 }
 
 void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
@@ -571,6 +602,9 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
 
     int width = args.width;
     int height = args.height;
+
+    float plot_width = width - args.left_margin - args.right_margin;
+    float plot_height = height - args.top_margin - args.bottom_margin;
 
     // Compute ranges and apply log scaling if needed
     //float x_min = log_x ? log10f(args.x_min) : args.x_min;
@@ -607,12 +641,12 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
         float yi = log_y ? log10f(y->ary[i]) : y->ary[i];
 
         // Map to screen coordinates with margins
-        xi = args.x_margin + (xi - x_min) / dx * (width - 2 * args.x_margin);
-        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2 * args.y_margin);
+        xi = args.left_margin + (xi - x_min) / dx * plot_width;
+        yi = args.height - args.bottom_margin - (yi - y_min) / dy * plot_height;
 
         particles[i].x = xi;
         particles[i].y = yi;
-        particles[i].period = 10.0f;
+        particles[i].i = i;
         Color c = rgb(cmap[i]);
         particles[i].r = c.r/255.0f;
         particles[i].g = c.g/255.0f;
@@ -624,33 +658,6 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
     VertexBuffer buffer = {&particles, MAX_PARTICLES};
     plot_gl(shader, buffer);
 }
-/*
-void plot(Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
-    assert(x->n == y->n);
-
-    int width = args.width;
-    int height = args.height;
-    float x_min = args.x_min;
-    float x_max = args.x_max;
-    float y_min = args.y_min;
-    float y_max = args.y_max;
-
-    float dx = x_max - x_min;
-    float dy = y_max - y_min;
-
-    for (int i=0; i<x->n; i++) {
-        if (filter != NULL && !filter[i]) {
-            continue;
-        }
-        float xi = log_x ? log10(x->ary[i]) : x->ary[i];
-        float yi = log_y ? log10(y->ary[i]) : y->ary[i];
-        xi = args.x_margin + (xi - x_min) / dx * (width - 2*args.x_margin);
-        yi = (height - args.y_margin) - (yi - y_min) / dy * (height - 2*args.y_margin);
-        Color c = rgb(cmap[i]);
-        DrawCircle(xi, yi, args.line_width, c);
-    }
-}
-*/
 
 void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
         bool log_x, bool log_y, bool log_z, PlotArgs args, float* cmap, bool* filter) {
@@ -710,7 +717,7 @@ void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
  
         particles[i].x = screen_pos.x;
         particles[i].y = screen_pos.y;
-        particles[i].period = 10.0f;
+        particles[i].i = i;
         c = rgb(cmap[i]);
         particles[i].r = c.r/255.0f;
         particles[i].g = c.g/255.0f;
@@ -947,7 +954,7 @@ int main(void) {
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
 
     Camera3D camera = (Camera3D){ 0 };
-    camera.position = (Vector3){ 2.0f, 2.0f, 2.0f };
+    camera.position = (Vector3){ 1.5f, 1.25f, 1.5f };
     camera.target = (Vector3){ 0.5f, 0.5f, 0.5f };
     camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
@@ -972,6 +979,8 @@ int main(void) {
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
     //SetTextureFilter(fig2.texture, TEXTURE_FILTER_POINT);
+    args2.left_margin = 50;
+    args2.right_margin = 50;
     int fig2_env_idx = 1;
     bool fig2_env_active = false;
     bool fig2_x_active = false;
@@ -986,6 +995,10 @@ int main(void) {
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
+    args3.left_margin = 10;
+    args3.right_margin = 10;
+    args3.top_margin = 10;
+    args3.bottom_margin = 10;
     bool fig3_range1_active = false;
     int fig3_range1_idx = 2;
     char fig3_range1_min[32];
@@ -1035,6 +1048,7 @@ int main(void) {
             focus = GetMousePosition();
         }
 
+        // Figure 1
         x_label = hyper_key[fig1_x_idx];
         y_label = hyper_key[fig1_y_idx];
         z_label = hyper_key[fig1_z_idx];
@@ -1081,32 +1095,15 @@ int main(void) {
                     cmap[j] = i/(float)data.n;
                 }
             }
-            //rlSetBlendMode(RL_BLEND_ADDITIVE);
             //BeginShaderMode(shader);
             plot3(camera, shader, x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
             //EndShaderMode();
-            //rlSetBlendMode(RL_BLEND_ALPHA);
         }
         BeginMode3D(camera);
-        UpdateCamera(&camera, CAMERA_ORBITAL);
-
-
+        CustomUpdateCamera(&camera, CAMERA_ORBITAL);
         draw_axes3(args1, fig1_x_log, fig1_y_log, fig1_z_log);
         EndMode3D();
         EndTextureMode();
-        DrawTextureRec(
-            fig1.texture,
-            (Rectangle){0, 0, fig1.texture.width, -fig1.texture.height },
-            (Vector2){ 0, SETTINGS_HEIGHT }, WHITE
-        );
-        Rectangle fig1_env_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig1_env_rect, env_options, &fig1_env_idx, fig1_env_active)){
-            fig1_env_active = !fig1_env_active;
-        }
-        GuiDropdownCheckbox(DROPDOWN_WIDTH, 0, options, &fig1_x_idx, &fig1_x_active, "Log X", &fig1_x_log);
-        GuiDropdownCheckbox(2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig1_y_idx, &fig1_y_active, "Log Y", &fig1_y_log);
-        GuiDropdownCheckbox(3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, options, &fig1_z_idx, &fig1_z_active, "Log Z", &fig1_z_log);
-        GuiDropdownCheckbox(4*DROPDOWN_WIDTH + 3*TOGGLE_WIDTH, 0, env_hyper_options, &fig1_color_idx, &fig1_color_active, "Log Color", &fig1_log_color);
 
 
         // Figure 2
@@ -1114,6 +1111,7 @@ int main(void) {
         y_label = hyper_key[fig2_y_idx];
         args2.x_label = x_label;
         args2.y_label = y_label;
+        args2.top_margin = 20;
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
 
@@ -1162,20 +1160,8 @@ int main(void) {
         //rlSetBlendMode(RL_BLEND_ALPHA);
 
         draw_axes(args2);
+        draw_ticks(args2);
         EndTextureMode();
-        DrawTextureRec(
-            fig2.texture,
-            (Rectangle){ 0, 0, fig2.texture.width, -fig2.texture.height },
-            (Vector2){ fig1.texture.width, SETTINGS_HEIGHT }, WHITE
-        );
-        Rectangle fig2_env_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig2_env_rect, env_options, &fig2_env_idx, fig2_env_active)){
-            fig2_env_active = !fig2_env_active;
-        }
-        GuiDropdownCheckbox(fig1.texture.width + DROPDOWN_WIDTH, 0, options, &fig2_x_idx, &fig2_x_active, "Log X", &fig2_x_log);
-        GuiDropdownCheckbox(fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig2_y_idx, &fig2_y_active, "Log Y", &fig2_y_log);
-        GuiDropdownCheckbox(fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, env_hyper_options, &fig2_color_idx, &fig2_color_active, "Log Color", &fig2_log_color);
-
 
         // Figure 3
         args3.x_label = "tsne1";
@@ -1203,22 +1189,16 @@ int main(void) {
             apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
             plot(shader, x, y, false, false, args3, cmap, filter);
         }
-        draw_axes(args3);
+        //draw_axes(args3);
         EndTextureMode();
-        DrawTextureRec(
-            fig3.texture,
-            (Rectangle){ 0, 0, fig3.texture.width, -fig3.texture.height },
-            (Vector2){ 0, SETTINGS_HEIGHT + fig1.texture.height }, WHITE
-        );
-        GuiDropdownFilter(0, fig1.texture.height, options, &fig3_range1_idx, &fig3_range1_active, focus,
-            fig3_range1_min, &fig3_range1_min_val, fig3_range1_max, &fig3_range1_max_val);
-        GuiDropdownFilter(2*DROPDOWN_WIDTH, fig1.texture.height, options, &fig3_range2_idx, &fig3_range2_active, focus,
-            fig3_range2_min, &fig3_range2_min_val, fig3_range2_max, &fig3_range2_max_val);
 
         // Figure 4
         args4.x_label = "Value";
         args4.y_label = "Hyperparameter";
-        args4.x_margin = 200;
+        args4.left_margin = 170;
+        args4.right_margin = 50;
+        args4.top_margin = 10;
+        args4.bottom_margin = 50;
         args4.x_min = 1e-8;
         args4.x_max = 1e8;
         BeginTextureMode(fig4);
@@ -1240,18 +1220,68 @@ int main(void) {
             }
         }
         EndBlendMode();
-        draw_box_axes(hyper_key, hyper_count, args4);
+        draw_axes(args4);
+        draw_box_ticks(hyper_key, hyper_count, args4);
         EndTextureMode();
+
+
+        // Figure 1-4
+        DrawTextureRec(
+            fig1.texture,
+            (Rectangle){0, 0, fig1.texture.width, -fig1.texture.height },
+            (Vector2){ 0, SETTINGS_HEIGHT }, WHITE
+        );
+        DrawTextureRec(
+            fig2.texture,
+            (Rectangle){ 0, 0, fig2.texture.width, -fig2.texture.height },
+            (Vector2){ fig1.texture.width, 2*SETTINGS_HEIGHT }, WHITE
+        );
+        DrawTextureRec(
+            fig3.texture,
+            (Rectangle){ 0, 0, fig3.texture.width, -fig3.texture.height },
+            (Vector2){ 0, 2*SETTINGS_HEIGHT + fig1.texture.height }, WHITE
+        );
         DrawTextureRec(
             fig4.texture,
             (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
             (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
         );
-        GuiDropdownFilter(fig1.texture.width, fig1.texture.height + SETTINGS_HEIGHT, options, &fig4_range1_idx, &fig4_range1_active, focus,
+
+
+        // Figure 3 UI
+        GuiDropdownFilter(0, SETTINGS_HEIGHT, options, &fig3_range1_idx, &fig3_range1_active, focus,
+            fig3_range1_min, &fig3_range1_min_val, fig3_range1_max, &fig3_range1_max_val);
+        GuiDropdownFilter(2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig3_range2_idx, &fig3_range2_active, focus,
+            fig3_range2_min, &fig3_range2_min_val, fig3_range2_max, &fig3_range2_max_val);
+
+
+        // Figure 4 UI
+        GuiDropdownFilter(fig1.texture.width, SETTINGS_HEIGHT, options, &fig4_range1_idx, &fig4_range1_active, focus,
             fig4_range1_min, &fig4_range1_min_val, fig4_range1_max, &fig4_range1_max_val);
-        GuiDropdownFilter(fig1.texture.width + 2*DROPDOWN_WIDTH, fig1.texture.height + SETTINGS_HEIGHT, options, &fig4_range2_idx, &fig4_range2_active, focus,
+        GuiDropdownFilter(fig1.texture.width + 2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig4_range2_idx, &fig4_range2_active, focus,
             fig4_range2_min, &fig4_range2_min_val, fig4_range2_max, &fig4_range2_max_val); 
         
+
+        // Figure 1 UI
+        Rectangle fig1_env_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig1_env_rect, env_options, &fig1_env_idx, fig1_env_active)){
+            fig1_env_active = !fig1_env_active;
+        }
+        GuiDropdownCheckbox(DROPDOWN_WIDTH, 0, options, &fig1_x_idx, &fig1_x_active, "Log X", &fig1_x_log);
+        GuiDropdownCheckbox(2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig1_y_idx, &fig1_y_active, "Log Y", &fig1_y_log);
+        GuiDropdownCheckbox(3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, options, &fig1_z_idx, &fig1_z_active, "Log Z", &fig1_z_log);
+        GuiDropdownCheckbox(4*DROPDOWN_WIDTH + 3*TOGGLE_WIDTH, 0, env_hyper_options, &fig1_color_idx, &fig1_color_active, "Log Color", &fig1_log_color);
+
+        // Figure 2 UI
+        Rectangle fig2_env_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(fig2_env_rect, env_options, &fig2_env_idx, fig2_env_active)){
+            fig2_env_active = !fig2_env_active;
+        }
+        GuiDropdownCheckbox(fig1.texture.width + DROPDOWN_WIDTH, 0, options, &fig2_x_idx, &fig2_x_active, "Log X", &fig2_x_log);
+        GuiDropdownCheckbox(fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig2_y_idx, &fig2_y_active, "Log Y", &fig2_y_log);
+        GuiDropdownCheckbox(fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, env_hyper_options, &fig2_color_idx, &fig2_color_active, "Log Color", &fig2_log_color);
+
+
         DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
     }
