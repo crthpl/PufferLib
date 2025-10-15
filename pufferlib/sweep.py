@@ -16,6 +16,7 @@ from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import LogNormalPrior
 from scipy.stats.qmc import Sobol
+from scipy.spatial import KDTree
 
 EPSILON = 1e-6
 
@@ -414,8 +415,8 @@ class Protein:
             infer_batch_size = 4096,            
             use_gpu = True,
             cost_param = "train/total_timesteps",
-            prune_pareto = False,
-            ucb_beta = None,  # Exploration-exploitation trade-off for UCB
+            prune_pareto = True,
+            # ucb_beta = None,  # Exploration-exploitation trade-off for UCB
         ):
         
         # NOTE: Check if this interfere with training. I put this to make gpytorch work with gpu
@@ -432,7 +433,7 @@ class Protein:
         self.gp_training_iter = gp_training_iter
         self.gp_learning_rate = gp_learning_rate
         self.prune_pareto = prune_pareto
-        self.ucb_beta = ucb_beta
+        # self.ucb_beta = ucb_beta
 
         self.success_observations = []
         self.failure_observations = []
@@ -478,27 +479,42 @@ class Protein:
         self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, dtype=torch.float32, device=self.device)
 
     # NOTE: This is a simple Heuristic. Consider sparse/scalable GP if necessary.
-    def _sample_observations(self, max_size=None, recent_ratio=0.5):
+    def _sample_observations(self, max_size=None, recent_ratio=0.5, duplicate_threshold=1e-3):
+        # Remove near-duplicate inputs for numerical stability using a KD-tree for performance
+        if not self.success_observations:
+            return []
+
+        unique_obs = []
+        # Use a list to collect unique inputs, then build the tree once
+        initial_unique_inputs = [self.success_observations[-1]['input']]
+        unique_obs.append(self.success_observations[-1])
+
+        for obs in reversed(self.success_observations): # Prioritize recent observations
+            tree = KDTree(initial_unique_inputs)
+            distance, _ = tree.query(obs['input'], k=1)
+            if distance > duplicate_threshold:
+                unique_obs.append(obs)
+                initial_unique_inputs.append(obs['input'])
+        
+        observations = list(reversed(unique_obs)) # Restore original order
+
         # Update the stats using the full data
-        y = np.array([e['output'] for e in self.success_observations])
+        y = np.array([e['output'] for e in observations])
         self.min_score, self.max_score = y.min(), y.max()
 
-        c = np.array([e['cost'] for e in self.success_observations])
+        c = np.array([e['cost'] for e in observations])
         log_c = np.log(np.maximum(c, EPSILON))
         self.log_c_min, self.log_c_max = log_c.min(), log_c.max()
 
         if max_size is None:
             max_size = self.gp_max_obs
 
-        # Sample the training data
-        num_obs = len(self.success_observations)
-        if num_obs <= max_size:
-            return self.success_observations
-
+        if len(observations) <= max_size:
+            return observations
+        
         recent_size = int(recent_ratio*max_size)
-        recent_obs = self.success_observations[-recent_size:]
-        older_obs = self.success_observations[:-recent_size]
-
+        recent_obs = observations[-recent_size:]
+        older_obs = observations[:-recent_size]
         num_to_sample = max_size - recent_size
         random_sample_obs = random.sample(older_obs, num_to_sample)
 
@@ -619,9 +635,9 @@ class Protein:
 
         score = gp_y_norm
         # Favor high-score and hign-uncertainty candidates for efficient exploration
-        # NOTE: Score GP has large errors, so check the magnitude before setting ucb_beta
-        if self.ucb_beta is not None:
-            score += self.ucb_beta * gp_y_std_norm
+        # But it seems gp score output is noisy, so that adding std seems to harm sweep.
+        # if self.ucb_beta is not None:
+        #     score += self.ucb_beta * gp_y_std_norm
 
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
                 score*weight)
