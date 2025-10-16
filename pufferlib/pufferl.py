@@ -842,13 +842,15 @@ class NeptuneLogger:
         self.neptune = neptune
         for k, v in pufferlib.unroll_nested_dict(args):
             neptune[k].append(v)
+        self.upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         for k, v in logs.items():
             self.neptune[k].append(v, step=step)
 
     def close(self, model_path):
-        self.neptune['model'].track_files(model_path)
+        if self.upload_model:
+            self.neptune['model'].track_files(model_path)
         self.neptune.stop()
 
     def download(self):
@@ -870,14 +872,16 @@ class WandbLogger:
         )
         self.wandb = wandb
         self.run_id = wandb.run.id
+        self.upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         self.wandb.log(logs, step=step)
 
     def close(self, model_path):
-        artifact = self.wandb.Artifact(self.run_id, type='model')
-        artifact.add_file(model_path)
-        self.wandb.run.log_artifact(artifact)
+        if self.upload_model:
+            artifact = self.wandb.Artifact(self.run_id, type='model')
+            artifact.add_file(model_path)
+            self.wandb.run.log_artifact(artifact)
         self.wandb.finish()
 
     def download(self):
@@ -1189,6 +1193,7 @@ def make_parser():
     parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
     parser.add_argument('--neptune-name', type=str, default='pufferai')
     parser.add_argument('--neptune-project', type=str, default='ablations')
+    parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb or neptune')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     return parser

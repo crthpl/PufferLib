@@ -109,6 +109,7 @@ if __name__ == "__main__":
 
     # Use wandb
     args["wandb"] = True
+    args["no_model_upload"] = True
     # args["train"]["optimizer"] = "adam"
 
     # Custom sweep args
