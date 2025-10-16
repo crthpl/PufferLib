@@ -85,6 +85,7 @@ const Color CONSTELLATION = (Color){255, 255, 255, 128};
 const float EMPTY = -4242.0f;
 
 #define MAX_PARTICLES       1000
+#define MAX_POINTS 10000
 
 typedef struct Particle {
     float x;
@@ -100,6 +101,18 @@ typedef struct VertexBuffer {
     float* vertices;
     int n;
 } VertexBuffer;
+
+typedef struct {
+    float x;
+    float y;
+    int env_idx;
+    int ary_idx;
+} ScreenPoint;
+
+typedef struct {
+    ScreenPoint points[MAX_POINTS];
+    int n;
+} RenderedPoints;
 
 typedef struct {
     char *key;
@@ -561,7 +574,8 @@ void plot_gl(Shader shader, VertexBuffer vertices) {
     rlSetBlendMode(RL_BLEND_ALPHA);
 }
 
-void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
+void plot(RenderedPoints* rendered_points, int rxoff, int ryoff, Shader shader, Hyper* x, Hyper* y,
+        bool log_x, bool log_y, PlotArgs args, float* cmap, bool* filter) {
     assert(x->n == y->n);
 
     int width = args.width;
@@ -611,6 +625,15 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
         particles[i].g = c.g/255.0f;
         particles[i].b = c.b/255.0f;
         particles[i].a = c.a/255.0f;
+
+        rendered_points->points[rendered_points->n] = (ScreenPoint){
+            rxoff + xi,
+            ryoff + yi,
+            rendered_points->points[rendered_points->n].env_idx,
+            idx
+        };
+        rendered_points->n++;
+
         idx++;
     }
 
@@ -618,7 +641,7 @@ void plot(Shader shader, Hyper* x, Hyper* y, bool log_x, bool log_y, PlotArgs ar
     plot_gl(shader, buffer);
 }
 
-void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
+void plot3(RenderedPoints* rendered_points, Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
         bool log_x, bool log_y, bool log_z, PlotArgs args, float* cmap, bool* filter) {
     assert(x->n == y->n  && x->n == z->n);
     float x_min = args.x_min;
@@ -682,9 +705,17 @@ void plot3(Camera3D camera, Shader shader, Hyper* x, Hyper* y, Hyper* z,
         particles[i].g = c.g/255.0f;
         particles[i].b = c.b/255.0f;
         particles[i].a = c.a/255.0f;
-        idx++;
+
+        rendered_points->points[rendered_points->n] = (ScreenPoint){
+            screen_pos.x,
+            screen_pos.y,
+            rendered_points->points[rendered_points->n].env_idx,
+            idx
+        };
+        rendered_points->n++;
 
         //DrawBillboard(camera, whiteTexture, point, 0.1f, c);
+        idx++;
 
     }
     VertexBuffer buffer = {&particles, idx};
@@ -892,6 +923,9 @@ int main(void) {
         strcat(env_options, data.envs[i].key);
     }
 
+    // Rendered points
+    RenderedPoints rendered_points = {0};
+
     // Initialize Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
@@ -1019,6 +1053,8 @@ int main(void) {
     Vector2 focus = {0, 0};
 
     while (!WindowShouldClose()) {
+        rendered_points.n = 0;
+
         BeginDrawing();
         ClearBackground(PUFF_BACKGROUND);
 
@@ -1074,7 +1110,10 @@ int main(void) {
                 }
             }
             //BeginShaderMode(shader);
-            plot3(camera, shader, x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
+            for (int j=0; j<x->n; j++) {
+                rendered_points.points[rendered_points.n + j].env_idx = i;
+            }
+            plot3(&rendered_points, camera, shader, x, y, z, fig1_x_log, fig1_y_log, fig1_z_log, args1, cmap, NULL);
             //EndShaderMode();
         }
 
@@ -1207,7 +1246,10 @@ int main(void) {
                     cmap[j] = i/(float)data.n;
                 }
             }
-            plot(shader, x, y, fig2_x_log, fig2_y_log, args2, cmap, NULL);
+            for (int j=0; j<x->n; j++) {
+                rendered_points.points[rendered_points.n + j].env_idx = i;
+            }
+            plot(&rendered_points, fig1.texture.width, 0, shader, x, y, fig2_x_log, fig2_y_log, args2, cmap, NULL);
         }
         //EndShaderMode();
         //rlSetBlendMode(RL_BLEND_ALPHA);
@@ -1240,7 +1282,10 @@ int main(void) {
             apply_filter(filter, filter_param_1, fig3_range1_min_val, fig3_range1_max_val);
             Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig3_range2_idx]);
             apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
-            plot(shader, x, y, false, false, args3, cmap, filter);
+            for (int j=0; j<x->n; j++) {
+                rendered_points.points[rendered_points.n + j].env_idx = i;
+            }
+            plot(&rendered_points, 0, fig1.texture.height, shader, x, y, false, false, args3, cmap, filter);
         }
 
         //draw_axes(args3);
@@ -1455,6 +1500,25 @@ int main(void) {
         GuiDropdownCheckbox(fig1.texture.width + DROPDOWN_WIDTH, 0, options, &fig2_x_idx, &fig2_x_active, "Log X", &fig2_x_log);
         GuiDropdownCheckbox(fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig2_y_idx, &fig2_y_active, "Log Y", &fig2_y_log);
         GuiDropdownCheckbox(fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, env_hyper_options, &fig2_color_idx, &fig2_color_active, "Log Color", &fig2_log_color);
+
+        // Tooltip
+        float x = focus.x;
+        float y = focus.y;
+        float min_dist = FLT_MAX;
+        int min_i = 0;
+        printf("N points: %d\n", rendered_points.n);
+        for (int i=0; i<rendered_points.n; i++) {
+            ScreenPoint point = rendered_points.points[i];
+            float dist = sqrt(pow(x - point.x, 2) + pow(y - point.y, 2));
+            if (dist < min_dist) {
+                min_dist = dist;
+                min_i = i;
+            }
+        }
+        ScreenPoint point = rendered_points.points[min_i];
+        char* env_key = data.envs[point.env_idx].key;
+        DrawText(TextFormat("%s[%d]", env_key, point.ary_idx), point.x, point.y, 10, WHITE);
+        //printf("%s[%d] at point (%f, %f)\n", env_key, point.ary_idx, point.x, point.y);
 
 
         //DrawFPS(GetScreenWidth() - 95, 10);
