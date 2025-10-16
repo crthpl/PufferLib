@@ -380,11 +380,15 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     # patience_counter = 0
 
     for _ in range(training_iter):
-        optimizer.zero_grad()
-        output = model(train_x)
-        loss = -mll(output, train_y)
-        loss.backward()
-        optimizer.step()
+        try:
+            optimizer.zero_grad()
+            output = model(train_x)
+            loss = -mll(output, train_y)
+            loss.backward()
+            optimizer.step()
+        except gpytorch.utils.errors.NotPSDError:
+            # It's rare but it does happen. Hope it's a transient issue.
+            break
 
         # TODO: Test early termination? requires tol and patience args
         # The default iter is 50, so might not be needed
