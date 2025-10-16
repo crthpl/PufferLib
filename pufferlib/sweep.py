@@ -597,7 +597,9 @@ class Protein:
         # Batch predictions to avoid GPU OOM for large number of suggestions
         gp_y_norm_list, gp_y_std_norm_list, gp_log_c_norm_list = [], [], []
 
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        with torch.no_grad(), gpytorch.settings.fast_pred_var(), warnings.catch_warnings():
+            warnings.simplefilter("ignore", gpytorch.utils.warnings.NumericalWarning)
+
             # Create a reusable buffer on the device to avoid allocating a huge tensor
             for i in range(0, len(suggestions), self.infer_batch_size):
                 batch_numpy = suggestions[i:i+self.infer_batch_size]
