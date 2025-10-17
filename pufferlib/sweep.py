@@ -1,10 +1,10 @@
-import numpy as np
 import random
 import math
 import warnings
-
 from copy import deepcopy
+from contextlib import contextmanager
 
+import numpy as np
 import pufferlib
 
 import torch
@@ -19,6 +19,15 @@ from scipy.stats.qmc import Sobol
 from scipy.spatial import KDTree
 
 EPSILON = 1e-6
+
+@contextmanager
+def default_tensor_dtype(dtype):
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 class Space:
     def __init__(self, min, max, scale, mean, is_integer=False):
@@ -361,8 +370,13 @@ class ExactGPModel(ExactGP):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = ConstantMean()
         # Matern 3/2 kernel (equivalent to Pyro's Matern32)
-        lengthscale_constraint = gpytorch.constraints.Interval(0.01, 10.0)
-        matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim, lengthscale_constraint=lengthscale_constraint)
+        matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim)
+
+        # NOTE: setting this constraint changes GP behavior, including the lengthscale
+        # even though the lengthscale is well within the range ... Commenting out for now.
+        # lengthscale_constraint = gpytorch.constraints.Interval(0.01, 10.0)
+        # matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim, lengthscale_constraint=lengthscale_constraint)
+
         linear_kernel = PolynomialKernel(power=1)
         self.covar_module = ScaleKernel(AdditiveKernel(linear_kernel, matern_kernel))
 
@@ -432,10 +446,6 @@ class Protein:
             prune_pareto = True,
             # ucb_beta = None,  # Exploration-exploitation trade-off for UCB
         ):
-        
-        # NOTE: Check if this interfere with training. I put this to make gpytorch work with gpu
-        torch.set_default_dtype(torch.float32)
-
         self.device = torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
         self.global_search_scale = global_search_scale
@@ -465,34 +475,36 @@ class Protein:
         # points_per_run = sweep_config['downsample']
         # self.num_random_samples = 3 * points_per_run * self.hyperparameters.num
 
-        # Params taken from HEBO: https://arxiv.org/abs/2012.03826
-        noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
-
-        # Create dummy data for model initialization on the selected device
-        dummy_x = torch.ones((1, self.hyperparameters.num), device=self.device)
-        dummy_y = torch.zeros(1, device=self.device)
-        # Score GP
-        self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
-        self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num).to(self.device)
-        self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score).to(self.device)
-        self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
-
-        # Cost GP
-        self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
-        self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num).to(self.device)
-        self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost).to(self.device)
-        self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
-
-        # Buffers for GP training data
         self.gp_max_obs = gp_max_obs  # train time bumps after 800?
-        self.gp_params_buffer = torch.empty(self.gp_max_obs, self.hyperparameters.num, dtype=torch.float32, device=self.device)
-        self.gp_score_buffer = torch.empty(self.gp_max_obs, dtype=torch.float32, device=self.device)
-        self.gp_cost_buffer = torch.empty(self.gp_max_obs, dtype=torch.float32, device=self.device)
-
         self.infer_batch_size = infer_batch_size
-        self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, dtype=torch.float32, device=self.device)
 
-    def _filter_near_duplicates(self, inputs, duplicate_threshold=1e-3):
+        # Use 64 bit for GP regression
+        with default_tensor_dtype(torch.float64):
+            # Params taken from HEBO: https://arxiv.org/abs/2012.03826
+            noise_prior = LogNormalPrior(math.log(1e-2), 0.5)
+
+            # Create dummy data for model initialization on the selected device
+            dummy_x = torch.ones((1, self.hyperparameters.num), device=self.device)
+            dummy_y = torch.zeros(1, device=self.device)
+            # Score GP
+            self.likelihood_score = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
+            self.gp_score = ExactGPModel(dummy_x, dummy_y, self.likelihood_score, self.hyperparameters.num).to(self.device)
+            self.mll_score = ExactMarginalLogLikelihood(self.likelihood_score, self.gp_score).to(self.device)
+            self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
+
+            # Cost GP
+            self.likelihood_cost = GaussianLikelihood(noise_prior=deepcopy(noise_prior)).to(self.device)
+            self.gp_cost = ExactGPModel(dummy_x, dummy_y, self.likelihood_cost, self.hyperparameters.num).to(self.device)
+            self.mll_cost = ExactMarginalLogLikelihood(self.likelihood_cost, self.gp_cost).to(self.device)
+            self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
+
+            # Buffers for GP training and inference
+            self.gp_params_buffer = torch.empty(self.gp_max_obs, self.hyperparameters.num, device=self.device)
+            self.gp_score_buffer = torch.empty(self.gp_max_obs, device=self.device)
+            self.gp_cost_buffer = torch.empty(self.gp_max_obs, device=self.device)
+            self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, device=self.device)
+
+    def _filter_near_duplicates(self, inputs, duplicate_threshold=EPSILON):
         if len(inputs) < 2:
             return np.arange(len(inputs))
 
