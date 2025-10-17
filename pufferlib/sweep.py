@@ -391,7 +391,7 @@ class ExactGPModel(ExactGP):
         lengthscale = self.covar_module.base_kernel.kernels[1].lengthscale.tolist()[0]
         return min(lengthscale), max(lengthscale)
 
-def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=100):
+def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=50):
     model.train()
     likelihood.train()
     model.set_train_data(inputs=train_x, targets=train_y, strict=False)
@@ -407,19 +407,11 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
             loss = -mll(output, train_y)
             loss.backward()
             optimizer.step()
+            loss = loss.detach()
+
         except gpytorch.utils.errors.NotPSDError:
             # It's rare but it does happen. Hope it's a transient issue.
             break
-
-        # TODO: Test early termination? requires tol and patience args
-        # The default iter is 50, so might not be needed
-        # if best_loss - loss.item() > tol:
-        #     best_loss = loss.item()
-        #     patience_counter = 0
-        # else:
-        #     patience_counter += 1
-        #     if patience_counter >= patience:
-        #         break
 
     model.eval()
     likelihood.eval()
@@ -644,12 +636,14 @@ class Protein:
                     # Score prediction
                     pred_y = self.likelihood_score(self.gp_score(batch_tensor))
                     gp_y_norm_list.append(pred_y.mean.cpu())
-                    # NOTE: stddev had a numerical issue.
                     # gp_y_std_norm_list.append(pred_y.stddev.cpu())
      
                     # Cost prediction
                     pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
                     gp_log_c_norm_list.append(pred_c.mean.cpu())
+
+                    del pred_y, pred_c
+
                 except RuntimeError:
                     # Handle numerical errors during GP prediction
                     gp_y_norm_list.append(torch.zeros(current_batch_size))
