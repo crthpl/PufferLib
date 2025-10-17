@@ -84,6 +84,7 @@ typedef struct {
     float y;
     int env_idx;
     int ary_idx;
+    bool active;
 } Tooltip;
 
 typedef struct {
@@ -691,6 +692,21 @@ void update_closest(Tooltip* tooltip, Vector2 *indices, Glyph* glyphs, int size,
     }
 }
 
+void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
+    char* start = buffer;
+    for (int hyper_idx = 0; hyper_idx < env->n; hyper_idx++) {
+        Hyper *hyper = &env->hypers[hyper_idx];
+        char *slash = strchr(hyper->key, '/');
+        if (!slash) {
+            continue;
+        }
+        char* suffix = slash + 1;
+        buffer += sprintf(buffer, "%s = %f\n", suffix, hyper->ary[ary_idx]);
+    }
+    buffer[0] = '\0';
+    SetClipboardText(start);
+}
+
 int main(void) {
     FILE *file = fopen("pufferlib/ocean/constellation/all_cache.json", "r");
     if (!file) {
@@ -827,6 +843,8 @@ int main(void) {
         if (i > 0) strcat(env_options, ";");
         strcat(env_options, data.envs[i].key);
     }
+
+    char* clipboard = malloc(1024);
 
     // Points
     Point* points = calloc(MAX_POINTS, sizeof(Point));
@@ -965,18 +983,26 @@ int main(void) {
     bool *filter = calloc(max_data_points, sizeof(bool));
 
     Tooltip tooltip = {0};
+
     Vector2 focus = {0, 0};
 
     while (!WindowShouldClose()) {
         int screen_points_count = 0;
+        bool right_clicked = false;
 
         BeginDrawing();
         ClearBackground(PUFF_BACKGROUND);
 
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             focus = GetMousePosition();
-            tooltip.click_x = focus.x;
-            tooltip.click_y = focus.y;
+            tooltip.active = false;
+        }
+        if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+            Vector2 mouse_pos = GetMousePosition();
+            right_clicked = true;
+            tooltip.active = true;
+            tooltip.click_x = mouse_pos.x;
+            tooltip.click_y = mouse_pos.y;
         }
 
         // Figure 1
@@ -1390,20 +1416,26 @@ int main(void) {
         Env* env = &data.envs[env_idx];
         char* env_key = env->key;
 
-        DrawTextEx(
-            args1.font_small,
-            TextFormat("%s[%d]", env_key, ary_idx),
-            (Vector2){
-                tooltip.x,
-                tooltip.y,
-            },
-            args1.axis_tick_font_size,
-            0,
-            WHITE
-        );
+        float cost = get_hyper(&data, env_key, "cost")->ary[ary_idx];
+        float score = get_hyper(&data, env_key, "environment/score")->ary[ary_idx];
+        float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
 
+        if (tooltip.active) {
+            char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
+            Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
+            DrawRectangle(tooltip.x, tooltip.y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
+            DrawCircle(tooltip.x, tooltip.y, 2, PUFF_CYAN);
+            DrawTextEx(args1.font_small, text, (Vector2){tooltip.x + 2, tooltip.y + 2}, args1.axis_tick_font_size, 0, WHITE);
+
+        }
         //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
+
+        // Copy hypers to clipboard
+        int total_len = 0;
+        if (right_clicked) {
+            copy_hypers_to_clipboard(env, clipboard, ary_idx);
+        }
     }
 
     UnloadShader(shader);
