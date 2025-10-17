@@ -361,7 +361,8 @@ class ExactGPModel(ExactGP):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = ConstantMean()
         # Matern 3/2 kernel (equivalent to Pyro's Matern32)
-        matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim)
+        lengthscale_constraint = gpytorch.constraints.Interval(0.01, 10.0)
+        matern_kernel = MaternKernel(nu=1.5, ard_num_dims=x_dim, lengthscale_constraint=lengthscale_constraint)
         linear_kernel = PolynomialKernel(power=1)
         self.covar_module = ScaleKernel(AdditiveKernel(linear_kernel, matern_kernel))
 
@@ -369,6 +370,12 @@ class ExactGPModel(ExactGP):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    @property
+    def lengthscale_range(self):
+        # Get lengthscale from MaternKernel
+        lengthscale = self.covar_module.base_kernel.kernels[1].lengthscale.tolist()[0]
+        return min(lengthscale), max(lengthscale)
 
 def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training_iter=100):
     model.train()
@@ -485,33 +492,39 @@ class Protein:
         self.infer_batch_size = infer_batch_size
         self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, dtype=torch.float32, device=self.device)
 
-    # NOTE: This is a simple Heuristic. Consider sparse/scalable GP if necessary.
-    def _sample_observations(self, max_size=None, recent_ratio=0.5, duplicate_threshold=1e-3):
+    def _filter_near_duplicates(self, inputs, duplicate_threshold=1e-3):
+        if len(inputs) < 2:
+            return np.arange(len(inputs))
+
+        tree = KDTree(inputs)
+        to_keep = np.ones(len(inputs), dtype=bool)
+        # Iterate from most recent to oldest
+        for i in range(len(inputs) - 1, -1, -1):
+            if to_keep[i]:
+                nearby_indices = tree.query_ball_point(inputs[i], r=duplicate_threshold)
+                # Exclude the point itself from being marked for removal
+                nearby_indices.remove(i)
+                if nearby_indices:
+                    to_keep[nearby_indices] = False
+
+        return np.where(to_keep)[0]
+
+    def _sample_observations(self, max_size=None, recent_ratio=0.5):
         # Remove near-duplicate inputs for numerical stability using a KD-tree for performance
         if not self.success_observations:
             return []
 
-        unique_obs = []
-        # Use a list to collect unique inputs, then build the tree once
-        initial_unique_inputs = [self.success_observations[-1]['input']]
-        unique_obs.append(self.success_observations[-1])
-
-        for obs in reversed(self.success_observations): # Prioritize recent observations
-            tree = KDTree(initial_unique_inputs)
-            distance, _ = tree.query(obs['input'], k=1)
-            if distance > duplicate_threshold:
-                unique_obs.append(obs)
-                initial_unique_inputs.append(obs['input'])
-        
-        observations = list(reversed(unique_obs)) # Restore original order
-
         # Update the stats using the full data
-        y = np.array([e['output'] for e in observations])
+        y = np.array([e['output'] for e in self.success_observations])
         self.min_score, self.max_score = y.min(), y.max()
 
-        c = np.array([e['cost'] for e in observations])
+        c = np.array([e['cost'] for e in self.success_observations])
         log_c = np.log(np.maximum(c, EPSILON))
         self.log_c_min, self.log_c_max = log_c.min(), log_c.max()
+
+        params = np.array([e['input'] for e in self.success_observations])
+        dedup_indices = self._filter_near_duplicates(params)
+        observations = [self.success_observations[i] for i in dedup_indices]
 
         if max_size is None:
             max_size = self.gp_max_obs
@@ -593,6 +606,12 @@ class Protein:
         suggestions = self.hyperparameters.sample(
             len(candidates)*self.suggestions_per_pareto, mu=search_centers)
 
+        dedup_indices = self._filter_near_duplicates(suggestions)
+        suggestions = suggestions[dedup_indices]
+
+        if len(suggestions) == 0:
+            return self.suggest(fill) # Fallback to random if all suggestions are filtered
+
         ### Predict scores and costs
         # Batch predictions to avoid GPU OOM for large number of suggestions
         gp_y_norm_list, gp_y_std_norm_list, gp_log_c_norm_list = [], [], []
@@ -609,15 +628,20 @@ class Protein:
                 batch_tensor = self.infer_batch_buffer[:current_batch_size]
                 batch_tensor.copy_(torch.from_numpy(batch_numpy))
 
-                # Score prediction
-                pred_y = self.likelihood_score(self.gp_score(batch_tensor))
-                gp_y_norm_list.append(pred_y.mean.cpu())
-                # NOTE: stddev had a numerical issue.
-                # gp_y_std_norm_list.append(pred_y.stddev.cpu())
- 
-                # Cost prediction
-                pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
-                gp_log_c_norm_list.append(pred_c.mean.cpu())
+                try:
+                    # Score prediction
+                    pred_y = self.likelihood_score(self.gp_score(batch_tensor))
+                    gp_y_norm_list.append(pred_y.mean.cpu())
+                    # NOTE: stddev had a numerical issue.
+                    # gp_y_std_norm_list.append(pred_y.stddev.cpu())
+     
+                    # Cost prediction
+                    pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
+                    gp_log_c_norm_list.append(pred_c.mean.cpu())
+                except RuntimeError:
+                    # Handle numerical errors during GP prediction
+                    gp_y_norm_list.append(torch.zeros(current_batch_size))
+                    gp_log_c_norm_list.append(torch.zeros(current_batch_size))
 
         # Concatenate results from all batches
         gp_y_norm = torch.cat(gp_y_norm_list).numpy()
@@ -660,6 +684,8 @@ class Protein:
             rating = suggestion_scores[best_idx].item(),
             score_loss = score_loss,
             cost_loss = cost_loss,
+            score_lengthscale = self.gp_score.lengthscale_range,
+            cost_lengthscale = self.gp_cost.lengthscale_range,
         )
         print('Predicted -- ',
             f'Score: {info["score"]:.3f}',

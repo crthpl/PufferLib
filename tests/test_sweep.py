@@ -91,6 +91,10 @@ def test_sweep(args):
             info_str += f', score_loss: {info["score_loss"]:.4f}'
         if "cost_loss" in info:
             info_str += f', cost_loss: {info["cost_loss"]:.4f}'
+        if "score_lengthscale" in info:
+            info_str += f'\nscore_lengthscale: {info["score_lengthscale"]}'
+        if "cost_lengthscale" in info:
+            info_str += f', cost_lengthscale: {info["cost_lengthscale"]}'
         print(info_str)
 
         total_timesteps = args['train']['total_timesteps']
