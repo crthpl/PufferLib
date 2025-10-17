@@ -433,6 +433,7 @@ class Protein:
             gp_learning_rate = 0.001,
             gp_max_obs = 750,  # gp train time jumps after 800
             infer_batch_size = 4096,            
+            optimizer_reset_frequency = 50,
             use_gpu = True,
             cost_param = "train/total_timesteps",
             prune_pareto = True,
@@ -448,6 +449,7 @@ class Protein:
         self.expansion_rate = expansion_rate
         self.gp_training_iter = gp_training_iter
         self.gp_learning_rate = gp_learning_rate
+        self.optimizer_reset_frequency = optimizer_reset_frequency
         self.prune_pareto = prune_pareto
         # self.ucb_beta = ucb_beta
 
@@ -598,6 +600,11 @@ class Protein:
             return self.hyperparameters.to_dict(best, fill), info
 
         score_loss, cost_loss = self._train_gp_models()
+
+        if self.optimizer_reset_frequency and self.suggestion_idx % self.optimizer_reset_frequency == 0:
+            print(f'Resetting GP optimizers at suggestion {self.suggestion_idx}')
+            self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
+            self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
        
         candidates, pareto_idxs = pareto_points(self.success_observations)
         # pareto_costs = np.array([e['cost'] for e in candidates])
@@ -618,7 +625,7 @@ class Protein:
 
         ### Predict scores and costs
         # Batch predictions to avoid GPU OOM for large number of suggestions
-        gp_y_norm_list, gp_y_std_norm_list, gp_log_c_norm_list = [], [], []
+        gp_y_norm_list, gp_log_c_norm_list = [], []
 
         with torch.no_grad(), gpytorch.settings.fast_pred_var(), warnings.catch_warnings():
             warnings.simplefilter("ignore", gpytorch.utils.warnings.NumericalWarning)
@@ -633,25 +640,21 @@ class Protein:
                 batch_tensor.copy_(torch.from_numpy(batch_numpy))
 
                 try:
-                    # Score prediction
-                    pred_y = self.likelihood_score(self.gp_score(batch_tensor))
-                    gp_y_norm_list.append(pred_y.mean.cpu())
-                    # gp_y_std_norm_list.append(pred_y.stddev.cpu())
-     
-                    # Cost prediction
-                    pred_c = self.likelihood_cost(self.gp_cost(batch_tensor))
-                    gp_log_c_norm_list.append(pred_c.mean.cpu())
-
-                    del pred_y, pred_c
+                    # Score and cost prediction
+                    pred_y_mean = self.likelihood_score(self.gp_score(batch_tensor)).mean.cpu()
+                    pred_c_mean = self.likelihood_cost(self.gp_cost(batch_tensor)).mean.cpu()
 
                 except RuntimeError:
                     # Handle numerical errors during GP prediction
-                    gp_y_norm_list.append(torch.zeros(current_batch_size))
-                    gp_log_c_norm_list.append(torch.zeros(current_batch_size))
+                    pred_y_mean, pred_c_mean = torch.zeros(current_batch_size)
+
+                gp_y_norm_list.append(pred_y_mean.cpu())
+                gp_log_c_norm_list.append(pred_c_mean.cpu())
+
+                del pred_y_mean, pred_c_mean
 
         # Concatenate results from all batches
         gp_y_norm = torch.cat(gp_y_norm_list).numpy()
-        # gp_y_std_norm = torch.cat(gp_y_std_norm_list).numpy()
         gp_log_c_norm = torch.cat(gp_log_c_norm_list).numpy()
 
         # Unlinearize
@@ -681,7 +684,7 @@ class Protein:
         #     score += self.ucb_beta * gp_y_std_norm
 
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
-                score*weight)
+                score * weight)
 
         best_idx = np.argmax(suggestion_scores)
         info = dict(
