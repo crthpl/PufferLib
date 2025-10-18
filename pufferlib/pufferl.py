@@ -132,7 +132,7 @@ class PuffeRL:
         self.policy = policy
         if config['compile']:
             self.policy = torch.compile(policy, mode=config['compile_mode'])
-            self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+            #self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         # Optimizer
@@ -251,7 +251,11 @@ class PuffeRL:
                     state['lstm_h'] = self.lstm_h[env_id.start]
                     state['lstm_c'] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                #h, c = state['lstm_h'], state['lstm_c']
+                logits, value = self.policy(o_device)
+                #logits, value, h, c = self.policy(o_device, h, c)
+                #state['lstm_h'] = h
+                #state['lstm_c'] = c
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -311,69 +315,19 @@ class PuffeRL:
 
 
     def train(self):
-        profile = self.profile
         epoch = self.epoch
+        profile = self.profile
         profile('train', epoch)
-        losses = defaultdict(float)
-        config = self.config
-        device = config['device']
+        profile('train_learn', epoch, nest=True)
+ 
+        _compiled_train(self.policy, self.optimizer, self.observations, self.actions, self.logprobs, self.rewards,
+                self.terminals, self.truncations, self.ratio, self.values, self.epoch, self.total_epochs,
+                self.minibatch_segments, self.segments, self.vecenv.single_observation_space.shape,
+                int(self.vecenv.single_action_space.n), self.config)
 
-        b0 = config['prio_beta0']
-        a = config['prio_alpha']
-        clip_coef = config['clip_coef']
-        vf_clip = config['vf_clip_coef']
-        anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
-        self.ratio[:] = 1
-
-        num_minibatches = config['num_minibatches']
-        for mb in range(num_minibatches):
-            profile('train_misc', epoch, nest=True)
-            self.amp_context.__enter__()
-
-            shape = self.values.shape
-            advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(self.values, self.rewards,
-                self.terminals, self.ratio, advantages, config['gamma'],
-                config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
-
-            profile('train_copy', epoch)
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
-            prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs,
-                self.minibatch_segments, replacement=True)
-            mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
-            mb_obs = self.observations[idx]
-            mb_actions = self.actions[idx]
-            mb_logprobs = self.logprobs[idx]
-            mb_rewards = self.rewards[idx]
-            mb_terminals = self.terminals[idx]
-            mb_truncations = self.truncations[idx]
-            mb_ratio = self.ratio[idx]
-            mb_values = self.values[idx]
-            mb_returns = advantages[idx] + mb_values
-            mb_advantages = advantages[idx]
-
-            profile('train_forward', epoch)
-            if not config['use_rnn']:
-                mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
-
-            state = dict(
-                action=mb_actions,
-                lstm_h=None,
-                lstm_c=None,
-            )
-
-            adv = advantages[idx]
-
-            _compiled_train(self.policy, self.optimizer,
-                    mb_obs, mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
-                    mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
-                    config, clip_coef, vf_clip, num_minibatches, mb
-            )
-
-
+        profile('train_misc', epoch)
         # Reprioritize experience
+        '''
         profile('train_misc', epoch)
         if config['anneal_lr']:
             self.scheduler.step()
@@ -383,19 +337,26 @@ class PuffeRL:
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
         losses['explained_variance'] = explained_var
+        '''
 
         profile.end()
+
+        config = self.config
+
+
         logs = None
         self.epoch += 1
         done_training = self.global_step >= config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
-            self.losses = losses
+            #self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
             profile.clear()
+            if self.epoch == 1:
+                profile.reset()
 
         if self.epoch % config['checkpoint_interval'] == 0 or done_training:
             self.save_checkpoint()
@@ -654,9 +615,12 @@ def dist_mean(value, device):
 
 class Profile:
     def __init__(self, frequency=5):
-        self.profiles = defaultdict(lambda: defaultdict(float))
+        self.reset()
         self.frequency = frequency
         self.stack = []
+
+    def reset(self):
+        self.profiles = defaultdict(lambda: defaultdict(float))
 
     def __iter__(self):
         return iter(self.profiles.items())
@@ -700,9 +664,31 @@ class Profile:
 
 def compute_loss(params_and_buffers, policy, mb_obs,
         mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
-        mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
-        config, clip_coef, vf_clip, num_minibatches, mb):
+        mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv,  epoch, idx,
+        config, clip_coef, vf_clip, num_minibatches, mb, horizon, num_atns, segments):
+    segments = int(segments)
+    num_atns = int(num_atns)
+    #logits = torch.empty(segments, horizon, num_atns, device=config['device'])
+    #newvalue = torch.empty(segments, horizon, 1, device=config['device'])
+    logits = []
+    newvalue = []
+    #h = None
+    #c = None
+    h = torch.zeros(segments, 128, device=config['device'])
+    c = torch.zeros(segments, 128, device=config['device'])
+
+    #for t in range(horizon):
+    #    #l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], h, c))
+    #    l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], None, None))
+    #    #logits[:, t] = l
+    #    #newvalue[:, t] = n
+    #    logits.append(l)
+    #    newvalue.append(n)
+
     logits, newvalue = func.functional_call(policy, params_and_buffers, mb_obs)
+
+    #logits = torch.cat(logits, dim=0)
+    #newvalue = torch.stack(newvalue, dim=1)
 
     actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
@@ -739,26 +725,69 @@ def compute_loss(params_and_buffers, policy, mb_obs,
     return loss
 
 @torch.compile(fullgraph=True)
-def _compiled_train(policy, optimizer, mb_obs, mb_actions, mb_logprobs, mb_rewards,
-            mb_terminals, mb_truncations, mb_ratio, mb_values, mb_returns, mb_advantages,
-            mb_prio, adv, state, epoch, idx, config, clip_coef, vf_clip, num_minibatches, mb):
+def _compiled_train(policy, optimizer, observations, actions, logprobs, rewards,
+        terminals, truncations, ratio, values, epoch, total_epochs,
+        minibatch_segments, segments, obs_shape, atn_shape, config):
+
+    config['device']
+    horizon = config['bptt_horizon']
+    device = config['device']
+    b0 = config['prio_beta0']
+    a = config['prio_alpha']
+    clip_coef = config['clip_coef']
+    vf_clip = config['vf_clip_coef']
+    anneal_beta = b0 + (1 - b0)*a*epoch/total_epochs
+
+    ratio = torch.ones_like(values)
+
+    num_minibatches = config['num_minibatches']
 
     lr = optimizer.param_groups[0]['lr']
-    buffers = dict(policy.named_buffers())
+    buffers = {}#dict(policy.named_buffers())
     param_names = [k for k, v in policy.named_parameters() if v.requires_grad]
     params = [v for k, v in policy.named_parameters() if v.requires_grad]
     params_dict = dict(zip(param_names, params))
     params_and_buffers = {**buffers, **params_dict}
 
-    grad_fn = func.grad(compute_loss, has_aux=False)
-    grads = grad_fn(params_and_buffers, policy, mb_obs,
-        mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
-        mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
-        config, clip_coef, vf_clip, num_minibatches, mb)
- 
-    for name, param in zip(param_names, params):
-        if name in grads:
-            param.data.sub_(lr * grads[name])
+    for mb in range(num_minibatches):
+        shape = values.shape
+        advantages = torch.zeros(shape, device=device)
+        advantages = compute_puff_advantage(values, rewards,
+            terminals, ratio, advantages, config['gamma'],
+            config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+
+        adv = advantages.abs().sum(axis=1)
+        prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+        prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
+        idx = torch.multinomial(prio_probs,
+            minibatch_segments, replacement=True)
+        mb_prio = (segments*prio_probs[idx, None])**-anneal_beta
+        mb_obs = observations[idx]
+        mb_actions = actions[idx]
+        mb_logprobs = logprobs[idx]
+        mb_rewards = rewards[idx]
+        mb_terminals = terminals[idx]
+        mb_truncations = truncations[idx]
+        mb_ratio = ratio[idx]
+        mb_values = values[idx]
+        mb_returns = advantages[idx] + mb_values
+        mb_advantages = advantages[idx]
+
+        if not config['use_rnn']:
+            mb_obs = mb_obs.reshape(-1, *obs_shape)
+
+
+        adv = advantages[idx]
+
+        grad_fn = func.grad(compute_loss, has_aux=False)
+        grads = grad_fn(params_and_buffers, policy, mb_obs,
+            mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
+            mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, epoch, idx,
+            config, clip_coef, vf_clip, num_minibatches, mb, horizon, atn_shape, minibatch_segments)
+     
+        for name, param in zip(param_names, params):
+            if name in grads:
+                param.data.sub_(lr * grads[name])
 
 class Utilization(Thread):
     def __init__(self, delay=1, maxlen=20):

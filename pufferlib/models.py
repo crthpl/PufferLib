@@ -97,6 +97,60 @@ class Default(nn.Module):
         values = self.value(hidden)
         return logits, values
 
+class Default(nn.Module):
+    '''Default PyTorch policy. Flattens obs and applies a linear layer.
+
+    PufferLib is not a framework. It does not enforce a base class.
+    You can use any PyTorch policy that returns actions and values.
+    We structure our forward methods as encode_observations and decode_actions
+    to make it easier to wrap policies with LSTMs. You can do that and use
+    our LSTM wrapper or implement your own. To port an existing policy
+    for use with our LSTM wrapper, simply put everything from forward() before
+    the recurrent cell into encode_observations and put everything after
+    into decode_actions.
+    '''
+    def __init__(self, env, hidden_size=128):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_multidiscrete = isinstance(env.single_action_space,
+                pufferlib.spaces.MultiDiscrete)
+        self.is_continuous = isinstance(env.single_action_space,
+                pufferlib.spaces.Box)
+
+        num_obs = np.prod(env.single_observation_space.shape)
+        self.encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
+            nn.GELU(),
+        )
+        num_atns = env.single_action_space.n
+        self.decoder = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, num_atns), std=0.01)
+        self.value = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        logits, values = self.decode_actions(hidden)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        '''Encodes a batch of observations into hidden states. Assumes
+        no time dimension (handled by LSTM wrappers).'''
+        batch_size = observations.shape[0]
+        observations = observations.view(batch_size, -1)
+        return self.encoder(observations.float())
+
+    def decode_actions(self, hidden):
+        '''Decodes a batch of hidden states into (multi)discrete actions.
+        Assumes no time dimension (handled by LSTM wrappers).'''
+        logits = self.decoder(hidden)
+        values = self.value(hidden)
+        return logits, values
+
+
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, hidden_size=128):
         '''Wraps your policy with an LSTM without letting you shoot yourself in the
@@ -112,6 +166,7 @@ class LSTMWrapper(nn.Module):
         self.hidden_size = hidden_size
         self.is_continuous = self.policy.is_continuous
 
+        '''
         for name, param in self.named_parameters():
             if 'layer_norm' in name:
                 continue
@@ -119,23 +174,22 @@ class LSTMWrapper(nn.Module):
                 nn.init.constant_(param, 0)
             elif "weight" in name and param.ndim >= 2:
                 nn.init.orthogonal_(param, 1.0)
+        '''
 
-        self.lstm = nn.LSTM(input_size, hidden_size)
+        #self.lstm = nn.LSTM(input_size, hidden_size)
 
         self.cell = torch.nn.LSTMCell(input_size, hidden_size)
-        self.cell.weight_ih = self.lstm.weight_ih_l0
-        self.cell.weight_hh = self.lstm.weight_hh_l0
-        self.cell.bias_ih = self.lstm.bias_ih_l0
-        self.cell.bias_hh = self.lstm.bias_hh_l0
+        #self.cell.weight_ih = self.lstm.weight_ih_l0
+        #self.cell.weight_hh = self.lstm.weight_hh_l0
+        #self.cell.bias_ih = self.lstm.bias_ih_l0
+        #self.cell.bias_hh = self.lstm.bias_hh_l0
 
         #self.pre_layernorm = nn.LayerNorm(hidden_size)
         #self.post_layernorm = nn.LayerNorm(hidden_size)
 
-    def forward_eval(self, observations, state):
+    def forward(self, observations, h, c):
         '''Forward function for inference. 3x faster than using LSTM directly'''
-        hidden = self.policy.encode_observations(observations, state=state)
-        h = state['lstm_h']
-        c = state['lstm_c']
+        hidden = self.policy.encode_observations(observations)
 
         # TODO: Don't break compile
         if h is not None:
@@ -147,14 +201,12 @@ class LSTMWrapper(nn.Module):
         #hidden = self.pre_layernorm(hidden)
         hidden, c = self.cell(hidden, lstm_state)
         #hidden = self.post_layernorm(hidden)
-        state['hidden'] = hidden
-        state['lstm_h'] = hidden
-        state['lstm_c'] = c
         logits, values = self.policy.decode_actions(hidden)
-        return logits, values
+        return logits, values, hidden, c
 
+    '''
     def forward(self, observations, state):
-        '''Forward function for training. Uses LSTM for fast time-batching'''
+        #Forward function for training. Uses LSTM for fast time-batching
         x = observations
         lstm_h = state['lstm_h']
         lstm_c = state['lstm_c']
@@ -199,6 +251,46 @@ class LSTMWrapper(nn.Module):
         state['lstm_h'] = lstm_h.detach()
         state['lstm_c'] = lstm_c.detach()
         return logits, values
+    '''
+
+'''
+class LSTMWrapper(nn.Module):
+    def __init__(self, env, policy, hidden_size=128):
+        super().__init__()
+        self.obs_shape = env.single_observation_space.shape
+        input_size = hidden_size
+
+        self.policy = policy
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.is_continuous = self.policy.is_continuous
+
+        self.cell = sLSTM(input_size, hidden_size, 4)
+
+        #self.cell = torch.nn.LSTMCell(input_size, hidden_size)
+        #self.cell.weight_ih = self.lstm.weight_ih_l0
+        #self.cell.weight_hh = self.lstm.weight_hh_l0
+        #self.cell.bias_ih = self.lstm.bias_ih_l0
+        #self.cell.bias_hh = self.lstm.bias_hh_l0
+
+        #self.pre_layernorm = nn.LayerNorm(hidden_size)
+        #self.post_layernorm = nn.LayerNorm(hidden_size)
+
+    def forward(self, observations, c, n, h, m):
+        hidden = self.policy.encode_observations(observations)
+
+        # TODO: Don't break compile
+        if h is not None:
+            assert h.shape[0] == c.shape[0] == observations.shape[0], 'LSTM state must be (h, c)'
+            lstm_state = (h, c)
+        else:
+            lstm_state = None
+
+        hidden, c = self.cell(hidden, lstm_state)
+        logits, values = self.policy.decode_actions(hidden)
+        return logits, values, hidden, c
+'''
+
 
 class Convolutional(nn.Module):
     def __init__(self, env, *args, framestack, flat_size,
