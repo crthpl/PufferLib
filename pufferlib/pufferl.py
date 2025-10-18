@@ -943,9 +943,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 all_logs.append(logs)
 
             # If nan starts to appear in the logs, stop training
-            for k, v in logs.items():
-                if "losses/" in k and np.isnan(v):
-                    break
+            if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
+                break
 
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
