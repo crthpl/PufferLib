@@ -23,6 +23,7 @@ import numpy as np
 import psutil
 
 import torch
+from torch import func
 import torch.distributed
 from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
@@ -48,6 +49,10 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
 # Assume advantage kernel has been built if CUDA compiler is available
 ADVANTAGE_CUDA = shutil.which("nvcc") is not None
+
+# DEBUG FLAG IS A BUG. FUCK THIS DO NOT NOT NOT ENABLE
+#torch.autograd.set_detect_anomaly(True)
+#torch._dynamo.config.capture_scalar_outputs = True
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None, verbose=True):
@@ -304,7 +309,7 @@ class PuffeRL:
         profile.end()
         return self.stats
 
-    @record
+
     def train(self):
         profile = self.profile
         epoch = self.epoch
@@ -359,63 +364,14 @@ class PuffeRL:
                 lstm_c=None,
             )
 
-            logits, newvalue = self.policy(mb_obs, state)
-            actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
-
-            profile('train_misc', epoch)
-            newlogprob = newlogprob.reshape(mb_logprobs.shape)
-            logratio = newlogprob - mb_logprobs
-            ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach()
-
-            with torch.no_grad():
-                old_approx_kl = (-logratio).mean()
-                approx_kl = ((ratio - 1) - logratio).mean()
-                clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
-
             adv = advantages[idx]
-            adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
-                ratio, adv, config['gamma'], config['gae_lambda'],
-                config['vtrace_rho_clip'], config['vtrace_c_clip'])
-            adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
-            # Losses
-            pg_loss1 = -adv * ratio
-            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            _compiled_train(self.policy, self.optimizer,
+                    mb_obs, mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
+                    mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
+                    config, clip_coef, vf_clip, num_minibatches, mb
+            )
 
-            newvalue = newvalue.view(mb_returns.shape)
-            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
-            v_loss_unclipped = (newvalue - mb_returns) ** 2
-            v_loss_clipped = (v_clipped - mb_returns) ** 2
-            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
-
-            entropy_loss = entropy.mean()
-
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            self.amp_context.__enter__() # TODO: AMP needs some debugging
-
-            # This breaks vloss clipping?
-            self.values[idx] = newvalue.detach().float()
-
-            # Logging
-            profile('train_misc', epoch)
-            losses['policy_loss'] += pg_loss.item() / num_minibatches
-            losses['value_loss'] += v_loss.item() / num_minibatches
-            losses['entropy'] += entropy_loss.item() / num_minibatches
-            losses['old_approx_kl'] += old_approx_kl.item() / num_minibatches
-            losses['approx_kl'] += approx_kl.item() / num_minibatches
-            losses['clipfrac'] += clipfrac.item() / num_minibatches
-            losses['importance'] += ratio.mean().item() / num_minibatches
-
-            # Learn on accumulated minibatches
-            profile('learn', epoch)
-            loss.backward()
-            if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                self.optimizer.step()
-                self.optimizer.zero_grad()
 
         # Reprioritize experience
         profile('train_misc', epoch)
@@ -741,6 +697,68 @@ class Profile:
             if prof['delta'] > 0:
                 prof['buffer'] = prof['delta']
                 prof['delta'] = 0
+
+def compute_loss(params_and_buffers, policy, mb_obs,
+        mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
+        mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
+        config, clip_coef, vf_clip, num_minibatches, mb):
+    logits, newvalue = func.functional_call(policy, params_and_buffers, mb_obs)
+
+    actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
+
+    #profile('train_misc', epoch)
+    newlogprob = newlogprob.reshape(mb_logprobs.shape)
+    logratio = newlogprob - mb_logprobs
+    ratio = logratio.exp()
+    #self.ratio[idx] = ratio.detach()
+
+    with torch.no_grad():
+        old_approx_kl = (-logratio).mean()
+        approx_kl = ((ratio - 1) - logratio).mean()
+        clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
+
+    adv_new = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
+        ratio, adv, config['gamma'], config['gae_lambda'],
+        config['vtrace_rho_clip'], config['vtrace_c_clip'])
+    adv_new = mb_prio * (adv_new - adv_new.mean()) / (adv_new.std() + 1e-8)
+
+    # Losses
+    pg_loss1 = -adv_new * ratio
+    pg_loss2 = -adv_new * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+    newvalue = newvalue.view(mb_returns.shape)
+    v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+    v_loss_unclipped = (newvalue - mb_returns) ** 2
+    v_loss_clipped = (v_clipped - mb_returns) ** 2
+    v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+    entropy_loss = entropy.mean()
+
+    loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+    return loss
+
+@torch.compile(fullgraph=True)
+def _compiled_train(policy, optimizer, mb_obs, mb_actions, mb_logprobs, mb_rewards,
+            mb_terminals, mb_truncations, mb_ratio, mb_values, mb_returns, mb_advantages,
+            mb_prio, adv, state, epoch, idx, config, clip_coef, vf_clip, num_minibatches, mb):
+
+    lr = optimizer.param_groups[0]['lr']
+    buffers = dict(policy.named_buffers())
+    param_names = [k for k, v in policy.named_parameters() if v.requires_grad]
+    params = [v for k, v in policy.named_parameters() if v.requires_grad]
+    params_dict = dict(zip(param_names, params))
+    params_and_buffers = {**buffers, **params_dict}
+
+    grad_fn = func.grad(compute_loss, has_aux=False)
+    grads = grad_fn(params_and_buffers, policy, mb_obs,
+        mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
+        mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, state, epoch, idx,
+        config, clip_coef, vf_clip, num_minibatches, mb)
+ 
+    for name, param in zip(param_names, params):
+        if name in grads:
+            param.data.sub_(lr * grads[name])
 
 class Utilization(Thread):
     def __init__(self, delay=1, maxlen=20):
