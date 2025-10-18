@@ -1298,7 +1298,7 @@ int main(void) {
                     (zi - z_min)/(z_max - z_min)
                 };
 
-                Vector2 screen_i = GetWorldToScreenEx(src_point, camera, 960, 520);
+                Vector2 screen_i = GetWorldToScreenEx(src_point, args1.camera, args1.width, args1.height);
 
                 for (int i=0; i<data.n; i++) {
                     int bdi = best_idx[k][i];
@@ -1322,7 +1322,7 @@ int main(void) {
                         (yj - y_min)/(y_max - y_min),
                         (zj - z_min)/(z_max - z_min)
                     };
-                    Vector2 screen_j = GetWorldToScreenEx(dst_point, camera, 960, 520);
+                    Vector2 screen_j = GetWorldToScreenEx(dst_point, args1.camera, args1.width, args1.height);
                     DrawLineEx(
                         (Vector2){screen_i.x, screen_i.y},
                         (Vector2){screen_j.x, screen_j.y},
