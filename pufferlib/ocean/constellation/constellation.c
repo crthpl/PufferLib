@@ -36,7 +36,7 @@
 #include "rlgl.h"
 #include "raymath.h"
 
-#define CAMERA_ORBITAL_SPEED 0.025f
+#define CAMERA_ORBITAL_SPEED 0.05f
 void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
     float cameraOrbitalSpeed = CAMERA_ORBITAL_SPEED*GetFrameTime();
     Matrix rotation = MatrixRotate(GetCameraUp(camera), cameraOrbitalSpeed);
@@ -659,7 +659,9 @@ void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
         if (args.log_c) {
             cmap = safe_log10(cmap);
         }
-        cmap = (cmap - c_min)/(c_max - c_min);
+        if (c_min != c_max) {
+            cmap = (cmap - c_min)/(c_max - c_min);
+        }
         Color c = rgb(cmap);
         glyphs[i] = (Glyph){
             px,
@@ -707,6 +709,32 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
     SetClipboardText(start);
 }
 
+void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
+        float env_perf, float perf_threshold, Vector2 tsne, float tsne_thresh) {
+    for (int i=0; i<data->n; i++) {
+        Env* env = &data->envs[i];
+        Hyper* perf = get_hyper(data, env->key, "environment/perf");
+        Hyper* tsne1 = get_hyper(data, env->key, "tsne1");
+        Hyper* tsne2 = get_hyper(data, env->key, "tsne2");
+        for (int j=0; j<tsne1->n; j++) {
+            if (perf->ary[j] < perf_threshold) {
+                continue;
+            }
+            float t1_dist = tsne1->ary[j] - tsne.x;
+            float t2_dist = tsne2->ary[j] - tsne.y;
+            float tsne_dist = t1_dist*t1_dist + t2_dist*t2_dist;
+            if (tsne_dist > tsne_thresh) {
+                continue;
+            }
+            if (tsne_dist < env_dists[i]) {
+                env_dists[i] = tsne_dist;
+                env_idxs[i] = j;
+            }
+        }
+    }
+}
+    
+ 
 int main(void) {
     FILE *file = fopen("pufferlib/ocean/constellation/all_cache.json", "r");
     if (!file) {
@@ -986,6 +1014,50 @@ int main(void) {
 
     Vector2 focus = {0, 0};
 
+    // Find best hypers
+    float tsne_thresh = 100.0f;
+    memset(best_n, 0, sizeof(int)*4);
+    memset(best_srci, 0, sizeof(int)*4);
+    for (int env_i=0; env_i<data.n; env_i++) {
+        Env* src = &data.envs[env_i];
+        Hyper* src_perf = get_hyper(&data, src->key, "environment/perf");
+        Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
+        Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
+        for (int i=0; i<src_tsne1->n; i++) {
+            float perfi = src_perf->ary[i];
+            Vector2 tsnei = (Vector2){src_tsne1->ary[i], src_tsne2->ary[i]};
+            for (int ki=0; ki<4; ki++) {
+                if (perfi < perf_thresholds[ki]) {
+                    continue;
+                }
+                for (int kj=0; kj<data.n; kj++) {
+                    temp_idx[ki][kj] = -1;
+                    temp_dist[ki][kj] = FLT_MAX;
+                }
+                compute_constellation(&data, temp_idx[ki], temp_dist[ki], perfi, perf_thresholds[ki], tsnei, tsne_thresh);
+                int temp_n = 0;
+                for (int kj=0; kj<data.n; kj++) {
+                    if (temp_idx[ki][kj] != -1) {
+                        temp_n++;
+                    }
+                }
+                if (temp_n > best_n[ki]) {
+                    best_n[ki] = temp_n;
+                    best_srci[ki] = env_i;
+                    for (int kj=0; kj<data.n; kj++) {
+                        best_idx[ki][kj] = temp_idx[ki][kj];
+                    }
+                    if (best_idx[ki][env_i] == -1) {
+                        compute_constellation(&data, temp_idx[ki], temp_dist[ki], perfi, perf_thresholds[ki], tsnei, tsne_thresh);
+                        printf("Error: Best index not found\n");
+                        exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+
     while (!WindowShouldClose()) {
         int screen_points_count = 0;
         bool right_clicked = false;
@@ -1045,81 +1117,6 @@ int main(void) {
         toPx(points, glyphs, size, args1);
         update_closest(&tooltip, env_indices, glyphs, size, 0, 2*SETTINGS_HEIGHT);
         plot_gl(glyphs, size, &shader);
-
-        // Find best hypers
-        float tsne_thresh = 100.0f;
-        memset(best_n, 0, sizeof(int)*4);
-        memset(best_srci, 0, sizeof(int)*4);
-        for (int env_i=0; env_i<data.n; env_i++) {
-            Env* src = &data.envs[env_i];
-            Hyper* src_perf = get_hyper(&data, src->key, "environment/perf");
-            Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
-            Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
-            for (int i=0; i<src_tsne1->n; i++) {
-                float perfi = src_perf->ary[i];
-                if (perfi < perf_thresholds[0]) {
-                    continue;
-                }
-                float t1i = src_tsne1->ary[i];
-                float t2i = src_tsne2->ary[i];
-                for (int ki=0; ki<4; ki++) {
-                    for (int kj=0; kj<data.n; kj++) {
-                        temp_idx[ki][kj] = -1;
-                        temp_dist[ki][kj] = FLT_MAX;
-                    }
-                }
-                for (int env_j=0; env_j<data.n; env_j++) {
-                    Env* dst = &data.envs[env_j];
-                    Hyper* dst_perf = get_hyper(&data, dst->key, "environment/perf");
-                    Hyper* dst_tsne1 = get_hyper(&data, dst->key, "tsne1");
-                    Hyper* dst_tsne2 = get_hyper(&data, dst->key, "tsne2");
-                    for (int j=0; j<dst_tsne1->n; j++) {
-                        float perfj = dst_perf->ary[j];
-                        if (perfj < perf_thresholds[0]) {
-                            continue;
-                        }
-                        float t1j = dst_tsne1->ary[j];
-                        float t2j = dst_tsne2->ary[j];
-                        float t1_dist = t1i - t1j;
-                        float t2_dist = t2i - t2j;
-                        float tsne_dist = t1_dist*t1_dist + t2_dist*t2_dist;
-                        if (tsne_dist > tsne_thresh) {
-                            continue;
-                        }
-                        for (int thresh_idx=0; thresh_idx<4; thresh_idx++) {
-                            float perf_thresh = perf_thresholds[thresh_idx];
-                            if (perfi < perf_thresh || perfj < perf_thresh) {
-                                break;
-                            }
-                            if (temp_idx[thresh_idx][env_j] == -1 || tsne_dist < temp_dist[thresh_idx][env_j]) {
-                                temp_idx[thresh_idx][env_j] = j;
-                                temp_dist[thresh_idx][env_j] = tsne_dist;
-                            }
-                        }
-                    }
-                }
-            
-                for (int ki=0; ki<4; ki++) {
-                    int temp_n = 0;
-                    for (int kj=0; kj<data.n; kj++) {
-                        if (temp_idx[ki][kj] != -1) {
-                            temp_n++;
-                        }
-                    }
-                    if (temp_n > best_n[ki]) {
-                        best_n[ki] = temp_n;
-                        best_srci[ki] = env_i;
-                        for (int kj=0; kj<data.n; kj++) {
-                            best_idx[ki][kj] = temp_idx[ki][kj];
-                        }
-                        if (best_idx[ki][env_i] == -1) {
-                            printf("Error: Best index not found\n");
-                            exit(1);
-                        }
-                    }
-                }
-            }
-        }
 
         BeginMode3D(args1.camera);
         CustomUpdateCamera(&args1.camera, CAMERA_ORBITAL_SPEED);
@@ -1232,7 +1229,6 @@ int main(void) {
         draw_box_ticks(hyper_key, hyper_count, args4);
         EndTextureMode();
 
-
         // Figure 1-4
         DrawTextureRec(
             fig1.texture,
@@ -1274,66 +1270,113 @@ int main(void) {
         );
 
         // Figure 1 Overlay
-        float x_min = (args1.log_x) ? safe_log10(args1.x_min) : args1.x_min;
-        float x_max = (args1.log_x) ? safe_log10(args1.x_max) : args1.x_max;
-        float y_min = (args1.log_y) ? safe_log10(args1.y_min) : args1.y_min;
-        float y_max = (args1.log_y) ? safe_log10(args1.y_max) : args1.y_max;
-        float z_min = (args1.log_z) ? safe_log10(args1.z_min) : args1.z_min;
-        float z_max = (args1.log_z) ? safe_log10(args1.z_max) : args1.z_max;
-        for (int k=0; k<4; k++) {
-            int bsi = best_srci[k];
-            char* src_env = data.envs[bsi].key;
-            int src_idx = best_idx[k][bsi];
-            x = get_hyper(&data, src_env, hyper_key[fig1_x_idx]);
-            y = get_hyper(&data, src_env, hyper_key[fig1_y_idx]);
-            z = get_hyper(&data, src_env, hyper_key[fig1_z_idx]);
-            float xi = x->ary[src_idx];
-            float yi = y->ary[src_idx];
-            float zi = z->ary[src_idx];
+        if (fig1_env_idx == 0) {
+            float x_min = (args1.log_x) ? safe_log10(args1.x_min) : args1.x_min;
+            float x_max = (args1.log_x) ? safe_log10(args1.x_max) : args1.x_max;
+            float y_min = (args1.log_y) ? safe_log10(args1.y_min) : args1.y_min;
+            float y_max = (args1.log_y) ? safe_log10(args1.y_max) : args1.y_max;
+            float z_min = (args1.log_z) ? safe_log10(args1.z_min) : args1.z_min;
+            float z_max = (args1.log_z) ? safe_log10(args1.z_max) : args1.z_max;
+            for (int k=0; k<4; k++) {
+                int bsi = best_srci[k];
+                char* src_env = data.envs[bsi].key;
+                int src_idx = best_idx[k][bsi];
+                x = get_hyper(&data, src_env, hyper_key[fig1_x_idx]);
+                y = get_hyper(&data, src_env, hyper_key[fig1_y_idx]);
+                z = get_hyper(&data, src_env, hyper_key[fig1_z_idx]);
+                float xi = x->ary[src_idx];
+                float yi = y->ary[src_idx];
+                float zi = z->ary[src_idx];
 
-            xi = (args1.log_x) ? safe_log10(xi) : xi;
-            yi = (args1.log_y) ? safe_log10(yi) : yi;
-            zi = (args1.log_z) ? safe_log10(zi) : zi;
+                xi = (args1.log_x) ? safe_log10(xi) : xi;
+                yi = (args1.log_y) ? safe_log10(yi) : yi;
+                zi = (args1.log_z) ? safe_log10(zi) : zi;
 
-            Vector3 src_point = (Vector3){
-                (xi - x_min)/(x_max - x_min),
-                (yi - y_min)/(y_max - y_min),
-                (zi - z_min)/(z_max - z_min)
-            };
-
-            Vector2 screen_i = GetWorldToScreenEx(src_point, camera, 960, 520);
-
-            for (int i=0; i<data.n; i++) {
-                int bdi = best_idx[k][i];
-                if (bdi == -1 || i == bsi) {
-                    continue;
-                }
-                char* dst_env = data.envs[i].key;
-                x = get_hyper(&data, dst_env, hyper_key[fig1_x_idx]);
-                y = get_hyper(&data, dst_env, hyper_key[fig1_y_idx]);
-                z = get_hyper(&data, dst_env, hyper_key[fig1_z_idx]);
-                float xj = x->ary[bdi];
-                float yj = y->ary[bdi];
-                float zj = z->ary[bdi];
-
-                xj = (args1.log_x) ? safe_log10(xj) : xj;
-                yj = (args1.log_y) ? safe_log10(yj) : yj;
-                zj = (args1.log_z) ? safe_log10(zj) : zj;
-
-                Vector3 dst_point = (Vector3){
-                    (xj - x_min)/(x_max - x_min),
-                    (yj - y_min)/(y_max - y_min),
-                    (zj - z_min)/(z_max - z_min)
+                Vector3 src_point = (Vector3){
+                    (xi - x_min)/(x_max - x_min),
+                    (yi - y_min)/(y_max - y_min),
+                    (zi - z_min)/(z_max - z_min)
                 };
-                Vector2 screen_j = GetWorldToScreenEx(dst_point, camera, 960, 520);
-                DrawLineEx(
-                    (Vector2){screen_i.x, screen_i.y},
-                    (Vector2){screen_j.x, screen_j.y},
-                    2,
-                    CONSTELLATION
-                );
+
+                Vector2 screen_i = GetWorldToScreenEx(src_point, camera, 960, 520);
+
+                for (int i=0; i<data.n; i++) {
+                    int bdi = best_idx[k][i];
+                    if (bdi == -1 || i == bsi) {
+                        continue;
+                    }
+                    char* dst_env = data.envs[i].key;
+                    x = get_hyper(&data, dst_env, hyper_key[fig1_x_idx]);
+                    y = get_hyper(&data, dst_env, hyper_key[fig1_y_idx]);
+                    z = get_hyper(&data, dst_env, hyper_key[fig1_z_idx]);
+                    float xj = x->ary[bdi];
+                    float yj = y->ary[bdi];
+                    float zj = z->ary[bdi];
+
+                    xj = (args1.log_x) ? safe_log10(xj) : xj;
+                    yj = (args1.log_y) ? safe_log10(yj) : yj;
+                    zj = (args1.log_z) ? safe_log10(zj) : zj;
+
+                    Vector3 dst_point = (Vector3){
+                        (xj - x_min)/(x_max - x_min),
+                        (yj - y_min)/(y_max - y_min),
+                        (zj - z_min)/(z_max - z_min)
+                    };
+                    Vector2 screen_j = GetWorldToScreenEx(dst_point, camera, 960, 520);
+                    DrawLineEx(
+                        (Vector2){screen_i.x, screen_i.y},
+                        (Vector2){screen_j.x, screen_j.y},
+                        2,
+                        CONSTELLATION
+                    );
+                }
             }
         }
+            /*
+            Rectangle bounds = {0, 0, fig1.texture.width, fig1.texture.height};
+            int env_n = data.envs[0].n;
+            Point points[4*(env_n + 1)];
+            Glyph glyphs[4*(env_n + 1)];
+            for (int k=0; k<4; k++) {
+                int bsi = best_srci[k];
+                char* src_env = data.envs[bsi].key;
+                int src_idx = best_idx[k][bsi];
+                float xx = get_hyper(&data, src_env, hyper_key[fig1_x_idx])->ary[src_idx];
+                float yy = get_hyper(&data, src_env, hyper_key[fig1_y_idx])->ary[src_idx];
+                float zz = get_hyper(&data, src_env, hyper_key[fig1_z_idx])->ary[src_idx];
+                float cc = get_hyper(&data, src_env, hyper_key[fig1_color_idx])->ary[src_idx];
+                points[k*env_n] = (Point){.x = xx, .y = yy, .z = zz, .c = cc};
+                for (int i=0; i<data.n; i++) {
+                    char* dst_env = data.envs[i].key;
+                    float xj = get_hyper(&data, dst_env, hyper_key[fig1_x_idx])->ary[i];
+                    float yj = get_hyper(&data, dst_env, hyper_key[fig1_y_idx])->ary[i];
+                    float zj = get_hyper(&data, dst_env, hyper_key[fig1_z_idx])->ary[i];
+                    float cj = get_hyper(&data, dst_env, hyper_key[fig1_color_idx])->ary[i];
+                    points[k*env_n + i] = (Point){.x = xj, .y = yj, .z = zj, .c = cj};
+                }
+            }
+            toPx(points, glyphs, 4*(env_n + 1), args1);
+            for (int k=0; k<4; k++) {
+                Glyph src = glyphs[k*env_n];
+                Vector2 src_point = (Vector2){src.x, src.y};
+                if (!CheckCollisionPointRec(src_point, bounds)) {
+                    continue;
+                }
+                for (int i=0; i<env_n + 1; i++) {
+                    Glyph dst = glyphs[k*env_n + i];
+                    Vector2 dst_point = (Vector2){dst.x, dst.y};
+                    if (!CheckCollisionPointRec(dst_point, bounds)) {
+                        continue;
+                    }
+                    DrawLineEx(
+                        (Vector2){dst.x, dst.y},
+                        (Vector2){src.x, src.y},
+                        2,
+                        CONSTELLATION
+                    );
+                }
+            }
+            */
 
 
         // Figure 3 Overlay 
@@ -1376,13 +1419,11 @@ int main(void) {
             //DrawCircleLines(xi, yi, tsne_thresh_px, CONSTELLATION);
         }
 
-
         // Figure 3 UI
         GuiDropdownFilter(0, SETTINGS_HEIGHT, options, &fig3_range1_idx, &fig3_range1_active, focus,
             fig3_range1_min, &fig3_range1_min_val, fig3_range1_max, &fig3_range1_max_val);
         GuiDropdownFilter(2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig3_range2_idx, &fig3_range2_active, focus,
             fig3_range2_min, &fig3_range2_min_val, fig3_range2_max, &fig3_range2_max_val);
-
 
         // Figure 4 UI
         GuiDropdownFilter(fig1.texture.width, SETTINGS_HEIGHT, options, &fig4_range1_idx, &fig4_range1_active, focus,
@@ -1390,7 +1431,6 @@ int main(void) {
         GuiDropdownFilter(fig1.texture.width + 2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig4_range2_idx, &fig4_range2_active, focus,
             fig4_range2_min, &fig4_range2_min_val, fig4_range2_max, &fig4_range2_max_val); 
         
-
         // Figure 1 UI
         Rectangle fig1_env_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
         if (GuiDropdownBox(fig1_env_rect, env_options, &fig1_env_idx, fig1_env_active)){
@@ -1419,14 +1459,27 @@ int main(void) {
         float cost = get_hyper(&data, env_key, "cost")->ary[ary_idx];
         float score = get_hyper(&data, env_key, "environment/score")->ary[ary_idx];
         float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
+        float perf = get_hyper(&data, env_key, "environment/perf")->ary[ary_idx];
+        float tsne1 = get_hyper(&data, env_key, "tsne1")->ary[ary_idx];
+        float tsne2 = get_hyper(&data, env_key, "tsne2")->ary[ary_idx];
+        Vector2 tsne = (Vector2){tsne1, tsne2};
 
         if (tooltip.active) {
+            /*
+            float idx[env->n];
+            float dist[env->n];
+            compute_constellation(&data, idx, dist, perf, perf, tsne, tsne_thresh);
+            for (int i=0; i<env->n; i++) {
+                if (idx[i] == -1) {
+                    continue;
+                }
+            */
+
             char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
             DrawRectangle(tooltip.x, tooltip.y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
             DrawCircle(tooltip.x, tooltip.y, 2, PUFF_CYAN);
             DrawTextEx(args1.font_small, text, (Vector2){tooltip.x + 2, tooltip.y + 2}, args1.axis_tick_font_size, 0, WHITE);
-
         }
         //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
