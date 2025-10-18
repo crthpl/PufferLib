@@ -944,16 +944,18 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
             # If nan starts to appear in the logs, stop training
             if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
-                break
+                # Skip final eval
+                model_path = pufferl.close()
+                pufferl.logger.close(model_path)
+                return all_logs
 
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
-    i = 0
-    stats = {}
-    while i < 32 or not stats:
-        stats = pufferl.evaluate()
-        i += 1
+    # NOTE: Had problems with g2048 not reporting back, so made it end on 32.
+    for _ in range(32):
+        if pufferl.evaluate():
+            break
 
     logs = pufferl.mean_and_log()
     if logs is not None:
