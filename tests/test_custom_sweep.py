@@ -103,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument('--gp-iter', type=int, default=None)
     parser.add_argument('--gp-lr', type=float, default=None)
     # parser.add_argument('--use-gpu', action="store_true")
-    parser.add_argument('--prune-pareto', action="store_true")
+    # parser.add_argument('--prune-pareto', action="store_true")
     # parser.add_argument('--ucb-beta', type=float, default=None)
     args = pufferl.load_config(env_name, parser)
 
@@ -120,8 +120,8 @@ if __name__ == "__main__":
         args["sweep_extra"]["gp_learning_rate"] = args["gp_lr"]
     # if args["use_gpu"]:
     #     args["sweep"]["use_gpu"] = True
-    if args["prune_pareto"]:
-        args["sweep_extra"]["prune_pareto"] = args["prune_pareto"]
+    # if args["prune_pareto"]:
+    #     args["sweep_extra"]["prune_pareto"] = args["prune_pareto"]
     # if args["ucb_beta"] is not None:
     #     args["sweep_extra"]["ucb_beta"] = args["ucb_beta"]
 

@@ -889,7 +889,7 @@ class WandbLogger:
         data_dir = artifact.download()
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
- 
+
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
 
@@ -941,6 +941,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if logs is not None:
             if pufferl.global_step > 0.20*train_config['total_timesteps']:
                 all_logs.append(logs)
+
+            # If nan starts to appear in the logs, stop training
+            for k, v in logs.items():
+                if "losses/" in k and np.isnan(v):
+                    break
 
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
@@ -1042,6 +1047,14 @@ def sweep(args=None, env_name=None):
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+
+        # TODO: let sweep know and handle aborted trainings
+        # If the training was aborted, drop the last point
+        if timesteps[-1] < 0.7 * total_timesteps:  # this is a hack
+            scores.pop()
+            costs.pop()
+            timesteps.pop()
+
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
             sweep.observe(args, score, cost)
