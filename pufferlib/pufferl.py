@@ -17,7 +17,7 @@ import argparse
 import importlib
 import configparser
 from threading import Thread
-from collections import defaultdict, deque
+from collections import abc, defaultdict, deque
 
 import numpy as np
 import psutil
@@ -890,7 +890,8 @@ class WandbLogger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None,
+          should_stop_early: abc.Callable=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -942,9 +943,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             if pufferl.global_step > 0.20*train_config['total_timesteps']:
                 all_logs.append(logs)
 
-            # If nan starts to appear in the logs, stop training
-            if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
-                # Skip final eval
+            if should_stop_early is not None and should_stop_early(logs):
                 model_path = pufferl.close()
                 pufferl.logger.close(model_path)
                 return all_logs
@@ -1022,6 +1021,9 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
 
+def stop_if_loss_nan(logs):
+    return any("losses/" in k and np.isnan(v) for k, v in logs.items())
+
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
@@ -1043,7 +1045,7 @@ def sweep(args=None, env_name=None):
         torch.manual_seed(seed)
         sweep.suggest(args)
         total_timesteps = args['train']['total_timesteps']
-        all_logs = train(env_name, args=args)
+        all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
         all_logs = [e for e in all_logs if target_key in e]
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)

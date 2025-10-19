@@ -48,7 +48,7 @@ def sweep(env_name, args):
         )
 
         # Run training with the suggested hyperparameters
-        all_logs = pufferl.train(env_name, args=run_args)
+        all_logs = pufferl.train(env_name, args=run_args, should_stop_early=pufferl.stop_if_loss_nan)
 
         # Process the logs to get scores and costs for the sweep observation
         all_logs = [e for e in all_logs if target_key in e]
