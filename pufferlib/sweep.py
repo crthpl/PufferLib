@@ -397,9 +397,6 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     model.set_train_data(inputs=train_x, targets=train_y, strict=False)
 
     loss = None
-    # best_loss = math.inf
-    # patience_counter = 0
-
     for _ in range(training_iter):
         try:
             optimizer.zero_grad()
@@ -437,7 +434,6 @@ class Protein:
             use_gpu = True,
             cost_param = "train/total_timesteps",
             prune_pareto = True,
-            # ucb_beta = None,  # Exploration-exploitation trade-off for UCB
         ):
         self.device = torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
@@ -451,7 +447,6 @@ class Protein:
         self.gp_learning_rate = gp_learning_rate
         self.optimizer_reset_frequency = optimizer_reset_frequency
         self.prune_pareto = prune_pareto
-        # self.ucb_beta = ucb_beta
 
         self.success_observations = []
         self.failure_observations = []
@@ -461,13 +456,13 @@ class Protein:
 
         # Use Sobel seq for structured random exploration
         self.sobol = Sobol(d=self.hyperparameters.num, scramble=True)
-        self.cost_param_idx = self.hyperparameters.get_flat_idx(cost_param)
-        self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
-
         self.num_random_samples = num_random_samples
         # NOTE: test if sobol sampling really helps
         # points_per_run = sweep_config['downsample']
         # self.num_random_samples = 3 * points_per_run * self.hyperparameters.num
+
+        self.cost_param_idx = self.hyperparameters.get_flat_idx(cost_param)
+        self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
 
         self.gp_max_obs = gp_max_obs  # train time bumps after 800?
         self.infer_batch_size = infer_batch_size
@@ -516,7 +511,6 @@ class Protein:
         return np.where(to_keep)[0]
 
     def _sample_observations(self, max_size=None, recent_ratio=0.5):
-        # Remove near-duplicate inputs for numerical stability using a KD-tree for performance
         if not self.success_observations:
             return []
 
@@ -607,7 +601,6 @@ class Protein:
             self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
        
         candidates, pareto_idxs = pareto_points(self.success_observations)
-        # pareto_costs = np.array([e['cost'] for e in candidates])
 
         if self.prune_pareto:
             candidates = prune_pareto_front(candidates)
@@ -662,26 +655,13 @@ class Protein:
         gp_log_c = gp_log_c_norm*(self.log_c_max - self.log_c_min) + self.log_c_min
         gp_c = np.exp(gp_log_c)
 
-        # gp_c_min, gp_c_max = np.min(gp_c), np.max(gp_c)
-        # gp_c_norm = (gp_c - gp_c_min) / (gp_c_max - gp_c_min + EPSILON)
-
-        # pareto_y = y[pareto_idxs]
-        # pareto_c = c[pareto_idxs]
-        # pareto_log_c_norm = log_c_norm[pareto_idxs]
-
-        # max_c = np.max(c)
-        # min_c = np.min(c)
-
         max_c_mask = gp_c < self.max_suggestion_cost
 
         target = (1 + self.expansion_rate)*np.random.rand()
         weight = 1 - abs(target - gp_log_c_norm)
 
+        # NOTE: Tried upper confidence bounds, but it did more harm because gp was noisy
         score = gp_y_norm
-        # Favor high-score and hign-uncertainty candidates for efficient exploration
-        # But it seems gp score output is noisy, so that adding std seems to harm sweep.
-        # if self.ucb_beta is not None:
-        #     score += self.ucb_beta * gp_y_std_norm
 
         suggestion_scores = self.hyperparameters.optimize_direction * max_c_mask * (
                 score * weight)
@@ -732,93 +712,3 @@ class Protein:
             return
 
         self.success_observations.append(new_observation)
-
-def _carbs_params_from_puffer_sweep(sweep_config):
-    from carbs import (
-        Param,
-        LinearSpace,
-        LogSpace,
-        LogitSpace,
-    )
-
-    param_spaces = {}
-    for name, param in sweep_config.items():
-        if name in ('method', 'name', 'metric', 'max_score'):
-            continue
-
-        assert isinstance(param, dict)
-        if any(isinstance(param[k], dict) for k in param):
-            param_spaces[name] = _carbs_params_from_puffer_sweep(param)
-            continue
- 
-        assert 'distribution' in param
-        distribution = param['distribution']
-        search_center = param['mean']
-        kwargs = dict(
-            min=param['min'],
-            max=param['max'],
-        )
-        if distribution == 'uniform':
-            space = LinearSpace(**kwargs)
-        elif distribution in ('int_uniform', 'uniform_pow2'):
-            space = LinearSpace(**kwargs, is_integer=True)
-        elif distribution == 'log_normal':
-            space = LogSpace(**kwargs)
-        elif distribution == 'logit_normal':
-            space = LogitSpace(**kwargs)
-        else:
-            raise ValueError(f'Invalid distribution: {distribution}')
-
-        param_spaces[name] = Param(
-            name=name,
-            space=space,
-            search_center=search_center
-        )
-
-    return param_spaces
-
-class Carbs:
-    def __init__(self,
-            sweep_config: dict,
-            max_suggestion_cost: float = 3600,
-            resample_frequency: int = 5,
-            num_random_samples: int = 10,
-        ):
-
-        param_spaces = _carbs_params_from_puffer_sweep(sweep_config)
-        flat_spaces = [e[1] for e in pufferlib.unroll_nested_dict(param_spaces)]
-        for e in flat_spaces:
-            print(e.name, e.space)
-
-        from carbs import (
-            CARBSParams,
-            CARBS,
-        )
-
-        carbs_params = CARBSParams(
-            better_direction_sign=1,
-            is_wandb_logging_enabled=False,
-            resample_frequency=resample_frequency,
-            num_random_samples=num_random_samples,
-            max_suggestion_cost=max_suggestion_cost,
-            is_saved_on_every_observation=False,
-        )
-        self.carbs = CARBS(carbs_params, flat_spaces)
-
-    def suggest(self, args):
-        self.suggestion = self.carbs.suggest().suggestion
-        for k in ('train', 'env'):
-            for name, param in args['sweep'][k].items():
-                if name in self.suggestion:
-                    args[k][name] = self.suggestion[name]
-
-    def observe(self, hypers, score, cost, is_failure=False):
-        from carbs import ObservationInParam
-        self.carbs.observe(
-            ObservationInParam(
-                input=self.suggestion,
-                output=score,
-                cost=cost,
-                is_failure=is_failure,
-            )
-        )
