@@ -167,14 +167,15 @@ class BuildExt(build_ext):
         self.run_command('build_torch')
         self.run_command('build_c')
 
+extnames = ["pufferlib._C", "squared_torch._C"]
 class CBuildExt(build_ext):
     def run(self, *args, **kwargs):
-        self.extensions = [e for e in self.extensions if e.name != "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name not in extnames]
         super().run(*args, **kwargs)
 
 class TorchBuildExt(cpp_extension.BuildExtension):
     def run(self):
-        self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name in extnames]
         super().run()
 
 RAYLIB_A = f'{RAYLIB_NAME}/lib/libraylib.a'
@@ -218,6 +219,7 @@ if not NO_TRAIN:
     if shutil.which("nvcc"):
         extension = CUDAExtension
         torch_sources.append("pufferlib/extensions/cuda/pufferlib.cu")
+        torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
     else:
         extension = CppExtension
 
