@@ -728,7 +728,8 @@ class Profile:
         return self.profiles[name]
 
     def __call__(self, name, epoch, nest=False):
-        if epoch % self.frequency != 0:
+        # Skip profiling the first few epochs, which are noisy due to setup
+        if (epoch + 1) % self.frequency != 0:
             return
 
         #if torch.cuda.is_available():
@@ -744,8 +745,9 @@ class Profile:
     def pop(self, end):
         profile = self.profiles[self.stack.pop()]
         delta = end - profile['start']
-        profile['elapsed'] += delta
         profile['delta'] += delta
+        # Multiply delta by freq to account for skipped epochs
+        profile['elapsed'] += delta * self.frequency
 
     def end(self):
         #if torch.cuda.is_available():
