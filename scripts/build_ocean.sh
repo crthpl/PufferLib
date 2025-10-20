@@ -72,10 +72,16 @@ FLAGS=(
     -I./pufferlib/extensions
     "$SRC_DIR/cJSON.c" "$SRC_DIR/$ENV.c" -o "$ENV"
     $LINK_ARCHIVES
+    -lGL
     -lm
     -lpthread
     -ferror-limit=3
     -DPLATFORM_DESKTOP
+    # Bite me
+    -Werror=incompatible-pointer-types
+    -Wno-error=incompatible-pointer-types-discards-qualifiers
+    -Wno-incompatible-pointer-types-discards-qualifiers
+    -Wno-error=array-parameter
 )
 
 
