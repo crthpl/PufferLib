@@ -8,7 +8,6 @@ void demo() {
     Tetris env = {
         .n_rows = 20,
         .n_cols = 10,
-        .deck_size=3,
     };
     allocate(&env);
     env.client = make_client(&env);
@@ -20,23 +19,26 @@ void demo() {
 
     while (!WindowShouldClose()) {
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
+            // Use KeyDown for left, right, down to allow continuous input
+
             if (IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A)){
                 env.actions[0] = 1;
             }
             if (IsKeyDown(KEY_RIGHT)  || IsKeyDown(KEY_D)){
                 env.actions[0] = 2;
             }
-            if (IsKeyPressed(KEY_UP)  || IsKeyDown(KEY_W)) {
-                env.actions[0] = 3;
-            }
             if (IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S)) {
-                env.actions[0] = 4;
+                env.actions[0] = 4; // Soft drop
+            }
+            // Use KeyPressed for rotation (up), hard drop, swap
+            if (IsKeyPressed(KEY_UP)  || IsKeyPressed(KEY_W)) {
+                env.actions[0] = 3; // Rotate
             }
             if (IsKeyPressed(KEY_SPACE)) {
-                env.actions[0] = 5;
+                env.actions[0] = 5; // Hard drop
             }
             if (IsKeyPressed(KEY_C)) {
-                env.actions[0] = 6;
+                env.actions[0] = 6; // Swap
             }
         } else {
             forward_linearlstm(net, env.observations, env.actions);

@@ -6,7 +6,6 @@
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->n_rows = unpack(kwargs, "n_rows");
     env->n_cols = unpack(kwargs, "n_cols");
-    env->deck_size = unpack(kwargs, "deck_size");
     init(env);
     return 0;
 }
