@@ -59,7 +59,7 @@ int main() {
     int num_obs = 21;
 
     OnlyFish env = {
-        .width = 1080,
+        .width = 1280,
         .height = 720,
         .num_agents = num_agents,
         .num_goals = num_goals,

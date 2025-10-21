@@ -16,8 +16,10 @@
  *   cp puffer_onlyfish_weights.bin resources/onlyfish/<your_username>.bin
  *   bash scripts/build_ocean onlyfish local # Test your model in C
  *
- *  PR your .bin to PufferAI/onlyfish. Be sure to add a line to the index.html
- *  with your username and a link to your fork of the repo!
+ *  PR your .bin to:
+ *    https://github.com/PufferAI/PufferLib/tree/3.0/pufferlib/resources/onlyfish/your_name.bin
+ *
+ *  You can also PR a a link to your fork at pufferai/onlyfish.ai
  */
 
 #include <stdlib.h>
@@ -36,6 +38,15 @@
 #define STAR_SIZE 64
 #define PUFFER_SIZE 64
 #define MOUSE_SPEED 20
+
+float clip(float val, float min, float max) {
+    if (val < min) {
+        return min;
+    } else if (val > max) {
+        return max;
+    }
+    return val;
+}
 
 struct pair {
     float val;
@@ -109,6 +120,14 @@ typedef struct {
 } OnlyFish;
 
 void init(OnlyFish* env) {
+    if (env->names == NULL) {
+        env->names = calloc(env->num_agents, sizeof(char*));
+        for (int i=0; i<env->num_agents; i++) {
+            char name[100];
+            sprintf(name, "Agent %d", i);
+            env->names[i] = strdup(name);
+        }
+    }
     env->num_goals = NUM_GOALS;
     env->width = WIDTH;
     env->height = HEIGHT;
@@ -125,17 +144,18 @@ void update_goals(OnlyFish* env) {
             }
             Goal* goal = &env->goals[g];
             goal->y += HEIGHT/(float)3600;
-            if (goal->y > HEIGHT - STAR_SIZE) {
-                goal->y = HEIGHT - STAR_SIZE;
-            }
+            goal->y = clip(goal->y, 0, HEIGHT - STAR_SIZE);
+            goal->x = clip(goal->x, 0, env->width - STAR_SIZE);
 
             float dx = (goal->x - agent->x);
             float dy = (goal->y - agent->y);
             float dist = sqrt(dx*dx + dy*dy);
-            if (dist > 32) {
+            if (dist > 64) {
                 continue;
             }
             goal->active = false;
+
+            // Right now, you just get a reward of 1 for eating a star
             env->rewards[a] = 1.0f;
             env->log.perf += 1.0f;
             env->log.score += 1.0f;
@@ -162,28 +182,28 @@ void spawn_goal(OnlyFish* env, int x, int y) {
 
 void compute_observations(OnlyFish* env) {
     int obs_idx = 0;
-    for (int a=0; a<env->num_agents; a++) {
-        Agent* agent = &env->agents[a];
+    for (int i=0; i<env->num_agents; i++) {
+        Agent* agent = &env->agents[i];
         float x = agent->x;
         float y = agent->y;
 
         // Nearest GOAL_OBS goals
         float goal_dists[env->num_goals];
         int goal_idx[env->num_goals];
-        for (int g=0; g<env->num_goals; g++) {
-            Goal* goal = &env->goals[g];
+        for (int j=0; j<env->num_goals; j++) {
+            Goal* goal = &env->goals[j];
             float dist = FLT_MAX;
             if (goal->active) {
                 float dx = goal->x - x;
                 float dy = goal->y - y;
                 dist = sqrt(dx*dx + dy*dy);
             }
-            goal_dists[g] = dist;
-            goal_idx[g] = g;
+            goal_dists[j] = dist;
+            goal_idx[j] = j;
         }
         argsort((float*)goal_dists, (int*)goal_idx, env->num_goals);
-        for (int g=0; g<GOAL_OBS; g++) {
-            Goal* goal = &env->goals[goal_idx[g]];
+        for (int j=0; j<GOAL_OBS; j++) {
+            Goal* goal = &env->goals[goal_idx[j]];
             env->observations[obs_idx++] = (goal->x - agent->x)/env->width;
             env->observations[obs_idx++] = (goal->y - agent->y)/env->height;
         }
@@ -191,17 +211,17 @@ void compute_observations(OnlyFish* env) {
         // Nearest AGENT_OBS agents
         float agent_dists[env->num_agents];
         int agent_idx[env->num_agents];
-        for (int a=0; a<env->num_agents; a++) {
-            Agent* other = &env->agents[a];
+        for (int j=0; j<env->num_agents; j++) {
+            Agent* other = &env->agents[j];
             float dx = other->x - x;
             float dy = other->y - y;
-            agent_dists[a] = sqrt(dx*dx + dy*dy);
-            agent_idx[a] = a;
+            agent_dists[j] = sqrt(dx*dx + dy*dy);
+            agent_idx[j] = j;
         }
         argsort((float*)agent_dists, (int*)agent_idx, env->num_agents);
-        for (int a=0; a<AGENT_OBS; a++) {
-            if (a >= env->num_agents) break;
-            Agent* other = &env->agents[agent_idx[a]];
+        for (int j=0; j<AGENT_OBS; j++) {
+            if (j >= env->num_agents) break;
+            Agent* other = &env->agents[agent_idx[j]];
             env->observations[obs_idx++] = (other->x - agent->x)/env->width;
             env->observations[obs_idx++] = (other->y - agent->y)/env->height;
         }
@@ -225,15 +245,6 @@ void c_reset(OnlyFish* env) {
         env->goals[i].active = false;
     }
     compute_observations(env);
-}
-
-float clip(float val, float min, float max) {
-    if (val < min) {
-        return min;
-    } else if (val > max) {
-        return max;
-    }
-    return val;
 }
 
 void c_step(OnlyFish* env) {
