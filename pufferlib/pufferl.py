@@ -17,7 +17,7 @@ import argparse
 import importlib
 import configparser
 from threading import Thread
-from collections import defaultdict, deque
+from collections import abc, defaultdict, deque
 
 import numpy as np
 import psutil
@@ -730,7 +730,8 @@ class Profile:
         return self.profiles[name]
 
     def __call__(self, name, epoch, nest=False):
-        if epoch % self.frequency != 0:
+        # Skip profiling the first few epochs, which are noisy due to setup
+        if (epoch + 1) % self.frequency != 0:
             return
 
         #if torch.cuda.is_available():
@@ -746,8 +747,9 @@ class Profile:
     def pop(self, end):
         profile = self.profiles[self.stack.pop()]
         delta = end - profile['start']
-        profile['elapsed'] += delta
         profile['delta'] += delta
+        # Multiply delta by freq to account for skipped epochs
+        profile['elapsed'] += delta * self.frequency
 
     def end(self):
         #if torch.cuda.is_available():
@@ -798,7 +800,7 @@ class Utilization(Thread):
         self.stopped = True
 
 def downsample(arr, m):
-    if len(arr) < m:
+    if len(arr) <= m:
         return arr
 
     if m == 0:
@@ -809,6 +811,7 @@ def downsample(arr, m):
     arr = arr[:-1]
     arr = np.array(arr)
     n = len(arr)
+    m -= 1  # one down for the last one
     n = (n//m)*m
     arr = arr[-n:]
     downsampled = arr.reshape(m, -1).mean(axis=1)
@@ -843,13 +846,15 @@ class NeptuneLogger:
         self.neptune = neptune
         for k, v in pufferlib.unroll_nested_dict(args):
             neptune[k].append(v)
+        self.upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         for k, v in logs.items():
             self.neptune[k].append(v, step=step)
 
     def close(self, model_path):
-        self.neptune['model'].track_files(model_path)
+        if self.upload_model:
+            self.neptune['model'].track_files(model_path)
         self.neptune.stop()
 
     def download(self):
@@ -871,14 +876,16 @@ class WandbLogger:
         )
         self.wandb = wandb
         self.run_id = wandb.run.id
+        self.upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         self.wandb.log(logs, step=step)
 
     def close(self, model_path):
-        artifact = self.wandb.Artifact(self.run_id, type='model')
-        artifact.add_file(model_path)
-        self.wandb.run.log_artifact(artifact)
+        if self.upload_model:
+            artifact = self.wandb.Artifact(self.run_id, type='model')
+            artifact.add_file(model_path)
+            self.wandb.run.log_artifact(artifact)
         self.wandb.finish()
 
     def download(self):
@@ -886,8 +893,9 @@ class WandbLogger:
         data_dir = artifact.download()
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
- 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None):
+
+def train(env_name, args=None, vecenv=None, policy=None, logger=None,
+          should_stop_early: abc.Callable=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -939,14 +947,18 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             if pufferl.global_step > 0.20*train_config['total_timesteps']:
                 all_logs.append(logs)
 
+            if should_stop_early is not None and should_stop_early(logs):
+                model_path = pufferl.close()
+                pufferl.logger.close(model_path)
+                return all_logs
+
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
-    i = 0
-    stats = {}
-    while i < 32 or not stats:
-        stats = pufferl.evaluate()
-        i += 1
+    # NOTE: Had problems with g2048 not reporting back, so made it end on 32.
+    for _ in range(32):
+        if pufferl.evaluate():
+            break
 
     logs = pufferl.mean_and_log()
     if logs is not None:
@@ -1013,6 +1025,9 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
 
+def stop_if_loss_nan(logs):
+    return any("losses/" in k and np.isnan(v) for k, v in logs.items())
+
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
@@ -1034,11 +1049,19 @@ def sweep(args=None, env_name=None):
         torch.manual_seed(seed)
         sweep.suggest(args)
         total_timesteps = args['train']['total_timesteps']
-        all_logs = train(env_name, args=args)
+        all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
         all_logs = [e for e in all_logs if target_key in e]
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+
+        # TODO: let sweep know and handle aborted trainings
+        # If the training was aborted, drop the last point
+        if timesteps[-1] < 0.7 * total_timesteps:  # this is a hack
+            scores.pop()
+            costs.pop()
+            timesteps.pop()
+
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
             sweep.observe(args, score, cost)
@@ -1190,6 +1213,7 @@ def make_parser():
     parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
     parser.add_argument('--neptune-name', type=str, default='pufferai')
     parser.add_argument('--neptune-project', type=str, default='ablations')
+    parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb or neptune')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     return parser
