@@ -550,7 +550,7 @@ class PuffeRL:
         return model_path
 
     def print_dashboard(self, clear=False, idx=[0],
-            c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
+            c1='[cyan]', c2='[dim default]', b1='[bright_cyan]', b2='[default]'):
         config = self.config
         sps = dist_sum(self.sps, config['device'])
         agent_steps = dist_sum(self.global_step, config['device'])
@@ -581,19 +581,19 @@ class PuffeRL:
         idx[0] = (idx[0] - 1) % 10
             
         s = Table(box=None, expand=True)
-        remaining = 'A hair past a freckle'
+        remaining = f'{b2}A hair past a freckle{c2}'
         if sps != 0:
             remaining = duration((config['total_timesteps'] - agent_steps)/sps, b2, c2)
 
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
-        s.add_row(f'{c2}Env', f'{b2}{config["env"]}')
-        s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
-        s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
-        s.add_row(f'{c2}SPS', abbreviate(sps, b2, c2))
-        s.add_row(f'{c2}Epoch', f'{b2}{self.epoch}')
-        s.add_row(f'{c2}Uptime', duration(self.uptime, b2, c2))
-        s.add_row(f'{c2}Remaining', remaining)
+        s.add_row(f'{b2}Env', f'{b2}{config["env"]}')
+        s.add_row(f'{b2}Params', abbreviate(self.model_size, b2, c2))
+        s.add_row(f'{b2}Steps', abbreviate(agent_steps, b2, c2))
+        s.add_row(f'{b2}SPS', abbreviate(sps, b2, c2))
+        s.add_row(f'{b2}Epoch', f'{b2}{self.epoch}')
+        s.add_row(f'{b2}Uptime', duration(self.uptime, b2, c2))
+        s.add_row(f'{b2}Remaining', remaining)
 
         delta = profile.eval['buffer'] + profile.train['buffer']
         p = Table(box=None, expand=True, show_header=False)
@@ -601,21 +601,21 @@ class PuffeRL:
         p.add_column(f"{c1}Time", justify="right", width=8)
         p.add_column(f"{c1}%", justify="right", width=4)
         p.add_row(*fmt_perf('Evaluate', b1, delta, profile.eval, b2, c2))
-        p.add_row(*fmt_perf('  Forward', c2, delta, profile.eval_forward, b2, c2))
-        p.add_row(*fmt_perf('  Env', c2, delta, profile.env, b2, c2))
-        p.add_row(*fmt_perf('  Copy', c2, delta, profile.eval_copy, b2, c2))
-        p.add_row(*fmt_perf('  Misc', c2, delta, profile.eval_misc, b2, c2))
+        p.add_row(*fmt_perf('  Forward', b2, delta, profile.eval_forward, b2, c2))
+        p.add_row(*fmt_perf('  Env', b2, delta, profile.env, b2, c2))
+        p.add_row(*fmt_perf('  Copy', b2, delta, profile.eval_copy, b2, c2))
+        p.add_row(*fmt_perf('  Misc', b2, delta, profile.eval_misc, b2, c2))
         p.add_row(*fmt_perf('Train', b1, delta, profile.train, b2, c2))
-        p.add_row(*fmt_perf('  Forward', c2, delta, profile.train_forward, b2, c2))
-        p.add_row(*fmt_perf('  Learn', c2, delta, profile.learn, b2, c2))
-        p.add_row(*fmt_perf('  Copy', c2, delta, profile.train_copy, b2, c2))
-        p.add_row(*fmt_perf('  Misc', c2, delta, profile.train_misc, b2, c2))
+        p.add_row(*fmt_perf('  Forward', b2, delta, profile.train_forward, b2, c2))
+        p.add_row(*fmt_perf('  Learn', b2, delta, profile.learn, b2, c2))
+        p.add_row(*fmt_perf('  Copy', b2, delta, profile.train_copy, b2, c2))
+        p.add_row(*fmt_perf('  Misc', b2, delta, profile.train_misc, b2, c2))
 
         l = Table(box=None, expand=True, )
         l.add_column(f'{c1}Losses', justify="left", width=16)
         l.add_column(f'{c1}Value', justify="right", width=8)
         for metric, value in self.losses.items():
-            l.add_row(f'{c2}{metric}', f'{b2}{value:.3f}')
+            l.add_row(f'{b2}{metric}', f'{b2}{value:.3f}')
 
         monitor = Table(box=None, expand=True, pad_edge=False)
         monitor.add_row(s, p, l)
@@ -642,7 +642,7 @@ class PuffeRL:
                 continue
 
             u = left if i % 2 == 0 else right
-            u.add_row(f'{c2}{metric}', f'{b2}{value:.3f}')
+            u.add_row(f'{b2}{metric}', f'{b2}{value:.3f}')
             i += 1
             if i == 30:
                 break
@@ -680,15 +680,15 @@ def compute_puff_advantage(values, rewards, terminals,
 
 def abbreviate(num, b2, c2):
     if num < 1e3:
-        return str(num)
+        return f'{b2}{num}{c2}'
     elif num < 1e6:
-        return f'{num/1e3:.1f}K'
+        return f'{b2}{num/1e3:.1f}{c2}K'
     elif num < 1e9:
-        return f'{num/1e6:.1f}M'
+        return f'{b2}{num/1e6:.1f}{c2}M'
     elif num < 1e12:
-        return f'{num/1e9:.1f}B'
+        return f'{b2}{num/1e9:.1f}{c2}B'
     else:
-        return f'{num/1e12:.2f}T'
+        return f'{b2}{num/1e12:.2f}{c2}T'
 
 def duration(seconds, b2, c2):
     if seconds < 0:
