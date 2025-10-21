@@ -23,6 +23,7 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <float.h>
@@ -35,8 +36,8 @@
 #define GOAL_OBS 4
 #define AGENT_OBS 4
 
-#define STAR_SIZE 64
-#define PUFFER_SIZE 64
+#define STAR_SIZE 128 
+#define PUFFER_SIZE 128 
 #define MOUSE_SPEED 20
 
 float clip(float val, float min, float max) {
@@ -82,8 +83,7 @@ typedef struct {
 } Log;
 
 typedef struct {
-    Texture2D puffer;
-    Texture2D star;
+    Texture2D spritesheet;
 } Client;
 
 typedef struct {
@@ -144,8 +144,8 @@ void update_goals(OnlyFish* env) {
             }
             Goal* goal = &env->goals[g];
             goal->y += HEIGHT/(float)3600;
-            goal->y = clip(goal->y, 0, HEIGHT - STAR_SIZE);
-            goal->x = clip(goal->x, 0, env->width - STAR_SIZE);
+            goal->y = clip(goal->y, 0, HEIGHT - STAR_SIZE/2);
+            goal->x = clip(goal->x, STAR_SIZE/2, env->width - STAR_SIZE/2);
 
             float dx = (goal->x - agent->x);
             float dy = (goal->y - agent->y);
@@ -190,6 +190,7 @@ void compute_observations(OnlyFish* env) {
         // Nearest GOAL_OBS goals
         float goal_dists[env->num_goals];
         int goal_idx[env->num_goals];
+        int nearby_goals = 0;
         for (int j=0; j<env->num_goals; j++) {
             Goal* goal = &env->goals[j];
             float dist = FLT_MAX;
@@ -197,15 +198,21 @@ void compute_observations(OnlyFish* env) {
                 float dx = goal->x - x;
                 float dy = goal->y - y;
                 dist = sqrt(dx*dx + dy*dy);
+                nearby_goals++;
             }
             goal_dists[j] = dist;
             goal_idx[j] = j;
         }
         argsort((float*)goal_dists, (int*)goal_idx, env->num_goals);
         for (int j=0; j<GOAL_OBS; j++) {
-            Goal* goal = &env->goals[goal_idx[j]];
-            env->observations[obs_idx++] = (goal->x - agent->x)/env->width;
-            env->observations[obs_idx++] = (goal->y - agent->y)/env->height;
+            if (j >= nearby_goals) {
+                env->observations[obs_idx++] = 0;
+                env->observations[obs_idx++] = 0;
+            } else {
+                Goal* goal = &env->goals[goal_idx[j]];
+                env->observations[obs_idx++] = (goal->x - agent->x)/env->width;
+                env->observations[obs_idx++] = (goal->y - agent->y)/env->height;
+            }
         }
 
         // Nearest AGENT_OBS agents
@@ -220,10 +227,14 @@ void compute_observations(OnlyFish* env) {
         }
         argsort((float*)agent_dists, (int*)agent_idx, env->num_agents);
         for (int j=0; j<AGENT_OBS; j++) {
-            if (j >= env->num_agents) break;
-            Agent* other = &env->agents[agent_idx[j]];
-            env->observations[obs_idx++] = (other->x - agent->x)/env->width;
-            env->observations[obs_idx++] = (other->y - agent->y)/env->height;
+            if (j >= env->num_agents) {
+                env->observations[obs_idx++] = 0;
+                env->observations[obs_idx++] = 0;
+            } else {
+                Agent* other = &env->agents[agent_idx[j]];
+                env->observations[obs_idx++] = (other->x - agent->x)/env->width;
+                env->observations[obs_idx++] = (other->y - agent->y)/env->height;
+            }
         }
 
         // Additional observations
@@ -256,14 +267,14 @@ void c_step(OnlyFish* env) {
         agent->heading += ((float)env->actions[2*i] - 4.0f)/12.0f;
         agent->heading = clip(agent->heading, 0, 2*PI);
 
-        agent->speed += 0.5f*((float)env->actions[2*i + 1] - 2.0f);
+        agent->speed += 0.10*((float)env->actions[2*i + 1] - 2.0f);
         agent->speed = clip(agent->speed, -10.0f, 10.0f);
 
         agent->x += agent->speed*cosf(agent->heading);
-        agent->x = clip(agent->x, PUFFER_SIZE, env->width - PUFFER_SIZE);
+        agent->x = clip(agent->x, PUFFER_SIZE/2, env->width - PUFFER_SIZE/2);
 
         agent->y += agent->speed*sinf(agent->heading);
-        agent->y = clip(agent->y, PUFFER_SIZE, env->height - PUFFER_SIZE);
+        agent->y = clip(agent->y, PUFFER_SIZE/2, env->height - PUFFER_SIZE/2);
 
         if (env->client == NULL) {
             if (agent->ticks_since_reward % 512 == 0) {
@@ -293,8 +304,7 @@ void c_render(OnlyFish* env) {
         InitWindow(env->width, env->height, "PufferLib OnlyFish");
         SetTargetFPS(60);
         env->client = (Client*)calloc(1, sizeof(Client));
-        env->client->puffer = LoadTexture("resources/shared/puffers_128.png");
-        env->client->star = LoadTexture("resources/onlyfish/star.png");
+        env->client->spritesheet = LoadTexture("resources/shared/puffers.png");
     }
 
     if (IsKeyDown(KEY_ESCAPE)) {
@@ -315,10 +325,19 @@ void c_render(OnlyFish* env) {
         if (!goal->active) {
             continue;
         }
-        DrawTexture(
-            env->client->star,
-            goal->x - 32,
-            goal->y - 32,
+        DrawTexturePro(
+            env->client->spritesheet,
+            (Rectangle){
+                384, 256, 128, 128,
+            },
+            (Rectangle){
+                goal->x - STAR_SIZE/2,
+                goal->y - STAR_SIZE/2,
+                STAR_SIZE,
+                STAR_SIZE
+            },
+            (Vector2){0, 0},
+            0,
             WHITE
         );
     }
@@ -327,23 +346,24 @@ void c_render(OnlyFish* env) {
         Agent* agent = &env->agents[i];
         float heading = agent->heading;
         DrawTexturePro(
-            env->client->puffer,
+            env->client->spritesheet,
             (Rectangle){
-                (heading < PI/2 || heading > 3*PI/2) ? 0 : 128,
-                0, 128, 128,
+                0, 
+                (heading < PI/2 || heading > 3*PI/2) ? 0: 128,
+                128, 128,
             },
             (Rectangle){
-                agent->x - 64,
-                agent->y - 64,
-                128,
-                128
+                agent->x - PUFFER_SIZE/2,
+                agent->y - PUFFER_SIZE/2,
+                PUFFER_SIZE,
+                PUFFER_SIZE
             },
             (Vector2){0, 0},
             0,
             WHITE
         );
-        int text_width = MeasureText(env->names[i], 10);
-        DrawText(env->names[i], agent->x + PUFFER_SIZE/2 - text_width, agent->y + PUFFER_SIZE, 10, WHITE);
+        int text_width = MeasureText(env->names[i], 14);
+        DrawText(env->names[i], agent->x - text_width/2, agent->y + PUFFER_SIZE/2, 14, WHITE);
     }
 
     EndDrawing();
@@ -352,10 +372,10 @@ void c_render(OnlyFish* env) {
 void c_close(OnlyFish* env) {
     free(env->agents);
     free(env->goals);
+    free(env->names);
     if (env->client != NULL) {
         Client* client = env->client;
-        UnloadTexture(client->puffer);
-        UnloadTexture(client->star);
+        UnloadTexture(client->spritesheet);
         CloseWindow();
         free(client);
     }
