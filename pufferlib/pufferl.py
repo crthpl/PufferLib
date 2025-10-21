@@ -154,8 +154,10 @@ class PuffeRL:
                 eps=config['adam_eps'],
             )
         elif config['optimizer'] == 'muon':
+            import heavyball
             from heavyball import ForeachMuon
             warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
+            heavyball.utils.compile_mode = "default"
 
             # # optionally a little bit better/faster alternative to newtonschulz iteration
             # import heavyball.utils
