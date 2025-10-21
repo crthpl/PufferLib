@@ -1065,7 +1065,6 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
 
 def export(args=None, env_name=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
-    args['vec']['backend'] = 'Serial'
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv)
 
