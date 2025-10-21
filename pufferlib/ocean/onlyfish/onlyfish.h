@@ -143,7 +143,7 @@ void update_goals(OnlyFish* env) {
                 continue;
             }
             Goal* goal = &env->goals[g];
-            goal->y += HEIGHT/(float)3600;
+            goal->y += HEIGHT/(float)600;
             goal->y = clip(goal->y, 0, HEIGHT - STAR_SIZE/2);
             goal->x = clip(goal->x, STAR_SIZE/2, env->width - STAR_SIZE/2);
 
