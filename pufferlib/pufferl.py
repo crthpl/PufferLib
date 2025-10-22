@@ -963,7 +963,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
-        if i >= 32 and pufferl.evaluate():
+        stats = pufferl.evaluate()
+        if i >= 32 and stats:
             break
 
     logs = pufferl.mean_and_log()
