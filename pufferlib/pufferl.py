@@ -17,7 +17,7 @@ import argparse
 import importlib
 import configparser
 from threading import Thread
-from collections import abc, defaultdict, deque
+from collections import defaultdict, deque
 
 import numpy as np
 import psutil
@@ -799,23 +799,25 @@ class Utilization(Thread):
     def stop(self):
         self.stopped = True
 
-def downsample(arr, m):
-    if len(arr) <= m:
-        return arr
+def downsample(data_list, num_points):
+    if not data_list or num_points <= 0:
+        return []
+    if num_points == 1:
+        return [data_list[-1]]
+    if len(data_list) <= num_points:
+        return data_list
 
-    if m == 0:
-        return [arr[-1]]
+    last = data_list[-1]
+    data_list = data_list[:-1]
 
-    orig_arr = arr
-    last = arr[-1]
-    arr = arr[:-1]
-    arr = np.array(arr)
-    n = len(arr)
-    m -= 1  # one down for the last one
-    n = (n//m)*m
-    arr = arr[-n:]
-    downsampled = arr.reshape(m, -1).mean(axis=1)
-    return np.concatenate([downsampled, [last]])
+    data_np = np.array(data_list)
+    num_points -= 1  # one down for the last one
+
+    n = (len(data_np) // num_points) * num_points
+    data_np = data_np[-n:] if n > 0 else data_np
+    downsampled = data_np.reshape(num_points, -1).mean(axis=1)
+
+    return downsampled.tolist() + [last]
 
 class NoLogger:
     def __init__(self, args):
@@ -846,15 +848,18 @@ class NeptuneLogger:
         self.neptune = neptune
         for k, v in pufferlib.unroll_nested_dict(args):
             neptune[k].append(v)
-        self.upload_model = not args['no_model_upload']
+        self.should_upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         for k, v in logs.items():
             self.neptune[k].append(v, step=step)
 
+    def upload_model(self, model_path):
+        self.neptune['model'].track_files(model_path)
+
     def close(self, model_path):
-        if self.upload_model:
-            self.neptune['model'].track_files(model_path)
+        if self.should_upload_model:
+            self.upload_model(model_path)
         self.neptune.stop()
 
     def download(self):
@@ -876,16 +881,19 @@ class WandbLogger:
         )
         self.wandb = wandb
         self.run_id = wandb.run.id
-        self.upload_model = not args['no_model_upload']
+        self.should_upload_model = not args['no_model_upload']
 
     def log(self, logs, step):
         self.wandb.log(logs, step=step)
 
+    def upload_model(self, model_path):
+        artifact = self.wandb.Artifact(self.run_id, type='model')
+        artifact.add_file(model_path)
+        self.wandb.run.log_artifact(artifact)
+
     def close(self, model_path):
-        if self.upload_model:
-            artifact = self.wandb.Artifact(self.run_id, type='model')
-            artifact.add_file(model_path)
-            self.wandb.run.log_artifact(artifact)
+        if self.should_upload_model:
+            self.upload_model(model_path)
         self.wandb.finish()
 
     def download(self):
@@ -894,8 +902,7 @@ class WandbLogger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None,
-          should_stop_early: abc.Callable=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_stop_early=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -955,9 +962,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None,
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
-    # NOTE: Had problems with g2048 not reporting back, so made it end on 32.
-    for _ in range(32):
-        if pufferl.evaluate():
+    for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
+        stats = pufferl.evaluate()
+        if i >= 32 and stats:
             break
 
     logs = pufferl.mean_and_log()
@@ -1047,20 +1054,26 @@ def sweep(args=None, env_name=None):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
+
         sweep.suggest(args)
-        total_timesteps = args['train']['total_timesteps']
         all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
         all_logs = [e for e in all_logs if target_key in e]
+
+        if not all_logs:
+            sweep.observe(args, 0, 0, is_failure=True)
+            continue
+
+        total_timesteps = args['train']['total_timesteps']
+
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
 
-        # TODO: let sweep know and handle aborted trainings
-        # If the training was aborted, drop the last point
-        if timesteps[-1] < 0.7 * total_timesteps:  # this is a hack
-            scores.pop()
-            costs.pop()
-            timesteps.pop()
+        if len(timesteps) > 0 and timesteps[-1] < 0.7 * total_timesteps:  # 0.7 is arbitrary
+            s = scores.pop()
+            c = costs.pop()
+            args['train']['total_timesteps'] = timesteps.pop()
+            sweep.observe(args, s, c, is_failure=True)
 
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
