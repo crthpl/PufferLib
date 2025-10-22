@@ -1069,12 +1069,11 @@ def sweep(args=None, env_name=None):
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
 
-        # The last data point may be corrupted if the run was aborted.
-        # Drop it if it is not close to the target number of timesteps.
-        if len(timesteps) > 0 and timesteps[-1] < 0.7 * total_timesteps:
-            scores.pop()
-            costs.pop()
-            timesteps.pop()
+        if len(timesteps) > 0 and timesteps[-1] < 0.7 * total_timesteps:  # 0.7 is arbitrary
+            s = scores.pop()
+            c = costs.pop()
+            args['train']['total_timesteps'] = timesteps.pop()
+            sweep.observe(args, s, c, is_failure=True)
 
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
