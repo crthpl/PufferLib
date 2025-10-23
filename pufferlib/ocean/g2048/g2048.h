@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 #include "raylib.h"
+#define max(a, b) (((a) > (b)) ? (a) : (b))
 
 #define SIZE 4
 #define EMPTY 0
@@ -12,15 +13,20 @@
 #define DOWN 2
 #define LEFT 3
 #define RIGHT 4
+#define BASE_MAX_TICKS 2000
 
 // Precomputed constants
 #define REWARD_MULTIPLIER 0.0625f
 #define INVALID_MOVE_PENALTY -0.05f
 #define GAME_OVER_PENALTY -1.0f
 
+// To normalize perf from 0 to 1. Update when beaten.
+#define OBSERVED_MAX_SCORE 100000.0f
+
 typedef struct {
     float perf;
     float score;
+    float max_tile;
     float episode_return;
     float episode_length;
     float n;
@@ -36,6 +42,7 @@ typedef struct {
     int tick;
     unsigned char grid[SIZE][SIZE];
     float episode_reward;           // Accumulate episode reward
+    int max_episode_ticks;          // Dynamic max_ticks based on score
     
     // Cached values to avoid recomputation
     int empty_count;
@@ -93,8 +100,7 @@ static inline void update_empty_count(Game* game) {
     game->empty_count = count;
 }
 
-// Optimized score calculation
-static inline unsigned char calc_score(Game* game) {
+static inline unsigned char get_max_tile(Game* game) {
     unsigned char max_tile = 0;
     // Unroll loop for better performance
     for (int i = 0; i < SIZE; i++) {
@@ -108,9 +114,10 @@ static inline unsigned char calc_score(Game* game) {
 }
 
 void add_log(Game* game) {
-    unsigned char s = calc_score(game);
-    game->log.score = (float)(1 << s);
-    game->log.perf += ((float)s) * 0.0909f;
+    unsigned char s = get_max_tile(game);
+    game->log.max_tile += (float)(1 << s);
+    game->log.score += (float)game->score;
+    game->log.perf += (float)game->score / OBSERVED_MAX_SCORE;
     game->log.episode_length += game->tick;
     game->log.episode_return += game->episode_reward;
     game->log.n += 1;
@@ -129,6 +136,7 @@ void c_reset(Game* game) {
     game->empty_count = SIZE * SIZE;
     game->game_over_cached = false;
     game->grid_changed = true;
+    game->max_episode_ticks = BASE_MAX_TICKS;
     
     if (game->terminals) game->terminals[0] = 0;
     
@@ -251,9 +259,7 @@ bool move(Game* game, int direction, float* reward, float* score_increase) {
         }
     }
 
-    if (!moved) {
-        *reward = INVALID_MOVE_PENALTY;
-    } else {
+    if (moved) {
         game->grid_changed = true;
         game->game_over_cached = false; // Invalidate cache
     }
@@ -306,11 +312,16 @@ void c_step(Game* game) {
         add_random_tile(game);
         game->score += score_add;
         update_empty_count(game); // Update after adding tile
+        // This is to limit infinite invalid moves during eval
+        game->max_episode_ticks = max(BASE_MAX_TICKS, game->score / 20);
+    } else {
+        reward = INVALID_MOVE_PENALTY;
     }
-    
+
     bool game_over = is_game_over(game);
-    game->terminals[0] = game_over ? 1 : 0;
-    
+    bool max_ticks_reached = game->tick >= game->max_episode_ticks;
+    game->terminals[0] = (game_over || max_ticks_reached) ? 1 : 0;
+
     if (game_over) {
         reward = GAME_OVER_PENALTY;
     }
