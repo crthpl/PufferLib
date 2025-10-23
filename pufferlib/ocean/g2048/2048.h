@@ -14,7 +14,7 @@
 #define RIGHT 4
 
 // Precomputed constants
-#define REWARD_MULTIPLIER 0.09090909f
+#define REWARD_MULTIPLIER 0.0625f
 #define INVALID_MOVE_PENALTY -0.05f
 #define GAME_OVER_PENALTY -1.0f
 
@@ -93,9 +93,24 @@ static inline void update_empty_count(Game* game) {
     game->empty_count = count;
 }
 
+// Optimized score calculation
+static inline unsigned char calc_score(Game* game) {
+    unsigned char max_tile = 0;
+    // Unroll loop for better performance
+    for (int i = 0; i < SIZE; i++) {
+        for (int j = 0; j < SIZE; j++) {
+            if (game->grid[i][j] > max_tile) {
+                max_tile = game->grid[i][j];
+            }
+        }
+    }
+    return max_tile;
+}
+
 void add_log(Game* game) {
-    game->log.score = (float)(1 << game->score);
-    game->log.perf += ((float)game->score) * REWARD_MULTIPLIER;
+    unsigned char s = calc_score(game);
+    game->log.score = (float)(1 << s);
+    game->log.perf += ((float)s) * 0.0909f;
     game->log.episode_length += game->tick;
     game->log.episode_return += game->episode_reward;
     game->log.n += 1;
@@ -162,7 +177,7 @@ void add_random_tile(Game* game) {
 }
 
 // Optimized slide and merge with fewer memory operations
-static inline bool slide_and_merge(unsigned char* row, float* reward) {
+static inline bool slide_and_merge(unsigned char* row, float* reward, float* score_increase) {
     bool moved = false;
     int write_pos = 0;
     
@@ -183,6 +198,7 @@ static inline bool slide_and_merge(unsigned char* row, float* reward) {
         if (row[i] != EMPTY && row[i] == row[i + 1]) {
             row[i]++;
             *reward += ((float)row[i]) * REWARD_MULTIPLIER;
+            *score_increase += (float)(1 << (int)row[i]);
             // Shift remaining elements left
             for (int j = i + 1; j < SIZE - 1; j++) {
                 row[j] = row[j + 1];
@@ -195,7 +211,7 @@ static inline bool slide_and_merge(unsigned char* row, float* reward) {
     return moved;
 }
 
-bool move(Game* game, int direction, float* reward) {
+bool move(Game* game, int direction, float* reward, float* score_increase) {
     bool moved = false;
     unsigned char temp[SIZE];
     
@@ -207,7 +223,7 @@ bool move(Game* game, int direction, float* reward) {
                 temp[i] = game->grid[idx][col];
             }
             
-            if (slide_and_merge(temp, reward)) {
+            if (slide_and_merge(temp, reward, score_increase)) {
                 moved = true;
                 // Write back column
                 for (int i = 0; i < SIZE; i++) {
@@ -224,7 +240,7 @@ bool move(Game* game, int direction, float* reward) {
                 temp[i] = game->grid[row][idx];
             }
             
-            if (slide_and_merge(temp, reward)) {
+            if (slide_and_merge(temp, reward, score_increase)) {
                 moved = true;
                 // Write back row
                 for (int i = 0; i < SIZE; i++) {
@@ -280,28 +296,15 @@ bool is_game_over(Game* game) {
     return true;
 }
 
-// Optimized score calculation
-static inline unsigned char calc_score(Game* game) {
-    unsigned char max_tile = 0;
-    // Unroll loop for better performance
-    for (int i = 0; i < SIZE; i++) {
-        for (int j = 0; j < SIZE; j++) {
-            if (game->grid[i][j] > max_tile) {
-                max_tile = game->grid[i][j];
-            }
-        }
-    }
-    return max_tile;
-}
-
 void c_step(Game* game) {
     float reward = 0.0f;
-    bool did_move = move(game, game->actions[0] + 1, &reward);
+    float score_add = 0.0f;
+    bool did_move = move(game, game->actions[0] + 1, &reward, &score_add);
     game->tick++;
     
     if (did_move) {
         add_random_tile(game);
-        game->score = calc_score(game);
+        game->score += score_add;
         update_empty_count(game); // Update after adding tile
     }
     
@@ -369,7 +372,7 @@ void c_render(Game* game) {
     }
     
     // Draw score (format once per frame)
-    snprintf(score_text, sizeof(score_text), "Score: %d", 1 << game->score);
+    snprintf(score_text, sizeof(score_text), "Score: %d", game->score);
     DrawText(score_text, 10, px * SIZE + 10, 24, PUFF_WHITE);
     
     EndDrawing();

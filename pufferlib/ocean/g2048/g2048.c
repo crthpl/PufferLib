@@ -22,18 +22,19 @@ int main() {
 
     // Main game loop
     int frame = 0;
+    int action = -1;
     while (!WindowShouldClose()) {
         c_render(&env);
         frame++;
-
-        int action = 0;
+        
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) action = UP;
-            else if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) action = DOWN;
-            else if (IsKeyPressed(KEY_A) || IsKeyPressed(KEY_LEFT)) action = LEFT;
-            else if (IsKeyPressed(KEY_D) || IsKeyPressed(KEY_RIGHT)) action = RIGHT;
+            action = -1;
+            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) action = UP;
+            else if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) action = DOWN;
+            else if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) action = LEFT;
+            else if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) action = RIGHT;
             env.actions[0] = action - 1;
-        } else if (frame % 10 != 0) {
+        } else if (frame % 1 != 0) {
             continue;
         } else {
             action = 1;
@@ -43,9 +44,15 @@ int main() {
             forward_linearlstm(net, net->obs, env.actions);
         }
 
-        if (action != 0) {
+        if (action > 0) {
             c_step(&env);
         }
+        
+        if (IsKeyDown(KEY_LEFT_SHIFT) && action > 0) {
+            WaitTime(0.05);
+        }
+
+
     }
 
     free_linearlstm(net);
