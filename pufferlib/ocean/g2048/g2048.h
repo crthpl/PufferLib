@@ -20,13 +20,13 @@
 #define INVALID_MOVE_PENALTY -0.05f
 #define GAME_OVER_PENALTY -1.0f
 
-// To normalize perf from 0 to 1. Update when beaten.
-#define OBSERVED_MAX_SCORE 100000.0f
+// To normalize perf from 0 to 1. Reachable with hidden size 256.
+#define OBSERVED_MAX_TILE 4096.0f
 
 typedef struct {
     float perf;
     float score;
-    float max_tile;
+    float merge_score;
     float episode_return;
     float episode_length;
     float n;
@@ -42,6 +42,7 @@ typedef struct {
     int tick;
     unsigned char grid[SIZE][SIZE];
     float episode_reward;           // Accumulate episode reward
+    int moves_made;
     int max_episode_ticks;          // Dynamic max_ticks based on score
     
     // Cached values to avoid recomputation
@@ -115,9 +116,9 @@ static inline unsigned char get_max_tile(Game* game) {
 
 void add_log(Game* game) {
     unsigned char s = get_max_tile(game);
-    game->log.max_tile += (float)(1 << s);
-    game->log.score += (float)game->score;
-    game->log.perf += (float)game->score / OBSERVED_MAX_SCORE;
+    game->log.score += (float)(1 << s);
+    game->log.perf += (float)(1 << s) / OBSERVED_MAX_TILE;
+    game->log.merge_score += (float)game->score;
     game->log.episode_length += game->tick;
     game->log.episode_return += game->episode_reward;
     game->log.n += 1;
@@ -136,6 +137,7 @@ void c_reset(Game* game) {
     game->empty_count = SIZE * SIZE;
     game->game_over_cached = false;
     game->grid_changed = true;
+    game->moves_made = 0;
     game->max_episode_ticks = BASE_MAX_TICKS;
     
     if (game->terminals) game->terminals[0] = 0;
@@ -176,6 +178,7 @@ void add_random_tile(Game* game) {
     if (chosen_pos >= 0) {
         int i = chosen_pos / SIZE;
         int j = chosen_pos % SIZE;
+        // Implement the 90% 2, 10% 4 rule
         game->grid[i][j] = (rand() % 10 == 0) ? 2 : 1;
         game->empty_count--;
         game->grid_changed = true;
@@ -309,11 +312,13 @@ void c_step(Game* game) {
     game->tick++;
     
     if (did_move) {
+        game->moves_made++;
         add_random_tile(game);
         game->score += score_add;
         update_empty_count(game); // Update after adding tile
         // This is to limit infinite invalid moves during eval
-        game->max_episode_ticks = max(BASE_MAX_TICKS, game->score / 20);
+        // Don't need to be tight. Don't need to show to user?
+        game->max_episode_ticks = max(BASE_MAX_TICKS, game->score / 10);
     } else {
         reward = INVALID_MOVE_PENALTY;
     }
@@ -385,6 +390,9 @@ void c_render(Game* game) {
     // Draw score (format once per frame)
     snprintf(score_text, sizeof(score_text), "Score: %d", game->score);
     DrawText(score_text, 10, px * SIZE + 10, 24, PUFF_WHITE);
+
+    snprintf(score_text, sizeof(score_text), "Moves: %d", game->moves_made);
+    DrawText(score_text, 210, px * SIZE + 10, 24, PUFF_WHITE);
     
     EndDrawing();
 }
