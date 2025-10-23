@@ -11,20 +11,21 @@ cudnn.benchmark_limit = 32
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
-INPUT_SIZE = 16
-HIDDEN_SIZE = 128
-OUTPUT_SIZE = 16
-B = 2048
+INPUT_SIZE = 128
+HIDDEN_SIZE1 = 128
+HIDDEN_SIZE2 = 512
+OUTPUT_SIZE = 128
+B = 8192
 dtype = torch.bfloat16
 inner_loops = 100  # Number of inner iterations to amortize overhead
 
 # Define the model with explicit Kaiming uniform initialization to match JAX
 model = torch.nn.Sequential(
-    torch.nn.Linear(INPUT_SIZE, HIDDEN_SIZE),
+    torch.nn.Linear(INPUT_SIZE, HIDDEN_SIZE1),
     torch.nn.ReLU(),
-    torch.nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE),
+    torch.nn.Linear(HIDDEN_SIZE1, HIDDEN_SIZE2),
     torch.nn.ReLU(),
-    torch.nn.Linear(HIDDEN_SIZE, OUTPUT_SIZE),
+    torch.nn.Linear(HIDDEN_SIZE2, OUTPUT_SIZE),
 ).cuda().to(dtype)
 
 # Create input batch
@@ -43,9 +44,9 @@ def multi_step(model, batch, inner_loops):
 
 # Manual FLOPs calculation to match JAX (ignores bias adds and ReLUs as negligible)
 flops = (
-    2 * B * INPUT_SIZE * HIDDEN_SIZE +
-    2 * B * HIDDEN_SIZE * HIDDEN_SIZE +
-    2 * B * HIDDEN_SIZE * OUTPUT_SIZE
+    2 * B * INPUT_SIZE * HIDDEN_SIZE1 +
+    2 * B * HIDDEN_SIZE1 * HIDDEN_SIZE2 +
+    2 * B * HIDDEN_SIZE2 * OUTPUT_SIZE
 )
 
 # Warmup

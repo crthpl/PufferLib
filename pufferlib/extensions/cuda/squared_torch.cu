@@ -1,9 +1,12 @@
 #include <torch/extension.h>
+#include <torch/torch.h>
 #include <cuda_runtime.h>
 
 #include <curand_kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+namespace pufferlib {
 
 static constexpr unsigned char NOOP   = 0;
 static constexpr unsigned char DOWN   = 1;
@@ -203,11 +206,8 @@ create_squared_environments(int64_t num_envs, int64_t grid_size, torch::Tensor d
     return std::make_tuple(envs_tensor, obs, actions, rewards, terminals);
 }
 
-void step_environments_cuda(torch::Tensor envs_tensor) {
+void step_environments_cuda(torch::Tensor envs_tensor, int64_t num_envs) {
     Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
-    // YOU HARDCODED THIS HERE
-    int num_envs = 2048;
-
     step_environments<<<make_grid(num_envs), 256>>>(envs, num_envs);
     cudaDeviceSynchronize();
 }
@@ -221,14 +221,4 @@ void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_te
     cudaDeviceSynchronize();
 }
 
-TORCH_LIBRARY(squared, m) {
-    m.def("create_squared_environments(int num_envs, int grid_size, Tensor dummy) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
-    m.def("step_environments(Tensor envs) -> ()");
-    m.def("reset_environments(Tensor envs, Tensor indices) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(squared, CUDA, m) {
-    m.impl("create_squared_environments", &create_squared_environments);
-    m.impl("step_environments", &step_environments_cuda);
-    m.impl("reset_environments", &reset_environments_cuda);
 }

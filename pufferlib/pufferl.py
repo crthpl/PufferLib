@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings('error', category=RuntimeWarning)
 
 import os
+import io
 import sys
 import glob
 import ast
@@ -29,6 +30,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
 
 import pufferlib
+from pufferlib.models import forward_train
 import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
@@ -36,6 +38,26 @@ try:
     from pufferlib import _C
 except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
+
+#@torch.library.impl_abstract("squared::step_environments")
+#def meta_step_environments(envs):
+#    pass
+
+class SquaredEnv:
+    def __init__(self, num_envs, grid_size):
+        dummy = torch.zeros(5).cuda()
+        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size, dummy)
+        self.observations = self.observations.view(num_envs, -1)
+        self.indices = torch.arange(num_envs).cuda().int()
+
+    def reset(self):
+        _C.reset_environments(self.env, self.indices)
+        return self.observations
+
+    def step(self, actions):
+        self.actions[:] = actions
+        _C.step_environments(self.env)
+        return self.observations, self.rewards, self.terminals
 
 import rich
 import rich.traceback
@@ -55,7 +77,9 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 #torch._dynamo.config.capture_scalar_outputs = True
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None, verbose=True):
+    #def __init__(self, config, vecenv, policy, logger=None, verbose=True):
+    #def __init__(self, config, policy, logger=None, verbose=True):
+    def __init__(self, config, logger=None, verbose=True):
         # Backend perf optimization
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.deterministic = config['torch_deterministic']
@@ -67,12 +91,30 @@ class PuffeRL:
         #np.random.seed(seed)
         #torch.manual_seed(seed)
 
+        num_envs = 4096
+        self.num_envs = num_envs
+        grid_size = 11
+        dummy = torch.zeros(5).cuda()
+        vecenv = SquaredEnv(num_envs, grid_size)
+        vecenv.reset()
+
+        from gymnasium.spaces import Box, Discrete
+        obs_space = Box(low=-1, high=1, shape=(grid_size*grid_size,), dtype=np.float32)
+        atn_space = Discrete(5)
+        self.single_observation_space = obs_space
+        self.single_action_space = atn_space
+
+        policy = _C.PolicyLSTM(grid_size*grid_size, 5, 128)
+        policy.cuda()
+
         # Vecenv info
-        vecenv.async_reset(seed)
-        obs_space = vecenv.single_observation_space
-        atn_space = vecenv.single_action_space
-        total_agents = vecenv.num_agents
+        #vecenv.async_reset(seed)
+        #obs_space = vecenv.single_observation_space
+        #atn_space = vecenv.single_action_space
+        #total_agents = vecenv.num_agents
+        total_agents = num_envs
         self.total_agents = total_agents
+        self.agents_per_batch = total_agents
 
         # Experience
         if config['batch_size'] == 'auto' and config['bptt_horizon'] == 'auto':
@@ -111,8 +153,9 @@ class PuffeRL:
 
         # LSTM
         if config['use_rnn']:
-            n = vecenv.agents_per_batch
-            h = policy.hidden_size
+            n = self.agents_per_batch
+            #h = policy.hidden_size
+            h = 128
             self.lstm_h = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
             self.lstm_c = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
 
@@ -121,6 +164,7 @@ class PuffeRL:
         max_minibatch_size = config['max_minibatch_size']
         self.minibatch_size = min(minibatch_size, max_minibatch_size)
         self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
+        self.total_minibatches = config['num_minibatches']
         self.minibatch_segments = self.minibatch_size // horizon 
         if self.minibatch_segments * horizon != self.minibatch_size:
             raise pufferlib.APIUsageError(
@@ -130,6 +174,7 @@ class PuffeRL:
         # Torch compile
         self.uncompiled_policy = policy
         self.policy = policy
+        #self.compiled_policy = torch.compile(policy)
         if config['compile']:
             self.policy = torch.compile(policy, mode=config['compile_mode'])
             #self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
@@ -172,10 +217,10 @@ class PuffeRL:
         # Automatic mixed precision
         precision = config['precision']
         self.amp_context = contextlib.nullcontext()
-        if config.get('amp', True) and config['device'] == 'cuda':
-            self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
-        if precision not in ('float32', 'bfloat16'):
-            raise pufferlib.APIUsageError(f'Invalid precision: {precision}: use float32 or bfloat16')
+        #if config.get('amp', True) and config['device'] == 'cuda':
+        #    self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
+        #if precision not in ('float32', 'bfloat16'):
+        #    raise pufferlib.APIUsageError(f'Invalid precision: {precision}: use float32 or bfloat16')
 
         # Initializations
         self.config = config
@@ -207,156 +252,139 @@ class PuffeRL:
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
+    def _compiled_evaluate(self, lstm_h, lstm_c):
+        config = self.config
+        device = config['device']
+        o = self.vecenv.observations
+        r = self.vecenv.rewards
+        d = self.vecenv.terminals
+        t = torch.zeros(o.shape[0], dtype=torch.bool, device=device)
+        for i in range(config['bptt_horizon']):
+            done_mask = d
+            self.global_step += self.num_envs
+
+            with torch.no_grad(), self.amp_context:
+                logits, value, lstm_h, lstm_c = self.policy(o, lstm_h, lstm_c)
+                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                r = torch.clamp(r, -1, 1)
+
+            with torch.no_grad():
+                self.observations[:, i] = o
+                self.actions[:, i] = action
+                self.logprobs[:, i] = logprob
+                self.rewards[:, i] = r
+                self.terminals[:, i] = d.float()
+                self.values[:, i] = value.flatten()
+
+                if isinstance(logits, torch.distributions.Normal):
+                    action = torch.clamp(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
+
+            self.vecenv.step(action)
+
+
     def evaluate(self):
         profile = self.profile
         epoch = self.epoch
         profile('eval', epoch)
-        profile('eval_misc', epoch, nest=True)
 
         config = self.config
         device = config['device']
 
         if config['use_rnn']:
-            for k in self.lstm_h:
-                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
-                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
+            n = self.agents_per_batch
+            h = 128
+            #h = self.policy.hidden_size
+ 
+            lstm_h = torch.zeros((n, h), device=device)
+            lstm_c = torch.zeros((n, h), device=device)
 
-        self.full_rows = 0
-        while self.full_rows < self.segments:
-            profile('env', epoch)
-            o, r, d, t, info, env_id, mask = self.vecenv.recv()
+        lstm_h, lstm_c = _C.compiled_evaluate(
+            self.vecenv.env,
+            self.vecenv.observations,
+            self.vecenv.actions,
+            self.vecenv.rewards,
+            self.vecenv.terminals,
+            self.policy,
+            lstm_h,
+            lstm_c,
+            self.observations,
+            self.actions,
+            self.logprobs,
+            self.rewards,
+            self.terminals,
+            self.values,
+            self.config['bptt_horizon'],
+            self.num_envs  # Or wherever num_envs is stored
+        )
 
-            profile('eval_misc', epoch)
-            env_id = slice(env_id[0], env_id[-1] + 1)
-
-            done_mask = d + t # TODO: Handle truncations separately
-            self.global_step += int(mask.sum())
-
-            profile('eval_copy', epoch)
-            o = torch.as_tensor(o)
-            o_device = o.to(device)#, non_blocking=True)
-            r = torch.as_tensor(r).to(device)#, non_blocking=True)
-            d = torch.as_tensor(d).to(device)#, non_blocking=True)
-
-            profile('eval_forward', epoch)
-            with torch.no_grad(), self.amp_context:
-                state = dict(
-                    reward=r,
-                    done=d,
-                    env_id=env_id,
-                    mask=mask,
-                )
-
-                if config['use_rnn']:
-                    state['lstm_h'] = self.lstm_h[env_id.start]
-                    state['lstm_c'] = self.lstm_c[env_id.start]
-
-                #h, c = state['lstm_h'], state['lstm_c']
-                logits, value = self.policy(o_device)
-                #logits, value, h, c = self.policy(o_device, h, c)
-                #state['lstm_h'] = h
-                #state['lstm_c'] = c
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
-                r = torch.clamp(r, -1, 1)
-
-            profile('eval_copy', epoch)
-            with torch.no_grad():
-                if config['use_rnn']:
-                    self.lstm_h[env_id.start] = state['lstm_h']
-                    self.lstm_c[env_id.start] = state['lstm_c']
-
-                # Fast path for fully vectorized envs
-                l = self.ep_lengths[env_id.start].item()
-                batch_rows = slice(self.ep_indices[env_id.start].item(), 1+self.ep_indices[env_id.stop - 1].item())
-
-                if config['cpu_offload']:
-                    self.observations[batch_rows, l] = o
-                else:
-                    self.observations[batch_rows, l] = o_device
-
-                self.actions[batch_rows, l] = action
-                self.logprobs[batch_rows, l] = logprob
-                self.rewards[batch_rows, l] = r
-                self.terminals[batch_rows, l] = d.float()
-                self.values[batch_rows, l] = value.flatten()
-
-                # Note: We are not yet handling masks in this version
-                self.ep_lengths[env_id] += 1
-                if l+1 >= config['bptt_horizon']:
-                    num_full = env_id.stop - env_id.start
-                    self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config['device']).int()
-                    self.ep_lengths[env_id] = 0
-                    self.free_idx += num_full
-                    self.full_rows += num_full
-
-                action = action.cpu().numpy()
-                if isinstance(logits, torch.distributions.Normal):
-                    action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
-
-            profile('eval_misc', epoch)
-            for i in info:
-                for k, v in pufferlib.unroll_nested_dict(i):
-                    if isinstance(v, np.ndarray):
-                        v = v.tolist()
-                    elif isinstance(v, (list, tuple)):
-                        self.stats[k].extend(v)
-                    else:
-                        self.stats[k].append(v)
-
-            profile('env', epoch)
-            self.vecenv.send(action)
-
-        profile('eval_misc', epoch)
-        self.free_idx = self.total_agents
-        self.ep_indices = torch.arange(self.total_agents, device=device, dtype=torch.int32)
-        self.ep_lengths.zero_()
+        self.global_step += config['batch_size']
         profile.end()
         return self.stats
 
-
     def train(self):
-        epoch = self.epoch
         profile = self.profile
+        epoch = self.epoch
         profile('train', epoch)
-        profile('train_learn', epoch, nest=True)
- 
-        _compiled_train(self.policy, self.optimizer, self.observations, self.actions, self.logprobs, self.rewards,
-                self.terminals, self.truncations, self.ratio, self.values, self.epoch, self.total_epochs,
-                self.minibatch_segments, self.segments, self.vecenv.single_observation_space.shape,
-                int(self.vecenv.single_action_space.n), self.config)
+        config = self.config
+        device = config['device']
 
-        profile('train_misc', epoch)
+        losses = _C.compiled_train(
+            self.observations,
+            self.actions,
+            self.logprobs,
+            self.rewards,
+            self.terminals,
+            self.truncations,
+            self.ratio,
+            self.values,
+            self.policy,
+            self.optimizer,
+            self.scheduler if self.config['anneal_lr'] else None,
+            self.total_minibatches,
+            self.minibatch_segments,
+            self.segments,  # Assuming self.segments = self.num_envs
+            self.accumulate_minibatches,
+            self.config['bptt_horizon'],
+            self.config['prio_beta0'],
+            self.config['prio_alpha'],
+            self.config['clip_coef'],
+            self.config['vf_clip_coef'],
+            self.config['gamma'],
+            self.config['gae_lambda'],
+            self.config['vtrace_rho_clip'],
+            self.config['vtrace_c_clip'],
+            self.config['vf_coef'],
+            self.config['ent_coef'],
+            self.config['max_grad_norm'],
+            self.config['use_rnn'],
+            self.config['anneal_lr'],
+            self.total_epochs,
+            self.epoch
+        )
+
         # Reprioritize experience
-        '''
         profile('train_misc', epoch)
         if config['anneal_lr']:
             self.scheduler.step()
 
-        y_pred = self.values.flatten()
-        y_true = advantages.flatten() + self.values.flatten()
-        var_y = y_true.var()
-        explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
-        losses['explained_variance'] = explained_var
-        '''
+        #y_pred = self.values.flatten()
+        #y_true = advantages.flatten() + self.values.flatten()
+        #var_y = y_true.var()
+        #explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
+        #losses['explained_variance'] = explained_var
 
         profile.end()
-
-        config = self.config
-
-
         logs = None
         self.epoch += 1
         done_training = self.global_step >= config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
-            #self.losses = losses
+            self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
             profile.clear()
-            if self.epoch == 1:
-                profile.reset()
 
         if self.epoch % config['checkpoint_interval'] == 0 or done_training:
             self.save_checkpoint()
@@ -427,7 +455,7 @@ class PuffeRL:
         if os.path.exists(model_path):
             return model_path
 
-        torch.save(self.uncompiled_policy.state_dict(), model_path)
+        #torch.save(self.uncompiled_policy.state_dict(), model_path)
 
         state = {
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -614,7 +642,7 @@ def dist_mean(value, device):
     return dist_sum(value, device) / torch.distributed.get_world_size()
 
 class Profile:
-    def __init__(self, frequency=5):
+    def __init__(self, frequency=1):
         self.reset()
         self.frequency = frequency
         self.stack = []
@@ -662,30 +690,53 @@ class Profile:
                 prof['buffer'] = prof['delta']
                 prof['delta'] = 0
 
-def compute_loss(params_and_buffers, policy, mb_obs,
+@torch.compile(fullgraph=True, mode='reduce-overhead')
+def lstm_loop(policy, params_and_buffers, mb_obs, h, c, logits, newvalue, horizon):
+    for t in range(horizon):
+        l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], h, c))
+        logits[:, t] = l
+        newvalue[:, t] = n
+
+    return logits, newvalue
+
+def compute_loss(params_and_buffers, policy, lstm, mb_obs,
         mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
         mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv,  epoch, idx,
         config, clip_coef, vf_clip, num_minibatches, mb, horizon, num_atns, segments):
     segments = int(segments)
     num_atns = int(num_atns)
-    #logits = torch.empty(segments, horizon, num_atns, device=config['device'])
-    #newvalue = torch.empty(segments, horizon, 1, device=config['device'])
-    logits = []
-    newvalue = []
+    logits = torch.empty(segments, horizon, num_atns, device=config['device'])
+    newvalue = torch.empty(segments, horizon, 1, device=config['device'])
+    #logits = []
+    #newvalue = []
     #h = None
     #c = None
+    
+    '''
     h = torch.zeros(segments, 128, device=config['device'])
     c = torch.zeros(segments, 128, device=config['device'])
+    logits, values = lstm_loop(policy, params_and_buffers, mb_obs, h, c, logits, newvalue, horizon)
+    '''
+
+    state = {
+        'lstm_h': None,
+        'lstm_c': None
+    }
+    logits, values = forward_train(policy, lstm, mb_obs, state)
+
 
     #for t in range(horizon):
-    #    #l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], h, c))
-    #    l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], None, None))
-    #    #logits[:, t] = l
-    #    #newvalue[:, t] = n
-    #    logits.append(l)
-    #    newvalue.append(n)
+    #    l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], h, c))
+    #    #l, n, h, c = func.functional_call(policy, params_and_buffers, (mb_obs[:, t], None, None))
+    #    logits[:, t] = l
+    #    newvalue[:, t] = n
+    #    #logits.append(l)
+    #    #newvalue.append(n)
 
-    logits, newvalue = func.functional_call(policy, params_and_buffers, mb_obs)
+    logits = logits.reshape(segments*horizon, num_atns)
+
+    #logits, newvalue, h, c = policy(mb_obs, h, c)
+    #logits, newvalue = func.functional_call(policy, params_and_buffers, mb_obs)
 
     #logits = torch.cat(logits, dim=0)
     #newvalue = torch.stack(newvalue, dim=1)
@@ -724,8 +775,8 @@ def compute_loss(params_and_buffers, policy, mb_obs,
     loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
     return loss
 
-@torch.compile(fullgraph=True)
-def _compiled_train(policy, optimizer, observations, actions, logprobs, rewards,
+#@torch.compile(fullgraph=True)
+def _compiled_train(policy, lstm, optimizer, observations, actions, logprobs, rewards,
         terminals, truncations, ratio, values, epoch, total_epochs,
         minibatch_segments, segments, obs_shape, atn_shape, config):
 
@@ -779,8 +830,17 @@ def _compiled_train(policy, optimizer, observations, actions, logprobs, rewards,
 
         adv = advantages[idx]
 
+        optimizer.zero_grad()
+        loss = compute_loss(params_and_buffers, policy, lstm, mb_obs,
+            mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
+            mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, epoch, idx,
+            config, clip_coef, vf_clip, num_minibatches, mb, horizon, atn_shape, minibatch_segments)
+        loss.backward()
+        optimizer.step()
+
+        '''
         grad_fn = func.grad(compute_loss, has_aux=False)
-        grads = grad_fn(params_and_buffers, policy, mb_obs,
+        grads = grad_fn(params_and_buffers, policy, lstm, mb_obs,
             mb_actions, mb_logprobs, mb_rewards, mb_terminals, mb_truncations,
             mb_ratio, mb_values, mb_returns, mb_advantages, mb_prio, adv, epoch, idx,
             config, clip_coef, vf_clip, num_minibatches, mb, horizon, atn_shape, minibatch_segments)
@@ -788,6 +848,7 @@ def _compiled_train(policy, optimizer, observations, actions, logprobs, rewards,
         for name, param in zip(param_names, params):
             if name in grads:
                 param.data.sub_(lr * grads[name])
+        '''
 
 class Utilization(Thread):
     def __init__(self, delay=1, maxlen=20):
@@ -974,7 +1035,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         logger = WandbLogger(args)
 
     train_config = dict(**args['train'], env=env_name)
-    pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
+    #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
+    pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 
     all_logs = []

@@ -11,6 +11,7 @@ import zipfile
 import tarfile
 import platform
 import shutil
+import pybind11
 
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
@@ -76,7 +77,7 @@ extra_link_args = [
 cxx_args = [
     '-fdiagnostics-color=always',
 ]
-nvcc_args = []
+nvcc_args = ['-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1']
 
 if DEBUG:
     extra_compile_args += [
@@ -227,6 +228,7 @@ if not NO_TRAIN:
        extension(
             "pufferlib._C",
             torch_sources,
+            include_dirs=[pybind11.get_include()],
             extra_compile_args = {
                 "cxx": cxx_args,
                 "nvcc": nvcc_args,

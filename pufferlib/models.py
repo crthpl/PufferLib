@@ -117,12 +117,12 @@ class Default(nn.Module):
         self.is_continuous = isinstance(env.single_action_space,
                 pufferlib.spaces.Box)
 
-        num_obs = np.prod(env.single_observation_space.shape)
+        num_obs = int(np.prod(env.single_observation_space.shape))
         self.encoder = torch.nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
             nn.GELU(),
         )
-        num_atns = env.single_action_space.n
+        num_atns = int(env.single_action_space.n)
         self.decoder = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, num_atns), std=0.01)
         self.value = pufferlib.pytorch.layer_init(
@@ -150,6 +150,54 @@ class Default(nn.Module):
         values = self.value(hidden)
         return logits, values
 
+def forward_train(policy, lstm, observations, state):
+    #Forward function for training. Uses LSTM for fast time-batching
+    x = observations
+    lstm_h = state['lstm_h']
+    lstm_c = state['lstm_c']
+
+    x_shape, space_shape = x.shape, policy.obs_shape
+    x_n, space_n = len(x_shape), len(space_shape)
+    if x_shape[-space_n:] != space_shape:
+        raise ValueError('Invalid input tensor shape', x.shape)
+
+    if x_n == space_n + 1:
+        B, TT = x_shape[0], 1
+    elif x_n == space_n + 2:
+        B, TT = x_shape[:2]
+    else:
+        raise ValueError('Invalid input tensor shape', x.shape)
+
+    if lstm_h is not None:
+        assert lstm_h.shape[1] == lstm_c.shape[1] == B, 'LSTM state must be (h, c)'
+        lstm_state = (lstm_h, lstm_c)
+    else:
+        lstm_state = None
+
+    x = x.reshape(B*TT, *space_shape)
+    hidden = policy.policy.encode_observations(x, state)
+    assert hidden.shape == (B*TT, policy.input_size)
+
+    hidden = hidden.reshape(B, TT, policy.input_size)
+
+    hidden = hidden.transpose(0, 1)
+    #hidden = self.pre_layernorm(hidden)
+    hidden, (lstm_h, lstm_c) = lstm(hidden, lstm_state)
+    hidden = hidden.float()
+
+    #hidden = self.post_layernorm(hidden)
+    hidden = hidden.transpose(0, 1)
+
+    flat_hidden = hidden.reshape(B*TT, policy.hidden_size)
+    logits, values = policy.policy.decode_actions(flat_hidden)
+    values = values.reshape(B, TT)
+    #state.batch_logits = logits.reshape(B, TT, -1)
+    state['hidden'] = hidden
+    state['lstm_h'] = lstm_h.detach()
+    state['lstm_c'] = lstm_c.detach()
+    return logits, values
+
+
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, hidden_size=128):
@@ -166,7 +214,6 @@ class LSTMWrapper(nn.Module):
         self.hidden_size = hidden_size
         self.is_continuous = self.policy.is_continuous
 
-        '''
         for name, param in self.named_parameters():
             if 'layer_norm' in name:
                 continue
@@ -174,15 +221,14 @@ class LSTMWrapper(nn.Module):
                 nn.init.constant_(param, 0)
             elif "weight" in name and param.ndim >= 2:
                 nn.init.orthogonal_(param, 1.0)
-        '''
 
-        #self.lstm = nn.LSTM(input_size, hidden_size)
+        self.lstm = nn.LSTM(input_size, hidden_size)
 
         self.cell = torch.nn.LSTMCell(input_size, hidden_size)
-        #self.cell.weight_ih = self.lstm.weight_ih_l0
-        #self.cell.weight_hh = self.lstm.weight_hh_l0
-        #self.cell.bias_ih = self.lstm.bias_ih_l0
-        #self.cell.bias_hh = self.lstm.bias_hh_l0
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
 
         #self.pre_layernorm = nn.LayerNorm(hidden_size)
         #self.post_layernorm = nn.LayerNorm(hidden_size)
@@ -198,15 +244,12 @@ class LSTMWrapper(nn.Module):
         else:
             lstm_state = None
 
-        #hidden = self.pre_layernorm(hidden)
         hidden, c = self.cell(hidden, lstm_state)
-        #hidden = self.post_layernorm(hidden)
         logits, values = self.policy.decode_actions(hidden)
         return logits, values, hidden, c
 
-    '''
-    def forward(self, observations, state):
-        #Forward function for training. Uses LSTM for fast time-batching
+    def forward_train(self, observations, state):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
         x = observations
         lstm_h = state['lstm_h']
         lstm_c = state['lstm_c']
@@ -251,7 +294,6 @@ class LSTMWrapper(nn.Module):
         state['lstm_h'] = lstm_h.detach()
         state['lstm_c'] = lstm_c.detach()
         return logits, values
-    '''
 
 '''
 class LSTMWrapper(nn.Module):

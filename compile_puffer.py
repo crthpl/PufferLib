@@ -64,7 +64,7 @@ def get_params_and_buffers(model):
     return {**buffers, **params_dict}
 
 
-@torch.compile(fullgraph=True, dynamic=False, mode='max-autotune')
+@torch.compile(fullgraph=True, dynamic=False, mode='reduce-overhead')
 def functional_forward(model, params_and_buffers, batch, h, c):
     return func.functional_call(model, params_and_buffers, (batch, h, c))
 
@@ -81,7 +81,7 @@ def rollout(model, params_and_buffers, batch, h, c, seq):
 
     return logits, values
 
-@torch.compile(fullgraph=True, dynamic=False, mode='max-autotune')
+@torch.compile(fullgraph=True, dynamic=False, mode='reduce-overhead')
 def fast_rollout(model, batch, h, c, seq):
     logits = torch.empty(seq, batch.shape[1], OUTPUT_SIZE, device=batch.device, dtype=batch.dtype)
     values = torch.empty(seq, batch.shape[1], 1, device=batch.device, dtype=batch.dtype)
@@ -102,9 +102,10 @@ def compute_loss(params_and_buffers, model, batch, h, c, seq):
     return loss
 
 grad_fn = torch.compile(func.grad(compute_loss),
-    fullgraph=True, dynamic=False, mode='max-autotune')
+    fullgraph=True, dynamic=False, mode='reduce-overhead')
 
-@torch.compile(fullgraph=True, dynamic=False, mode='max-autotune')
+#grad_fn = func.grad(compute_loss)
+
 def train(model, params_and_buffers, batch, h, c, loops, seq):
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for _ in range(loops):
@@ -130,7 +131,7 @@ if __name__ == '__main__':
 
     # TODO: carefully test slowdown from this
     params_and_buffers = get_params_and_buffers(model)
-    #model = torch.compile(model, mode='max-autotune', dynamic=False, fullgraph=True)
+    #model = torch.compile(model, mode='reduce-overhead', dynamic=False, fullgraph=True)
 
     # Create input batch
     batch = torch.randn(SEQ, B, INPUT_SIZE).cuda().to(dtype)
