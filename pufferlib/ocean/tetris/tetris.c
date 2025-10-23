@@ -17,37 +17,58 @@ void demo() {
     int logit_sizes[1] = {7};
     LinearLSTM* net = make_linearlstm(weights, 1, 234, logit_sizes, 1);
 
-    while (!WindowShouldClose()) {
-        if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            // Use KeyDown for left, right, down to allow continuous input
+    // State tracking for single-press actions to avoid using IsKeyPressed
+    // because IsKeyPressed doesn't work well in web browsers
+    static bool rotate_key_was_down = false;
+    static bool hard_drop_key_was_down = false;
+    static bool swap_key_was_down = false;
 
-            if (IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A)){
-                env.actions[0] = 1;
-            }
-            if (IsKeyDown(KEY_RIGHT)  || IsKeyDown(KEY_D)){
-                env.actions[0] = 2;
-            }
-            if (IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S)) {
-                env.actions[0] = 4; // Soft drop
-            }
-            // Use KeyPressed for rotation (up), hard drop, swap
-            if (IsKeyPressed(KEY_UP)  || IsKeyPressed(KEY_W)) {
-                env.actions[0] = 3; // Rotate
-            }
-            if (IsKeyPressed(KEY_SPACE)) {
-                env.actions[0] = 5; // Hard drop
-            }
-            if (IsKeyPressed(KEY_C)) {
-                env.actions[0] = 6; // Swap
+    int frame = 0;
+    while (!WindowShouldClose()) {
+        bool process_logic = true;
+        frame++;
+
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+            if (frame % 3 != 0) {
+                // This effectively slows down the client by 3x
+                process_logic = false;
+            } else {
+                // Use KeyDown for left, right, down to allow continuous input
+                // Though, IsKeyDown can overshoot ...
+                if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+                    env.actions[0] = 1;
+                } else if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+                    env.actions[0] = 2;
+                } else if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) {
+                    env.actions[0] = 4; // Soft drop
+                }
+                // Manual state tracking for single-press actions, mutually exclusive
+                else if ((IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) && !rotate_key_was_down) {
+                    env.actions[0] = 3; // Rotate
+                } else if (IsKeyDown(KEY_SPACE) && !hard_drop_key_was_down) {
+                    env.actions[0] = 5; // Hard drop
+                } else if (IsKeyDown(KEY_C) && !swap_key_was_down) {
+                    env.actions[0] = 6; // Swap
+                }
             }
         } else {
             forward_linearlstm(net, env.observations, env.actions);
         }
 
-        c_step(&env);
-        env.actions[0] = 0;
+        if (process_logic) {
+            // Update key state flags after processing actions for the frame
+            rotate_key_was_down = IsKeyDown(KEY_UP) || IsKeyDown(KEY_W);
+            hard_drop_key_was_down = IsKeyDown(KEY_SPACE);
+            swap_key_was_down = IsKeyDown(KEY_C);
+
+            c_step(&env);
+
+            env.actions[0] = 0;
+        }
+
         c_render(&env);
     }
+
     free_linearlstm(net);
     free_allocated(&env);
     close_client(env.client);

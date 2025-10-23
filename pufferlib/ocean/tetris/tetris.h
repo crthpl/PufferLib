@@ -569,7 +569,7 @@ Client *make_client(Tetris *env) {
 	client->preview_target_col = env->n_cols / 2;
 	client->preview_target_rotation = 0;
 	InitWindow(SQUARE_SIZE * client->total_cols, SQUARE_SIZE * client->total_rows, "PufferLib Tetris");
-	SetTargetFPS(10);
+	SetTargetFPS(30);
 	return client;
 }
 
