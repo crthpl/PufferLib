@@ -248,32 +248,30 @@ public:
     }
 };
 
-struct OptimizerWrapper {
-    torch::optim::Adam optimizer;
+typedef struct {
+    PolicyLSTM* policy;
+    torch::optim::Adam* optimizer;
+} PuffeRL;
 
-    // Constructor
-    explicit OptimizerWrapper(torch::nn::Module& module, double lr, double beta1, double beta2, double eps)
-        : optimizer(module.parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps))
-    {
-    }
-    // Optional: expose step, zero_grad, etc., if needed from Python
-    void step() {
-        optimizer.step();
-    }
+std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
+        int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps) {
+    auto policy = new PolicyLSTM(input_size, num_atns, hidden_size);
+    auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
 
-    void zero_grad() {
-        optimizer.zero_grad();
-    }
-};
+    auto pufferl = std::make_unique<pufferlib::PuffeRL>();
+    pufferl->policy = policy;
+    pufferl->optimizer = optimizer;
+    return pufferl;
+}
 
 // Updated compiled_evaluate
 std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
+    pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
     torch::Tensor obs,
     torch::Tensor actions,
     torch::Tensor rewards,
     torch::Tensor terminals,
-    pybind11::object policy_obj,  // pybind11::object for Python compatibility
     torch::Tensor lstm_h,
     torch::Tensor lstm_c,
     torch::Tensor obs_buffer,
@@ -285,7 +283,9 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     int64_t horizon,
     int64_t num_envs
 ) {
-    auto& policy = policy_obj.cast<pufferlib::PolicyLSTM&>();
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& policy = pufferl.policy;
+    auto& optimizer = pufferl.optimizer;
 
     // No-grad guard
     torch::NoGradGuard no_grad;
@@ -295,7 +295,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         auto r = rewards.clamp(-1.0f, 1.0f);
 
         // Policy forward: Native C++ call
-        auto [logits, value, lstm_h_out, lstm_c_out] = policy.forward(obs, lstm_h, lstm_c);
+        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs, lstm_h, lstm_c);
         lstm_h = lstm_h_out;
         lstm_c = lstm_c_out;
 
@@ -327,6 +327,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
 
 // Updated compiled_train
 pybind11::dict compiled_train(
+    pybind11::object pufferl_obj,
     torch::Tensor observations,  // [num_envs, horizon, grid_size, grid_size] uint8
     torch::Tensor actions,       // [num_envs, horizon] int32
     torch::Tensor logprobs,      // [num_envs, horizon] float
@@ -335,8 +336,6 @@ pybind11::dict compiled_train(
     torch::Tensor truncations,   // [num_envs, horizon] float (included but not used in loop)
     torch::Tensor ratio,         // [num_envs, horizon] float
     torch::Tensor values,        // [num_envs, horizon] float
-    pybind11::object policy_obj,
-    pybind11::object optimizer_wrapper_obj,
     //pybind11::object scheduler,
     int64_t total_minibatches,
     int64_t minibatch_segments,
@@ -359,9 +358,9 @@ pybind11::dict compiled_train(
     int64_t total_epochs,
     int64_t current_epoch
 ) {
-    auto& policy = policy_obj.cast<pufferlib::PolicyLSTM&>();
-    auto& optimized_wrapper = optimizer_wrapper_obj.cast<pufferlib::OptimizerWrapper&>();
-    auto& optimizer = optimized_wrapper.optimizer;
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& policy = pufferl.policy;
+    auto& optimizer = pufferl.optimizer;
 
     // Compute anneal_beta
     double anneal_beta = prio_beta0 + (1.0 - prio_beta0) * prio_alpha * static_cast<double>(current_epoch) / total_epochs;
@@ -408,7 +407,7 @@ pybind11::dict compiled_train(
         torch::Tensor mb_lstm_c;
 
         // Policy forward: Native C++ call
-        auto [logits, newvalue] = policy.forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
 
         // Compute newlogprob and entropy (discrete assumption)
         auto flat_batch = minibatch_segments * horizon;
@@ -465,14 +464,9 @@ pybind11::dict compiled_train(
 
         // Accumulate and step
         if ((mb + 1) % accumulate_minibatches == 0) {
-            pybind11::iterable params_iter = policy_obj.attr("parameters")();
-            std::vector<torch::Tensor> params_list;
-            for (pybind11::handle param : params_iter) {
-                params_list.push_back(param.cast<torch::Tensor>());
-            }
-            torch::nn::utils::clip_grad_norm_(params_list, max_grad_norm);
-            optimizer.step();
-            optimizer.zero_grad();
+            torch::nn::utils::clip_grad_norm_(policy->parameters(), max_grad_norm);
+            optimizer->step();
+            optimizer->zero_grad();
         }
     }
 
@@ -499,11 +493,10 @@ PYBIND11_MODULE(_C, m) {
     m.def("compiled_evaluate", &compiled_evaluate);
     m.def("compiled_train", &compiled_train);
 
-    py::class_<OptimizerWrapper>(m, "OptimizerWrapper")
-    .def(py::init<torch::nn::Module&, double, double, double, double>(),
-         py::arg("module"), py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"))
-    .def("step", &OptimizerWrapper::step)
-    .def("zero_grad", &OptimizerWrapper::zero_grad);
+    m.def("create_pufferl", &create_pufferl);
+    py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
+        .def_readwrite("policy", &pufferlib::PuffeRL::policy)
+        .def_readwrite("optimizer", &pufferlib::PuffeRL::optimizer);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
     cls.def(py::init<int64_t, int64_t, int64_t>());

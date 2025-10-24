@@ -104,8 +104,8 @@ class PuffeRL:
         self.single_observation_space = obs_space
         self.single_action_space = atn_space
 
-        policy = _C.PolicyLSTM(grid_size*grid_size, 5, 128)
-        policy.cuda()
+        #policy = _C.PolicyLSTM(grid_size*grid_size, 5, 128)
+        #policy.cuda()
 
         # Vecenv info
         #vecenv.async_reset(seed)
@@ -172,13 +172,13 @@ class PuffeRL:
             )
 
         # Torch compile
-        self.uncompiled_policy = policy
-        self.policy = policy
+        #self.uncompiled_policy = policy
+        #self.policy = policy
         #self.compiled_policy = torch.compile(policy)
-        if config['compile']:
-            self.policy = torch.compile(policy, mode=config['compile_mode'])
-            #self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
-            pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
+        #if config['compile']:
+        #    self.policy = torch.compile(policy, mode=config['compile_mode'])
+        #    #self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+        #    pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         # Optimizer
         '''
@@ -203,15 +203,16 @@ class PuffeRL:
         else:
             raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
         '''
-        optimizer = _C.OptimizerWrapper(
-            self.policy,
+        self.pufferl_cpp = _C.create_pufferl(
+            grid_size*grid_size,
+            5,
+            128,
             config['learning_rate'],
             config['adam_beta1'],
             config['adam_beta2'],
             config['adam_eps'],
         )
-
-        self.optimizer = optimizer
+        self.pufferl_cpp.policy.cuda()
 
         # Logging
         self.logger = logger
@@ -247,7 +248,7 @@ class PuffeRL:
         self.verbose = verbose
 
         # Dashboard
-        self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        #self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
 
     @property
@@ -308,12 +309,12 @@ class PuffeRL:
             lstm_c = torch.zeros((n, h), device=device)
 
         lstm_h, lstm_c = _C.compiled_evaluate(
+            self.pufferl_cpp,
             self.vecenv.env,
             self.vecenv.observations,
             self.vecenv.actions,
             self.vecenv.rewards,
             self.vecenv.terminals,
-            self.policy,
             lstm_h,
             lstm_c,
             self.observations,
@@ -338,6 +339,7 @@ class PuffeRL:
         device = config['device']
 
         losses = _C.compiled_train(
+            self.pufferl_cpp,
             self.observations,
             self.actions,
             self.logprobs,
@@ -346,8 +348,6 @@ class PuffeRL:
             self.truncations,
             self.ratio,
             self.values,
-            self.policy,
-            self.optimizer,
             #self.scheduler if self.config['anneal_lr'] else None,
             self.total_minibatches,
             self.minibatch_segments,
@@ -521,7 +521,7 @@ class PuffeRL:
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
         s.add_row(f'{c2}Env', f'{b2}{config["env"]}')
-        s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
+        #s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
         s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
         s.add_row(f'{c2}SPS', abbreviate(sps, b2, c2))
         s.add_row(f'{c2}Epoch', f'{b2}{self.epoch}')
