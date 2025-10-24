@@ -23,7 +23,7 @@
 #define ACTION_HOLD 6
 
 #define MAX_TICKS 10000
-#define PERSONAL_BEST 26789
+#define PERSONAL_BEST 100000
 #define INITIAL_TICKS_PER_FALL 6 // how many ticks before the tetromino naturally falls down of one square
 #define GARBAGE_KICKOFF_TICK 500
 #define INITIAL_TICKS_PER_GARBAGE 100
@@ -442,8 +442,8 @@ void place_tetromino(Tetris *env) {
 
 		// These determine the game difficulty. Consider making them args.
 		env->game_level = 1 + env->lines_deleted / LINES_PER_LEVEL;
-		env->ticks_per_fall = max(2, INITIAL_TICKS_PER_FALL - env->game_level / 3);
-		env->ticks_per_garbage = max(30, INITIAL_TICKS_PER_GARBAGE - 2 * env->game_level);
+		env->ticks_per_fall = max(3, INITIAL_TICKS_PER_FALL - env->game_level / 4);
+		env->ticks_per_garbage = max(50, (int)(INITIAL_TICKS_PER_GARBAGE - 5.0 * sqrt((double)env->game_level)));
 	}
 
 	if (can_spawn_new_tetromino(env)) {
@@ -725,7 +725,7 @@ void c_render(Tetris *env) {
 		}
 	}
 	// Draw UI
-	DrawText(TextFormat("Score: %i", env->score), SQUARE_SIZE + 4, SQUARE_SIZE + 4, 30, (Color){255, 160, 160, 255});
-	DrawText(TextFormat("Lvl: %i", env->game_level), (client->total_cols - 4) * SQUARE_SIZE, SQUARE_SIZE + 4, 30, (Color){160, 255, 160, 255});
+	DrawText(TextFormat("Score: %i", env->score), SQUARE_SIZE + 4, SQUARE_SIZE + 4, 28, (Color){255, 160, 160, 255});
+	DrawText(TextFormat("Lvl: %i", env->game_level), (client->total_cols - 4) * SQUARE_SIZE, SQUARE_SIZE + 4, 28, (Color){160, 255, 160, 255});
 	EndDrawing();
 }
