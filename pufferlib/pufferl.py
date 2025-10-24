@@ -223,8 +223,6 @@ class PuffeRL:
             config['adam_eps'],
             epochs,
         )
-        self.pufferl_cpp.policy.cuda()
-
         # Automatic mixed precision
         precision = config['precision']
         self.amp_context = contextlib.nullcontext()

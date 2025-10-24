@@ -174,7 +174,7 @@ public:
                         "c must be [B, hidden_size]");
         }
 
-        auto hidden = encoder->forward(observations.to(torch::kFloat32));
+        auto hidden = encoder->forward(observations);
 
         std::tuple<torch::Tensor, torch::Tensor> cell_out;
         if (h.defined() && h.numel() > 0) {
@@ -221,7 +221,7 @@ public:
             TT = 1;
         }
 
-        auto hidden = encoder->forward(x.to(torch::kFloat32));
+        auto hidden = encoder->forward(x);
 
         hidden = hidden.reshape({B, TT, hidden_size_});
         hidden = hidden.transpose(0, 1);  // [TT, B, hidden_size]
@@ -234,7 +234,6 @@ public:
         }
 
         hidden = std::get<0>(lstm_out);
-        hidden = hidden.to(torch::kFloat32);
         hidden = hidden.transpose(0, 1);  // [B, TT, hidden_size]
 
         auto flat_hidden = hidden.reshape({-1, hidden_size_});
@@ -255,8 +254,17 @@ double cosine_annealing(double lr_base, int64_t t, int64_t T) {
     return lr_base * 0.5 * (1 + std::cos(M_PI * ratio));
 }
 
+void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* policy_32) {
+    auto params_32 = policy_32->parameters();
+    auto params_16 = policy_16->parameters();
+    for (size_t i = 0; i < params_32.size(); ++i) {
+        params_16[i].copy_(params_32[i].to(torch::kBFloat16));
+    }
+}
+
 typedef struct {
-    PolicyLSTM* policy;
+    PolicyLSTM* policy_16;
+    PolicyLSTM* policy_32;
     torch::optim::Adam* optimizer;
     double lr;
     int64_t max_epochs;
@@ -264,11 +272,18 @@ typedef struct {
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
         int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
-    auto policy = new PolicyLSTM(input_size, num_atns, hidden_size);
-    auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    auto policy_16 = new PolicyLSTM(input_size, num_atns, hidden_size);
+    policy_16->to(torch::kCUDA);
+    policy_16->to(torch::kBFloat16);
+
+    auto policy_32 = new PolicyLSTM(input_size, num_atns, hidden_size);
+    policy_32->to(torch::kCUDA);
+
+    auto optimizer = new torch::optim::Adam(policy_16->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
-    pufferl->policy = policy;
+    pufferl->policy_16 = policy_16;
+    pufferl->policy_32 = policy_32;
     pufferl->optimizer = optimizer;
     pufferl->lr = lr;
     pufferl->max_epochs = max_epochs;
@@ -279,12 +294,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
-    torch::Tensor obs,
-    torch::Tensor actions,
-    torch::Tensor rewards,
-    torch::Tensor terminals,
-    torch::Tensor lstm_h,
-    torch::Tensor lstm_c,
+    torch::Tensor obs_input,
+    torch::Tensor actions_input,
+    torch::Tensor rewards_input,
+    torch::Tensor terminals_input,
+    torch::Tensor lstm_h_input,
+    torch::Tensor lstm_c_input,
     torch::Tensor obs_buffer,
     torch::Tensor act_buffer,
     torch::Tensor logprob_buffer,
@@ -295,11 +310,18 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     int64_t num_envs
 ) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy;
+    auto& policy = pufferl.policy_16;
     auto& optimizer = pufferl.optimizer;
 
     // No-grad guard
     torch::NoGradGuard no_grad;
+
+    auto obs = obs_input.to(torch::kBFloat16);
+    auto actions = actions_input.to(torch::kBFloat16);
+    auto rewards = rewards_input.to(torch::kBFloat16);
+    auto terminals = terminals_input.to(torch::kBFloat16);
+    auto lstm_h = lstm_h_input.to(torch::kBFloat16);
+    auto lstm_c = lstm_c_input.to(torch::kBFloat16);
 
     for (int64_t i = 0; i < horizon; ++i) {
         // Clamp rewards
@@ -321,12 +343,12 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         action = action.squeeze(1);
 
         // Store to buffers
-        obs_buffer.select(1, i).copy_(obs);
-        act_buffer.select(1, i).copy_(action);
-        logprob_buffer.select(1, i).copy_(logprob);
-        rew_buffer.select(1, i).copy_(r);
+        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
+        act_buffer.select(1, i).copy_(action.to(torch::kInt32));
+        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
+        rew_buffer.select(1, i).copy_(r.to(torch::kFloat32));
         term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
-        val_buffer.select(1, i).copy_(value.flatten());
+        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
 
         // Step the environments
         actions.copy_(action);
@@ -369,7 +391,7 @@ pybind11::dict compiled_train(
     int64_t current_epoch
 ) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy;
+    auto& policy_16 = pufferl.policy_16;
     auto& optimizer = pufferl.optimizer;
 
     if (anneal_lr) {
@@ -402,15 +424,15 @@ pybind11::dict compiled_train(
         auto mb_prio = torch::pow(static_cast<double>(segments) * prio_probs_mb, -anneal_beta);
 
         // Select minibatch tensors
-        auto mb_obs = observations.index_select(0, idx);
+        auto mb_obs = observations.index_select(0, idx).to(torch::kBFloat16);
         auto mb_actions = actions.index_select(0, idx);
-        auto mb_logprobs = logprobs.index_select(0, idx);
-        auto mb_rewards = rewards.index_select(0, idx);
-        auto mb_terminals = terminals.index_select(0, idx);
-        auto mb_ratio = ratio.index_select(0, idx);  // Not used directly
-        auto mb_values = values.index_select(0, idx);
-        auto mb_advantages = advantages.index_select(0, idx);
-        auto mb_returns = mb_advantages + mb_values;
+        auto mb_logprobs = logprobs.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_rewards = rewards.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_terminals = terminals.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_ratio = ratio.index_select(0, idx).to(torch::kBFloat16);  // Not used directly
+        auto mb_values = values.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_advantages = advantages.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_returns = mb_advantages + mb_values.to(torch::kBFloat16);
 
         auto original_obs_shape = mb_obs.sizes();  // [minibatch_segments, horizon, grid_size, grid_size]
         if (!use_rnn) {
@@ -422,7 +444,7 @@ pybind11::dict compiled_train(
         torch::Tensor mb_lstm_c;
 
         // Policy forward: Native C++ call
-        auto [logits, newvalue] = policy->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy_16->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
 
         // Compute newlogprob and entropy (discrete assumption)
         auto flat_batch = minibatch_segments * horizon;
@@ -441,7 +463,7 @@ pybind11::dict compiled_train(
         auto mb_ratio_new = logratio.exp();
 
         // Update full ratio (detach)
-        ratio.index_copy_(0, idx, mb_ratio_new.detach());
+        ratio.index_copy_(0, idx, mb_ratio_new.detach().to(torch::kFloat32));
 
         // Advantages normalization
         auto adv = mb_advantages;
@@ -479,7 +501,7 @@ pybind11::dict compiled_train(
 
         // Accumulate and step
         if ((mb + 1) % accumulate_minibatches == 0) {
-            torch::nn::utils::clip_grad_norm_(policy->parameters(), max_grad_norm);
+            torch::nn::utils::clip_grad_norm_(policy_16->parameters(), max_grad_norm);
             optimizer->step();
             optimizer->zero_grad();
         }
@@ -505,7 +527,8 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
-        .def_readwrite("policy", &pufferlib::PuffeRL::policy)
+        .def_readwrite("policy_16", &pufferlib::PuffeRL::policy_16)
+        .def_readwrite("policy_32", &pufferlib::PuffeRL::policy_32)
         .def_readwrite("optimizer", &pufferlib::PuffeRL::optimizer);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
