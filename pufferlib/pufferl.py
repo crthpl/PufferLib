@@ -203,17 +203,6 @@ class PuffeRL:
         else:
             raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
         '''
-        self.pufferl_cpp = _C.create_pufferl(
-            grid_size*grid_size,
-            5,
-            128,
-            config['learning_rate'],
-            config['adam_beta1'],
-            config['adam_beta2'],
-            config['adam_eps'],
-        )
-        self.pufferl_cpp.policy.cuda()
-
         # Logging
         self.logger = logger
         if logger is None:
@@ -223,6 +212,18 @@ class PuffeRL:
         epochs = max(1, config['total_timesteps'] // config['batch_size'])
         #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
+
+        self.pufferl_cpp = _C.create_pufferl(
+            grid_size*grid_size,
+            5,
+            128,
+            config['learning_rate'],
+            config['adam_beta1'],
+            config['adam_beta2'],
+            config['adam_eps'],
+            epochs,
+        )
+        self.pufferl_cpp.policy.cuda()
 
         # Automatic mixed precision
         precision = config['precision']

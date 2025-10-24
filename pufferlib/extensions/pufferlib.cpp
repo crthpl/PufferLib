@@ -248,19 +248,30 @@ public:
     }
 };
 
+double cosine_annealing(double lr_base, int64_t t, int64_t T) {
+    if (T == 0) return lr_base;  // avoid division by zero
+    double ratio = static_cast<double>(t) / static_cast<double>(T);
+    ratio = std::max(0.0, std::min(1.0, ratio));  // clamp to [0, 1]
+    return lr_base * 0.5 * (1 + std::cos(M_PI * ratio));
+}
+
 typedef struct {
     PolicyLSTM* policy;
     torch::optim::Adam* optimizer;
+    double lr;
+    int64_t max_epochs;
 } PuffeRL;
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
-        int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps) {
+        int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
     auto policy = new PolicyLSTM(input_size, num_atns, hidden_size);
     auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy = policy;
     pufferl->optimizer = optimizer;
+    pufferl->lr = lr;
+    pufferl->max_epochs = max_epochs;
     return pufferl;
 }
 
@@ -336,7 +347,6 @@ pybind11::dict compiled_train(
     torch::Tensor truncations,   // [num_envs, horizon] float (included but not used in loop)
     torch::Tensor ratio,         // [num_envs, horizon] float
     torch::Tensor values,        // [num_envs, horizon] float
-    //pybind11::object scheduler,
     int64_t total_minibatches,
     int64_t minibatch_segments,
     int64_t segments,  // num_envs
@@ -361,6 +371,11 @@ pybind11::dict compiled_train(
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy = pufferl.policy;
     auto& optimizer = pufferl.optimizer;
+
+    if (anneal_lr) {
+        double lr = cosine_annealing(pufferl.lr, current_epoch, pufferl.max_epochs);
+        optimizer->param_groups().at(0).options().set_lr(lr);
+    }
 
     // Compute anneal_beta
     double anneal_beta = prio_beta0 + (1.0 - prio_beta0) * prio_alpha * static_cast<double>(current_epoch) / total_epochs;
@@ -469,11 +484,6 @@ pybind11::dict compiled_train(
             optimizer->zero_grad();
         }
     }
-
-    // Scheduler step if anneal_lr
-    //if (anneal_lr) {
-    //    scheduler.attr("step")();
-    //}
 
     pybind11::dict losses;
     auto num_mb = static_cast<double>(total_minibatches);
