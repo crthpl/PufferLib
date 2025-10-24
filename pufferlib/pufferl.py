@@ -181,6 +181,7 @@ class PuffeRL:
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         # Optimizer
+        '''
         if config['optimizer'] == 'adam':
             optimizer = torch.optim.Adam(
                 self.policy.parameters(),
@@ -201,6 +202,14 @@ class PuffeRL:
             )
         else:
             raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
+        '''
+        optimizer = _C.OptimizerWrapper(
+            self.policy,
+            config['learning_rate'],
+            config['adam_beta1'],
+            config['adam_beta2'],
+            config['adam_eps'],
+        )
 
         self.optimizer = optimizer
 
@@ -211,7 +220,7 @@ class PuffeRL:
 
         # Learning rate scheduler
         epochs = max(1, config['total_timesteps'] // config['batch_size'])
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
 
         # Automatic mixed precision
@@ -339,7 +348,7 @@ class PuffeRL:
             self.values,
             self.policy,
             self.optimizer,
-            self.scheduler if self.config['anneal_lr'] else None,
+            #self.scheduler if self.config['anneal_lr'] else None,
             self.total_minibatches,
             self.minibatch_segments,
             self.segments,  # Assuming self.segments = self.num_envs
@@ -364,8 +373,8 @@ class PuffeRL:
 
         # Reprioritize experience
         profile('train_misc', epoch)
-        if config['anneal_lr']:
-            self.scheduler.step()
+        #if config['anneal_lr']:
+        #    self.scheduler.step()
 
         #y_pred = self.values.flatten()
         #y_true = advantages.flatten() + self.values.flatten()
@@ -410,7 +419,7 @@ class PuffeRL:
             'agent_steps': agent_steps,
             'uptime': time.time() - self.start_time,
             'epoch': int(dist_sum(self.epoch, device)),
-            'learning_rate': self.optimizer.param_groups[0]["lr"],
+            #'learning_rate': self.optimizer.param_groups[0]["lr"],
             **{f'environment/{k}': v for k, v in self.stats.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
             **{f'performance/{k}': v['elapsed'] for k, v in self.profile},
@@ -458,7 +467,7 @@ class PuffeRL:
         #torch.save(self.uncompiled_policy.state_dict(), model_path)
 
         state = {
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            #'optimizer_state_dict': self.optimizer.state_dict(),
             'global_step': self.global_step,
             'agent_step': self.global_step,
             'update': self.epoch,

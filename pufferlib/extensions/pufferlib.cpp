@@ -248,6 +248,24 @@ public:
     }
 };
 
+struct OptimizerWrapper {
+    torch::optim::Adam optimizer;
+
+    // Constructor
+    explicit OptimizerWrapper(torch::nn::Module& module, double lr, double beta1, double beta2, double eps)
+        : optimizer(module.parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps))
+    {
+    }
+    // Optional: expose step, zero_grad, etc., if needed from Python
+    void step() {
+        optimizer.step();
+    }
+
+    void zero_grad() {
+        optimizer.zero_grad();
+    }
+};
+
 // Updated compiled_evaluate
 std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     torch::Tensor envs_tensor,
@@ -318,8 +336,8 @@ pybind11::dict compiled_train(
     torch::Tensor ratio,         // [num_envs, horizon] float
     torch::Tensor values,        // [num_envs, horizon] float
     pybind11::object policy_obj,
-    pybind11::object optimizer,
-    pybind11::object scheduler,
+    pybind11::object optimizer_wrapper_obj,
+    //pybind11::object scheduler,
     int64_t total_minibatches,
     int64_t minibatch_segments,
     int64_t segments,  // num_envs
@@ -342,6 +360,8 @@ pybind11::dict compiled_train(
     int64_t current_epoch
 ) {
     auto& policy = policy_obj.cast<pufferlib::PolicyLSTM&>();
+    auto& optimized_wrapper = optimizer_wrapper_obj.cast<pufferlib::OptimizerWrapper&>();
+    auto& optimizer = optimized_wrapper.optimizer;
 
     // Compute anneal_beta
     double anneal_beta = prio_beta0 + (1.0 - prio_beta0) * prio_alpha * static_cast<double>(current_epoch) / total_epochs;
@@ -451,15 +471,15 @@ pybind11::dict compiled_train(
                 params_list.push_back(param.cast<torch::Tensor>());
             }
             torch::nn::utils::clip_grad_norm_(params_list, max_grad_norm);
-            optimizer.attr("step")();
-            optimizer.attr("zero_grad")();
+            optimizer.step();
+            optimizer.zero_grad();
         }
     }
 
     // Scheduler step if anneal_lr
-    if (anneal_lr) {
-        scheduler.attr("step")();
-    }
+    //if (anneal_lr) {
+    //    scheduler.attr("step")();
+    //}
 
     pybind11::dict losses;
     auto num_mb = static_cast<double>(total_minibatches);
@@ -478,6 +498,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("reset_environments", &reset_environments_cuda);
     m.def("compiled_evaluate", &compiled_evaluate);
     m.def("compiled_train", &compiled_train);
+
+    py::class_<OptimizerWrapper>(m, "OptimizerWrapper")
+    .def(py::init<torch::nn::Module&, double, double, double, double>(),
+         py::arg("module"), py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"))
+    .def("step", &OptimizerWrapper::step)
+    .def("zero_grad", &OptimizerWrapper::zero_grad);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
     cls.def(py::init<int64_t, int64_t, int64_t>());
