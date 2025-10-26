@@ -1,6 +1,25 @@
 #include "g2048.h"
 #include "puffernet.h"
 
+// Network with hidden size 256. Should go to puffernet
+LinearLSTM* make_linearlstm_256(Weights* weights, int num_agents, int input_dim, int logit_sizes[], int num_actions) {
+    LinearLSTM* net = calloc(1, sizeof(LinearLSTM));
+    net->num_agents = num_agents;
+    net->obs = calloc(num_agents*input_dim, sizeof(float));
+    int hidden_dim = 256;
+    net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
+    net->gelu1 = make_gelu(num_agents, hidden_dim);
+    int atn_sum = 0;
+    for (int i = 0; i < num_actions; i++) {
+        atn_sum += logit_sizes[i];
+    }
+    net->actor = make_linear(weights, num_agents, hidden_dim, atn_sum);
+    net->value_fn = make_linear(weights, num_agents, hidden_dim, 1);
+    net->lstm = make_lstm(weights, num_agents, hidden_dim, hidden_dim);
+    net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, num_actions);
+    return net;
+}
+
 int main() {
     srand(time(NULL));
     Game env;
@@ -14,9 +33,9 @@ int main() {
     env.actions = actions;
     env.rewards = rewards;
 
-    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 134917);
+    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 531973);
     int logit_sizes[1] = {4};
-    LinearLSTM* net = make_linearlstm(weights, 1, 16, logit_sizes, 1);
+    LinearLSTM* net = make_linearlstm_256(weights, 1, 16, logit_sizes, 1);
     c_reset(&env);
     c_render(&env);
 
