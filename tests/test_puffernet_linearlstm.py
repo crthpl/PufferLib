@@ -25,9 +25,6 @@ def assert_near(a, b, tolerance=1e-4):
     assert np.all(np.abs(a - b) < tolerance), f"Value mismatch exceeds tolerance {tolerance}"
 
 def test_tetris_puffernet(model_path='puffer_tetris_weights.bin'):
-    """
-    Compare the PyTorch Tetris policy with the PufferNet C++ implementation layer by layer.
-    """
     # Load the environment to get parameters
     env = env_creator('puffer_tetris')()
 

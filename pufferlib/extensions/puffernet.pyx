@@ -51,9 +51,6 @@ def puf_relu(cnp.ndarray input, cnp.ndarray output, int size):
 def puf_gelu(cnp.ndarray input, cnp.ndarray output, int size):
     _gelu(<float*> input.data, <float*> output.data, size)
 
-def puf_gelu(cnp.ndarray input, cnp.ndarray output, int size):
-    _gelu(<float*> input.data, <float*> output.data, size)
-
 def puf_sigmoid(float x):
     return _sigmoid(x)
 

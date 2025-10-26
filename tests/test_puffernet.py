@@ -126,9 +126,6 @@ def test_puffernet_convolution_3d_layer(batch_size=4096, in_width=9, in_height=5
     torch_conv.bias.data = bias_torch
     output_torch = torch_conv(input_torch).detach()
     assert_near(output_puffer, output_torch.numpy())
-    
-    
-    
 
 def test_puffernet_lstm(batch_size=16, input_size=128, hidden_size=128):
     input_np = make_dummy_data(batch_size, input_size, seed=42)
@@ -259,7 +256,6 @@ def test_nmmo3(batch_size=1, input_size=512, hidden_size=512):
 
 if __name__ == '__main__':
     test_puffernet_relu()
-    test_puffernet_gelu()
     test_puffernet_gelu()
     test_puffernet_sigmoid()
     test_puffernet_linear_layer()
