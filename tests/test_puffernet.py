@@ -44,15 +44,14 @@ def test_puffernet_relu(batch_size=16, input_size=128):
 
 def test_puffernet_gelu(batch_size=16, input_size=128):
     input_puffer = make_dummy_data(batch_size, input_size)
-    output_puffer = np.zeros_like(input_puffer)
 
     input_torch = torch.from_numpy(input_puffer)
-    output_torch = torch.nn.functional.gelu(input_torch).detach()
+    output_torch = torch.nn.functional.gelu(input_torch, approximate='tanh').detach()
 
-    puffernet.puf_gelu(input_puffer, output_puffer, input_puffer.size)
+    # PufferNet done second because it is in-place on the input
+    puffernet.puf_gelu(input_puffer, input_puffer, batch_size*input_size)
 
-    assert_near(output_puffer, output_torch.numpy())
-
+    assert_near(input_puffer, output_torch.numpy())
 
 def test_puffernet_sigmoid(n=1024, epsilon=1e-4):
     input_np = make_dummy_data(n)
@@ -259,9 +258,8 @@ def test_nmmo3(batch_size=1, input_size=512, hidden_size=512):
     pass
 
 if __name__ == '__main__':
-    # test_nmmo3()
-    # exit()
     test_puffernet_relu()
+    test_puffernet_gelu()
     test_puffernet_gelu()
     test_puffernet_sigmoid()
     test_puffernet_linear_layer()
@@ -273,4 +271,4 @@ if __name__ == '__main__':
     test_puffernet_one_hot()
     test_puffernet_cat_dim1()
     test_puffernet_argmax_multidiscrete()
-    print("All tests passed!")
+    #test_nmmo3()
