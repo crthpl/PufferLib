@@ -9,7 +9,7 @@ class Tetris(pufferlib.PufferEnv):
         num_envs=1, 
         n_cols=10, 
         n_rows=20,
-        use_deck_obs=False,
+        use_deck_obs=True,
         n_noise_obs=10,
         n_init_garbage=4,
         render_mode=None, 

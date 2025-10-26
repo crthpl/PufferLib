@@ -21,8 +21,9 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "avg_combo", log->avg_combo);
     assign_to_dict(dict, "lines_deleted", log->lines_deleted);
     assign_to_dict(dict, "game_level", log->game_level);
+    assign_to_dict(dict, "ticks_per_line", log->ticks_per_line);
 
-    assign_to_dict(dict, "atn_frac_soft_drop", log->atn_frac_soft_drop);
+    // assign_to_dict(dict, "atn_frac_soft_drop", log->atn_frac_soft_drop);
     assign_to_dict(dict, "atn_frac_hard_drop", log->atn_frac_hard_drop);
     assign_to_dict(dict, "atn_frac_rotate", log->atn_frac_rotate);
     assign_to_dict(dict, "atn_frac_hold", log->atn_frac_hold);

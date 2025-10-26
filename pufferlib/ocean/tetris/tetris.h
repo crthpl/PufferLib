@@ -6,8 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#define min(a, b) (((a) < (b)) ? (a) : (b))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
+
+static inline int min(int a, int b) { return a < b ? a : b; }
+static inline int max(int a, int b) { return a > b ? a : b; }
 
 #define HALF_LINEWIDTH 1
 #define SQUARE_SIZE 32
@@ -24,7 +25,7 @@
 #define ACTION_HOLD 6
 
 #define MAX_TICKS 10000
-#define PERSONAL_BEST 100000
+#define PERSONAL_BEST 67890
 #define INITIAL_TICKS_PER_FALL 6 // how many ticks before the tetromino naturally falls down of one square
 #define GARBAGE_KICKOFF_TICK 500
 #define INITIAL_TICKS_PER_GARBAGE 100
@@ -53,6 +54,7 @@ typedef struct Log {
 	float atn_frac_rotate;
 	float atn_frac_hold;
 	float game_level;
+	float ticks_per_line;
 	float n;
 } Log;
 
@@ -80,7 +82,6 @@ typedef struct Tetris {
 	bool use_deck_obs;
 	int n_noise_obs;
 	int n_init_garbage;
-	bool eval_mode;
 
 	int *grid;
 	int tick;
@@ -112,8 +113,13 @@ typedef struct Tetris {
 
 void init(Tetris *env) {
 	env->grid = (int *)calloc(env->n_rows * env->n_cols, sizeof(int));
+	if (env->grid == NULL) {
+		exit(1);
+	}
 	env->tetromino_deck = calloc(DECK_SIZE, sizeof(int));
-	env->eval_mode = false;
+	if (env->tetromino_deck == NULL) {
+		exit(1);
+	}
 }
 
 void allocate(Tetris *env) {
@@ -151,6 +157,7 @@ void add_log(Tetris *env) {
 	env->log.atn_frac_rotate += env->atn_count_rotate / ((float)env->tick);
 	env->log.atn_frac_hold += env->atn_count_hold / ((float)env->tick);
 	env->log.game_level += env->game_level;
+	env->log.ticks_per_line += (env->lines_deleted > 0) ? ((float)env->tick / (float)env->lines_deleted) : (float)env->tick;
 	env->log.n += 1;
 }
 
@@ -196,7 +203,7 @@ void compute_observations(Tetris *env) {
 		offset += NUM_TETROMINOES * (NUM_PREVIEW + 2);
 	}
 
-	// Turn off noise bits, one-by-one. In eval_mode, these are 0 by default.
+	// Turn off noise bits, one-by-one.
 	if (env->n_noise_obs > 0) {
 		env->observations[offset + rand() % env->n_noise_obs] = 0;
 	}
@@ -386,12 +393,20 @@ void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
 			env->grid[r * env->n_cols + c] = -(rand() % NUM_TETROMINOES + 1);
 		}
 
+		// Create holes by selecting distinct columns
+		int cols[env->n_cols];
+		for (int i = 0; i < env->n_cols; i++) {
+			cols[i] = i;
+		}
+		// Shuffle column indices
+		for (int i = env->n_cols - 1; i > 0; i--) {
+			int j = rand() % (i + 1);
+			int temp = cols[i];
+			cols[i] = cols[j];
+			cols[j] = temp;
+		}
 		for (int i = 0; i < num_holes; i++) {
-			int hole_col;
-			do {
-				hole_col = rand() % env->n_cols;
-			} while (env->grid[r * env->n_cols + hole_col] == 0);
-			env->grid[r * env->n_cols + hole_col] = 0;
+			env->grid[r * env->n_cols + cols[i]] = 0;
 		}
 	}
 
@@ -467,7 +482,7 @@ void place_tetromino(Tetris *env) {
 		// These determine the game difficulty. Consider making them args.
 		env->game_level = 1 + env->lines_deleted / LINES_PER_LEVEL;
 		env->ticks_per_fall = max(3, INITIAL_TICKS_PER_FALL - env->game_level / 4);
-		env->ticks_per_garbage = max(50, (int)(INITIAL_TICKS_PER_GARBAGE - 5.0 * sqrt((double)env->game_level)));
+		env->ticks_per_garbage = max(40, (int)(INITIAL_TICKS_PER_GARBAGE - 7 * sqrt((double)env->game_level)));
 	}
 
 	if (can_spawn_new_tetromino(env)) {
@@ -570,7 +585,7 @@ void c_step(Tetris *env) {
 
 	if (env->tick >= GARBAGE_KICKOFF_TICK && env->tick_garbage >= env->ticks_per_garbage) {
 		env->tick_garbage = 0;
-		int num_holes = min(4, max(1, env->game_level / 10));
+		int num_holes = min(5, max(1, env->game_level / 8));
 		add_garbage_lines(env, 1, num_holes);
 	}
 
