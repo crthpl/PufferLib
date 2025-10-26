@@ -13,6 +13,7 @@
 #define SQUARE_SIZE 32
 #define DECK_SIZE (2 * NUM_TETROMINOES) // To implement the 7-bag system
 #define NUM_PREVIEW 2
+#define NUM_FLOAT_OBS 6
 
 #define ACTION_NO_OP 0
 #define ACTION_LEFT 1
@@ -27,14 +28,14 @@
 #define INITIAL_TICKS_PER_FALL 6 // how many ticks before the tetromino naturally falls down of one square
 #define GARBAGE_KICKOFF_TICK 500
 #define INITIAL_TICKS_PER_GARBAGE 100
-#define GARBAGE_BLOCK_ID (NUM_TETROMINOES + 1)
 
 #define LINES_PER_LEVEL 10
 // Revisit scoring with level. See https://tetris.wiki/Scoring
 #define SCORE_SOFT_DROP 1
-#define REWARD_SOFT_DROP 0.01f
+#define REWARD_SOFT_DROP 0.0f
 #define SCORE_HARD_DROP 2
 #define REWARD_HARD_DROP 0.02f
+#define REWARD_ROTATE 0.01f
 #define REWARD_INVALID_ACTION 0.0f
 
 const int SCORE_COMBO[5] = {0, 100, 300, 500, 1000};
@@ -76,6 +77,11 @@ typedef struct Tetris {
 
 	int n_rows;
 	int n_cols;
+	bool use_deck_obs;
+	int n_noise_obs;
+	int n_init_garbage;
+	bool eval_mode;
+
 	int *grid;
 	int tick;
 	int tick_fall;
@@ -107,13 +113,13 @@ typedef struct Tetris {
 void init(Tetris *env) {
 	env->grid = (int *)calloc(env->n_rows * env->n_cols, sizeof(int));
 	env->tetromino_deck = calloc(DECK_SIZE, sizeof(int));
+	env->eval_mode = false;
 }
 
 void allocate(Tetris *env) {
 	init(env);
-	// grid, 6 floats, 4 one-hot tetrominoes encode (current, 2 previews, hold)
-	env->num_float_obs = 6;
-	env->dim_obs = env->n_cols * env->n_rows + env->num_float_obs + NUM_TETROMINOES * 4;
+	// grid, 6 floats, 4 one-hot tetrominoes encode (current, previews, hold) + self-inflicting noisy action bits
+	env->dim_obs = env->n_cols * env->n_rows + NUM_FLOAT_OBS + NUM_TETROMINOES * (NUM_PREVIEW + 2) + env->n_noise_obs;
 	env->observations = (float *)calloc(env->dim_obs, sizeof(float));
 	env->actions = (int *)calloc(1, sizeof(int));
 	env->rewards = (float *)calloc(1, sizeof(float));
@@ -149,8 +155,6 @@ void add_log(Tetris *env) {
 }
 
 void compute_observations(Tetris *env) {
-	memset(env->observations, 0.0, env->dim_obs * sizeof(float));
-
 	// content of the grid: 0 for empty, 1 for placed blocks, 2 for the current tetromino
 	for (int i = 0; i < env->n_cols * env->n_rows; i++) {
 		env->observations[i] = env->grid[i] != 0;
@@ -170,18 +174,31 @@ void compute_observations(Tetris *env) {
 	env->observations[offset + 3] = env->cur_tetromino_col / ((float)env->n_cols);
 	env->observations[offset + 4] = env->cur_tetromino_rot;
 	env->observations[offset + 5] = env->can_swap;
-	offset += env->num_float_obs;
+	offset += NUM_FLOAT_OBS;
 
-	// deck, one hot encoded
-	int tetromino_id;
-	for (int j = 0; j < NUM_PREVIEW + 1; j++) {
-		tetromino_id = env->tetromino_deck[(env->cur_position_in_deck + j) % DECK_SIZE];
-		env->observations[offset + j * NUM_TETROMINOES + tetromino_id] = 1;
+	// Zero out the one-hot encoded part of the observations for deck and hold.
+	memset(env->observations + offset, 0, NUM_TETROMINOES * (NUM_PREVIEW + 2) * sizeof(float));
+	if (env->use_deck_obs) {
+		// Deck, one hot encoded
+		int tetromino_id;
+		for (int j = 0; j < NUM_PREVIEW + 1; j++) {
+			tetromino_id = env->tetromino_deck[(env->cur_position_in_deck + j) % DECK_SIZE];
+			env->observations[offset + tetromino_id] = 1;
+			offset += NUM_TETROMINOES;
+		}
+		
+		// Hold, one hot encoded
+		if (env->hold_tetromino > -1) {
+			env->observations[offset + env->hold_tetromino] = 1;
+		}
+		offset += NUM_TETROMINOES;
+	} else {
+		offset += NUM_TETROMINOES * (NUM_PREVIEW + 2);
 	}
 
-	// hold, one hot encoded
-	if (env->hold_tetromino > -1) {
-		env->observations[offset + 3 * NUM_TETROMINOES + env->hold_tetromino] = 1;
+	// Turn off noise bits, one-by-one. In eval_mode, these are 0 by default.
+	if (env->n_noise_obs > 0) {
+		env->observations[offset + rand() % env->n_noise_obs] = 0;
 	}
 }
 
@@ -345,33 +362,7 @@ void clear_row(Tetris *env, int row) {
 	}
 }
 
-void c_reset(Tetris *env) {
-	env->score = 0;
-	env->hold_tetromino = -1;
-	env->tick = 0;
-	env->game_level = 1;
-	env->ticks_per_fall = INITIAL_TICKS_PER_FALL;
-	env->tick_fall = 0;
-	env->ticks_per_garbage = INITIAL_TICKS_PER_GARBAGE;
-	env->tick_garbage = 0;
-	env->can_swap = 1;
-
-	env->ep_return = 0.0;
-	env->count_combos = 0;
-	env->lines_deleted = 0;
-	env->atn_count_hard_drop = 0;
-	env->atn_count_soft_drop = 0;
-	env->atn_count_rotate = 0;
-	env->atn_count_hold = 0;
-	memset(env->tetromino_counts, 0, sizeof(env->tetromino_counts));
-
-	restore_grid(env);
-	initialize_deck(env);
-	spawn_new_tetromino(env);
-	compute_observations(env);
-}
-
-void add_garbage_lines(Tetris *env, int num_lines) {
+void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
 	// Check if adding garbage would cause an immediate game over
 	for (int r = 0; r < num_lines; r++) {
 		for (int c = 0; c < env->n_cols; c++) {
@@ -395,8 +386,6 @@ void add_garbage_lines(Tetris *env, int num_lines) {
 			env->grid[r * env->n_cols + c] = -(rand() % NUM_TETROMINOES + 1);
 		}
 
-		// Then, create holes based on the game level
-		int num_holes = min(4, max(1, env->game_level / 10));
 		for (int i = 0; i < num_holes; i++) {
 			int hole_col;
 			do {
@@ -408,6 +397,41 @@ void add_garbage_lines(Tetris *env, int num_lines) {
 
 	// Move the current piece up as well
 	env->cur_tetromino_row = max(0, env->cur_tetromino_row - num_lines);
+}
+
+void c_reset(Tetris *env) {
+	env->score = 0;
+	env->hold_tetromino = -1;
+	env->tick = 0;
+	env->game_level = 1;
+	env->ticks_per_fall = INITIAL_TICKS_PER_FALL;
+	env->tick_fall = 0;
+	env->ticks_per_garbage = INITIAL_TICKS_PER_GARBAGE;
+	env->tick_garbage = 0;
+	env->can_swap = 1;
+
+	env->ep_return = 0.0;
+	env->count_combos = 0;
+	env->lines_deleted = 0;
+	env->atn_count_hard_drop = 0;
+	env->atn_count_soft_drop = 0;
+	env->atn_count_rotate = 0;
+	env->atn_count_hold = 0;
+	memset(env->tetromino_counts, 0, sizeof(env->tetromino_counts));
+
+	restore_grid(env);
+	// This acts as a learning curriculum, exposing agents to garbage lines later
+	add_garbage_lines(env, env->n_init_garbage, 9);
+
+	// Noise obs effectively jitters the action.
+	// The agents will eventually learn to ignore these.
+	for (int i = 0; i < env->n_noise_obs; i++) {
+		env->observations[234 + i] = 1;
+	}
+
+	initialize_deck(env);
+	spawn_new_tetromino(env);
+	compute_observations(env);
 }
 
 void place_tetromino(Tetris *env) {
@@ -481,6 +505,8 @@ void c_step(Tetris *env) {
 		env->atn_count_rotate += 1;
 		if (can_rotate(env)) {
 			env->cur_tetromino_rot = (env->cur_tetromino_rot + 1) % NUM_ROTATIONS;
+			env->rewards[0] += REWARD_ROTATE;
+			env->ep_return += REWARD_ROTATE;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
 			env->ep_return += REWARD_INVALID_ACTION;
@@ -491,8 +517,8 @@ void c_step(Tetris *env) {
 		if (can_soft_drop(env)) {
 			env->cur_tetromino_row += 1;
 			env->score += SCORE_SOFT_DROP;
-			env->rewards[0] += REWARD_SOFT_DROP;
-			env->ep_return += REWARD_SOFT_DROP;
+			// env->rewards[0] += REWARD_SOFT_DROP;
+			// env->ep_return += REWARD_SOFT_DROP;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
 			env->ep_return += REWARD_INVALID_ACTION;
@@ -544,7 +570,8 @@ void c_step(Tetris *env) {
 
 	if (env->tick >= GARBAGE_KICKOFF_TICK && env->tick_garbage >= env->ticks_per_garbage) {
 		env->tick_garbage = 0;
-		add_garbage_lines(env, 1);
+		int num_holes = min(4, max(1, env->game_level / 10));
+		add_garbage_lines(env, 1, num_holes);
 	}
 
 	if (env->terminals[0] == 1 || (env->tick >= MAX_TICKS)) {
