@@ -80,9 +80,19 @@ TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 create_squared_environments(int64_t num_envs, int64_t grid_size, torch::Tensor dummy);
 
+struct Log {
+    float perf;
+    float score;
+    float episode_return;
+    float episode_length;
+    float n;
+};
+
 void step_environments_cuda(torch::Tensor envs_tensor, int64_t num_envs);
 
 void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
+
+Log log_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
 
 void compute_puff_advantage_cuda(
     torch::Tensor values,
@@ -258,7 +268,7 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
     auto params_32 = policy_32->parameters();
     auto params_16 = policy_16->parameters();
     for (size_t i = 0; i < params_32.size(); ++i) {
-        params_16[i].copy_(params_32[i].to(torch::kBFloat16));
+        params_16[i].copy_(params_32[i].to(torch::kFloat32));
     }
 }
 
@@ -272,14 +282,30 @@ typedef struct {
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
         int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
+
+    // Enable cuDNN benchmarking
+    torch::globalContext().setBenchmarkCuDNN(true);
+    torch::globalContext().setDeterministicCuDNN(false);
+    torch::globalContext().setBenchmarkLimitCuDNN(32);
+
+    // Enable TF32 for faster FP32 math (uses Tensor Cores on 4090)
+    torch::globalContext().setAllowTF32CuBLAS(true);
+    torch::globalContext().setAllowTF32CuDNN(true);
+
+    // Enable faster FP16 reductions
+    torch::globalContext().setAllowFP16ReductionCuBLAS(true);
+
+    // BF16 reduction (if using bfloat16)
+    torch::globalContext().setAllowBF16ReductionCuBLAS(true);
+
     auto policy_16 = new PolicyLSTM(input_size, num_atns, hidden_size);
     policy_16->to(torch::kCUDA);
-    policy_16->to(torch::kBFloat16);
+    policy_16->to(torch::kFloat32);
 
     auto policy_32 = new PolicyLSTM(input_size, num_atns, hidden_size);
     policy_32->to(torch::kCUDA);
 
-    auto optimizer = new torch::optim::Adam(policy_16->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy_16 = policy_16;
@@ -316,12 +342,12 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     // No-grad guard
     torch::NoGradGuard no_grad;
 
-    auto obs = obs_input.to(torch::kBFloat16);
-    auto actions = actions_input.to(torch::kBFloat16);
-    auto rewards = rewards_input.to(torch::kBFloat16);
-    auto terminals = terminals_input.to(torch::kBFloat16);
-    auto lstm_h = lstm_h_input.to(torch::kBFloat16);
-    auto lstm_c = lstm_c_input.to(torch::kBFloat16);
+    auto obs = obs_input.to(torch::kFloat32);
+    auto actions = actions_input.to(torch::kFloat32);
+    auto rewards = rewards_input.to(torch::kFloat32);
+    auto terminals = terminals_input.to(torch::kFloat32);
+    auto lstm_h = lstm_h_input.to(torch::kFloat32);
+    auto lstm_c = lstm_c_input.to(torch::kFloat32);
 
     for (int64_t i = 0; i < horizon; ++i) {
         // Clamp rewards
@@ -392,6 +418,7 @@ pybind11::dict compiled_train(
 ) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy_16 = pufferl.policy_16;
+    auto& policy_32 = pufferl.policy_32;
     auto& optimizer = pufferl.optimizer;
 
     if (anneal_lr) {
@@ -424,15 +451,15 @@ pybind11::dict compiled_train(
         auto mb_prio = torch::pow(static_cast<double>(segments) * prio_probs_mb, -anneal_beta);
 
         // Select minibatch tensors
-        auto mb_obs = observations.index_select(0, idx).to(torch::kBFloat16);
+        auto mb_obs = observations.index_select(0, idx).to(torch::kFloat32);
         auto mb_actions = actions.index_select(0, idx);
-        auto mb_logprobs = logprobs.index_select(0, idx).to(torch::kBFloat16);
-        auto mb_rewards = rewards.index_select(0, idx).to(torch::kBFloat16);
-        auto mb_terminals = terminals.index_select(0, idx).to(torch::kBFloat16);
-        auto mb_ratio = ratio.index_select(0, idx).to(torch::kBFloat16);  // Not used directly
-        auto mb_values = values.index_select(0, idx).to(torch::kBFloat16);
-        auto mb_advantages = advantages.index_select(0, idx).to(torch::kBFloat16);
-        auto mb_returns = mb_advantages + mb_values.to(torch::kBFloat16);
+        auto mb_logprobs = logprobs.index_select(0, idx).to(torch::kFloat32);
+        auto mb_rewards = rewards.index_select(0, idx).to(torch::kFloat32);
+        auto mb_terminals = terminals.index_select(0, idx).to(torch::kFloat32);
+        auto mb_ratio = ratio.index_select(0, idx).to(torch::kFloat32);  // Not used directly
+        auto mb_values = values.index_select(0, idx).to(torch::kFloat32);
+        auto mb_advantages = advantages.index_select(0, idx).to(torch::kFloat32);
+        auto mb_returns = mb_advantages + mb_values.to(torch::kFloat32);
 
         auto original_obs_shape = mb_obs.sizes();  // [minibatch_segments, horizon, grid_size, grid_size]
         if (!use_rnn) {
@@ -444,7 +471,8 @@ pybind11::dict compiled_train(
         torch::Tensor mb_lstm_c;
 
         // Policy forward: Native C++ call
-        auto [logits, newvalue] = policy_16->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32), mb_lstm_h, mb_lstm_c);
+        //auto [logits, newvalue] = policy_16->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
 
         // Compute newlogprob and entropy (discrete assumption)
         auto flat_batch = minibatch_segments * horizon;
@@ -522,8 +550,16 @@ PYBIND11_MODULE(_C, m) {
     m.def("create_squared_environments", &create_squared_environments);
     m.def("step_environments", &step_environments_cuda);
     m.def("reset_environments", &reset_environments_cuda);
+    m.def("log_environments", &log_environments_cuda);
     m.def("compiled_evaluate", &compiled_evaluate);
     m.def("compiled_train", &compiled_train);
+
+    py::class_<Log>(m, "Log")
+    .def_readwrite("perf", &Log::perf)
+    .def_readwrite("score", &Log::score)
+    .def_readwrite("episode_return", &Log::episode_return)
+    .def_readwrite("episode_length", &Log::episode_length)
+    .def_readwrite("n", &Log::n);
 
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")

@@ -59,6 +59,13 @@ class SquaredEnv:
         _C.step_environments(self.env)
         return self.observations, self.rewards, self.terminals
 
+    def log(self):
+        return _C.log_environments(self.env, self.indices)
+
+    def close(self):
+        # TODO
+        pass
+
 import rich
 import rich.traceback
 from rich.table import Table
@@ -325,6 +332,13 @@ class PuffeRL:
             self.config['bptt_horizon'],
             self.num_envs  # Or wherever num_envs is stored
         )
+
+        logs = self.vecenv.log()
+        self.stats['perf'] = [logs.perf]
+        self.stats['score'] = [logs.score]
+        self.stats['episode_return'] = [logs.episode_return]
+        self.stats['episode_length'] = [logs.episode_length]
+        self.stats['n'] = [logs.n]
 
         self.global_step += config['batch_size']
         profile.end()

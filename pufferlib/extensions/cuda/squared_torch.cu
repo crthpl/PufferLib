@@ -70,7 +70,6 @@ __device__ void cuda_step(Squared* env) {
     env->tick += 1;
     int action = env->actions[0];
     env->terminals[0] = 0;
-    /*
     env->rewards[0] = 0.0f;
 
     int pos = env->r * env->size + env->c;
@@ -90,8 +89,8 @@ __device__ void cuda_step(Squared* env) {
     pos = env->r * env->size + env->c;
 
     // Check bounds and timeout
-    if (env->r < 0 || env->c < 0 || env->r >= env->size || env->c >= env->size ||
-        env->tick > 3 * env->size) {
+    if (env->r < 0 || env->c < 0 || env->r >= env->size
+            || env->c >= env->size || env->tick > 3 * env->size) {
         env->terminals[0] = 1;
         env->rewards[0] = -1.0f;
         env->log.perf += 0;
@@ -118,7 +117,6 @@ __device__ void cuda_step(Squared* env) {
 
     // Place agent
     env->observations[pos] = AGENT;
-    */
 }
 
 // Kernel: Step all environments
@@ -134,6 +132,14 @@ __global__ void reset_environments(Squared* envs, int* indices, int num_reset) {
     if (idx >= num_reset) return;
     int env_idx = indices[idx];
     cuda_reset(&envs[env_idx], &envs[env_idx].rng);
+}
+
+// Kernel: Reset specific environment logs
+__global__ void reset_logs(Squared* envs, int* indices, int num_reset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_reset) return;
+    int env_idx = indices[idx];
+    envs[env_idx].log = {0};
 }
 
 // Kernel: Initialize all environments
@@ -219,6 +225,32 @@ void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_te
 
     reset_environments<<<make_grid(num_reset), 256>>>(envs, indices, num_reset);
     cudaDeviceSynchronize();
+}
+
+Log log_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
+    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.cpu().data_ptr<unsigned char>());
+    auto indices = indices_tensor.cpu().data_ptr<int>();
+    int num_log = indices_tensor.size(0);
+    Log log = {0};
+    for (int i=0; i<num_log; i++) {
+        log.perf += envs[indices[i]].log.perf;
+        log.score += envs[indices[i]].log.score;
+        log.episode_return += envs[indices[i]].log.episode_return;
+        log.episode_length += envs[indices[i]].log.episode_length;
+        log.n += envs[indices[i]].log.n;
+    }
+    log.perf /= log.n;
+    log.score /= log.n;
+    log.episode_return /= log.n;
+    log.episode_length /= log.n;
+
+    // Reset must be done in cuda
+    Squared* envs_gpu = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    auto indices_gpu = indices_tensor.data_ptr<int>();
+    reset_logs<<<make_grid(num_log), 256>>>(envs_gpu, indices_gpu, num_log);
+    cudaDeviceSynchronize();
+
+    return log;
 }
 
 }
