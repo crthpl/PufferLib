@@ -154,13 +154,9 @@ public:
         // Initialization
         auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
         torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
-        encoder_linear->bias.data().zero_();
-
-        torch::nn::init::orthogonal_(decoder->weight, 0.01);
-        decoder->bias.data().zero_();
-
-        torch::nn::init::orthogonal_(value->weight, 1.0);
-        value->bias.data().zero_();
+        torch::nn::init::constant_(encoder_linear->bias, 0.0);
+        torch::nn::init::orthogonal_(decoder->weight, std::sqrt(0.01));
+        torch::nn::init::constant_(decoder->bias, 0.0);
 
         torch::nn::init::orthogonal_(lstm->named_parameters()["weight_ih_l0"], 1.0);
         torch::nn::init::orthogonal_(lstm->named_parameters()["weight_hh_l0"], 1.0);
@@ -298,6 +294,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     // BF16 reduction (if using bfloat16)
     torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
+    // Random seed
+    torch::manual_seed(42);
+
     auto policy_16 = new PolicyLSTM(input_size, num_atns, hidden_size);
     policy_16->to(torch::kCUDA);
     policy_16->to(torch::kFloat32);
@@ -320,12 +319,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
-    torch::Tensor obs_input,
-    torch::Tensor actions_input,
-    torch::Tensor rewards_input,
-    torch::Tensor terminals_input,
-    torch::Tensor lstm_h_input,
-    torch::Tensor lstm_c_input,
+    torch::Tensor obs,
+    torch::Tensor actions,
+    torch::Tensor rewards,
+    torch::Tensor terminals,
+    torch::Tensor lstm_h,
+    torch::Tensor lstm_c,
     torch::Tensor obs_buffer,
     torch::Tensor act_buffer,
     torch::Tensor logprob_buffer,
@@ -336,68 +335,51 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     int64_t num_envs
 ) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy_16;
-    auto& optimizer = pufferl.optimizer;
+    auto& policy = pufferl.policy_32;
 
-    // No-grad guard
     torch::NoGradGuard no_grad;
 
-    auto obs = obs_input.to(torch::kFloat32);
-    auto actions = actions_input.to(torch::kFloat32);
-    auto rewards = rewards_input.to(torch::kFloat32);
-    auto terminals = terminals_input.to(torch::kFloat32);
-    auto lstm_h = lstm_h_input.to(torch::kFloat32);
-    auto lstm_c = lstm_c_input.to(torch::kFloat32);
-
     for (int64_t i = 0; i < horizon; ++i) {
-        // Clamp rewards
-        auto r = rewards.clamp(-1.0f, 1.0f);
-
-        // Policy forward: Native C++ call
-        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs, lstm_h, lstm_c);
+        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32), lstm_h, lstm_c);
         lstm_h = lstm_h_out;
         lstm_c = lstm_c_out;
 
-        // Sample action and logprob (assuming discrete categorical from logits)
-        auto max_logits = logits.amax(1, true);
-        auto logits_shifted = logits - max_logits;
-        auto logsumexp = logits_shifted.exp().sum(1, true).log() + max_logits;
-        auto logprobs = logits - logsumexp;
-        auto probs = logprobs.exp();
-        auto action = at::multinomial(probs, 1, /*replacement=*/true);
-        auto logprob = logprobs.gather(1, action).squeeze(1);
-        action = action.squeeze(1);
+        auto logprobs = torch::log_softmax(logits, 1);
+        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
+        auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
-        // Store to buffers
+        // Store
         obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
         act_buffer.select(1, i).copy_(action.to(torch::kInt32));
         logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
-        rew_buffer.select(1, i).copy_(r.to(torch::kFloat32));
+        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
         term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
         val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
 
-        // Step the environments
         actions.copy_(action);
-        step_environments_cuda(envs_tensor, num_envs);
+        {
+            pybind11::gil_scoped_release no_gil;
+            step_environments_cuda(envs_tensor, num_envs);
+        }
+        rewards.clamp_(-1.0f, 1.0f);
     }
 
     return std::make_tuple(lstm_h, lstm_c);
 }
 
-// Updated compiled_train
 pybind11::dict compiled_train(
     pybind11::object pufferl_obj,
-    torch::Tensor observations,  // [num_envs, horizon, grid_size, grid_size] uint8
-    torch::Tensor actions,       // [num_envs, horizon] int32
-    torch::Tensor logprobs,      // [num_envs, horizon] float
-    torch::Tensor rewards,       // [num_envs, horizon] float
-    torch::Tensor terminals,     // [num_envs, horizon] float
-    torch::Tensor truncations,   // [num_envs, horizon] float (included but not used in loop)
-    torch::Tensor ratio,         // [num_envs, horizon] float
-    torch::Tensor values,        // [num_envs, horizon] float
+    torch::Tensor observations,  // [num_envs, horizon, ...]
+    torch::Tensor actions,       // [num_envs, horizon]
+    torch::Tensor logprobs,      // [num_envs, horizon]
+    torch::Tensor rewards,       // [num_envs, horizon]
+    torch::Tensor terminals_input, // [num_envs, horizon]
+    torch::Tensor truncations,   // [num_envs, horizon] (not used in puff advantage?)
+    torch::Tensor ratio,         // [num_envs, horizon]
+    torch::Tensor values,        // [num_envs, horizon]
     int64_t total_minibatches,
     int64_t minibatch_segments,
-    int64_t segments,  // num_envs
+    int64_t segments,
     int64_t accumulate_minibatches,
     int64_t horizon,
     double prio_beta0,
@@ -417,89 +399,102 @@ pybind11::dict compiled_train(
     int64_t current_epoch
 ) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy_16 = pufferl.policy_16;
     auto& policy_32 = pufferl.policy_32;
     auto& optimizer = pufferl.optimizer;
+
+    auto device = values.device();
+    auto terminals = terminals_input.to(torch::kFloat32);
 
     if (anneal_lr) {
         double lr = cosine_annealing(pufferl.lr, current_epoch, pufferl.max_epochs);
         optimizer->param_groups().at(0).options().set_lr(lr);
     }
 
-    // Compute anneal_beta
+    // Annealed priority exponent
     double anneal_beta = prio_beta0 + (1.0 - prio_beta0) * prio_alpha * static_cast<double>(current_epoch) / total_epochs;
 
-    // Compute advantages
+    // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
+    ratio.fill_(1.0);
+
+    // Accumulators
+    torch::Tensor pg_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor v_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor ent_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor total_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor old_approx_kl_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor approx_kl_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor clipfrac_sum = torch::zeros({}, torch::kFloat32).to(device);
+    torch::Tensor importance_sum = torch::zeros({}, torch::kFloat32).to(device);
+
+    optimizer->zero_grad();  // Start with clean grads
     auto advantages = torch::zeros_like(values);
-    compute_puff_advantage_cuda(values, rewards, terminals, ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip);
-
-    // Prioritize
-    auto adv = advantages.abs().sum(1);
-    auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-    auto sum_weights = prio_weights.sum() + static_cast<double>(adv.size(0)) * 1e-6;
-    auto prio_probs = (prio_weights + 1e-6) / sum_weights;
-
-    auto device = values.device();
-    auto pg_sum = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    auto v_sum = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    auto ent_sum = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    auto total_sum = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
-        auto idx = at::multinomial(prio_probs, minibatch_segments, /*replacement=*/true);
-        auto prio_probs_mb = prio_probs.index_select(0, idx).unsqueeze(1);
-        auto mb_prio = torch::pow(static_cast<double>(segments) * prio_probs_mb, -anneal_beta);
+        advantages = torch::zeros_like(values);
+        compute_puff_advantage_cuda(
+            values, rewards, terminals, ratio,
+            advantages, gamma, gae_lambda,
+            vtrace_rho_clip, vtrace_c_clip
+        );
 
-        // Select minibatch tensors
-        auto mb_obs = observations.index_select(0, idx).to(torch::kFloat32);
-        auto mb_actions = actions.index_select(0, idx);
-        auto mb_logprobs = logprobs.index_select(0, idx).to(torch::kFloat32);
-        auto mb_rewards = rewards.index_select(0, idx).to(torch::kFloat32);
-        auto mb_terminals = terminals.index_select(0, idx).to(torch::kFloat32);
-        auto mb_ratio = ratio.index_select(0, idx).to(torch::kFloat32);  // Not used directly
-        auto mb_values = values.index_select(0, idx).to(torch::kFloat32);
-        auto mb_advantages = advantages.index_select(0, idx).to(torch::kFloat32);
-        auto mb_returns = mb_advantages + mb_values.to(torch::kFloat32);
+        // Prioritization
+        auto adv = advantages.abs().sum(1);  // [num_envs]
+        auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+        auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
+        auto idx = at::multinomial(prio_probs, minibatch_segments); // #Replacement?
+        auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
 
-        auto original_obs_shape = mb_obs.sizes();  // [minibatch_segments, horizon, grid_size, grid_size]
+        // Index into data
+        torch::Tensor mb_obs = observations.index_select(0, idx);
+        torch::Tensor mb_actions = actions.index_select(0, idx);
+        torch::Tensor mb_logprobs = logprobs.index_select(0, idx);
+        torch::Tensor mb_values = values.index_select(0, idx);
+        torch::Tensor mb_advantages = advantages.index_select(0, idx);
+        torch::Tensor mb_returns = mb_advantages + mb_values;
+
+        // Reshape obs if not using RNN
         if (!use_rnn) {
-            mb_obs = mb_obs.reshape({-1, original_obs_shape[2], original_obs_shape[3]});
+            auto flat_shape = std::vector<int64_t>{-1, mb_obs.size(2), mb_obs.size(3)};
+            mb_obs = mb_obs.reshape(flat_shape);
         }
 
-        // Initial LSTM states (undefined for zero init)
-        torch::Tensor mb_lstm_h;
-        torch::Tensor mb_lstm_c;
+        // HARDCODED LSTM SIZE 128
+        // Initial LSTM states (zero or none)
+        torch::Tensor mb_lstm_h = torch::zeros(
+            {1, minibatch_segments, 128},
+            torch::kFloat32
+        ).to(device);
+        torch::Tensor mb_lstm_c = torch::zeros_like(mb_lstm_h);
 
-        // Policy forward: Native C++ call
+        // Forward pass
         auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32), mb_lstm_h, mb_lstm_c);
-        //auto [logits, newvalue] = policy_16->forward_train(mb_obs, mb_lstm_h, mb_lstm_c);
 
-        // Compute newlogprob and entropy (discrete assumption)
-        auto flat_batch = minibatch_segments * horizon;
-        auto flat_logits = logits.reshape({flat_batch, -1});
-        auto flat_actions = mb_actions.reshape({flat_batch});
-        auto max_logits = flat_logits.amax(1, true);
-        auto logits_shifted = flat_logits - max_logits;
-        auto logsumexp = (logits_shifted.exp().sum(1, true)).log() + max_logits;
-        auto logprobs = flat_logits - logsumexp;  // Correct
-        auto probs = logprobs.exp();
-        auto newlogprob_flat = logprobs.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+        // Flatten for action lookup
+        auto flat_logits = logits.reshape({-1, logits.size(-1)});
+        auto flat_actions = mb_actions.reshape({-1});
+        auto logprobs_new = torch::log_softmax(flat_logits, /*dim=*/1);
+        auto probs_new = logprobs_new.exp();
+
+        // Gather logprobs for taken actions
+        auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
         auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
-        auto entropy = - (probs * logprobs).sum(1).mean();
+        auto entropy = - (probs_new * logprobs_new).sum(1).mean();  // mean over batch
 
+        // Compute ratio
         auto logratio = newlogprob - mb_logprobs;
-        auto mb_ratio_new = logratio.exp();
+        auto ratio_new = logratio.exp();
 
-        // Update full ratio (detach)
-        ratio.index_copy_(0, idx, mb_ratio_new.detach().to(torch::kFloat32));
+        // Update global ratio and values in-place (matches Python)
+        ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+        values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
-        // Advantages normalization
-        auto adv = mb_advantages;
-        adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8);
+        // Normalize advantages: (adv - mean) / std, then weight
+        auto adv_normalized = mb_advantages;
+        adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
 
         // Policy loss
-        auto pg_loss1 = -adv * mb_ratio_new;
-        auto pg_loss2 = -adv * torch::clamp(mb_ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+        auto pg_loss1 = -adv_normalized * ratio_new;
+        auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
         auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
 
         // Value loss
@@ -509,41 +504,67 @@ pybind11::dict compiled_train(
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
-        // Entropy loss
+        // Entropy
         auto entropy_loss = entropy;  // Already mean
 
         // Total loss
-        auto loss = pg_loss + vf_coef * v_loss - ent_coef * entropy_loss;
+        auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy_loss;
+
+        // Accumulate stats
         pg_sum += pg_loss.detach();
         v_sum += v_loss.detach();
-        ent_sum += entropy.detach();
+        ent_sum += entropy_loss.detach();
         total_sum += loss.detach();
 
+        // KL and clipping diagnostics (matches Python)
+        {
+            torch::NoGradGuard no_grad;
+            auto old_kl = (-logratio).mean();
+            auto kl = ((ratio_new - 1) - logratio).mean();
+            auto cf = (ratio_new - 1.0).abs().gt(clip_coef).to(torch::kFloat32).mean();
+            auto imp = ratio_new.mean();
+
+            old_approx_kl_sum += old_kl.detach();
+            approx_kl_sum += kl.detach();
+            clipfrac_sum += cf.detach();
+            importance_sum += imp.detach();
+        }
+
+        // Backward pass
         {
             pybind11::gil_scoped_release no_gil;
             loss.backward();
         }
 
-        // Update values
-        values.index_copy_(0, idx, newvalue.detach().to(torch::kFloat32));
-
-        // Accumulate and step
+        // Gradient accumulation and step
         if ((mb + 1) % accumulate_minibatches == 0) {
-            torch::nn::utils::clip_grad_norm_(policy_16->parameters(), max_grad_norm);
+            torch::nn::utils::clip_grad_norm_(policy_32->parameters(), max_grad_norm);
             optimizer->step();
             optimizer->zero_grad();
         }
     }
 
+    // Compute explained variance at end of epoch
+    auto y_true = advantages.flatten() + values.flatten();
+    auto y_pred = values.flatten();
+    auto var_y = y_true.var();
+    //double explained_var = (var_y.abs() < 1e-8) ? NAN : (1 - (y_true - y_pred).var() / var_y).item<double>();
+
+    // Return losses (averaged)
     pybind11::dict losses;
     auto num_mb = static_cast<double>(total_minibatches);
     losses["pg_loss"] = (pg_sum / num_mb).item<double>();
     losses["v_loss"] = (v_sum / num_mb).item<double>();
     losses["entropy"] = (ent_sum / num_mb).item<double>();
     losses["total_loss"] = (total_sum / num_mb).item<double>();
+    losses["old_approx_kl"] = (old_approx_kl_sum / num_mb).item<double>();
+    losses["approx_kl"] = (approx_kl_sum / num_mb).item<double>();
+    losses["clipfrac"] = (clipfrac_sum / num_mb).item<double>();
+    losses["importance"] = (importance_sum / num_mb).item<double>();
+    //losses["explained_variance"] = explained_var;
+
     return losses;
 }
-
 
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {

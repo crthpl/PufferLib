@@ -57,10 +57,12 @@ __device__ void cuda_reset(Squared* env, curandState* rng) {
     env->tick = 0;
 
     // Place target randomly (not on agent)
-    int target_idx;
+    int target_idx = center; // Deterministic for testing
+    /*
     do {
         target_idx = curand(rng) % tiles;
     } while (target_idx == center);
+    */
 
     env->observations[target_idx] = TARGET;
 }
