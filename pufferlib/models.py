@@ -38,6 +38,10 @@ class Default(nn.Module):
             self.encoder = nn.Linear(input_size, self.hidden_size)
         else:
             num_obs = np.prod(env.single_observation_space.shape)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.manual_seed(42)
+            torch.cuda.manual_seed(42)
             self.encoder = torch.nn.Sequential(
                 pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
                 nn.GELU(),
@@ -61,6 +65,19 @@ class Default(nn.Module):
         self.value = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1)
 
+        self.lstm = nn.LSTM(hidden_size, hidden_size)
+        nn.init.orthogonal_(self.lstm.weight_ih_l0, 1.0)
+        nn.init.orthogonal_(self.lstm.weight_hh_l0, 1.0)
+        self.lstm.bias_ih_l0.data.zero_()
+        self.lstm.bias_hh_l0.data.zero_()
+
+        self.cell = torch.nn.LSTMCell(hidden_size, hidden_size)
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
+
+ 
     def forward_eval(self, observations, state=None):
         hidden = self.encode_observations(observations, state=state)
         logits, values = self.decode_actions(hidden)
@@ -95,6 +112,76 @@ class Default(nn.Module):
 
         values = self.value(hidden)
         return logits, values
+
+    def forward_eval(self, observations, state):
+        '''Forward function for inference. 3x faster than using LSTM directly'''
+        hidden = self.encode_observations(observations, state=state)
+        h = state['lstm_h']
+        c = state['lstm_c']
+
+        # TODO: Don't break compile
+        if h is not None:
+            assert h.shape[0] == c.shape[0] == observations.shape[0], 'LSTM state must be (h, c)'
+            lstm_state = (h, c)
+        else:
+            lstm_state = None
+
+        #hidden = self.pre_layernorm(hidden)
+        hidden, c = self.cell(hidden, lstm_state)
+        #hidden = self.post_layernorm(hidden)
+        state['hidden'] = hidden
+        state['lstm_h'] = hidden
+        state['lstm_c'] = c
+        logits, values = self.decode_actions(hidden)
+        return logits, values
+
+    def forward(self, observations, state):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x = observations
+        lstm_h = state['lstm_h']
+        lstm_c = state['lstm_c']
+
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        if x_shape[-space_n:] != space_shape:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        if x_n == space_n + 1:
+            B, TT = x_shape[0], 1
+        elif x_n == space_n + 2:
+            B, TT = x_shape[:2]
+        else:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        if lstm_h is not None:
+            assert lstm_h.shape[1] == lstm_c.shape[1] == B, 'LSTM state must be (h, c)'
+            lstm_state = (lstm_h, lstm_c)
+        else:
+            lstm_state = None
+
+        x = x.reshape(B*TT, *space_shape)
+        hidden = self.encode_observations(x, state)
+        assert hidden.shape == (B*TT, self.input_size)
+
+        hidden = hidden.reshape(B, TT, self.input_size)
+
+        hidden = hidden.transpose(0, 1)
+        #hidden = self.pre_layernorm(hidden)
+        hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
+        hidden = hidden.float()
+ 
+        #hidden = self.post_layernorm(hidden)
+        hidden = hidden.transpose(0, 1)
+
+        flat_hidden = hidden.reshape(B*TT, self.hidden_size)
+        logits, values = self.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        #state.batch_logits = logits.reshape(B, TT, -1)
+        state['hidden'] = hidden
+        state['lstm_h'] = lstm_h.detach()
+        state['lstm_c'] = lstm_c.detach()
+        return logits, values
+
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, hidden_size=128):

@@ -132,36 +132,39 @@ public:
     PolicyLSTM(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128)
         : input_size_(input_size), hidden_size_(hidden_size), num_atns_(num_atns) {
 
+        torch::globalContext().setDeterministicCuDNN(true);
+        torch::globalContext().setBenchmarkCuDNN(false);
+        torch::manual_seed(42);
+        torch::cuda::manual_seed(42);
         encoder = register_module("encoder", torch::nn::Sequential(
             torch::nn::Linear(input_size_, hidden_size_),
             torch::nn::GELU()
         ));
+        auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
+        torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
+        torch::nn::init::constant_(encoder_linear->bias, 0.0);
 
         decoder = register_module("decoder", torch::nn::Linear(hidden_size_, num_atns_));
+        torch::nn::init::orthogonal_(decoder->weight, 0.01);
+        torch::nn::init::constant_(decoder->bias, 0.0);
 
         value = register_module("value", torch::nn::Linear(hidden_size_, 1));
+        torch::nn::init::orthogonal_(value->weight, 1.0);
+        torch::nn::init::constant_(value->bias, 0.0);
 
         lstm = register_module("lstm", torch::nn::LSTM(torch::nn::LSTMOptions(hidden_size_, hidden_size_).num_layers(1)));
-
-        cell = register_module("cell", torch::nn::LSTMCell(hidden_size_, hidden_size_));
+        torch::nn::init::orthogonal_(lstm->named_parameters()["weight_ih_l0"], 1.0);
+        torch::nn::init::orthogonal_(lstm->named_parameters()["weight_hh_l0"], 1.0);
+        lstm->named_parameters()["bias_ih_l0"].data().zero_();
+        lstm->named_parameters()["bias_hh_l0"].data().zero_();
 
         // Share weights between LSTM and LSTMCell
+        cell = register_module("cell", torch::nn::LSTMCell(hidden_size_, hidden_size_));
         cell->named_parameters()["weight_ih"] = lstm->named_parameters()["weight_ih_l0"];
         cell->named_parameters()["weight_hh"] = lstm->named_parameters()["weight_hh_l0"];
         cell->named_parameters()["bias_ih"] = lstm->named_parameters()["bias_ih_l0"];
         cell->named_parameters()["bias_hh"] = lstm->named_parameters()["bias_hh_l0"];
 
-        // Initialization
-        auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
-        torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
-        torch::nn::init::constant_(encoder_linear->bias, 0.0);
-        torch::nn::init::orthogonal_(decoder->weight, std::sqrt(0.01));
-        torch::nn::init::constant_(decoder->bias, 0.0);
-
-        torch::nn::init::orthogonal_(lstm->named_parameters()["weight_ih_l0"], 1.0);
-        torch::nn::init::orthogonal_(lstm->named_parameters()["weight_hh_l0"], 1.0);
-        lstm->named_parameters()["bias_ih_l0"].data().zero_();
-        lstm->named_parameters()["bias_hh_l0"].data().zero_();
     }
 
     // Forward for evaluation/inference (uses LSTMCell)
@@ -280,19 +283,19 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
         int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
 
     // Enable cuDNN benchmarking
-    torch::globalContext().setBenchmarkCuDNN(true);
-    torch::globalContext().setDeterministicCuDNN(false);
-    torch::globalContext().setBenchmarkLimitCuDNN(32);
+    //torch::globalContext().setBenchmarkCuDNN(true);
+    //torch::globalContext().setDeterministicCuDNN(false);
+    //torch::globalContext().setBenchmarkLimitCuDNN(32);
 
     // Enable TF32 for faster FP32 math (uses Tensor Cores on 4090)
-    torch::globalContext().setAllowTF32CuBLAS(true);
-    torch::globalContext().setAllowTF32CuDNN(true);
+    //torch::globalContext().setAllowTF32CuBLAS(true);
+    //torch::globalContext().setAllowTF32CuDNN(true);
 
     // Enable faster FP16 reductions
-    torch::globalContext().setAllowFP16ReductionCuBLAS(true);
+    //torch::globalContext().setAllowFP16ReductionCuBLAS(true);
 
     // BF16 reduction (if using bfloat16)
-    torch::globalContext().setAllowBF16ReductionCuBLAS(true);
+    //torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
     // Random seed
     torch::manual_seed(42);

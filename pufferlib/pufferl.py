@@ -92,18 +92,18 @@ class PuffeRL:
         torch.backends.cudnn.deterministic = config['torch_deterministic']
         torch.backends.cudnn.benchmark = True
 
-        # Reproducibility
-        seed = config['seed']
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
         num_envs = 4096
         self.num_envs = num_envs
         grid_size = 11
         dummy = torch.zeros(5).cuda()
         vecenv = SquaredEnv(num_envs, grid_size)
         vecenv.reset()
+
+        # Reproducibility
+        seed = config['seed']
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
         from gymnasium.spaces import Box, Discrete
         obs_space = Box(low=-1, high=1, shape=(grid_size*grid_size,), dtype=np.float32)
@@ -805,9 +805,12 @@ class WandbLogger:
 def check(env_name):
     args = load_config(env_name)
     vecenv = load_env(env_name, args)
+
+    torch.manual_seed(args['train']['seed'])
     policy = load_policy(args, vecenv, env_name)
-    train_config = dict(**args['train'], env=env_name)
+
     import pufferlib.python_pufferl
+    train_config = dict(**args['train'], env=env_name)
     pufferl_python = pufferlib.python_pufferl.PuffeRL(train_config, vecenv, policy)
 
     # TODO: remember to set seet again before this
@@ -817,10 +820,13 @@ def check(env_name):
     pufferl_cpp = PuffeRL(train_config)
     python_params = dict(policy.named_parameters())
     for k, v in pufferl_cpp.pufferl_cpp.policy_32.named_parameters():
-        v_python = python_params[f'policy.{k}'].data
+        # For some reason, cpp records twice
+        if 'cell' in k:
+            continue
+
+        v_python = python_params[k].data
         assert torch.allclose(v, v_python), k 
 
-    breakpoint()
 
     pufferl_cpp.evaluate()
     pufferl_cpp.train()
@@ -1241,11 +1247,12 @@ def load_policy(args, vecenv, env_name=''):
     policy_cls = getattr(env_module.torch, args['policy_name'])
     policy = policy_cls(vecenv.driver_env, **args['policy'])
 
+    '''
     rnn_name = args['rnn_name']
     if rnn_name is not None:
         rnn_cls = getattr(env_module.torch, args['rnn_name'])
         policy = rnn_cls(vecenv.driver_env, policy, **args['policy'])
-
+    '''
     policy = policy.to(device)
 
     load_id = args['load_id']

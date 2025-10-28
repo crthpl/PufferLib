@@ -1291,10 +1291,12 @@ def load_policy(args, vecenv, env_name=''):
     policy_cls = getattr(env_module.torch, args['policy_name'])
     policy = policy_cls(vecenv.driver_env, **args['policy'])
 
+    '''
     rnn_name = args['rnn_name']
     if rnn_name is not None:
         rnn_cls = getattr(env_module.torch, args['rnn_name'])
         policy = rnn_cls(vecenv.driver_env, policy, **args['policy'])
+    '''
 
     policy = policy.to(device)
 
