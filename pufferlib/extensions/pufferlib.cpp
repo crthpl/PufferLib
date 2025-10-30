@@ -164,7 +164,7 @@ public:
         cell->named_parameters()["weight_hh"].data() = lstm->named_parameters()["weight_hh_l0"].data();
         cell->named_parameters()["bias_ih"].data() = lstm->named_parameters()["bias_ih_l0"].data();
         cell->named_parameters()["bias_hh"].data() = lstm->named_parameters()["bias_hh_l0"].data();
-        cell->to(torch::kCUDA);
+        //cell->to(torch::kCUDA);
     }
 
     // Forward for evaluation/inference (uses LSTMCell)
@@ -278,8 +278,8 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 typedef struct {
     PolicyLSTM* policy_16;
     PolicyLSTM* policy_32;
-    torch::optim::Adam* optimizer;
-    //torch::optim::SGD* optimizer;
+    //torch::optim::Adam* optimizer;
+    torch::optim::SGD* optimizer;
     double lr;
     int64_t max_epochs;
 } PuffeRL;
@@ -306,14 +306,14 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     torch::manual_seed(42);
 
     auto policy_16 = new PolicyLSTM(input_size, num_atns, hidden_size);
-    policy_16->to(torch::kCUDA);
+    //policy_16->to(torch::kCUDA);
     policy_16->to(torch::kFloat32);
 
     auto policy_32 = new PolicyLSTM(input_size, num_atns, hidden_size);
-    policy_32->to(torch::kCUDA);
+    //policy_32->to(torch::kCUDA);
 
-    auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
-    //auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
+    //auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy_16 = policy_16;
@@ -350,7 +350,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     torch::NoGradGuard no_grad;
 
     for (int64_t i = 0; i < horizon; ++i) {
-        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32), lstm_h, lstm_c);
+        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32).to(torch::kCPU), lstm_h, lstm_c);
         lstm_h = lstm_h_out;
         lstm_c = lstm_c_out;
 
@@ -359,14 +359,14 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store
-        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
-        act_buffer.select(1, i).copy_(action.to(torch::kInt32));
-        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
-        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
-        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
-        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
+        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32).to(torch::kCPU));
+        act_buffer.select(1, i).copy_(action.to(torch::kInt32).to(torch::kCPU));
+        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32).to(torch::kCPU));
+        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32).to(torch::kCPU));
+        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32).to(torch::kCPU));
+        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32).to(torch::kCPU));
 
-        actions.copy_(action);
+        actions.copy_(action.to(torch::kCUDA));
         {
             pybind11::gil_scoped_release no_gil;
             step_environments_cuda(envs_tensor, indices_tensor);
@@ -374,6 +374,49 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         rewards.clamp_(-1.0f, 1.0f);
     }
 
+    return std::make_tuple(lstm_h, lstm_c);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> evaluate_step(
+    pybind11::object pufferl_obj,
+    torch::Tensor envs_tensor,
+    torch::Tensor indices_tensor,
+    torch::Tensor obs,
+    torch::Tensor actions,
+    torch::Tensor rewards,
+    torch::Tensor terminals,
+    torch::Tensor lstm_h,
+    torch::Tensor lstm_c,
+    torch::Tensor obs_buffer,
+    torch::Tensor act_buffer,
+    torch::Tensor logprob_buffer,
+    torch::Tensor rew_buffer,
+    torch::Tensor term_buffer,
+    torch::Tensor val_buffer,
+    int64_t i
+) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& policy = pufferl.policy_32;
+
+    torch::NoGradGuard no_grad;
+
+    auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32), lstm_h, lstm_c);
+    lstm_h = lstm_h_out;
+    lstm_c = lstm_c_out;
+
+    auto logprobs = torch::log_softmax(logits, 1);
+    auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
+    auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
+
+    // Store
+    obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
+    act_buffer.select(1, i).copy_(action.to(torch::kInt32));
+    logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
+    rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
+    term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
+    val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
+
+    actions.copy_(action);
     return std::make_tuple(lstm_h, lstm_c);
 }
 
@@ -441,7 +484,7 @@ pybind11::dict compiled_train(
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
     //for (int64_t mb = 0; mb < 1; ++mb) {
         advantages = torch::zeros_like(values);
-        compute_puff_advantage_cuda(
+        compute_puff_advantage_cpu(
             values, rewards, terminals, ratio,
             advantages, gamma, gae_lambda,
             vtrace_rho_clip, vtrace_c_clip
@@ -466,12 +509,12 @@ pybind11::dict compiled_train(
         torch::Tensor mb_returns = mb_advantages + mb_values;
 
         /*
-        std::cout << "mb_obs: " << mb_obs.sum().item<float>() << std::endl;
-        std::cout << "mb_actions: " << mb_actions.sum().item<float>() << std::endl;
-        std::cout << "mb_logprobs: " << mb_logprobs.mean().item<float>() << std::endl;
-        std::cout << "mb_values: " << mb_values.mean().item<float>() << std::endl;
-        std::cout << "mb_advantages: " << mb_advantages.mean().item<float>() << std::endl;
-        std::cout << "mb_returns: " << mb_returns.mean().item<float>() << std::endl;
+        std::cout << "mb_obs: " << mb_obs.sum() << std::endl;
+        std::cout << "mb_actions: " << mb_actions.sum() << std::endl;
+        std::cout << "mb_logprobs: " << mb_logprobs.min() << std::endl;
+        std::cout << "mb_values: " << mb_values.min() << std::endl;
+        std::cout << "mb_advantages: " << mb_advantages.min() << std::endl;
+        std::cout << "mb_returns: " << mb_returns.min() << std::endl;
         */
 
         // Reshape obs if not using RNN
@@ -489,9 +532,9 @@ pybind11::dict compiled_train(
         torch::Tensor mb_lstm_c = torch::zeros_like(mb_lstm_h);
 
         // Forward pass
-        auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32), mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32).to(torch::kCPU), mb_lstm_h, mb_lstm_c);
 
-        //std::cout << "logits: " << logits.mean().item<float>() << std::endl;
+        //std::cout << "logits: " << logits.mean() << std::endl;
 
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
@@ -502,15 +545,18 @@ pybind11::dict compiled_train(
         // Gather logprobs for taken actions
         auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
         auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
-        auto entropy = - (probs_new * logprobs_new).sum(1).mean();  // mean over batch
+        auto entropy = - (probs_new * logprobs_new).sum(1);
 
-        //std::cout << "newlogprob: " << newlogprob.mean().item<float>() << std::endl;
-        //std::cout << "entropy: " << entropy << std::endl;
+        //std::cout << "newlogprob: " << newlogprob.min() << std::endl;
+        //std::cout << "entropy: " << entropy.min() << std::endl;
+
+        entropy = entropy.mean();
 
         // Compute ratio
         auto logratio = newlogprob - mb_logprobs;
         auto ratio_new = logratio.exp();
 
+        //std::cout << "logratio_new: " << std::fixed << std::setprecision(20) << logratio.min().item<float>() << std::endl;
         //std::cout << "ratio_new: " << std::fixed << std::setprecision(20) << ratio_new.min().item<float>() << std::endl;
 
         // Update global ratio and values in-place (matches Python)
@@ -521,7 +567,7 @@ pybind11::dict compiled_train(
         auto adv_normalized = mb_advantages;
         adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
 
-        //std::cout << "adv_normalized: " << std::fixed << std::setprecision(20) << adv_normalized.mean().item<float>() << std::endl;
+        //std::cout << "adv_normalized: " << std::fixed << std::setprecision(20) << adv_normalized.min().item<float>() << std::endl;
 
         // Policy loss
         auto pg_loss1 = -adv_normalized * ratio_new;
@@ -622,6 +668,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("reset_environments", &reset_environments_cuda);
     m.def("log_environments", &log_environments_cuda);
     m.def("compiled_evaluate", &compiled_evaluate);
+    m.def("evaluate_step", &evaluate_step);
     m.def("compiled_train", &compiled_train);
 
     py::class_<Log>(m, "Log")

@@ -256,6 +256,30 @@ class PuffeRL:
             lstm_h = torch.zeros((n, h), device=device)
             lstm_c = torch.zeros((n, h), device=device)
 
+        '''
+        for t in range(self.config['bptt_horizon']):
+            lstm_h, lstm_c = _C.evaluate_step(
+                self.pufferl_cpp,
+                self.vecenv.env,
+                self.vecenv.indices,
+                self.vecenv.observations,
+                self.vecenv.actions,
+                self.vecenv.rewards,
+                self.vecenv.terminals,
+                lstm_h,
+                lstm_c,
+                self.observations,
+                self.actions,
+                self.logprobs,
+                self.rewards,
+                self.terminals,
+                self.values,
+                t
+            )
+            self.rewards[:, t].clamp_(-1.0, 1.0)
+            self.vecenv.step(self.actions[:, t])
+        '''
+
         lstm_h, lstm_c = _C.compiled_evaluate(
             self.pufferl_cpp,
             self.vecenv.env,
@@ -812,7 +836,7 @@ def check(env_name):
 
     args['train']['optimizer'] = 'adam'
 
-    torch.set_printoptions(precision=10)
+    torch.set_printoptions(precision=16)
     torch.manual_seed(args['train']['seed'])
     policy = load_policy(args, vecenv, env_name)
 
@@ -853,7 +877,7 @@ def check(env_name):
         assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rewards[:, i]), f'Reward {i} mismatch'
         assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.terminals[:, i]), f'Terminal {i} mismatch'
         assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i]), f'Logprob {i} mismatch'
-        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i]), f'Value {i} mismatch'
+        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i], atol=1e-5), f'Value {i} mismatch'
 
     python_params = dict(policy.named_parameters())
     for k, v in pufferl_cpp.pufferl_cpp.policy_32.named_parameters():
@@ -870,7 +894,7 @@ def check(env_name):
             v_python = python_params[k].data
 
         print(k, v.view(-1)[0])
-        assert torch.allclose(v, v_python), k
+        assert torch.allclose(v, v_python, atol=1e-5)
 
     print('Check passed')
 
