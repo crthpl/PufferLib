@@ -115,6 +115,22 @@ void set_policy(torch::Tensor serialized_policy) {
     g_policy.eval();
 }
 */
+struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
+    ShareableLSTMCell(const torch::nn::LSTMCellOptions& options) : torch::nn::LSTMCellImpl(options) {}
+
+    void set_shared_weights(torch::Tensor w_ih, torch::Tensor w_hh, torch::Tensor b_ih, torch::Tensor b_hh) {
+        weight_ih = w_ih;
+        weight_hh = w_hh;
+        bias_ih = b_ih;
+        bias_hh = b_hh;
+
+        // Remove the original (unused) tensors from the parameter dict to avoid waste
+        parameters_.erase("weight_ih");
+        parameters_.erase("weight_hh");
+        parameters_.erase("bias_ih");
+        parameters_.erase("bias_hh");
+    }
+};
 
 class PolicyLSTM : public torch::nn::Module {
 private:
@@ -125,7 +141,8 @@ private:
     torch::nn::Linear decoder{nullptr};
     torch::nn::Linear value{nullptr};
     torch::nn::LSTM lstm{nullptr};
-    torch::nn::LSTMCell cell{nullptr};
+    //torch::nn::LSTMCell cell{nullptr};
+    std::shared_ptr<ShareableLSTMCell> cell{nullptr};
 
 public:
     // Constructor: input_size instead of grid_size
@@ -158,13 +175,23 @@ public:
         lstm->named_parameters()["bias_ih_l0"].data().zero_();
         lstm->named_parameters()["bias_hh_l0"].data().zero_();
 
+        // ... (your existing lstm creation and init)
+
+        cell = register_module("cell", std::make_shared<ShareableLSTMCell>(torch::nn::LSTMCellOptions(hidden_size_, hidden_size_)));
+        cell->set_shared_weights(lstm->named_parameters()["weight_ih_l0"],
+             lstm->named_parameters()["weight_hh_l0"],
+             lstm->named_parameters()["bias_ih_l0"],
+             lstm->named_parameters()["bias_hh_l0"]);
+        /*
         // Share weights between LSTM and LSTMCell. Do not register or you'll double-update during optim.
-        cell = torch::nn::LSTMCell(hidden_size_, hidden_size_);
+        //cell = torch::nn::LSTMCell(hidden_size_, hidden_size_);
+        cell = register_module("cell", torch::nn::LSTMCell(hidden_size_, hidden_size_));
         cell->named_parameters()["weight_ih"].data() = lstm->named_parameters()["weight_ih_l0"].data();
         cell->named_parameters()["weight_hh"].data() = lstm->named_parameters()["weight_hh_l0"].data();
         cell->named_parameters()["bias_ih"].data() = lstm->named_parameters()["bias_ih_l0"].data();
         cell->named_parameters()["bias_hh"].data() = lstm->named_parameters()["bias_hh_l0"].data();
         //cell->to(torch::kCUDA);
+        */
     }
 
     // Forward for evaluation/inference (uses LSTMCell)
@@ -278,8 +305,8 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 typedef struct {
     PolicyLSTM* policy_16;
     PolicyLSTM* policy_32;
-    //torch::optim::Adam* optimizer;
-    torch::optim::SGD* optimizer;
+    torch::optim::Adam* optimizer;
+    //torch::optim::SGD* optimizer;
     double lr;
     int64_t max_epochs;
 } PuffeRL;
@@ -312,8 +339,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     auto policy_32 = new PolicyLSTM(input_size, num_atns, hidden_size);
     //policy_32->to(torch::kCUDA);
 
-    //auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
-    auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
+    auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    //auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy_16 = policy_16;
@@ -370,6 +397,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         {
             pybind11::gil_scoped_release no_gil;
             step_environments_cuda(envs_tensor, indices_tensor);
+            torch::cuda::synchronize();
         }
         rewards.clamp_(-1.0f, 1.0f);
     }
@@ -508,14 +536,12 @@ pybind11::dict compiled_train(
         torch::Tensor mb_advantages = advantages.index_select(0, idx);
         torch::Tensor mb_returns = mb_advantages + mb_values;
 
-        /*
-        std::cout << "mb_obs: " << mb_obs.sum() << std::endl;
-        std::cout << "mb_actions: " << mb_actions.sum() << std::endl;
-        std::cout << "mb_logprobs: " << mb_logprobs.min() << std::endl;
-        std::cout << "mb_values: " << mb_values.min() << std::endl;
-        std::cout << "mb_advantages: " << mb_advantages.min() << std::endl;
-        std::cout << "mb_returns: " << mb_returns.min() << std::endl;
-        */
+        //std::cout << "mb_obs: " << mb_obs.sum() << std::endl;
+        //std::cout << "mb_actions: " << mb_actions.sum() << std::endl;
+        //std::cout << "mb_logprobs: " << mb_logprobs.min() << std::endl;
+        //std::cout << "mb_values: " << mb_values.min() << std::endl;
+        //std::cout << "mb_advantages: " << mb_advantages.min() << std::endl;
+        //std::cout << "mb_returns: " << mb_returns.min() << std::endl;
 
         // Reshape obs if not using RNN
         if (!use_rnn) {
@@ -561,7 +587,6 @@ pybind11::dict compiled_train(
 
         // Update global ratio and values in-place (matches Python)
         ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
-        values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
         // Normalize advantages: (adv - mean) / std, then weight
         auto adv_normalized = mb_advantages;
@@ -582,6 +607,8 @@ pybind11::dict compiled_train(
         auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+
+        values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
         //std::cout << "v_loss: " << v_loss << std::endl;
 

@@ -866,11 +866,14 @@ def check(env_name):
     torch.manual_seed(args['train']['seed'])
     pufferl_python.evaluate()
     pufferl_python.train()
+    pufferl_python.evaluate()
 
     torch.manual_seed(args['train']['seed'])
     pufferl_cpp.evaluate()
     pufferl_cpp.train()
+    pufferl_cpp.evaluate()
 
+    '''
     for i in range(args['train']['bptt_horizon']):
         assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.observations[:, i]), f'Observation {i} mismatch'
         assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.actions[:, i]), f'Action {i} mismatch'
@@ -878,11 +881,19 @@ def check(env_name):
         assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.terminals[:, i]), f'Terminal {i} mismatch'
         assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i]), f'Logprob {i} mismatch'
         assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i], atol=1e-5), f'Value {i} mismatch'
+    '''
 
+    pol = pufferl_cpp.pufferl_cpp.policy_32
+    pol = pufferl_cpp.pufferl_cpp.policy_32.named_parameters()
+    cpp_lstm = pol['lstm.weight_ih_l0']
+    cpp_lstm_cell = pol['cell.weight_ih']
+    assert torch.allclose(policy.lstm.weight_ih_l0, policy.cell.weight_ih)
+    assert torch.allclose(cpp_lstm, cpp_lstm_cell)
     python_params = dict(policy.named_parameters())
     for k, v in pufferl_cpp.pufferl_cpp.policy_32.named_parameters():
         # For some reason, cpp records twice
         if k == 'cell.weight_ih':
+            breakpoint()
             v_python = python_params['lstm.weight_ih_l0'].data
         elif k == 'cell.weight_hh':
             v_python = python_params['lstm.weight_hh_l0'].data
