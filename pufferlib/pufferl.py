@@ -88,9 +88,11 @@ class PuffeRL:
     #def __init__(self, config, policy, logger=None, verbose=True):
     def __init__(self, config, logger=None, verbose=True):
         # Backend perf optimization
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.deterministic = config['torch_deterministic']
-        torch.backends.cudnn.benchmark = True
+        #torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.deterministic = True #config['torch_deterministic']
+        torch.backends.cudnn.benchmark = False #True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
         num_envs = 4096
         self.num_envs = num_envs
@@ -257,6 +259,7 @@ class PuffeRL:
         lstm_h, lstm_c = _C.compiled_evaluate(
             self.pufferl_cpp,
             self.vecenv.env,
+            self.vecenv.indices,
             self.vecenv.observations,
             self.vecenv.actions,
             self.vecenv.rewards,
@@ -273,6 +276,7 @@ class PuffeRL:
             self.num_envs
         )
 
+        torch.cuda.synchronize()
         logs = self.vecenv.log()
         self.stats['perf'] = [logs.perf]
         self.stats['score'] = [logs.score]
@@ -806,42 +810,67 @@ def check(env_name):
     args = load_config(env_name)
     vecenv = load_env(env_name, args)
 
+    args['train']['optimizer'] = 'adam'
+
+    torch.set_printoptions(precision=10)
     torch.manual_seed(args['train']['seed'])
     policy = load_policy(args, vecenv, env_name)
 
     import pufferlib.python_pufferl
     train_config = dict(**args['train'], env=env_name)
-    pufferl_python = pufferlib.python_pufferl.PuffeRL(train_config, vecenv, policy)
+    pufferl_python = pufferlib.python_pufferl.PuffeRL(train_config, vecenv, policy, verbose=False)
 
-    # TODO: remember to set seet again before this
-    #pufferl_python.evaluate()
-    #pufferl_python.train()
-
-    pufferl_cpp = PuffeRL(train_config)
+    pufferl_cpp = PuffeRL(train_config, verbose=False)
     python_params = dict(policy.named_parameters())
     for k, v in pufferl_cpp.pufferl_cpp.policy_32.named_parameters():
         # For some reason, cpp records twice
-        if 'cell' in k:
-            continue
+        if k == 'cell.weight_ih':
+            v_python = python_params['lstm.weight_ih_l0'].data
+        elif k == 'cell.weight_hh':
+            v_python = python_params['lstm.weight_hh_l0'].data
+        elif k == 'cell.bias_ih':
+            v_python = python_params['lstm.bias_ih_l0'].data
+        elif k == 'cell.bias_hh':
+            v_python = python_params['lstm.bias_hh_l0'].data
+        else:
+            v_python = python_params[k].data
 
-        v_python = python_params[k].data
+        print(k, v.view(-1)[0])
         assert torch.allclose(v, v_python), k 
 
 
+    torch.manual_seed(args['train']['seed'])
+    pufferl_python.evaluate()
+    pufferl_python.train()
+
+    torch.manual_seed(args['train']['seed'])
     pufferl_cpp.evaluate()
     pufferl_cpp.train()
 
-    for i in range(pufferl_python.observations.shape[1]):
+    for i in range(args['train']['bptt_horizon']):
         assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.observations[:, i]), f'Observation {i} mismatch'
+        assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.actions[:, i]), f'Action {i} mismatch'
+        assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rewards[:, i]), f'Reward {i} mismatch'
+        assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.terminals[:, i]), f'Terminal {i} mismatch'
+        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i]), f'Logprob {i} mismatch'
+        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i]), f'Value {i} mismatch'
 
-    assert torch.allclose(pufferl_python.observations.float(), pufferl_cpp.observations)
-    assert torch.allclose(pufferl_python.actions, pufferl_cpp.actions)
-    assert torch.allclose(pufferl_python.rewards, pufferl_cpp.rewards)
-    assert torch.allclose(pufferl_python.terminals, pufferl_cpp.terminals)
-    assert torch.allclose(pufferl_python.values, pufferl_cpp.values)
+    python_params = dict(policy.named_parameters())
+    for k, v in pufferl_cpp.pufferl_cpp.policy_32.named_parameters():
+        # For some reason, cpp records twice
+        if k == 'cell.weight_ih':
+            v_python = python_params['lstm.weight_ih_l0'].data
+        elif k == 'cell.weight_hh':
+            v_python = python_params['lstm.weight_hh_l0'].data
+        elif k == 'cell.bias_ih':
+            v_python = python_params['lstm.bias_ih_l0'].data
+        elif k == 'cell.bias_hh':
+            v_python = python_params['lstm.bias_hh_l0'].data
+        else:
+            v_python = python_params[k].data
 
-    for k, v in policy.named_parameters():
-        assert torch.allclose(v, pufferl_cpp.policy.named_parameters()[k].data)
+        print(k, v.view(-1)[0])
+        assert torch.allclose(v, v_python), k
 
     print('Check passed')
 

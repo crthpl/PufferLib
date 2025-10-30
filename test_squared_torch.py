@@ -78,7 +78,7 @@ if __name__ == '__main__':
         actions[:] = atns
 
         # Step environment
-        _C.step_environments(envs, num_envs)
+        _C.step_environments(envs, indices)
 
     torch.cuda.synchronize()
     end = time.time()

@@ -27,6 +27,9 @@ class Default(nn.Module):
                 pufferlib.spaces.MultiDiscrete)
         self.is_continuous = isinstance(env.single_action_space,
                 pufferlib.spaces.Box)
+
+        self.input_size = hidden_size
+        self.obs_shape = env.single_observation_space.shape
         try:
             self.is_dict_obs = isinstance(env.env.observation_space, pufferlib.spaces.Dict) 
         except:
@@ -76,16 +79,7 @@ class Default(nn.Module):
         self.cell.weight_hh = self.lstm.weight_hh_l0
         self.cell.bias_ih = self.lstm.bias_ih_l0
         self.cell.bias_hh = self.lstm.bias_hh_l0
-
  
-    def forward_eval(self, observations, state=None):
-        hidden = self.encode_observations(observations, state=state)
-        logits, values = self.decode_actions(hidden)
-        return logits, values
-
-    def forward(self, observations, state=None):
-        return self.forward_eval(observations, state)
-
     def encode_observations(self, observations, state=None):
         '''Encodes a batch of observations into hidden states. Assumes
         no time dimension (handled by LSTM wrappers).'''
@@ -128,6 +122,7 @@ class Default(nn.Module):
 
         #hidden = self.pre_layernorm(hidden)
         hidden, c = self.cell(hidden, lstm_state)
+        #print('Hidden 0 python:', hidden[0, 0])
         #hidden = self.post_layernorm(hidden)
         state['hidden'] = hidden
         state['lstm_h'] = hidden

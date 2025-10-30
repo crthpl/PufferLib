@@ -39,31 +39,29 @@ struct __align__(16) Squared {
     int padding[3];
 };
 
+__device__ void add_log(Squared* env) {
+    env->log.perf += (env->rewards[0] > 0) ? 1 : 0;
+    env->log.score += env->rewards[0];
+    env->log.episode_length += env->tick;
+    env->log.episode_return += env->rewards[0];
+    env->log.n++;
+}
+
 
 // Device: Reset environment
 __device__ void cuda_reset(Squared* env, curandState* rng) {
     int tiles = env->size * env->size;
-    int center = env->size / 2 * env->size + env->size / 2;
-
-    // Clear grid
     for (int i = 0; i < tiles; i++) {
         env->observations[i] = EMPTY;
     }
-
-    // Place agent at center
-    env->observations[center] = AGENT;
-    env->r = env->size / 2;
-    env->c = env->size / 2;
+    env->observations[tiles/2] = AGENT;
+    env->r = env->size/2;
+    env->c = env->size/2;
     env->tick = 0;
-
-    // Place target randomly (not on agent)
-    int target_idx = center; // Deterministic for testing
-    /*
+    int target_idx = 0; // Deterministic for testing
     do {
         target_idx = curand(rng) % tiles;
-    } while (target_idx == center);
-    */
-
+    } while (target_idx == tiles/2);
     env->observations[target_idx] = TARGET;
 }
 
@@ -75,9 +73,8 @@ __device__ void cuda_step(Squared* env) {
     env->rewards[0] = 0.0f;
 
     int pos = env->r * env->size + env->c;
-    env->observations[pos] = EMPTY;  // Clear old agent pos
+    env->observations[pos] = EMPTY;
 
-    // Move agent
     if (action == DOWN) {
         env->r += 1;
     } else if (action == UP) {
@@ -88,41 +85,33 @@ __device__ void cuda_step(Squared* env) {
         env->c -= 1;
     }
 
-    pos = env->r * env->size + env->c;
 
-    // Check bounds and timeout
-    if (env->r < 0 || env->c < 0 || env->r >= env->size
-            || env->c >= env->size || env->tick > 3 * env->size) {
+    if (env->tick > 3 * env->size
+            || env->r < 0
+            || env->c < 0
+            || env->r >= env->size
+            || env->c >= env->size) {
         env->terminals[0] = 1;
         env->rewards[0] = -1.0f;
-        env->log.perf += 0;
-        env->log.score += -1.0f;
-        env->log.episode_return += -1.0f;
-        env->log.episode_length += env->tick;
-        env->log.n += 1;
+        add_log(env);
         cuda_reset(env, &env->rng);
         return;
     }
 
-    // Check if reached target
+    pos = env->r*env->size + env->c;
     if (env->observations[pos] == TARGET) {
         env->terminals[0] = 1;
         env->rewards[0] = 1.0f;
-        env->log.perf += 1;
-        env->log.score += 1.0f;
-        env->log.episode_return += 1.0f;
-        env->log.episode_length += env->tick;
-        env->log.n += 1;
+        add_log(env);
         cuda_reset(env, &env->rng);
         return;
     }
 
-    // Place agent
     env->observations[pos] = AGENT;
 }
 
 // Kernel: Step all environments
-__global__ void step_environments(Squared* envs, int num_envs) {
+__global__ void step_environments(Squared* envs, int* indices, int num_envs) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_envs) return;
     cuda_step(&envs[idx]);
@@ -169,11 +158,7 @@ __global__ void init_environments(Squared* envs,
     env->actions = actions_mem + idx;
     env->rewards = rewards_mem + idx;
     env->terminals = terminals_mem + idx;
-
     env->size = grid_size;
-    env->tick = 0;
-    env->r = grid_size / 2;
-    env->c = grid_size / 2;
 
     // Initialize RNG
     curand_init(clock64(), idx, 0, &env->rng);
@@ -214,9 +199,11 @@ create_squared_environments(int64_t num_envs, int64_t grid_size, torch::Tensor d
     return std::make_tuple(envs_tensor, obs, actions, rewards, terminals);
 }
 
-void step_environments_cuda(torch::Tensor envs_tensor, int64_t num_envs) {
+void step_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
     Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
-    step_environments<<<make_grid(num_envs), 256>>>(envs, num_envs);
+    auto indices = indices_tensor.data_ptr<int>();
+    int num_envs = indices_tensor.size(0);
+    step_environments<<<make_grid(num_envs), 256>>>(envs, indices, num_envs);
     cudaDeviceSynchronize();
 }
 
@@ -231,7 +218,8 @@ void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_te
 
 Log log_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
     Squared* envs = reinterpret_cast<Squared*>(envs_tensor.cpu().data_ptr<unsigned char>());
-    auto indices = indices_tensor.cpu().data_ptr<int>();
+    torch::Tensor cpu_indices = indices_tensor.cpu();
+    auto indices = cpu_indices.data_ptr<int>();
     int num_log = indices_tensor.size(0);
     Log log = {0};
     for (int i=0; i<num_log; i++) {

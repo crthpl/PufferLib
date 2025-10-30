@@ -88,7 +88,7 @@ struct Log {
     float n;
 };
 
-void step_environments_cuda(torch::Tensor envs_tensor, int64_t num_envs);
+void step_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
 
 void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
 
@@ -158,13 +158,13 @@ public:
         lstm->named_parameters()["bias_ih_l0"].data().zero_();
         lstm->named_parameters()["bias_hh_l0"].data().zero_();
 
-        // Share weights between LSTM and LSTMCell
-        cell = register_module("cell", torch::nn::LSTMCell(hidden_size_, hidden_size_));
-        cell->named_parameters()["weight_ih"] = lstm->named_parameters()["weight_ih_l0"];
-        cell->named_parameters()["weight_hh"] = lstm->named_parameters()["weight_hh_l0"];
-        cell->named_parameters()["bias_ih"] = lstm->named_parameters()["bias_ih_l0"];
-        cell->named_parameters()["bias_hh"] = lstm->named_parameters()["bias_hh_l0"];
-
+        // Share weights between LSTM and LSTMCell. Do not register or you'll double-update during optim.
+        cell = torch::nn::LSTMCell(hidden_size_, hidden_size_);
+        cell->named_parameters()["weight_ih"].data() = lstm->named_parameters()["weight_ih_l0"].data();
+        cell->named_parameters()["weight_hh"].data() = lstm->named_parameters()["weight_hh_l0"].data();
+        cell->named_parameters()["bias_ih"].data() = lstm->named_parameters()["bias_ih_l0"].data();
+        cell->named_parameters()["bias_hh"].data() = lstm->named_parameters()["bias_hh_l0"].data();
+        cell->to(torch::kCUDA);
     }
 
     // Forward for evaluation/inference (uses LSTMCell)
@@ -194,6 +194,10 @@ public:
 
         auto hidden_out = std::get<0>(cell_out);
         auto c_out = std::get<1>(cell_out);
+
+        //std::std::cout << std::fixed << std::setprecision(10);
+        //std::std::cout << "Hidden 0 cpp: " << hidden_out[0][0].item<float>() << std::std::endl;
+
 
         auto logits = decoder->forward(hidden_out);
         auto values = value->forward(hidden_out);
@@ -275,6 +279,7 @@ typedef struct {
     PolicyLSTM* policy_16;
     PolicyLSTM* policy_32;
     torch::optim::Adam* optimizer;
+    //torch::optim::SGD* optimizer;
     double lr;
     int64_t max_epochs;
 } PuffeRL;
@@ -308,6 +313,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     policy_32->to(torch::kCUDA);
 
     auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    //auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy_16 = policy_16;
@@ -322,6 +328,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
+    torch::Tensor indices_tensor,
     torch::Tensor obs,
     torch::Tensor actions,
     torch::Tensor rewards,
@@ -362,7 +369,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         actions.copy_(action);
         {
             pybind11::gil_scoped_release no_gil;
-            step_environments_cuda(envs_tensor, num_envs);
+            step_environments_cuda(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
     }
@@ -429,23 +436,26 @@ pybind11::dict compiled_train(
     torch::Tensor clipfrac_sum = torch::zeros({}, torch::kFloat32).to(device);
     torch::Tensor importance_sum = torch::zeros({}, torch::kFloat32).to(device);
 
-    optimizer->zero_grad();  // Start with clean grads
     auto advantages = torch::zeros_like(values);
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
+    //for (int64_t mb = 0; mb < 1; ++mb) {
         advantages = torch::zeros_like(values);
         compute_puff_advantage_cuda(
             values, rewards, terminals, ratio,
             advantages, gamma, gae_lambda,
             vtrace_rho_clip, vtrace_c_clip
         );
+        //std::cout << "Adv: " << advantages.mean().item<float>() << std::endl;
 
         // Prioritization
         auto adv = advantages.abs().sum(1);  // [num_envs]
         auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
         auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
-        auto idx = at::multinomial(prio_probs, minibatch_segments); // #Replacement?
+        auto idx = at::multinomial(prio_probs, minibatch_segments, true);
         auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+
+        //std::cout << "Prio: " << mb_prio.mean().item<float>() << std::endl;
 
         // Index into data
         torch::Tensor mb_obs = observations.index_select(0, idx);
@@ -454,6 +464,15 @@ pybind11::dict compiled_train(
         torch::Tensor mb_values = values.index_select(0, idx);
         torch::Tensor mb_advantages = advantages.index_select(0, idx);
         torch::Tensor mb_returns = mb_advantages + mb_values;
+
+        /*
+        std::cout << "mb_obs: " << mb_obs.sum().item<float>() << std::endl;
+        std::cout << "mb_actions: " << mb_actions.sum().item<float>() << std::endl;
+        std::cout << "mb_logprobs: " << mb_logprobs.mean().item<float>() << std::endl;
+        std::cout << "mb_values: " << mb_values.mean().item<float>() << std::endl;
+        std::cout << "mb_advantages: " << mb_advantages.mean().item<float>() << std::endl;
+        std::cout << "mb_returns: " << mb_returns.mean().item<float>() << std::endl;
+        */
 
         // Reshape obs if not using RNN
         if (!use_rnn) {
@@ -472,6 +491,8 @@ pybind11::dict compiled_train(
         // Forward pass
         auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32), mb_lstm_h, mb_lstm_c);
 
+        //std::cout << "logits: " << logits.mean().item<float>() << std::endl;
+
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -483,9 +504,14 @@ pybind11::dict compiled_train(
         auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
         auto entropy = - (probs_new * logprobs_new).sum(1).mean();  // mean over batch
 
+        //std::cout << "newlogprob: " << newlogprob.mean().item<float>() << std::endl;
+        //std::cout << "entropy: " << entropy << std::endl;
+
         // Compute ratio
         auto logratio = newlogprob - mb_logprobs;
         auto ratio_new = logratio.exp();
+
+        //std::cout << "ratio_new: " << std::fixed << std::setprecision(20) << ratio_new.min().item<float>() << std::endl;
 
         // Update global ratio and values in-place (matches Python)
         ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
@@ -495,10 +521,14 @@ pybind11::dict compiled_train(
         auto adv_normalized = mb_advantages;
         adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
 
+        //std::cout << "adv_normalized: " << std::fixed << std::setprecision(20) << adv_normalized.mean().item<float>() << std::endl;
+
         // Policy loss
         auto pg_loss1 = -adv_normalized * ratio_new;
         auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
         auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+
+        //std::cout << "pg_loss: " << pg_loss << std::endl;
 
         // Value loss
         newvalue = newvalue.view(mb_returns.sizes());
@@ -507,11 +537,15 @@ pybind11::dict compiled_train(
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
+        //std::cout << "v_loss: " << v_loss << std::endl;
+
         // Entropy
         auto entropy_loss = entropy;  // Already mean
 
         // Total loss
         auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy_loss;
+
+        //std::cout << "loss: " << loss << std::endl;
 
         // Accumulate stats
         pg_sum += pg_loss.detach();
@@ -542,6 +576,18 @@ pybind11::dict compiled_train(
         // Gradient accumulation and step
         if ((mb + 1) % accumulate_minibatches == 0) {
             torch::nn::utils::clip_grad_norm_(policy_32->parameters(), max_grad_norm);
+
+            /*
+            // Print grads
+            for (auto& param : policy_32->parameters()) {
+                std::cout << param.grad().abs().sum() << std::endl;
+            }
+            */
+
+            // Print current lr
+            //std::cout << "Current lr: " 
+            //          << optimizer->param_groups()[0].options().get_lr() 
+            //          << std::endl;
             optimizer->step();
             optimizer->zero_grad();
         }
