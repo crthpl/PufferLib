@@ -59,11 +59,9 @@ __device__ void cuda_reset(Squared* env, curandState* rng) {
     env->c = env->size/2;
     env->tick = 0;
     int target_idx = 0; // Deterministic for testing
-    /*
     do {
         target_idx = curand(rng) % tiles;
     } while (target_idx == tiles/2);
-    */
     env->observations[target_idx] = TARGET;
 }
 

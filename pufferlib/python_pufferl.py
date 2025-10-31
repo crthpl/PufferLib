@@ -321,7 +321,6 @@ class PuffeRL:
         self.ratio[:] = 1
 
         num_minibatches = config['num_minibatches']
-        #num_minibatches = 1
         for mb in range(num_minibatches):
             profile('train_misc', epoch, nest=True)
             self.amp_context.__enter__()
@@ -332,8 +331,6 @@ class PuffeRL:
                 self.terminals, self.ratio, advantages, config['gamma'],
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
-            #print("Adv Py", advantages.mean().item())
-
             profile('train_copy', epoch)
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
@@ -341,8 +338,6 @@ class PuffeRL:
             idx = torch.multinomial(prio_probs,
                 self.minibatch_segments, replacement=True)
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
-
-            #print("Prio Py", mb_prio.mean().item())
 
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
@@ -354,19 +349,6 @@ class PuffeRL:
             mb_values = self.values[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
-
-            '''
-            print("mb_obs Py", mb_obs.sum())
-            print("mb_actions Py", mb_actions.sum())
-            print("mb_logprobs Py", mb_logprobs.min())
-            print("mb_rewards Py", mb_rewards.min())
-            print("mb_terminals Py", mb_terminals.min())
-            print("mb_truncations Py", mb_truncations.min())
-            print("mb_ratio Py", mb_ratio.min())
-            print("mb_values Py", mb_values.min())
-            print("mb_returns Py", mb_returns.min())
-            print("mb_advantages Py", mb_advantages.min())
-            '''
 
             profile('train_forward', epoch)
             if not config['use_rnn']:
@@ -388,33 +370,18 @@ class PuffeRL:
             ratio = logratio.exp()
             self.ratio[idx] = ratio.detach()
 
-            '''
-            print("newlogprob Py", newlogprob.min().item())
-            print("entropy Py", entropy.min())
-            print(f"logratio_new Py {logratio.min().item():.16f}")
-            print(f"ratio Py {ratio.min().item():.16f}")
-            '''
-
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
-            #adv = advantages[idx]
-            #adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
-            #    ratio, adv, config['gamma'], config['gae_lambda'],
-            #    config['vtrace_rho_clip'], config['vtrace_c_clip'])
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
-
-            #print("new advantage", adv.min().item())
 
             # Losses
             pg_loss1 = -adv * ratio
             pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-            #print("pg_loss Py", pg_loss.item())
 
             newvalue = newvalue.view(mb_returns.shape)
             v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
@@ -422,12 +389,9 @@ class PuffeRL:
             v_loss_clipped = (v_clipped - mb_returns) ** 2
             v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-            #print("v_loss Py", v_loss.item())
-
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            #print("loss Py", loss.item())
             self.amp_context.__enter__() # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -448,12 +412,6 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                # Print grads
-                #for param in self.policy.parameters():
-                #    print(param.grad.abs().sum())
-
-                # Print current lr
-                #print(f'Current lr: {self.optimizer.param_groups[0]["lr"]}')
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
@@ -737,7 +695,7 @@ def dist_mean(value, device):
     return dist_sum(value, device) / torch.distributed.get_world_size()
 
 class Profile:
-    def __init__(self, frequency=5):
+    def __init__(self, frequency=1):
         self.profiles = defaultdict(lambda: defaultdict(float))
         self.frequency = frequency
         self.stack = []
@@ -752,8 +710,8 @@ class Profile:
         if epoch % self.frequency != 0:
             return
 
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         tick = time.time()
         if len(self.stack) != 0 and not nest:
@@ -769,8 +727,8 @@ class Profile:
         profile['delta'] += delta
 
     def end(self):
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         end = time.time()
         for i in range(len(self.stack)):
