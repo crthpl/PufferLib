@@ -138,12 +138,6 @@ class PuffeRL:
                 betas=(config['adam_beta1'], config['adam_beta2']),
                 eps=config['adam_eps'],
             )
-            '''
-            optimizer = torch.optim.SGD(
-                self.policy.parameters(),
-                lr=config['learning_rate'],
-            )
-            '''
         elif config['optimizer'] == 'muon':
             from heavyball import ForeachMuon
             warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
@@ -338,7 +332,7 @@ class PuffeRL:
                 self.terminals, self.ratio, advantages, config['gamma'],
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
-            print("Adv Py", advantages.mean().item())
+            #print("Adv Py", advantages.mean().item())
 
             profile('train_copy', epoch)
             adv = advantages.abs().sum(axis=1)
@@ -348,7 +342,7 @@ class PuffeRL:
                 self.minibatch_segments, replacement=True)
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
 
-            print("Prio Py", mb_prio.mean().item())
+            #print("Prio Py", mb_prio.mean().item())
 
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
@@ -361,6 +355,7 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
+            '''
             print("mb_obs Py", mb_obs.sum())
             print("mb_actions Py", mb_actions.sum())
             print("mb_logprobs Py", mb_logprobs.min())
@@ -371,6 +366,7 @@ class PuffeRL:
             print("mb_values Py", mb_values.min())
             print("mb_returns Py", mb_returns.min())
             print("mb_advantages Py", mb_advantages.min())
+            '''
 
             profile('train_forward', epoch)
             if not config['use_rnn']:
@@ -383,7 +379,7 @@ class PuffeRL:
             )
 
             logits, newvalue = self.policy(mb_obs, state)
-            print("logits Py", logits.min().item())
+            #print("logits Py", logits.min().item())
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile('train_misc', epoch)
@@ -392,10 +388,12 @@ class PuffeRL:
             ratio = logratio.exp()
             self.ratio[idx] = ratio.detach()
 
+            '''
             print("newlogprob Py", newlogprob.min().item())
             print("entropy Py", entropy.min())
             print(f"logratio_new Py {logratio.min().item():.16f}")
             print(f"ratio Py {ratio.min().item():.16f}")
+            '''
 
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
@@ -409,14 +407,14 @@ class PuffeRL:
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
-            print("new advantage", adv.min().item())
+            #print("new advantage", adv.min().item())
 
             # Losses
             pg_loss1 = -adv * ratio
             pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            print("pg_loss Py", pg_loss.item())
+            #print("pg_loss Py", pg_loss.item())
 
             newvalue = newvalue.view(mb_returns.shape)
             v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
@@ -424,12 +422,12 @@ class PuffeRL:
             v_loss_clipped = (v_clipped - mb_returns) ** 2
             v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-            print("v_loss Py", v_loss.item())
+            #print("v_loss Py", v_loss.item())
 
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            print("loss Py", loss.item())
+            #print("loss Py", loss.item())
             self.amp_context.__enter__() # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -455,7 +453,7 @@ class PuffeRL:
                 #    print(param.grad.abs().sum())
 
                 # Print current lr
-                print(f'Current lr: {self.optimizer.param_groups[0]["lr"]}')
+                #print(f'Current lr: {self.optimizer.param_groups[0]["lr"]}')
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
