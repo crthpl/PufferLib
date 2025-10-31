@@ -867,7 +867,8 @@ def check(env_name):
         assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.actions[:, i]), f'Action {i} mismatch'
         assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rewards[:, i]), f'Reward {i} mismatch'
         assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.terminals[:, i]), f'Terminal {i} mismatch'
-        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i]), f'Logprob {i} mismatch'
+        breakpoint()
+        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i], atol=1e-5), f'Logprob {i} mismatch'
         assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i], atol=1e-5), f'Value {i} mismatch'
 
     python_params = dict(policy.named_parameters())

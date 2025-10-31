@@ -333,11 +333,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     torch::manual_seed(42);
 
     auto policy_16 = new PolicyLSTM(input_size, num_atns, hidden_size);
-    //policy_16->to(torch::kCUDA);
+    policy_16->to(torch::kCUDA);
     policy_16->to(torch::kFloat32);
 
     auto policy_32 = new PolicyLSTM(input_size, num_atns, hidden_size);
-    //policy_32->to(torch::kCUDA);
+    policy_32->to(torch::kCUDA);
 
     auto optimizer = new torch::optim::Adam(policy_32->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
     //auto optimizer = new torch::optim::SGD(policy_32->parameters(), torch::optim::SGDOptions(lr));
@@ -377,7 +377,7 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     torch::NoGradGuard no_grad;
 
     for (int64_t i = 0; i < horizon; ++i) {
-        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32).to(torch::kCPU), lstm_h, lstm_c);
+        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32), lstm_h, lstm_c);
         lstm_h = lstm_h_out;
         lstm_c = lstm_c_out;
 
@@ -386,18 +386,18 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store
-        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32).to(torch::kCPU));
-        act_buffer.select(1, i).copy_(action.to(torch::kInt32).to(torch::kCPU));
-        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32).to(torch::kCPU));
-        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32).to(torch::kCPU));
-        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32).to(torch::kCPU));
-        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32).to(torch::kCPU));
+        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
+        act_buffer.select(1, i).copy_(action.to(torch::kInt32));
+        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
+        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
+        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
+        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
 
-        actions.copy_(action.to(torch::kCUDA));
+        actions.copy_(action);
         {
             pybind11::gil_scoped_release no_gil;
             step_environments_cuda(envs_tensor, indices_tensor);
-            torch::cuda::synchronize();
+            //torch::cuda::synchronize();
         }
         rewards.clamp_(-1.0f, 1.0f);
     }
@@ -512,7 +512,7 @@ pybind11::dict compiled_train(
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
     //for (int64_t mb = 0; mb < 1; ++mb) {
         advantages = torch::zeros_like(values);
-        compute_puff_advantage_cpu(
+        compute_puff_advantage_cuda(
             values, rewards, terminals, ratio,
             advantages, gamma, gae_lambda,
             vtrace_rho_clip, vtrace_c_clip
@@ -558,7 +558,7 @@ pybind11::dict compiled_train(
         torch::Tensor mb_lstm_c = torch::zeros_like(mb_lstm_h);
 
         // Forward pass
-        auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32).to(torch::kCPU), mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy_32->forward_train(mb_obs.to(torch::kFloat32), mb_lstm_h, mb_lstm_c);
 
         //std::cout << "logits: " << logits.mean() << std::endl;
 
