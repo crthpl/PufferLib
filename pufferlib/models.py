@@ -48,7 +48,9 @@ class minGRU(Module):
         proj_out = default(proj_out, expansion_factor != 1.)
 
         self.to_hidden_and_gate = Linear(dim, dim_inner * 2, bias = False)
+        nn.init.orthogonal_(self.to_hidden_and_gate.weight)
         self.to_out = Linear(dim_inner, dim, bias = False) if proj_out else Identity()
+        #nn.init.orthogonal_(self.to_out.weight)
 
     def forward(self, x, prev_hidden = None):
         seq_len = x.shape[1]
