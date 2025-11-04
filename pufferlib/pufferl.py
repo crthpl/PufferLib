@@ -142,7 +142,7 @@ class PuffeRL:
         self.policy = policy
         if config['compile']:
             self.policy = torch.compile(policy, mode=config['compile_mode'])
-            self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+            self.policy.forward_eval = torch.compile(policy.forward_eval, mode=config['compile_mode'])
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         self.muon = torch.optim.Muon(
@@ -215,7 +215,7 @@ class PuffeRL:
 
         if config['use_rnn']:
             for k in self.state:
-                self.state[k].zero_()
+                self.state[k] = torch.zeros_like(self.state[k])
 
         self.full_rows = 0
         while self.full_rows < self.segments:
