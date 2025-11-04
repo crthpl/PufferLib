@@ -171,24 +171,25 @@ class Default(nn.Module):
         return logits, values
 
 class MinGRUWrapper(nn.Module):
-    def __init__(self, env, policy, input_size=128, hidden_size=128):
+    def __init__(self, env, policy, input_size=128, hidden_size=128, num_layers=1):
         super().__init__()
         self.obs_shape = env.single_observation_space.shape
         self.policy = policy
 
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.is_continuous = self.policy.is_continuous
 
-        self.mingru = minGRU(hidden_size)
+        self.mingru = nn.ModuleList([minGRU(hidden_size) for _ in range(num_layers)])
 
     def forward_eval(self, observations, state):
         '''Forward function for inference. 3x faster than using LSTM directly'''
-        assert state.shape[0] == observations.shape[0]
+        assert state.shape[1] == observations.shape[0]
         observations = observations.unsqueeze(1)
-        state = state.unsqueeze(1)
-        logits, values, state = self.forward(observations, state)
-        state = state.squeeze(1)
+        states = state.unsqueeze(2)
+        logits, values, state = self.forward(observations, states)
+        state = state.squeeze(2)
         return logits, values, state
 
     def forward(self, observations, state):
@@ -206,7 +207,7 @@ class MinGRUWrapper(nn.Module):
         else:
             raise ValueError('Invalid input tensor shape', x.shape)
 
-        assert state.shape[0] == B
+        assert state.shape[1] == B
 
         x     = x.reshape(B*TT, *space_shape)
         hidden = self.policy.encode_observations(x, state)
@@ -215,14 +216,17 @@ class MinGRUWrapper(nn.Module):
         hidden = hidden.reshape(B, TT, self.input_size)
 
         #hidden = hidden.transpose(0, 1)
-        hidden, state = self.mingru(hidden, state)
- 
+        #states = list(state.split(self.num_layers, dim=0))
+        states = [state[i] for i in range(self.num_layers)]
+        for i in range(self.num_layers):
+            hidden, states[i] = self.mingru[i](hidden, states[i])
+
         #hidden = hidden.transpose(0, 1)
 
         flat_hidden = hidden.reshape(B*TT, self.hidden_size)
         logits, values = self.policy.decode_actions(flat_hidden)
         values = values.reshape(B, TT)
-        state = state.detach()
+        state = torch.stack(states, dim=0).detach()
         return logits, values, state
 
 class LSTMWrapper(nn.Module):

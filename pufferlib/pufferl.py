@@ -113,7 +113,8 @@ class PuffeRL:
         if config['use_rnn']:
             n = vecenv.agents_per_batch
             h = policy.hidden_size
-            self.state = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
+            l = policy.num_layers
+            self.state = {i*n: torch.zeros(l, n, h, device=device) for i in range(total_agents//n)}
 
         # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
@@ -365,7 +366,7 @@ class PuffeRL:
             if not config['use_rnn']:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
 
-            state = torch.zeros(mb_obs.shape[0], 1, self.policy.hidden_size, device=device)
+            state = torch.zeros(self.policy.num_layers, mb_obs.shape[0], 1, self.policy.hidden_size, device=device)
 
             logits, newvalue, _ = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
