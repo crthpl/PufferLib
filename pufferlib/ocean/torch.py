@@ -14,7 +14,7 @@ import pufferlib.models
 
 from pufferlib.models import Default as Policy
 from pufferlib.models import Convolutional as Conv
-Recurrent = pufferlib.models.LSTMWrapper
+Recurrent = pufferlib.models.MinGRUWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
 import numpy as np
 
