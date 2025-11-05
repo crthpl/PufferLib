@@ -115,6 +115,9 @@ class PuffeRL:
             h = policy.hidden_size
             l = policy.num_layers
             self.state = {i*n: torch.zeros(l, n, h, device=device) for i in range(total_agents//n)}
+            conv_states, ssm_states = policy.init_state(total_agents, device)
+            self.conv_state = {i*n: conv_states[i*n:(i+1)*n] for i in range(total_agents//n)}
+            self.ssm_state = {i*n: ssm_states[i*n:(i+1)*n] for i in range(total_agents//n)}
 
         # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
@@ -146,13 +149,13 @@ class PuffeRL:
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         self.muon = torch.optim.Muon(
-            [e for e in self.policy.parameters() if e.dim() > 1],
+            [e for e in self.policy.parameters() if e.dim() == 2],
             lr=config['learning_rate'],
             eps=config['adam_eps'],
             adjust_lr_fn='match_rms_adamw'
         )
         self.adam = torch.optim.Adam(
-            [e for e in self.policy.parameters() if e.dim() == 1],
+            [e for e in self.policy.parameters() if e.dim() != 2],
             lr=config['learning_rate'],
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
@@ -215,7 +218,8 @@ class PuffeRL:
 
         if config['use_rnn']:
             for k in self.state:
-                self.state[k] = torch.zeros_like(self.state[k])
+                self.conv_state[k] = torch.zeros_like(self.conv_state[k])
+                self.ssm_state[k] = torch.zeros_like(self.ssm_state[k])
 
         self.full_rows = 0
         while self.full_rows < self.segments:
@@ -237,16 +241,18 @@ class PuffeRL:
             profile('eval_forward', epoch)
             with torch.no_grad(), self.amp_context:
                 if config['use_rnn']:
-                    state = self.state[env_id.start]
+                    conv_state = self.conv_state[env_id.start]
+                    ssm_state = self.ssm_state[env_id.start]
 
-                logits, value, state = self.policy.forward_eval(o_device, state)
+                logits, value, conv_state, ssm_state = self.policy.forward_eval(o_device, conv_state, ssm_state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
             profile('eval_copy', epoch)
             with torch.no_grad():
                 if config['use_rnn']:
-                    self.state[env_id.start] = state
+                    self.conv_state[env_id.start] = conv_state
+                    self.ssm_state[env_id.start] = ssm_state
 
                 # Fast path for fully vectorized envs
                 l = self.ep_lengths[env_id.start].item()
@@ -353,9 +359,7 @@ class PuffeRL:
             if not config['use_rnn']:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
 
-            state = torch.zeros(self.policy.num_layers, mb_obs.shape[0], 1, self.policy.hidden_size, device=device)
-
-            logits, newvalue, _ = self.policy(mb_obs, state)
+            logits, newvalue = self.policy(mb_obs)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile('train_misc', epoch)

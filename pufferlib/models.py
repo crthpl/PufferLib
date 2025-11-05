@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 import pufferlib.emulation
-import pufferlib.pytorch
 import pufferlib.spaces
 
 # https://arxiv.org/abs/2410.01201v1
@@ -230,6 +229,75 @@ class MinGRUWrapper(nn.Module):
         values = values.reshape(B, TT)
         state = torch.stack(states, dim=0).detach()
         return logits, values, state
+
+class MambaWrapper(nn.Module):
+    def __init__(self, env, policy, input_size=128, hidden_size=128, num_layers=1):
+        super().__init__()
+        self.obs_shape = env.single_observation_space.shape
+        self.policy = policy
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.is_continuous = self.policy.is_continuous
+
+        from mamba_ssm import Mamba2
+        self.mamba = Mamba2(d_model=hidden_size, d_state=64, d_conv=4, expand=2)
+
+    def init_state(self, batch_size, device):
+        conv_state = torch.zeros(
+            batch_size,
+            self.mamba.d_conv,
+            self.mamba.conv1d.weight.shape[0],
+            device=device,
+            dtype=self.mamba.conv1d.weight.dtype,
+        ).transpose(1, 2).to(device)
+        ssm_state = torch.zeros(
+            batch_size,
+            self.mamba.nheads,
+            self.mamba.headdim,
+            self.mamba.d_state,
+            device=device,
+            dtype=self.mamba.in_proj.weight.dtype,
+        ).to(device)
+        return conv_state, ssm_state
+
+    def forward_eval(self, observations, conv_state, ssm_state):
+        '''Forward function for inference. 3x faster than using LSTM directly'''
+        hidden = self.policy.encode_observations(observations, None)
+        hidden = hidden.unsqueeze(1)
+        hidden, conv_state, ssm_state = self.mamba.step(hidden, conv_state, ssm_state)
+        hidden = hidden.squeeze(1)
+        logits, values = self.policy.decode_actions(hidden)
+        return logits, values, conv_state, ssm_state
+
+    def forward(self, observations):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x = observations
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        if x_shape[-space_n:] != space_shape:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        if x_n == space_n + 1:
+            B, TT = x_shape[0], 1
+        elif x_n == space_n + 2:
+            B, TT = x_shape[:2]
+        else:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        x     = x.reshape(B*TT, *space_shape)
+        hidden = self.policy.encode_observations(x, None)
+        assert hidden.shape == (B*TT, self.input_size)
+
+        hidden = hidden.reshape(B, TT, self.input_size)
+        hidden = self.mamba(hidden)
+
+        flat_hidden = hidden.reshape(B*TT, self.hidden_size)
+        logits, values = self.policy.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        return logits, values
+
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, input_size=128, hidden_size=128):
