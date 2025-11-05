@@ -78,6 +78,7 @@ class Moba(pufferlib.PufferEnv):
             binding.vec_render(self.c_envs, 0)
 
     def close(self):
+        binding.shared_close(self.c_state)
         binding.vec_close(self.c_envs)
 
 

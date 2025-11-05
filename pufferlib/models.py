@@ -102,6 +102,9 @@ class Default(nn.Module):
                 pufferlib.spaces.MultiDiscrete)
         self.is_continuous = isinstance(env.single_action_space,
                 pufferlib.spaces.Box)
+
+        self.input_size = hidden_size
+        self.obs_shape = env.single_observation_space.shape
         try:
             self.is_dict_obs = isinstance(env.env.observation_space, pufferlib.spaces.Dict) 
         except:
@@ -113,6 +116,10 @@ class Default(nn.Module):
             self.encoder = nn.Linear(input_size, self.hidden_size)
         else:
             num_obs = np.prod(env.single_observation_space.shape)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.manual_seed(42)
+            torch.cuda.manual_seed(42)
             self.encoder = torch.nn.Sequential(
                 pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
                 nn.GELU(),
@@ -136,14 +143,18 @@ class Default(nn.Module):
         self.value = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1)
 
-    def forward_eval(self, observations, state=None):
-        hidden = self.encode_observations(observations, state=state)
-        logits, values = self.decode_actions(hidden)
-        return logits, values
+        self.lstm = nn.LSTM(hidden_size, hidden_size)
+        nn.init.orthogonal_(self.lstm.weight_ih_l0, 1.0)
+        nn.init.orthogonal_(self.lstm.weight_hh_l0, 1.0)
+        self.lstm.bias_ih_l0.data.zero_()
+        self.lstm.bias_hh_l0.data.zero_()
 
-    def forward(self, observations, state=None):
-        return self.forward_eval(observations, state)
-
+        self.cell = torch.nn.LSTMCell(hidden_size, hidden_size)
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
+ 
     def encode_observations(self, observations, state=None):
         '''Encodes a batch of observations into hidden states. Assumes
         no time dimension (handled by LSTM wrappers).'''
@@ -300,13 +311,14 @@ class MambaWrapper(nn.Module):
 
 
 class LSTMWrapper(nn.Module):
-    def __init__(self, env, policy, input_size=128, hidden_size=128):
+    def __init__(self, env, policy, hidden_size=128):
         '''Wraps your policy with an LSTM without letting you shoot yourself in the
         foot with bad transpose and shape operations. This saves much pain.
         Requires that your policy define encode_observations and decode_actions.
         See the Default policy for an example.'''
         super().__init__()
         self.obs_shape = env.single_observation_space.shape
+        input_size = hidden_size
 
         self.policy = policy
         self.input_size = input_size
@@ -387,7 +399,6 @@ class LSTMWrapper(nn.Module):
         hidden = hidden.transpose(0, 1)
         #hidden = self.pre_layernorm(hidden)
         hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
-        hidden = hidden.float()
  
         #hidden = self.post_layernorm(hidden)
         hidden = hidden.transpose(0, 1)

@@ -11,6 +11,7 @@ import zipfile
 import tarfile
 import platform
 import shutil
+import pybind11
 
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
@@ -83,7 +84,7 @@ extra_link_args = [
 cxx_args = [
     '-fdiagnostics-color=always',
 ]
-nvcc_args = []
+nvcc_args = ['-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1']
 
 if DEBUG:
     extra_compile_args += [
@@ -167,14 +168,15 @@ class BuildExt(build_ext):
         self.run_command('build_torch')
         self.run_command('build_c')
 
+extnames = ["pufferlib._C", "squared_torch._C"]
 class CBuildExt(build_ext):
     def run(self, *args, **kwargs):
-        self.extensions = [e for e in self.extensions if e.name != "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name not in extnames]
         super().run(*args, **kwargs)
 
 class TorchBuildExt(cpp_extension.BuildExtension):
     def run(self):
-        self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name in extnames]
         super().run()
 
 INCLUDE = [f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
@@ -239,6 +241,7 @@ if not NO_TRAIN:
     if BUID_CUDA_EXT:
         extension = CUDAExtension
         torch_sources.append("pufferlib/extensions/cuda/pufferlib.cu")
+        torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
     else:
         extension = CppExtension
 
@@ -246,6 +249,7 @@ if not NO_TRAIN:
        extension(
             "pufferlib._C",
             torch_sources,
+            include_dirs=[pybind11.get_include()],
             extra_compile_args = {
                 "cxx": cxx_args,
                 "nvcc": nvcc_args,
@@ -284,7 +288,6 @@ if not NO_TRAIN:
         'rich_argparse',
         'imageio',
         'gpytorch',
-        'heavyball>=2.2.0', # contains relevant fixes compared to 1.7.2 and 2.1.1
         'neptune',
         'wandb',
     ]
