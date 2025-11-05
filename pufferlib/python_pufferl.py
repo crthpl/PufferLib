@@ -52,7 +52,7 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None, verbose=True):
         # Backend perf optimization
-        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.conv.fp32_precision = 'tf32'
         torch.backends.cudnn.deterministic = config['torch_deterministic']
         torch.backends.cudnn.benchmark = True
 
@@ -104,12 +104,10 @@ class PuffeRL:
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
 
-        # LSTM
+        # Recurrent cell
         if config['use_rnn']:
             n = vecenv.agents_per_batch
-            h = policy.hidden_size
-            self.lstm_h = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
-            self.lstm_c = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
+            self.state = {i*n: policy.initial_state(n, device=device) for i in range(total_agents//n)}
 
         # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
@@ -127,41 +125,29 @@ class PuffeRL:
         self.policy = policy
         if config['compile']:
             self.policy = torch.compile(policy, mode=config['compile_mode'])
-            self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
+            self.policy.forward_eval = torch.compile(policy.forward_eval, mode=config['compile_mode'])
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
-        # Optimizer
-        if config['optimizer'] == 'adam':
-            optimizer = torch.optim.Adam(
-                self.policy.parameters(),
-                lr=config['learning_rate'],
-                betas=(config['adam_beta1'], config['adam_beta2']),
-                eps=config['adam_eps'],
-            )
-        elif config['optimizer'] == 'muon':
-            from heavyball import ForeachMuon
-            warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
-            import heavyball.utils
-            heavyball.utils.compile_mode = config['compile_mode'] if config['compile'] else None
-            optimizer = ForeachMuon(
-                self.policy.parameters(),
-                lr=config['learning_rate'],
-                betas=(config['adam_beta1'], config['adam_beta2']),
-                eps=config['adam_eps'],
-            )
-        else:
-            raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
-
-        self.optimizer = optimizer
+        self.muon = torch.optim.Muon(
+            [e for e in self.policy.parameters() if e.dim() == 2],
+            lr=config['learning_rate'],
+            eps=config['adam_eps'],
+            adjust_lr_fn='match_rms_adamw'
+        )
+        self.adam = torch.optim.Adam(
+            [e for e in self.policy.parameters() if e.dim() != 2],
+            lr=config['learning_rate'],
+            betas=(config['adam_beta1'], config['adam_beta2']),
+            eps=config['adam_eps'],
+        )
 
         # Logging
         self.logger = logger
         if logger is None:
-            self.logger = Logger(config)
+            self.logger = Logger(config, policy.__class__.__name__)
 
         # Learning rate scheduler
         epochs = max(1, config['total_timesteps'] // config['batch_size'])
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
 
         # Automatic mixed precision
@@ -212,9 +198,8 @@ class PuffeRL:
         device = config['device']
 
         if config['use_rnn']:
-            for k in self.lstm_h:
-                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
-                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
+            for k, tensors in self.state.items():
+                self.state[k] = [torch.zeros_like(e) for e in tensors]
 
         self.full_rows = 0
         while self.full_rows < self.segments:
@@ -235,26 +220,17 @@ class PuffeRL:
 
             profile('eval_forward', epoch)
             with torch.no_grad(), self.amp_context:
-                state = dict(
-                    reward=r,
-                    done=d,
-                    env_id=env_id,
-                    mask=mask,
-                )
-
                 if config['use_rnn']:
-                    state['lstm_h'] = self.lstm_h[env_id.start]
-                    state['lstm_c'] = self.lstm_c[env_id.start]
+                    state = self.state[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                logits, value, state = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
             profile('eval_copy', epoch)
             with torch.no_grad():
                 if config['use_rnn']:
-                    self.lstm_h[env_id.start] = state['lstm_h']
-                    self.lstm_c[env_id.start] = state['lstm_c']
+                    self.state[env_id.start] = state
 
                 # Fast path for fully vectorized envs
                 l = self.ep_lengths[env_id.start].item()
@@ -320,6 +296,13 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
+        learning_rate = config['learning_rate']
+        if config['anneal_lr'] and self.epoch > 0:
+            lr_ratio = self.epoch / self.total_epochs
+            learning_rate = learning_rate * 0.5 * (1 + np.cos(np.pi * lr_ratio))
+            self.muon.param_groups[0]['lr'] = learning_rate
+            self.adam.param_groups[0]['lr'] = learning_rate
+
         num_minibatches = config['num_minibatches']
         for mb in range(num_minibatches):
             profile('train_misc', epoch, nest=True)
@@ -354,14 +337,7 @@ class PuffeRL:
             if not config['use_rnn']:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
 
-            state = dict(
-                action=mb_actions,
-                lstm_h=None,
-                lstm_c=None,
-            )
-
-            logits, newvalue = self.policy(mb_obs, state)
-            #print("logits Py", logits.min().item())
+            logits, newvalue = self.policy(mb_obs)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile('train_misc', epoch)
@@ -412,14 +388,13 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                self.muon.step()
+                self.adam.step()
+                self.muon.zero_grad()
+                self.adam.zero_grad()
 
         # Reprioritize experience
         profile('train_misc', epoch)
-        if config['anneal_lr']:
-            self.scheduler.step()
-
         y_pred = self.values.flatten()
         y_true = advantages.flatten() + self.values.flatten()
         var_y = y_true.var()
@@ -463,7 +438,7 @@ class PuffeRL:
             'agent_steps': agent_steps,
             'uptime': time.time() - self.start_time,
             'epoch': int(dist_sum(self.epoch, device)),
-            'learning_rate': self.optimizer.param_groups[0]["lr"],
+            'learning_rate': self.adam.param_groups[0]["lr"],
             **{f'environment/{k}': v for k, v in self.stats.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
             **{f'performance/{k}': v['elapsed'] for k, v in self.profile},
@@ -511,7 +486,8 @@ class PuffeRL:
         torch.save(self.uncompiled_policy.state_dict(), model_path)
 
         state = {
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'adam_state_dict': self.adam.state_dict(),
+            'muon_state_dict': self.muon.state_dict(),
             'global_step': self.global_step,
             'agent_step': self.global_step,
             'update': self.epoch,
@@ -792,9 +768,9 @@ def downsample(arr, m):
     return np.concatenate([downsampled, [last]])
 
 class Logger:
-    def __init__(self, args):
+    def __init__(self, args, policy_name):
         self.run_id = str(int(1000*time.time()))
-        root = os.path.join(args['data_dir'], 'logs', args['env'])
+        root = os.path.join(args['data_dir'], 'logs', policy_name, args['env'])
         if not os.path.exists(root):
             os.makedirs(root)
 

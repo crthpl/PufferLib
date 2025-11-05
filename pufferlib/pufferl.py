@@ -89,16 +89,8 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 
 class PuffeRL:
-    #def __init__(self, config, vecenv, policy, logger=None, verbose=True):
-    #def __init__(self, config, policy, logger=None, verbose=True):
     def __init__(self, config, logger=None, verbose=True):
         # Backend perf optimization
-        #torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.deterministic = True #config['torch_deterministic']
-        torch.backends.cudnn.benchmark = False #True
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-
         num_envs = 4096
         self.num_envs = num_envs
         grid_size = 11
@@ -167,15 +159,7 @@ class PuffeRL:
 
         # LSTM
         if config['use_rnn']:
-            n = vecenv.agents_per_batch
-            h = policy.hidden_size
-            #l = policy.num_layers
-            #self.state = {i*n: torch.zeros(l, n, h, device=device) for i in range(total_agents//n)}
-            #conv_states, ssm_states = policy.init_state(total_agents, device)
-            #self.conv_state = {i*n: conv_states[i*n:(i+1)*n] for i in range(total_agents//n)}
-            #self.ssm_state = {i*n: ssm_states[i*n:(i+1)*n] for i in range(total_agents//n)}
             n = self.agents_per_batch
-            #h = policy.hidden_size
             h = 128
             self.lstm_h = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
             self.lstm_c = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
@@ -192,33 +176,11 @@ class PuffeRL:
                 f'minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {horizon}'
             )
 
-        # Torch compile
-        self.uncompiled_policy = policy
-        self.policy = policy
-        if config['compile']:
-            self.policy = torch.compile(policy, mode=config['compile_mode'])
-            self.policy.forward_eval = torch.compile(policy.forward_eval, mode=config['compile_mode'])
-            pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
-
-        self.muon = torch.optim.Muon(
-            [e for e in self.policy.parameters() if e.dim() == 2],
-            lr=config['learning_rate'],
-            eps=config['adam_eps'],
-            adjust_lr_fn='match_rms_adamw'
-        )
-        self.adam = torch.optim.Adam(
-            [e for e in self.policy.parameters() if e.dim() != 2],
-            lr=config['learning_rate'],
-            betas=(config['adam_beta1'], config['adam_beta2']),
-            eps=config['adam_eps'],
-        )
-        '''
         # Logging
         self.logger = logger
         if logger is None:
             self.logger = Logger(config)
 
-        # Learning rate scheduler
         epochs = config['total_timesteps'] // config['batch_size']
         self.total_epochs = epochs
 
@@ -379,15 +341,6 @@ class PuffeRL:
 
         # Reprioritize experience
         profile('train_misc', epoch)
-        #if config['anneal_lr']:
-        #    self.scheduler.step()
-
-        #y_pred = self.values.flatten()
-        #y_true = advantages.flatten() + self.values.flatten()
-        #var_y = y_true.var()
-        #explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
-        #losses['explained_variance'] = explained_var
-
         profile.end()
         logs = None
         self.epoch += 1

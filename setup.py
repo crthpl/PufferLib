@@ -281,7 +281,7 @@ install_requires = [
 
 if not NO_TRAIN:
     install_requires += [
-        'torch',
+        'torch>=2.9',
         'psutil',
         'nvidia-ml-py',
         'rich',
