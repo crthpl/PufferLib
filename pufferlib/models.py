@@ -157,7 +157,7 @@ class DefaultDecoder(nn.Module):
  
 
 class Default(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1):
+    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.input_size = hidden_size
