@@ -204,6 +204,10 @@ if not NO_OCEAN:
         if "impulse_wars" in c_ext.name:
             print(f"Adding {c_ext.name} to extra objects")
             c_ext.extra_objects.append(f'{BOX2D_NAME}/libbox2d.a')
+            # TODO: Figure out why this is necessary for some users
+            impulse_include = 'pufferlib/ocean/impulse_wars/include'
+            if impulse_include not in c_ext.include_dirs:
+                c_ext.include_dirs.append(impulse_include)
 
         if 'matsci' in c_ext.name:
             c_ext.include_dirs.append('/usr/local/include')
