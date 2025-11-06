@@ -63,7 +63,6 @@ class MinGRULayer(Module):
             out = torch.lerp(prev_hidden, hidden, gate) if exists(prev_hidden) else (hidden * gate)
         else:
             # parallel
-
             log_coeffs = -F.softplus(gate)
 
             log_z = -F.softplus(-gate)
@@ -226,19 +225,19 @@ class Default(nn.Module):
         return logits, values
 
 class MinGRU(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
+    def __init__(self, env, hidden_size=128, num_layers=1, expand=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.input_size = hidden_size
         self.obs_shape = env.single_observation_space.shape
         self.encoder = DefaultEncoder(env, hidden_size)
         self.decoder = DefaultDecoder(env, hidden_size)
-
+        self.expand = expand
         self.num_layers = num_layers
-        self.mingru = nn.ModuleList([MinGRULayer(hidden_size) for _ in range(num_layers)])
+        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor=expand) for _ in range(num_layers)])
 
     def initial_state(self, batch_size, device):
-        state = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        state = torch.zeros(self.num_layers, batch_size, self.expand*self.hidden_size, device=device)
         return (state,)
 
     def forward_eval(self, x, state):
