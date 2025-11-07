@@ -52,6 +52,7 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None, verbose=True):
         # Backend perf optimization
+        torch.set_float32_matmul_precision('high') # Old
         torch.backends.cudnn.conv.fp32_precision = 'tf32'
         torch.backends.cudnn.deterministic = config['torch_deterministic']
         torch.backends.cudnn.benchmark = True
@@ -951,9 +952,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     stats = {}
     uptime = pufferl.uptime
     agent_steps = pufferl.global_step
-    while i < 128 or not stats:
+    for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
         stats = pufferl.evaluate()
-        i += 1
+        if i >= 32 and stats:
+            break
 
     logs = pufferl.mean_and_log()
     logs['uptime'] = uptime
