@@ -132,7 +132,7 @@ class PuffeRL:
         import heavyball
         from heavyball import ForeachMuon
         warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
-        heavyball.utils.compile_mode = "default"
+        heavyball.utils.compile_mode = "reduce-overhead"
 
         # # optionally a little bit better/faster alternative to newtonschulz iteration
         # import heavyball.utils
@@ -140,15 +140,21 @@ class PuffeRL:
 
         # heavyball_momentum=True introduced in heavyball 2.1.1
         # recovers heavyball-1.7.2 behaviour - previously swept hyperparameters work well
+        self.optimizer = torch.optim.Adam(
+            self.policy.parameters(),
+            lr=config['learning_rate'],
+            betas=(config['adam_beta1'], config['adam_beta2']),
+            eps=config['adam_eps'],
+        )
+ 
+        '''
         self.optimizer = ForeachMuon(
             self.policy.parameters(),
             lr=config['learning_rate'],
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
-            heavyball_momentum=True,
+            #heavyball_momentum=True,
         )
-
-        '''
         self.muon = torch.optim.Muon(
             [e for e in self.policy.parameters() if e.dim() == 2],
             lr=config['learning_rate'],
@@ -711,8 +717,8 @@ class Profile:
         if epoch % self.frequency != 0:
             return
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        #if torch.cuda.is_available():
+        #    torch.cuda.synchronize()
 
         tick = time.time()
         if len(self.stack) != 0 and not nest:
@@ -728,8 +734,8 @@ class Profile:
         profile['delta'] += delta
 
     def end(self):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        #if torch.cuda.is_available():
+        #    torch.cuda.synchronize()
 
         end = time.time()
         for i in range(len(self.stack)):

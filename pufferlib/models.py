@@ -233,7 +233,7 @@ class MinGRU(nn.Module):
         self.obs_shape = env.single_observation_space.shape
         self.encoder = DefaultEncoder(env, hidden_size)
         self.decoder = DefaultDecoder(env, hidden_size)
-        self.expand = expand
+        self.expansion_factor = expansion_factor
         self.num_layers = num_layers
         self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
 
