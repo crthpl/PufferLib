@@ -63,7 +63,6 @@ class MinGRULayer(Module):
             out = torch.lerp(prev_hidden, hidden, gate) if exists(prev_hidden) else (hidden * gate)
         else:
             # parallel
-
             log_coeffs = -F.softplus(gate)
 
             log_z = -F.softplus(-gate)
@@ -234,7 +233,7 @@ class MinGRU(nn.Module):
         self.obs_shape = env.single_observation_space.shape
         self.encoder = DefaultEncoder(env, hidden_size)
         self.decoder = DefaultDecoder(env, hidden_size)
-
+        self.expand = expand
         self.num_layers = num_layers
         self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
 

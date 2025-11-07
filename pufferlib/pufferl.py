@@ -238,8 +238,8 @@ class PuffeRL:
             h = 128
             #h = self.policy.hidden_size
  
-            lstm_h = torch.zeros((n, h), device=device)
-            lstm_c = torch.zeros((n, h), device=device)
+            state = torch.zeros((n, 2*h), device=device)
+
 
         '''
         for t in range(self.config['bptt_horizon']):
@@ -265,7 +265,7 @@ class PuffeRL:
             self.vecenv.step(self.actions[:, t])
         '''
 
-        lstm_h, lstm_c = _C.compiled_evaluate(
+        state = _C.compiled_evaluate(
             self.pufferl_cpp,
             self.vecenv.env,
             self.vecenv.indices,
@@ -273,8 +273,7 @@ class PuffeRL:
             self.vecenv.actions,
             self.vecenv.rewards,
             self.vecenv.terminals,
-            lstm_h,
-            lstm_c,
+            state,
             self.observations,
             self.actions,
             self.logprobs,
@@ -869,7 +868,7 @@ def check(env_name):
 
     print('Check passed')
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -905,7 +904,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = dict(**args['train'], env=env_name)
+    train_config = dict(**args['train'])#, env=env_name)
     #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
     pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
@@ -934,6 +933,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
+    uptime = pufferl.uptime
+    agent_steps = pufferl.global_step
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
         stats = pufferl.evaluate()
         if i >= 32 and stats:

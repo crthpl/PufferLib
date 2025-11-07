@@ -132,6 +132,186 @@ struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
     }
 };
 
+class MinGRULayer : public torch::nn::Module {
+private:
+    int64_t dim;
+    torch::nn::Linear to_hidden_and_gate{nullptr};
+    torch::nn::Linear to_out{nullptr};
+
+public:
+    int64_t expansion_factor;
+    MinGRULayer(int64_t dim, int64_t expansion_factor = 1.)
+        : dim(dim), expansion_factor(expansion_factor) {
+
+        int dim_inner = int(dim * expansion_factor);
+        to_hidden_and_gate = register_module("to_hidden_and_gate",
+                torch::nn::Linear(torch::nn::LinearOptions(dim, 2*dim_inner).bias(false)));
+        torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
+
+        if (expansion_factor != 1.) {
+            to_out = register_module("to_out",
+                    torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
+            torch::nn::init::orthogonal_(to_out->weight);
+        }
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor x, torch::Tensor state = torch::Tensor()) {
+        TORCH_CHECK(x.dim() == 3, "x must be [B, seq, input_size]");
+        TORCH_CHECK(state.dim() == 3, "state must be [B, seq, hidden_size]");
+        TORCH_CHECK(x.size(0) == state.size(0), "x and state must have the same batch size");
+
+        auto seq_len = x.size(1);
+        auto output = to_hidden_and_gate->forward(x);
+        auto chunks = output.chunk(2, 2);
+        auto hidden = chunks[0];
+        auto gate = chunks[1];
+
+        torch::Tensor out;
+        torch::Tensor next_prev_hidden;
+        if (seq_len == 1) {
+            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+            gate = gate.sigmoid();
+            out = torch::lerp(state, hidden, gate);
+            next_prev_hidden = out;
+        } else {
+            auto log_coeffs = -torch::nn::functional::softplus(gate);
+            auto log_z = -torch::nn::functional::softplus(-gate);
+            auto log_tilde_h = torch::where(hidden >= 0,
+                (torch::nn::functional::relu(hidden) + 0.5).log(),
+                -torch::nn::functional::softplus(-hidden));
+            auto log_values = log_z + log_tilde_h;
+            log_values = torch::cat({state.log(), log_values}, 1);
+            log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
+
+            // Heinsen associative scan
+            auto a_star = log_coeffs.cumsum(1);
+            auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
+            auto log_h = a_star + log_h0_plus_b_star;
+            out = log_h.exp();
+
+            out = out.narrow(1, out.size(1) - seq_len, seq_len);
+            next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
+        }
+
+        out = to_out->forward(out);
+        return std::make_tuple(out, next_prev_hidden);
+    }
+};
+
+
+class PolicyMinGRU : public torch::nn::Module {
+private:
+    int64_t input_size_;
+    int64_t hidden_size_;
+    int64_t num_atns_;
+    torch::nn::Sequential encoder{nullptr};
+    torch::nn::Linear decoder{nullptr};
+    torch::nn::Linear value{nullptr};
+    std::shared_ptr<MinGRULayer> mingru{nullptr};
+
+public:
+    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128)
+        : input_size_(input_size), hidden_size_(hidden_size), num_atns_(num_atns) {
+        encoder = register_module("encoder", torch::nn::Sequential(
+            torch::nn::Linear(input_size_, hidden_size_),
+            torch::nn::GELU()
+        ));
+        auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
+        torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
+        torch::nn::init::constant_(encoder_linear->bias, 0.0);
+
+        decoder = register_module("decoder", torch::nn::Linear(hidden_size_, num_atns_));
+        torch::nn::init::orthogonal_(decoder->weight, 0.01);
+        torch::nn::init::constant_(decoder->bias, 0.0);
+
+        value = register_module("value", torch::nn::Linear(hidden_size_, 1));
+        torch::nn::init::orthogonal_(value->weight, 1.0);
+        torch::nn::init::constant_(value->bias, 0.0);
+
+        mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size_, 2));
+    }
+
+    torch::Tensor initial_state(int64_t batch_size, torch::Device device) {
+        return torch::zeros(
+            {1, batch_size, hidden_size_},
+            torch::dtype(torch::kFloat32).device(device)
+        );
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(
+        torch::Tensor observations, torch::Tensor state) {
+        int64_t B = observations.size(0);
+
+        // Ensure flat input: [B, input_size]
+        TORCH_CHECK(observations.dim() == 2 && observations.size(1) == input_size_,
+            "Observations must be [B, input_size]");
+        TORCH_CHECK(state.dim() == 2 && state.size(0) == B && state.size(1) == hidden_size_*mingru->expansion_factor,
+            "state must be [1, B, hidden_size]");
+
+        auto hidden = encoder->forward(observations);
+
+        hidden = hidden.unsqueeze(1);
+        state = state.unsqueeze(1); // change to 2 for multi-layer
+
+        std::tuple<torch::Tensor, torch::Tensor> mingru_out;
+        mingru_out = mingru->forward(hidden, state);
+        auto hidden_out = std::get<0>(mingru_out);
+        auto state_out = std::get<1>(mingru_out);
+
+        hidden_out = hidden_out.squeeze(1);
+        state_out = state_out.squeeze(1); // change to 2 for multi-layer
+
+        auto logits = decoder->forward(hidden_out);
+        auto values = value->forward(hidden_out);
+
+        return {logits, values, state_out};
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor> forward_train(
+        torch::Tensor observations, torch::Tensor state) {
+
+        auto x = observations;
+        auto x_shape = x.sizes();
+
+        // Expecting [B, TT, input_size] or [B, input_size]
+        TORCH_CHECK((x.dim() == 2 || x.dim() == 3),
+                    "Observations must be [B, input_size] or [B, TT, input_size]");
+        TORCH_CHECK(x.size(-1) == input_size_,
+                    "Last dimension of observations must match input_size");
+
+        int64_t B = x_shape[0];
+        int64_t TT = (x.dim() == 3) ? x_shape[1] : 1;
+
+        TORCH_CHECK(state.dim() == 3 && state.size(0) == B && state.size(2) == hidden_size_*mingru->expansion_factor,
+                "state must be [B, seq, hidden_size]");
+
+        // Flatten time steps if needed
+        if (x.dim() == 3) {
+            x = x.reshape({B * TT, input_size_});
+        } else {
+            TT = 1;
+        }
+
+        auto hidden = encoder->forward(x);
+
+        hidden = hidden.reshape({B, TT, hidden_size_});
+
+        std::tuple<torch::Tensor, torch::Tensor> mingru_out;
+        mingru_out = mingru->forward(hidden, state);
+        hidden = std::get<0>(mingru_out);
+
+        auto flat_hidden = hidden.reshape({-1, hidden_size_});
+        auto logits = decoder->forward(flat_hidden);
+        auto values = value->forward(flat_hidden);
+
+        logits = logits.reshape({B, TT, num_atns_});
+        values = values.reshape({B, TT, 1});
+
+        return {logits, values};
+    }
+};
+
+
 class PolicyLSTM : public torch::nn::Module {
 private:
     int64_t input_size_;
@@ -141,7 +321,6 @@ private:
     torch::nn::Linear decoder{nullptr};
     torch::nn::Linear value{nullptr};
     torch::nn::LSTM lstm{nullptr};
-    //torch::nn::LSTMCell cell{nullptr};
     std::shared_ptr<ShareableLSTMCell> cell{nullptr};
 
 public:
@@ -169,8 +348,6 @@ public:
         torch::nn::init::orthogonal_(lstm->named_parameters()["weight_hh_l0"], 1.0);
         lstm->named_parameters()["bias_ih_l0"].data().zero_();
         lstm->named_parameters()["bias_hh_l0"].data().zero_();
-
-        // ... (your existing lstm creation and init)
 
         cell = register_module("cell", std::make_shared<ShareableLSTMCell>(torch::nn::LSTMCellOptions(hidden_size_, hidden_size_)));
         cell->set_shared_weights(lstm->named_parameters()["weight_ih_l0"],
@@ -298,7 +475,7 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 }
 
 typedef struct {
-    PolicyLSTM* policy;
+    PolicyMinGRU* policy;
     torch::optim::Adam* optimizer;
     double lr;
     int64_t max_epochs;
@@ -326,7 +503,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     // BF16 reduction (if using bfloat16)
     torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
-    auto policy = new PolicyLSTM(input_size, num_atns, hidden_size);
+    auto policy = new PolicyMinGRU(input_size, num_atns, hidden_size);
     policy->to(torch::kCUDA);
     policy->to(torch::kBFloat16);
 
@@ -341,7 +518,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 }
 
 // Updated compiled_evaluate
-std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
+torch::Tensor compiled_evaluate(
     pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
     torch::Tensor indices_tensor,
@@ -349,8 +526,8 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     torch::Tensor actions,
     torch::Tensor rewards,
     torch::Tensor terminals,
-    torch::Tensor lstm_h,
-    torch::Tensor lstm_c,
+    //torch::Tensor lstm_h,
+    torch::Tensor state,
     torch::Tensor obs_buffer,
     torch::Tensor act_buffer,
     torch::Tensor logprob_buffer,
@@ -365,13 +542,11 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy = pufferl.policy;
 
-    lstm_h = lstm_h.to(torch::kBFloat16);
-    lstm_c = lstm_c.to(torch::kBFloat16);
+    state = state.to(torch::kBFloat16);
 
     for (int64_t i = 0; i < horizon; ++i) {
-        auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kBFloat16), lstm_h, lstm_c);
-        lstm_h = lstm_h_out;
-        lstm_c = lstm_c_out;
+        auto [logits, value, state_out] = policy->forward(obs.to(torch::kBFloat16), state);
+        state = state_out;
 
         auto logprobs = torch::log_softmax(logits, 1);
         auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
@@ -393,9 +568,10 @@ std::tuple<torch::Tensor, torch::Tensor> compiled_evaluate(
         rewards.clamp_(-1.0f, 1.0f);
     }
 
-    return std::make_tuple(lstm_h, lstm_c);
+    return state;
 }
 
+/*
 std::tuple<torch::Tensor, torch::Tensor> evaluate_step(
     pybind11::object pufferl_obj,
     torch::Tensor envs_tensor,
@@ -438,6 +614,7 @@ std::tuple<torch::Tensor, torch::Tensor> evaluate_step(
     actions.copy_(action);
     return std::make_tuple(lstm_h, lstm_c);
 }
+*/
 
 pybind11::dict compiled_train(
     pybind11::object pufferl_obj,
@@ -532,14 +709,13 @@ pybind11::dict compiled_train(
 
         // HARDCODED LSTM SIZE 128
         // Initial LSTM states (zero or none)
-        torch::Tensor mb_lstm_h = torch::zeros(
-            {1, minibatch_segments, 128},
+        torch::Tensor mb_state= torch::zeros(
+            {minibatch_segments, 1, 256},
             torch::kBFloat16
         ).to(device);
-        torch::Tensor mb_lstm_c = torch::zeros_like(mb_lstm_h);
 
         // Forward pass
-        auto [logits, newvalue] = policy->forward_train(mb_obs.to(torch::kBFloat16), mb_lstm_h, mb_lstm_c);
+        auto [logits, newvalue] = policy->forward_train(mb_obs.to(torch::kBFloat16), mb_state);
 
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
@@ -643,7 +819,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("reset_environments", &reset_environments_cuda);
     m.def("log_environments", &log_environments_cuda);
     m.def("compiled_evaluate", &compiled_evaluate);
-    m.def("evaluate_step", &evaluate_step);
+    //m.def("evaluate_step", &evaluate_step);
     m.def("compiled_train", &compiled_train);
 
     py::class_<Log>(m, "Log")
@@ -662,5 +838,10 @@ PYBIND11_MODULE(_C, m) {
     cls.def(py::init<int64_t, int64_t, int64_t>());
     cls.def("forward", &pufferlib::PolicyLSTM::forward);
     cls.def("forward_train", &pufferlib::PolicyLSTM::forward_train);
+
+    py::class_<pufferlib::PolicyMinGRU, std::shared_ptr<pufferlib::PolicyMinGRU>, torch::nn::Module> cls2(m, "PolicyMinGRU");
+    cls2.def(py::init<int64_t, int64_t, int64_t>());
+    cls2.def("forward", &pufferlib::PolicyMinGRU::forward);
+    cls2.def("forward_train", &pufferlib::PolicyMinGRU::forward_train);
 }
 }
