@@ -28,6 +28,7 @@ torch::autograd::tensor_list fused_scan(
     torch::Tensor log_coeffs,
     torch::Tensor log_values
 );
+torch::Tensor logcumsumexp_cuda(torch::Tensor x);
 
 namespace pufferlib {
 
@@ -1018,9 +1019,12 @@ PYBIND11_MODULE(_C, m) {
     //m.def("evaluate_step", &evaluate_step);
     m.def("compiled_train", &compiled_train);
     m.def("batched_forward", &batched_forward);
+    m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
 
     // TODO: Why tf are these needed?
+    m.def("mingru_gate", &mingru_gate);
     m.def("log_coeffs_and_values", &log_coeffs_and_values);
+    m.def("fused_scan", &fused_scan);
 
     py::class_<Log>(m, "Log")
     .def_readwrite("perf", &Log::perf)
