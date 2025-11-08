@@ -15,9 +15,18 @@
 namespace py = pybind11;
 
 // Forward declare modules
+torch::Tensor mingru_gate(
+    torch::Tensor state,
+    torch::Tensor gate,
+    torch::Tensor hidden
+);
 torch::autograd::tensor_list log_coeffs_and_values(
     torch::Tensor gate,
     torch::Tensor hidden
+);
+torch::autograd::tensor_list fused_scan(
+    torch::Tensor log_coeffs,
+    torch::Tensor log_values
 );
 
 namespace pufferlib {
@@ -187,9 +196,12 @@ public:
         //out = hidden*gate + state;
 
         if (seq_len == 1) {
+            /*
             hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
             gate = gate.sigmoid();
             out = torch::lerp(state, hidden, gate);
+            */
+            out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
             next_prev_hidden = out;
         } else {
             /*
@@ -208,10 +220,14 @@ public:
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
+            /*
             auto a_star = log_coeffs.cumsum(1);
             auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
             auto log_h = a_star + log_h0_plus_b_star;
             out = log_h.exp();
+            */
+
+            out = fused_scan(log_coeffs, log_values)[0];
 
             out = out.narrow(1, out.size(1) - seq_len, seq_len);
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);

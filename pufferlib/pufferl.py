@@ -238,7 +238,7 @@ class PuffeRL:
             h = 128
             #h = self.policy.hidden_size
  
-            state = torch.zeros((n, 2*h), device=device)
+            state = torch.zeros((n, h), device=device)
 
 
         '''
@@ -952,6 +952,36 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     pufferl.logger.close(model_path)
     return all_logs
 
+def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
+    args = args or load_config(env_name)
+    train_config = dict(**args['train'])#, env=env_name)
+    pufferl = PuffeRL(train_config, logger, verbose)
+    # Warmup
+    for _ in range(3):
+        _C.batched_forward(
+            pufferl.pufferl_cpp,
+            pufferl.observations,
+            pufferl.total_minibatches,
+            pufferl.minibatch_segments,
+        )
+
+    N = 100
+    torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(N):
+        _C.batched_forward(
+            pufferl.pufferl_cpp,
+            pufferl.observations,
+            pufferl.total_minibatches,
+            pufferl.minibatch_segments,
+        )
+    torch.cuda.synchronize()
+    end = time.time()
+    dt = end - start
+    sps = pufferl.config['batch_size']*N/dt
+    print(f'SPS: {sps/1e6:.1f}M')
+
+
 def eval(env_name, args=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
     backend = args['vec']['backend']
@@ -1455,6 +1485,8 @@ def main():
         export(env_name=env_name)
     elif mode == 'check':
         check(env_name=env_name)
+    elif mode == 'sps':
+        sps(env_name=env_name)
     else:
         raise pufferlib.APIUsageError(err)
 

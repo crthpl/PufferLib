@@ -4,13 +4,17 @@
 #include <cuda_bf16.h>
 #include <cmath>
 
-// Thes functions are ported from pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/
+// These functions are ported from pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/
 // PyTorch defines these kernels anonymously and with extra saftey and features
 // This is a lower-overhead port of the math for use in fused kernels
 // The caller handles templating, so these can just be simple C-style code
+#ifndef CUDART_INF_F
+#define CUDART_INF_F __int_as_float(0x7f800000)
+#endif
 
 #define SOFTPLUS_BETA 1.0f
 #define SOFTPLUS_THRESHOLD 20.0f
+
 __device__ __forceinline__ float softplus_fwd(float x) {
     float x_scaled = x * SOFTPLUS_BETA;
     if (x_scaled > SOFTPLUS_THRESHOLD) {
@@ -46,6 +50,24 @@ __device__ __forceinline__ float sigmoid(float x) {
 __device__ __forceinline__ float sigmoid_backward(float x, float grad_output) {
     float sig = sigmoid(x);
     return grad_output * sig * (1.0f - sig);
+}
+
+__device__ __forceinline__ float tilde_relu_fwd(float x) {
+    if (x >= 0.0f) {
+        return x + 0.5f;
+    } else {
+        float z = expf(-fabsf(x));
+        return z / (1.0f + z);
+    }
+}
+
+__device__ __forceinline__ float tilde_relu_bwd(float x, float grad_output) {
+    if (x >= 0.0f) {
+        return grad_output * 1.0f;
+    } else {
+        float sig = sigmoid(x);
+        return grad_output * sig * (1.0f - sig);
+    }
 }
 
 __device__ __forceinline__ float lerp(float a, float b, float w) {
@@ -84,5 +106,55 @@ __device__ __forceinline__ float mingru_gate_backward(float h, float grad_output
     } else {
         float sig = sigmoid(h);
         return grad_output * sig * (1.0f - sig);
+    }
+}
+
+__device__ __forceinline__ float logaddexp(float a, float b) {
+    float m = fmaxf(a, b);
+    float v = fminf(a, b);
+    float diff = v - m;
+    return (diff < -88.0f) ? m : m + log1pf(expf(diff));
+}
+
+__device__ __forceinline__ float exp_safe(float x) {
+    return (x > 88.0f) ? 1.651e38f : ((x < -88.0f) ? 0.0f : expf(x));
+}
+
+__device__ __forceinline__ void cumsum_forward(const float* x, float* y, int T) {
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) {
+        sum += x[t];
+        y[t] = sum;
+    }
+}
+
+__device__ __forceinline__ void cumsum_backward(const float* grad_y, float* grad_x, int T) {
+    float running = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        running += grad_y[t];
+        grad_x[t] = running;
+    }
+}
+
+__device__ __forceinline__ void logcumsumexp_forward(const float* x, float* y, int T) {
+    float lse = -CUDART_INF_F;
+    for (int t = 0; t < T; t++) {
+        lse = (lse == -CUDART_INF_F) ? x[t] : logaddexp(lse, x[t]);
+        y[t] = lse;
+    }
+}
+
+__device__ __forceinline__ void logcumsumexp_backward(
+    const float* x,       // input: x[s]
+    const float* y,       // output: y[t]
+    const float* grad_y,  // dL/dy[t]
+    float* grad_x,        // output: dL/dx[s]
+    int T
+) {
+    float running = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        float weight = exp_safe(x[t] - y[t]);
+        running += grad_y[t] * weight;
+        grad_x[t] = running;
     }
 }
