@@ -246,11 +246,13 @@ class MinGRU(nn.Module):
         h = self.encoder(x)
         h = h.unsqueeze(1)
         state = state.unsqueeze(2)
+        state_out = []
         for i in range(self.num_layers):
-            h, state[i] = self.mingru[i](h, state[i])
+            h, s = self.mingru[i](h, state[i])
+            state_out.append(s)
 
         h = h.squeeze(1)
-        state = state.squeeze(2)
+        state = torch.stack(state_out, dim=0).squeeze(2)
         logits, values = self.decoder(h)
         return logits, values, (state,)
 
