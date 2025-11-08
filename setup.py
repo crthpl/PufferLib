@@ -83,8 +83,12 @@ extra_link_args = [
 ]
 cxx_args = [
     '-fdiagnostics-color=always',
+    '-std=c++17',
 ]
-nvcc_args = ['-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1']
+nvcc_args = [
+    '-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1',
+    '-std=c++17',
+]
 
 if DEBUG:
     extra_compile_args += [
@@ -242,14 +246,17 @@ if not NO_TRAIN:
         extension = CUDAExtension
         torch_sources.append("pufferlib/extensions/cuda/pufferlib.cu")
         torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
+        torch_sources.append("pufferlib/extensions/cuda/kernels.cu")
+        torch_sources.append("pufferlib/extensions/cuda/modules.cu")
     else:
         extension = CppExtension
 
+    import torch
     torch_extensions = [
        extension(
             "pufferlib._C",
             torch_sources,
-            include_dirs=[pybind11.get_include()],
+            include_dirs=[pybind11.get_include(), torch.utils.cpp_extension.include_paths()[0]],
             extra_compile_args = {
                 "cxx": cxx_args,
                 "nvcc": nvcc_args,
