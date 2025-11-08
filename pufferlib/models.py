@@ -1,4 +1,4 @@
-from pdb import set_trace as T
+/rom pdb import set_trace as T
 import numpy as np
 
 import torch
@@ -40,7 +40,7 @@ def log_g(x):
 # they enforce the hidden states to be positive
 
 class MinGRULayer(Module):
-    def __init__(self, dim, expansion_factor = 1., proj_out = None):
+    def __init__(self, dim, expansion_factor=1., proj_out = None):
         super().__init__()
 
         dim_inner = int(dim * expansion_factor)
@@ -225,19 +225,20 @@ class Default(nn.Module):
         return logits, values
 
 class MinGRU(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, expand=1, **kwargs):
+    def __init__(self, env, hidden_size=128, num_layers=1, expansion_factor=2, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.input_size = hidden_size
+        self.expansion_factor = expansion_factor
         self.obs_shape = env.single_observation_space.shape
         self.encoder = DefaultEncoder(env, hidden_size)
         self.decoder = DefaultDecoder(env, hidden_size)
-        self.expand = expand
+        self.expansion_factor = expansion_factor
         self.num_layers = num_layers
-        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor=expand) for _ in range(num_layers)])
+        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
 
     def initial_state(self, batch_size, device):
-        state = torch.zeros(self.num_layers, batch_size, self.expand*self.hidden_size, device=device)
+        state = torch.zeros(self.num_layers, batch_size, self.hidden_size*self.expansion_factor, device=device)
         return (state,)
 
     def forward_eval(self, x, state):
@@ -252,7 +253,7 @@ class MinGRU(nn.Module):
             state_out.append(s)
 
         h = h.squeeze(1)
-        state = torch.stack(state_out, dim=0).squeeze(2)
+        state = torch.stack(state_out, 0).squeeze(2)
         logits, values = self.decoder(h)
         return logits, values, (state,)
 
