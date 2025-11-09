@@ -941,7 +941,6 @@ pybind11::dict compiled_train(
         std::cout << "Prio dtype: " << mb_prio.dtype() << std::endl;
         std::cout << "Values dtype: " << mb_values.dtype() << std::endl;
         std::cout << "Returns dtype: " << mb_returns.dtype() << std::endl;
-        */
 
         std::cout << "Logit shape: " << logits.sizes() << std::endl;
         std::cout << "Values shape: " << newvalue.sizes() << std::endl;
@@ -951,6 +950,7 @@ pybind11::dict compiled_train(
         std::cout << "Prio shape: " << mb_prio.sizes() << std::endl;
         std::cout << "Values shape: " << mb_values.sizes() << std::endl;
         std::cout << "Returns shape: " << mb_returns.sizes() << std::endl;
+        */
 
         int BT = logits.size(0)*logits.size(1);
         auto loss = fused_ppo_loss(
