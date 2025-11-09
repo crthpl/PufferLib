@@ -553,3 +553,384 @@ void launch_logcumsumexp_backward(
     if (err != cudaSuccess)
         fprintf(stderr, "Backward kernel error: %s\n", cudaGetErrorString(err));
 }
+
+template<typename T>
+__global__ void ppo_loss_forward_kernel(
+    float* __restrict__ loss_output,
+    float* __restrict__ saved_for_backward,
+    const T* __restrict__ logits,
+    const T* __restrict__ values_pred,
+    const int64_t* __restrict__ actions,
+    const T* __restrict__ old_logprobs,
+    const T* __restrict__ advantages,
+    const T* __restrict__ prio,
+    const T* __restrict__ values,
+    const T* __restrict__ returns,
+    float adv_mean,
+    float adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * T_seq;
+    if (idx >= total_elements) return;
+
+    int n = idx / T_seq;  // batch index
+    int t = idx % T_seq;  // timestep
+
+    // === Direct indexing: no lambdas ===
+    int nt = n * T_seq + t;                    // index into (N, T_seq) tensors
+    int logits_offset = n * T_seq * A + t * A; // base index into logits
+
+    // === Step 1: Read action and compute logsumexp ===
+    int act = actions[nt];  // action taken at (n,t)
+
+    // Compute logsumexp: log(sum_a exp(logits[a]))
+    float max_logit = -INFINITY;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        max_logit = fmaxf(max_logit, l);
+    }
+
+    float logsumexp = 0.0f;
+    float sum = 0.0f;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        sum += expf(l - max_logit);
+    }
+    logsumexp = max_logit + logf(sum);
+
+    // === Step 2: new_logprob[action] = logits[action] - logsumexp ===
+    float new_logp = float(logits[logits_offset + act]) - logsumexp;
+
+    // === Step 3: entropy = -sum_a p_a * log p_a ===
+    float entropy = 0.0f;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float p = expf(l - logsumexp);
+        float logp = l - logsumexp;
+        entropy -= p * logp;
+    }
+
+    // === Step 4: policy gradient loss ===
+    float old_logp = float(old_logprobs[nt]);
+    float adv = float(advantages[nt]);
+    float w = float(prio[n]);  // importance weight, per-sequence
+    float adv_normalized = (adv - adv_mean) / (adv_std + 1e-8);
+
+    float logratio = new_logp - old_logp;
+    float ratio = expf(logratio);
+
+    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+    float pg_loss1 = -w * adv_normalized * ratio;
+    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+    float pg_loss = fmaxf(pg_loss1, pg_loss2);  // PPO clipped surrogate loss
+
+    // === Step 5: value function loss ===
+    float val = float(values[nt]);
+    float ret = float(returns[nt]);
+    float val_pred = float(values_pred[nt]);
+
+    float v_error = val_pred - val;
+    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
+    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
+
+    // === Step 6: total sample loss ===
+    //float sample_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
+    float sample_loss = vf_coef * v_loss;
+
+    // === Save for backward ===
+    float* saved_row = saved_for_backward + idx * 5;
+    saved_row[0] = new_logp;
+    saved_row[1] = ratio;
+    saved_row[2] = val_pred;
+    saved_row[3] = v_clipped;
+    saved_row[4] = entropy;
+
+    // === Accumulate into loss_output (scalar via atomic add) ===
+    atomicAdd(loss_output, sample_loss);
+}
+
+template<typename T>
+__global__ void ppo_loss_backward_kernel(
+    T* __restrict__ grad_logits,
+    T* __restrict__ grad_values_pred,
+    const float* __restrict__ grad_loss,  // scalar, [1], dL/dloss
+    const T* __restrict__ logits,
+    const int64_t* __restrict__ actions,
+    const T* __restrict__ old_logprobs,
+    const T* __restrict__ advantages,
+    const T* __restrict__ prio,
+    const T* __restrict__ values,
+    const T* __restrict__ returns,
+    const float* __restrict__ saved_for_backward,
+    float adv_mean,
+    float adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * T_seq;
+    if (idx >= total_elements) return;
+
+    float inv_NT = 1.0f / (N * T_seq);
+    int n = idx / T_seq;
+    int t = idx % T_seq;
+
+    // === Direct indexing ===
+    int nt = n * T_seq + t;
+    int logits_offset = n * T_seq * A + t * A;
+
+    // === Retrieve saved values from forward pass ===
+    const float* saved = saved_for_backward + idx * 5;
+    float new_logp = saved[0];   // new log prob of selected action
+    float ratio = saved[1];      // exp(new_logp - old_logp)
+    float val_pred = saved[2];   // value prediction
+    float v_clipped = saved[3];  // clipped value target
+    float entropy = saved[4];    // entropy at (n,t)
+
+    // === Read inputs ===
+    float old_logp = float(old_logprobs[nt]);
+    float adv = float(advantages[nt]);
+    float w = float(prio[n]);  // importance weight
+    float val = float(values[nt]);
+    float ret = float(returns[nt]);
+
+    // === Normalize advantage (same as forward) ===
+    float adv_normalized = (adv - adv_mean) / (adv_std + 1e-8f);
+
+    // Total loss gradient (scalar from autograd)
+    float dL = grad_loss[0] * inv_NT;  // dL/dloss (e.g. 1.0 if loss is final objective)
+
+    // Gradients w.r.t. components
+    float d_pg_loss = dL;                    // policy loss contributes dL
+    float d_v_loss = dL * vf_coef;           // value loss scaled by vf_coef
+    float d_entropy_term = dL * (-ent_coef); // entropy bonus gradient
+
+    // ===================================================
+    // 1. Gradient w.r.t. value function prediction
+    // ===================================================
+    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+
+    // Which branch was taken in forward? (same logic as PyTorch: use unclipped if tie)
+    bool use_clipped = (v_loss_clipped > v_loss_unclipped);
+    float d_val_pred = 0.0f;
+
+    if (use_clipped) {
+        // Gradient flows only if val_pred is in the "active" region of the clamp
+        float v_error = val_pred - val;
+        if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
+            // v_clipped = val_pred → gradient flows directly
+            d_val_pred = v_clipped - ret;  // = val_pred - ret
+        }
+        // else: v_clipped is clamped to val ± vf_clip_coef → constant → grad = 0
+    } else {
+        // Unclipped branch used
+        d_val_pred = val_pred - ret;
+    }
+
+    // Scale by dL * vf_coef (the 0.5 from forward cancels the 2 from derivative)
+    d_val_pred = dL * vf_coef * d_val_pred;
+
+    grad_values_pred[nt] = T(d_val_pred);
+
+    /*
+    // ===================================================
+    // 2. Gradient w.r.t. policy (logits)
+    // ===================================================
+    float logratio = new_logp - old_logp;
+    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+
+    float pg_loss1 = -w * adv_normalized * ratio;
+    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+
+    use_clipped = (pg_loss2 < pg_loss1);  // min loss → max negative
+    float d_ratio = 0.0f;
+
+    if (use_clipped) {
+        d_ratio = -w * adv_normalized * d_pg_loss;
+    } else {
+        d_ratio = -w * adv_normalized * d_pg_loss;
+    }
+
+    // d_ratio = d(loss)/dratio * I[used]
+    // But: ratio = exp(new_logp - old_logp) → d_ratio/d_new_logp = ratio
+    float d_new_logp = d_ratio * ratio;  // dL/d_new_logp via ratio
+
+    // ===================================================
+    // 3. Gradient w.r.t. entropy
+    // ===================================================
+    // Entropy: H = -sum_a p_a log p_a
+    // dH/dlogits_a = p_a * (1 - log p_a - sum_b p_b log p_b ???)
+    // Actually: dH/dlogits_a = p_a * ( -log p_a - 1 ) + sum_b p_b log p_b * p_b
+    // But simpler: dH/dlogits = p_a * (mean_logp - log p_a - 1) ??? → no
+
+    // Correct: dH/dlogits_a = p_a * (1 - log p_a) - sum_b p_b * (1 - log p_b) * p_b
+    // Actually, simpler: use:
+    //   H = logsumexp - mean(logits)  ??? no
+
+    // Better: recompute p_a and log p_a from logits
+    float max_logit = -INFINITY;
+    for (int a = 0; a < A; a++) {
+        max_logit = fmaxf(max_logit, float(logits[logits_offset + a]));
+    }
+    float logsumexp = 0.0f;
+    float sum_exp = 0.0f;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float exp_l = expf(l - max_logit);
+        sum_exp += exp_l;
+    }
+    logsumexp = max_logit + logf(sum_exp + 1e-8f);
+
+    // Initialize gradients for each action
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float p = expf(l - logsumexp);
+        float logp = l - logsumexp;
+
+        // dH/dlogits[a] = p * ( -logp - 1 ) + sum_b p_b log p_b * p_b ??? → no
+
+        // Actually: dH/dlogits[a] = p_a * (1 - log p_a) - sum_b p_b * (1 - log p_b) * p_b
+        // But correct derivation:
+        //   H = -sum_b p_b log p_b
+        //   dH/dlogits[a] = -sum_b d(p_b log p_b)/dlogits[a]
+        //   d(p_b)/dlogits[a] = p_b (I_{a=b} - p_a)
+        //   → dH/dlogits[a] = -sum_b [ (I_{a=b} - p_a) * (1 + log p_b) * p_b ]
+        //   = -[ (1 + log p_a) p_a ] + p_a * sum_b (1 + log p_b) p_b
+        //   = p_a * [ -1 - log p_a + sum_b p_b (1 + log p_b) ]
+        //   = p_a * [ -log p_a + sum_b p_b (log p_b) ]  ← because sum p_b = 1
+        //   = p_a * (H - log p_a)
+
+        float d_entropy_dlogit = p * (entropy - logp);
+        float d_logit = d_new_logp * (a == actions[nt] ? 1.0f : 0.0f);  // d/dlogits for logp[action]
+        d_logit -= p * d_new_logp;  // because logsumexp derivative: d(log p_a)/dlogits_b = I_{a=b} - p_b
+
+        // Add entropy gradient
+        d_logit += d_entropy_term * d_entropy_dlogit;
+
+        grad_logits[logits_offset + a] = T(d_logit);
+    }
+    */
+}
+
+template<typename T>
+void launch_ppo_loss_forward(
+    float* loss_output,
+    float* saved_for_backward,
+    const T* logits,
+    const T* values_pred,
+    const int64_t* actions,
+    const T* old_logprobs,
+    const T* advantages,
+    const T* prio,
+    const T* values,
+    const T* returns,
+    float adv_mean,
+    float adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int total_elements = N * T_seq;
+    int grid = (total_elements + 255) / 256;
+
+    ppo_loss_forward_kernel<T><<<grid, 256>>>(
+        loss_output,
+        saved_for_backward,
+        logits,
+        values_pred,
+        actions,
+        old_logprobs,
+        advantages,
+        prio,
+        values,
+        returns,
+        adv_mean,
+        adv_std,
+        clip_coef,
+        vf_clip_coef,
+        vf_coef,
+        ent_coef,
+        T_seq,
+        A,
+        N
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "PPO forward kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+template<typename T>
+void launch_ppo_loss_backward(
+    T* grad_logits,
+    T* grad_values_pred,
+    const float* grad_loss,
+    const T* logits,
+    const int64_t* actions,
+    const T* old_logprobs,
+    const T* advantages,
+    const T* prio,
+    const T* values,
+    const T* returns,
+    const float* saved_for_backward,
+    float adv_mean,
+    float adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int total_elements = N * T_seq;
+    int grid = (total_elements + 255) / 256;
+
+    ppo_loss_backward_kernel<T><<<grid, 256>>>(
+        grad_logits,
+        grad_values_pred,
+        grad_loss,
+        logits,
+        actions,
+        old_logprobs,
+        advantages,
+        prio,
+        values,
+        returns,
+        saved_for_backward,
+        adv_mean,
+        adv_std,
+        clip_coef,
+        vf_clip_coef,
+        vf_coef,
+        ent_coef,
+        T_seq,
+        A,
+        N
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "PPO backward kernel error: %s\n", cudaGetErrorString(err));
+    }
+}

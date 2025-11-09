@@ -29,6 +29,22 @@ torch::autograd::tensor_list fused_scan(
     torch::Tensor log_values
 );
 torch::Tensor logcumsumexp_cuda(torch::Tensor x);
+torch::autograd::tensor_list fused_ppo_loss(
+    torch::Tensor logits,
+    torch::Tensor values_pred,
+    torch::Tensor actions,
+    torch::Tensor old_logprobs,
+    torch::Tensor advantages,
+    torch::Tensor prio,
+    torch::Tensor values,
+    torch::Tensor returns,
+    float adv_mean,
+    float adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef
+);
 
 namespace pufferlib {
 
@@ -856,11 +872,18 @@ pybind11::dict compiled_train(
     ratio.fill_(1.0);
 
     auto advantages = torch::zeros_like(values);
+    compute_puff_advantage_cuda(
+        values, rewards, terminals, ratio,
+        advantages, gamma, gae_lambda,
+        vtrace_rho_clip, vtrace_c_clip
+    );
+    float adv_mean = advantages.mean().item<float>();
+    float adv_std = advantages.std().item<float>();
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         //torch::Tensor mb_obs = observations.narrow(0, mb*minibatch_segments, minibatch_segments);
 
-        advantages = torch::zeros_like(values);
+        advantages.fill_(0.0);
         compute_puff_advantage_cuda(
             values, rewards, terminals, ratio,
             advantages, gamma, gae_lambda,
@@ -909,6 +932,45 @@ pybind11::dict compiled_train(
         // Forward pass
         auto [logits, newvalue] = policy->forward_train(mb_obs.to(torch::kBFloat16), mb_state);
 
+        /*
+        std::cout << "Logits dtype: " << logits.dtype() << std::endl;
+        std::cout << "Values dtype: " << newvalue.dtype() << std::endl;
+        std::cout << "Actions dtype: " << mb_actions.dtype() << std::endl;
+        std::cout << "Logprobs dtype: " << mb_logprobs.dtype() << std::endl;
+        std::cout << "Advantages dtype: " << mb_advantages.dtype() << std::endl;
+        std::cout << "Prio dtype: " << mb_prio.dtype() << std::endl;
+        std::cout << "Values dtype: " << mb_values.dtype() << std::endl;
+        std::cout << "Returns dtype: " << mb_returns.dtype() << std::endl;
+        */
+
+        std::cout << "Logit shape: " << logits.sizes() << std::endl;
+        std::cout << "Values shape: " << newvalue.sizes() << std::endl;
+        std::cout << "Actions shape: " << mb_actions.sizes() << std::endl;
+        std::cout << "Logprobs shape: " << mb_logprobs.sizes() << std::endl;
+        std::cout << "Advantages shape: " << mb_advantages.sizes() << std::endl;
+        std::cout << "Prio shape: " << mb_prio.sizes() << std::endl;
+        std::cout << "Values shape: " << mb_values.sizes() << std::endl;
+        std::cout << "Returns shape: " << mb_returns.sizes() << std::endl;
+
+        int BT = logits.size(0)*logits.size(1);
+        auto loss = fused_ppo_loss(
+            logits,
+            newvalue,
+            mb_actions,
+            mb_logprobs.to(logits.dtype()),
+            mb_advantages.to(logits.dtype()),
+            mb_prio.to(logits.dtype()),
+            mb_values.to(logits.dtype()),
+            mb_returns.to(logits.dtype()),
+            adv_mean,
+            adv_std,
+            clip_coef,
+            vf_clip_coef,
+            vf_coef,
+            ent_coef
+        )[0];
+
+        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -949,8 +1011,6 @@ pybind11::dict compiled_train(
 
         // Total loss
         auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
-
-        /*
         {
             torch::NoGradGuard no_grad;
 
@@ -1007,8 +1067,6 @@ pybind11::dict compiled_train(
     return losses;
 }
 
-
-
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {
     m.def("create_squared_environments", &create_squared_environments);
@@ -1025,6 +1083,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("mingru_gate", &mingru_gate);
     m.def("log_coeffs_and_values", &log_coeffs_and_values);
     m.def("fused_scan", &fused_scan);
+    m.def("fused_ppo_loss", &fused_ppo_loss);
 
     py::class_<Log>(m, "Log")
     .def_readwrite("perf", &Log::perf)
