@@ -490,7 +490,7 @@ public:
         float ent_coef = ctx->saved_data["ent_coef"].to<float>();
 
         auto grad_out_scalar = grad_outputs[0].sum();  // dL/d(loss)
-        auto grad_loss = torch::empty({1}, logits.options());
+        auto grad_loss = torch::empty({1}, logits.options()).to(torch::kFloat32);
         grad_loss.fill_(grad_out_scalar.item<float>());
 
         auto grad_logits = torch::empty_like(logits);
@@ -499,6 +499,7 @@ public:
         int total = N * T;
         int grid = (total + 255) / 256;
 
+        // TODO: Why are we passing grad loss in float?
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_backward<float>(
                 grad_logits.data_ptr<float>(),
