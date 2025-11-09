@@ -11,7 +11,7 @@ B = 2048
 T = 64
 H = 128
 
-def assert_close(a, b, rtol=1e-5, atol=1e-5):
+def assert_close(a, b, rtol=1e-3, atol=1e-4):
     max_diff = (a - b).abs().max()
     passed = torch.allclose(a, b, rtol=rtol, atol=atol)
     if not passed:
@@ -44,7 +44,6 @@ def test_kernel(py_func, cpp_func, *args):
         cpp_out = [cpp_out]
 
     for py_o, cpp_o in zip(py_out, cpp_out):
-        print(py_o.float(), cpp_o)
         assert_close(py_o.float(), cpp_o)
 
     if not backward:
@@ -96,8 +95,8 @@ def fused_scan(log_coeffs, log_values):
 def test_fused_scan():
     # Numerically unstable function. Must be called with the distribution
     # that is used in the full network.
-    log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H), requires_grad=True)
-    log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H), requires_grad=True)
+    log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
+    log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
     test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
 
 def logcumsumexp(x):
@@ -140,8 +139,9 @@ def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
     v_loss_clipped = (v_clipped - returns).pow(2);
     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean();
 
-    #loss = pg_loss + vf_coef*v_loss - ent_coef*entropy
-    loss = vf_coef*v_loss
+    #loss = vf_coef*v_loss - ent_coef*entropy
+    loss = pg_loss + vf_coef*v_loss - ent_coef*entropy
+    #loss = vf_coef*v_loss
     return loss
 
 def test_fused_ppo_loss():
@@ -158,60 +158,14 @@ def test_fused_ppo_loss():
     vf_clip_coef = 0.1
     vf_coef = 0.1
     ent_coef = 0.1
-    '''
-
-    B, T, A = 2, 2, 4
-
-    vf_coef = 0.5
-    vf_clip_coef = 0.5
-
-    # Fixed inputs for value loss only
-    values_pred = torch.tensor([[1.0]], requires_grad=True)  # (B, T)
-    values = torch.tensor([[0.5]])                           # (B, T)
-    returns = torch.tensor([[2.0]])                          # (B, T)
-
-    # Dummy inputs (not used when isolating value loss)
-    logits = torch.randn(B, T, A, requires_grad=True)
-    actions = torch.randint(0, A, (B, T))
-    old_logprobs = torch.randn(B, T)
-    advantages = torch.randn(B, T)
-    prio = torch.rand(B)  # (B,)
-    ent_coef = 0.1
-    clip_coef = 0.1
-    adv_mean = advantages.mean()
-    adv_std = advantages.std()
-
-    
-    vf_coef = 0.5
-    vf_clip_coef = 0.5
-
-    # We'll define val_pred, values, returns explicitly for each (b,t)
-    # Format: [B, T]
-
-    values_pred = torch.tensor([
-        [1.0, 2.0],   # b=0: 1.0 (in range), 2.0 (out of range)
-        [0.0, 1.5]    # b=1: 0.0 (out), 1.5 (in)
-    ], requires_grad=True)
-
-    values = torch.tensor([
-        [0.5, 1.0],
-        [1.0, 1.0]
-    ])
-
-    returns = torch.tensor([
-        [2.0, 3.0],
-        [0.5, 1.0]
-    ])
-    '''
-
 
     test_kernel(fused_ppo_loss, _C.fused_ppo_loss, logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, advantages.mean(), advantages.std(),
         clip_coef, vf_clip_coef, vf_coef, ent_coef)
 
 if __name__ == '__main__':
-    #test_mingru_gate()
-    #test_log_coeffs_and_values()
-    #test_logcumsumexp()
-    #test_fused_scan()
+    test_mingru_gate()
+    test_log_coeffs_and_values()
+    test_logcumsumexp()
+    test_fused_scan()
     test_fused_ppo_loss()

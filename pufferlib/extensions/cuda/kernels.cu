@@ -643,8 +643,7 @@ __global__ void ppo_loss_forward_kernel(
     float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
 
     // === Step 6: total sample loss ===
-    //float sample_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
-    float sample_loss = vf_coef * v_loss;
+    float sample_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
 
     // === Save for backward ===
     float* saved_row = saved_for_backward + idx * 5;
@@ -712,7 +711,7 @@ __global__ void ppo_loss_backward_kernel(
     float adv_normalized = (adv - adv_mean) / (adv_std + 1e-8f);
 
     // Total loss gradient (scalar from autograd)
-    float dL = grad_loss[0] * inv_NT;  // dL/dloss (e.g. 1.0 if loss is final objective)
+    float dL = grad_loss[0] * inv_NT;  // dL/dloss
 
     // Gradients w.r.t. components
     float d_pg_loss = dL;                    // policy loss contributes dL
@@ -726,105 +725,74 @@ __global__ void ppo_loss_backward_kernel(
     float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
 
     // Which branch was taken in forward? (same logic as PyTorch: use unclipped if tie)
-    bool use_clipped = (v_loss_clipped > v_loss_unclipped);
+    bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
     float d_val_pred = 0.0f;
 
-    if (use_clipped) {
-        // Gradient flows only if val_pred is in the "active" region of the clamp
+    if (use_clipped_vf) {
         float v_error = val_pred - val;
         if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
-            // v_clipped = val_pred → gradient flows directly
             d_val_pred = v_clipped - ret;  // = val_pred - ret
         }
-        // else: v_clipped is clamped to val ± vf_clip_coef → constant → grad = 0
     } else {
-        // Unclipped branch used
         d_val_pred = val_pred - ret;
     }
 
-    // Scale by dL * vf_coef (the 0.5 from forward cancels the 2 from derivative)
     d_val_pred = dL * vf_coef * d_val_pred;
-
     grad_values_pred[nt] = T(d_val_pred);
 
-    /*
     // ===================================================
-    // 2. Gradient w.r.t. policy (logits)
+    // 2. Gradient w.r.t. policy and entropy (logits)
     // ===================================================
-    float logratio = new_logp - old_logp;
-    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-
-    float pg_loss1 = -w * adv_normalized * ratio;
-    float pg_loss2 = -w * adv_normalized * ratio_clipped;
-
-    use_clipped = (pg_loss2 < pg_loss1);  // min loss → max negative
-    float d_ratio = 0.0f;
-
-    if (use_clipped) {
-        d_ratio = -w * adv_normalized * d_pg_loss;
-    } else {
-        d_ratio = -w * adv_normalized * d_pg_loss;
-    }
-
-    // d_ratio = d(loss)/dratio * I[used]
-    // But: ratio = exp(new_logp - old_logp) → d_ratio/d_new_logp = ratio
-    float d_new_logp = d_ratio * ratio;  // dL/d_new_logp via ratio
-
-    // ===================================================
-    // 3. Gradient w.r.t. entropy
-    // ===================================================
-    // Entropy: H = -sum_a p_a log p_a
-    // dH/dlogits_a = p_a * (1 - log p_a - sum_b p_b log p_b ???)
-    // Actually: dH/dlogits_a = p_a * ( -log p_a - 1 ) + sum_b p_b log p_b * p_b
-    // But simpler: dH/dlogits = p_a * (mean_logp - log p_a - 1) ??? → no
-
-    // Correct: dH/dlogits_a = p_a * (1 - log p_a) - sum_b p_b * (1 - log p_b) * p_b
-    // Actually, simpler: use:
-    //   H = logsumexp - mean(logits)  ??? no
-
-    // Better: recompute p_a and log p_a from logits
+    // Recompute logsumexp for gradient
     float max_logit = -INFINITY;
     for (int a = 0; a < A; a++) {
-        max_logit = fmaxf(max_logit, float(logits[logits_offset + a]));
+        float l = float(logits[logits_offset + a]);
+        max_logit = fmaxf(max_logit, l);
     }
-    float logsumexp = 0.0f;
     float sum_exp = 0.0f;
     for (int a = 0; a < A; a++) {
         float l = float(logits[logits_offset + a]);
-        float exp_l = expf(l - max_logit);
-        sum_exp += exp_l;
+        sum_exp += expf(l - max_logit);
     }
-    logsumexp = max_logit + logf(sum_exp + 1e-8f);
+    float logsumexp = max_logit + logf(sum_exp + 1e-8f);
 
-    // Initialize gradients for each action
+    // Zero grad_logits for this (n,t)
+    for (int a = 0; a < A; a++) {
+        grad_logits[logits_offset + a] = T(0.0f);
+    }
+
+    // --- Policy Loss Gradient ---
+    float logratio = new_logp - old_logp;
+    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+    float pg_loss1 = -w * adv_normalized * ratio;
+    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+
+    bool use_clipped_pg = (pg_loss2 < pg_loss1);  // min loss → use clipped
+    float d_ratio = -w * adv_normalized * d_pg_loss;
+
+    // d(ratio)/d(new_logp) = ratio
+    float d_new_logp = d_ratio * ratio;
+
+    // --- Entropy Gradient ---
+    // dH/dlogits[a] = p_a * (entropy - log p_a)
     for (int a = 0; a < A; a++) {
         float l = float(logits[logits_offset + a]);
         float p = expf(l - logsumexp);
         float logp = l - logsumexp;
 
-        // dH/dlogits[a] = p * ( -logp - 1 ) + sum_b p_b log p_b * p_b ??? → no
+        // Gradient from policy loss: d/dlogits[a] new_logp = δ_{a,act} - p_a
+        float d_logit = 0.0f;
+        if (a == actions[nt]) {
+            d_logit += d_new_logp;
+        }
+        d_logit -= p * d_new_logp;
 
-        // Actually: dH/dlogits[a] = p_a * (1 - log p_a) - sum_b p_b * (1 - log p_b) * p_b
-        // But correct derivation:
-        //   H = -sum_b p_b log p_b
-        //   dH/dlogits[a] = -sum_b d(p_b log p_b)/dlogits[a]
-        //   d(p_b)/dlogits[a] = p_b (I_{a=b} - p_a)
-        //   → dH/dlogits[a] = -sum_b [ (I_{a=b} - p_a) * (1 + log p_b) * p_b ]
-        //   = -[ (1 + log p_a) p_a ] + p_a * sum_b (1 + log p_b) p_b
-        //   = p_a * [ -1 - log p_a + sum_b p_b (1 + log p_b) ]
-        //   = p_a * [ -log p_a + sum_b p_b (log p_b) ]  ← because sum p_b = 1
-        //   = p_a * (H - log p_a)
-
+        // Gradient from entropy
         float d_entropy_dlogit = p * (entropy - logp);
-        float d_logit = d_new_logp * (a == actions[nt] ? 1.0f : 0.0f);  // d/dlogits for logp[action]
-        d_logit -= p * d_new_logp;  // because logsumexp derivative: d(log p_a)/dlogits_b = I_{a=b} - p_b
-
-        // Add entropy gradient
         d_logit += d_entropy_term * d_entropy_dlogit;
 
         grad_logits[logits_offset + a] = T(d_logit);
     }
-    */
 }
 
 template<typename T>
