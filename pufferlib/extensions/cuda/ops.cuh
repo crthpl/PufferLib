@@ -52,12 +52,56 @@ __device__ __forceinline__ float sigmoid_backward(float x, float grad_output) {
     return grad_output * sig * (1.0f - sig);
 }
 
+__device__ __inline__ float fast_tanh(float x) {
+  const float plus_9 = 9.0f;
+  const float minus_9 = -9.0f;
+  float v1 = fminf(x, plus_9);
+  v1 = fmaxf(v1, minus_9);
+
+  const float alpha_1 = 4.89352455891786e-03f;
+  const float alpha_3 = 6.37261928875436e-04f;
+  const float alpha_5 = 1.48572235717979e-05f;
+  const float alpha_7 = 5.12229709037114e-08f;
+  const float alpha_9 = -8.60467152213735e-11f;
+  const float alpha_11 = 2.00018790482477e-13f;
+  const float alpha_13 = -2.76076847742355e-16f;
+  const float beta_0 = 4.89352518554385e-03f;
+  const float beta_2 = 2.26843463243900e-03f;
+  const float beta_4 = 1.18534705686654e-04f;
+  const float beta_6 = 1.19825839466702e-06f;
+
+  // Horner's method. Matches PyTorch implementation
+  float v2 = v1 * v1;
+  float p = v2 * alpha_13 + alpha_11;
+  p = v2 * p + alpha_9;
+  p = v2 * p + alpha_7;
+  p = v2 * p + alpha_5;
+  p = v2 * p + alpha_3;
+  p = v2 * p + alpha_1;
+  p = v1 * p;
+
+  float q = v2 * beta_6 + beta_4;
+  q = v2 * q + beta_2;
+  q = v2 * q + beta_0;
+
+  return p / q;
+}
+
+__device__ __inline__ float fast_sigmoid(float x) {
+  const float one_v = 1.0f;
+  const float half_v = 0.5f;
+  const float zero_v = 0.0f;
+  float x2 = x * half_v;
+  float y = fast_tanh(x2);
+  float z = (y + one_v) * half_v;
+  return fminf(one_v, fmaxf(zero_v, z));
+}
+
 __device__ __forceinline__ float tilde_relu_fwd(float x) {
     if (x >= 0.0f) {
         return x + 0.5f;
     } else {
-        float z = expf(-fabsf(x));
-        return z / (1.0f + z);
+        return fast_sigmoid(x);
     }
 }
 
@@ -65,7 +109,7 @@ __device__ __forceinline__ float tilde_relu_bwd(float x, float grad_output) {
     if (x >= 0.0f) {
         return grad_output * 1.0f;
     } else {
-        float sig = sigmoid(x);
+        float sig = fast_sigmoid(x);
         return grad_output * sig * (1.0f - sig);
     }
 }

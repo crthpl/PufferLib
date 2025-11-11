@@ -55,7 +55,7 @@ __global__ void mingru_gate_inference_kernel(
     float gate = float(gate_in[idx]);
     float hidden = float(hidden_in[idx]);
     float state = float(state_in[idx]);
-    float gate_sigmoid = sigmoid(gate);
+    float gate_sigmoid = fast_sigmoid(gate);
     float hidden_tilde = tilde_relu_fwd(hidden);
     float out_val = lerp(state, hidden_tilde, gate_sigmoid);
     out[idx] = T(out_val);
@@ -202,8 +202,8 @@ void launch_log_coeffs_and_values_backward(
 template<typename T>
 __global__ void fused_scan_forward_kernel(
     T* __restrict__ out,
-    float* __restrict__ a_star_buf,
-    float* __restrict__ s_buf,
+    double* __restrict__ a_star_buf,
+    double* __restrict__ s_buf,
     const T* __restrict__ log_coeffs,
     const T* __restrict__ log_values,
     int T_total,
@@ -218,36 +218,150 @@ __global__ void fused_scan_forward_kernel(
 
     int base = b * T_total * H + h;
 
-    float a_star = 0.0f;
-    float s = -INFINITY;  // this will be logcumsumexp(z[0..t])
+    double a_star = 0.0f;
+    double s = -INFINITY;  // this will be logcumsumexp(z[0..t])
 
     for (int t = 0; t < T_total; t++) {
         int curr = base + t * H;
 
         // Step 1: Update a_star[t] = sum_{i=0}^t log_coeffs[i]
-        a_star += float(log_coeffs[curr]);
+        a_star += double(log_coeffs[curr]);
 
         // Step 2: Compute z[t] = log_values[t] - a_star[t]
-        float z_val = float(log_values[curr]) - a_star;
+        double z_val = double(log_values[curr]) - a_star;
 
         // Step 3: logcumsumexp on z — EXACTLY as in logcumsumexp_forward_kernel
         if (s == -INFINITY) {
             s = z_val;
         } else {
-            float max_val = fmaxf(s, z_val);
-            float diff = fabsf(s - z_val);
-            s = max_val + log1pf(expf(-diff));
+            double max_val = fmax(s, z_val);
+            double diff = fabs(s - z_val);
+            s = max_val + log1p(exp(-diff));
         }
 
         // Step 4: log_h[t] = a_star[t] + s[t], then out[t] = exp(log_h[t])
-        float log_h = a_star + s;
-        out[curr] = T(expf(log_h));
+        double log_h = a_star + s;
+        out[curr] = T(exp(log_h));
 
         // Step 5: Save intermediates (same as before)
         a_star_buf[curr] = a_star;
         s_buf[curr] = s;
     }
 }
+
+template<typename T>
+__global__ void fused_scan_backward_kernel(
+    T* __restrict__ grad_log_coeffs,
+    T* __restrict__ grad_log_values,
+    const T* __restrict__ d_out,
+    const T* __restrict__ out,
+    const double* __restrict__ a_star_buf,
+    const double* __restrict__ s_buf,
+    const T* __restrict__ log_values,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int base = b * T_total * H + h;
+
+    double carry_d_a = 0.0;
+    double carry_d_s = 0.0;
+
+    for (int t = T_total - 1; t >= 0; --t) {
+        int curr = base + t * H;
+
+        double A = a_star_buf[curr];
+        double S = s_buf[curr];
+        double Z = double(log_values[curr]) - A;
+        double out_val = double(out[curr]);
+        double d_log_h = double(d_out[curr]) * out_val;
+
+        double d_S = d_log_h + carry_d_s;
+
+        double S_prev = (t == 0) ? -INFINITY : s_buf[base + (t - 1) * H];
+
+        double max_val = fmax(S_prev, Z);
+        double exp_prev = (S_prev == -INFINITY) ? 0.0 : exp(S_prev - max_val);
+        double exp_z = (Z == -INFINITY) ? 0.0 : exp(Z - max_val);
+        double denom = exp_prev + exp_z;
+        double frac_prev = (denom == 0.0) ? 0.0 : exp_prev / denom;
+        double frac_z = (denom == 0.0) ? 0.0 : exp_z / denom;
+
+        double d_Z = frac_z * d_S;
+        double d_A = d_log_h + carry_d_a - d_Z;
+
+        grad_log_values[curr] = T(d_Z);
+        grad_log_coeffs[curr] = T(d_A);
+
+        carry_d_a = d_A;
+        carry_d_s = frac_prev * d_S;
+    }
+}
+
+/*
+template<typename T>
+__global__ void fused_scan_backward_kernel(
+    T* __restrict__ grad_log_coeffs,
+    T* __restrict__ grad_log_values,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ log_coeffs,
+    const T* __restrict__ log_values,
+    const T* __restrict__ out,
+    const double* __restrict__ a_star_buf,
+    const double* __restrict__ s_buf,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int base = b * T_total * H + h;
+
+    double grad_a_star[1025] = {0};  // Assuming T_total <= 1024
+    double W = 0.0;  // Accumulates sum_{i=t}^{T-1} [grad_log_h[i] * exp(-s[i])]
+
+    for (int t = T_total - 1; t >= 0; t--) {
+        int curr = base + t * H;
+
+        double a_star = a_star_buf[curr];
+        double s_val = s_buf[curr];
+        double z_val = double(log_values[curr]) - a_star;
+
+        // Compute dL/d(log_h[t]) = dL/d(out[t]) * d(out[t])/d(log_h[t])
+        double grad_log_h = double(grad_out[curr]) * double(out[curr]);
+
+        // Update W: W[t] = grad_log_h[t] * exp(-s_val) + W[t+1]
+        W = grad_log_h * exp(-s_val) + W;
+
+        // Compute dL/d(z[t]) = exp(z_val) * W[t]
+        double grad_z = exp(z_val) * W;
+
+        // dL/d(log_values[t]) = dL/d(z[t]) * dz[t]/d(log_values[t]) = grad_z
+        grad_log_values[curr] = T(grad_z);
+
+        // dL/da_star[t] = dL/d(log_h[t]) - dL/d(z[t]) (due to chain rule)
+        grad_a_star[t] = grad_log_h - grad_z;
+    }
+
+    // Compute dL/d(log_coeffs) via cumulative sum of dL/da_star
+    double accum = 0.0;
+    for (int t = T_total - 1; t >= 0; t--) {
+        accum += grad_a_star[t];
+        grad_log_coeffs[base + t * H] = T(accum);
+    }
+}
+*/
+
 
 /*
 template<typename T>
@@ -375,66 +489,10 @@ __global__ void fused_scan_backward_kernel(
 */
 // This one tests correct but asserts
 template<typename T>
-__global__ void fused_scan_backward_kernel(
-    T* __restrict__ grad_log_coeffs,
-    T* __restrict__ grad_log_values,
-    const T* __restrict__ grad_out,
-    const T* __restrict__ log_coeffs,
-    const T* __restrict__ log_values,
-    const T* __restrict__ out,
-    const float* __restrict__ a_star_buf,
-    const float* __restrict__ s_buf,
-    int T_total,
-    int H,
-    int B
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H) return;
-
-    int b = idx / H;
-    int h = idx % H;
-
-    int base = b * T_total * H + h;
-
-    float grad_a_star[1025] = {0};  // Assuming T_total <= 1024
-    float W = 0.0f;  // Accumulates sum_{i=t}^{T-1} [grad_log_h[i] * exp(-s[i])]
-
-    for (int t = T_total - 1; t >= 0; t--) {
-        int curr = base + t * H;
-
-        float a_star = a_star_buf[curr];
-        float s_val = s_buf[curr];
-        float z_val = float(log_values[curr]) - a_star;
-
-        // Compute dL/d(log_h[t]) = dL/d(out[t]) * d(out[t])/d(log_h[t])
-        float grad_log_h = float(grad_out[curr]) * float(out[curr]);
-
-        // Update W: W[t] = grad_log_h[t] * exp(-s_val) + W[t+1]
-        W = grad_log_h * expf(-s_val) + W;
-
-        // Compute dL/d(z[t]) = exp(z_val) * W[t]
-        float grad_z = expf(z_val) * W;
-
-        // dL/d(log_values[t]) = dL/d(z[t]) * dz[t]/d(log_values[t]) = grad_z
-        grad_log_values[curr] = T(grad_z);
-
-        // dL/da_star[t] = dL/d(log_h[t]) - dL/d(z[t]) (due to chain rule)
-        grad_a_star[t] = grad_log_h - grad_z;
-    }
-
-    // Compute dL/d(log_coeffs) via cumulative sum of dL/da_star
-    float accum = 0.0f;
-    for (int t = T_total - 1; t >= 0; t--) {
-        accum += grad_a_star[t];
-        grad_log_coeffs[base + t * H] = T(accum);
-    }
-}
-
-template<typename T>
 void launch_fused_scan_forward(
     T* out,
-    float* a_star,
-    float* s_vals,
+    double* a_star,
+    double* s_vals,
     const T* log_coeffs,
     const T* log_values,
     int T_seq,
@@ -469,8 +527,8 @@ void launch_fused_scan_backward(
     const T* log_coeffs,
     const T* log_values,
     const T* out,
-    const float* a_star_buf,
-    const float* s_buf,
+    const double* a_star_buf,
+    const double* s_buf,
     int T_seq,
     int H,
     int B
@@ -482,11 +540,10 @@ void launch_fused_scan_backward(
         grad_log_coeffs,
         grad_log_values,
         grad_out,
-        log_coeffs,
-        log_values,
         out,
         a_star_buf,
         s_buf,
+        log_values,
         T_seq,
         H,
         B
@@ -498,10 +555,43 @@ void launch_fused_scan_backward(
     }
 }
 
+/*
+__device__ __forceinline__ float log_add_exp(const float a, const float b) {
+  if (::isnan(a) || ::isnan(b)) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  float min_val = fminf(a, b);
+  float max_val = fmaxf(a, b);
+  if (min_val != max_val || ::isfinite(min_val)) {
+    return max_val + log1pf(expf(min_val - max_val));
+  } else {
+      return a;
+  }
+}
+
+__device__ __forceinline__ float log_add_exp_backward(float x_val, float s_val) {
+  if (::isnan(x_val) || ::isnan(s_val)) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return expf(x_val - s_val);
+}
+*/
+
+__device__ __forceinline__ double log_add_exp(const double a, const double b) {
+  double min_val = fmin(a, b);
+  double max_val = fmax(a, b);
+  return max_val + log1p(exp(min_val - max_val));
+}
+
+__device__ __forceinline__ double log_add_exp_backward(double x, double s) {
+    return exp(x - s);
+}
+  
+// This exactly matches pytorch in double, but not in float
 template<typename T>
 __global__ void logcumsumexp_forward_kernel(
     T* __restrict__ out,           // exp(s[t])
-    float* __restrict__ s_buf,     // s[t] = logcumsumexp(x[0..t])
+    double* __restrict__ s_buf,     // s[t] = logcumsumexp(x[0..t])
     const T* __restrict__ x,       // input: log_values
     int T_total,
     int H,
@@ -515,24 +605,60 @@ __global__ void logcumsumexp_forward_kernel(
 
     int base = b * T_total * H + h;
 
-    float s = -INFINITY;
+    double s = -INFINITY;
 
     for (int t = 0; t < T_total; t++) {
         int curr = base + t * H;
-        float x_val = float(x[curr]);
+        double x_val = double(x[curr]);
 
         if (s == -INFINITY) {
             s = x_val;
         } else {
-            float max_val = fmaxf(s, x_val);
-            s = max_val + log1pf(expf(-fabsf(s - x_val)));
+            s = log_add_exp(s, x_val);
         }
 
         out[curr] = T(s);
         s_buf[curr] = s;
     }
 }
+template<typename T>
+__global__ void logcumsumexp_backward_kernel(
+    T* __restrict__ grad_x,
+    const T* __restrict__ grad_s,
+    const T* __restrict__ x,
+    const double* __restrict__ s_buf,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
 
+    int b = idx / H;
+    int h = idx % H;
+
+    int base = b * T_total * H + h;
+
+    double acc = 0.0;
+
+    for (int t = T_total - 1; t >= 0; --t) {
+        int curr = base + t * H;
+
+        double x_val = double(x[curr]);
+        double s_val = double(s_buf[curr]);
+        double g_val = double(grad_s[curr]);
+
+        if (t == T_total - 1) {
+            acc = g_val;
+        } else {
+            double s_next_val = double(s_buf[curr + H]);
+            acc = g_val + acc*log_add_exp_backward(s_val, s_next_val);
+        }
+
+        grad_x[curr] = T(acc*log_add_exp_backward(x_val, s_val));
+    }
+}
+/*
 template<typename T>
 __global__ void logcumsumexp_backward_kernel(
     T* __restrict__ grad_x,
@@ -561,17 +687,19 @@ __global__ void logcumsumexp_backward_kernel(
             int curr_t = base + t * H;
             float s_t = s_buf[curr_t];
             float prob = expf(x_i - s_t);
+            //float prob = log_add_exp_backward(x_i, s_t);
             g += float(grad_out[curr_t]) * prob;
         }
 
         grad_x[curr_i] = T(g);
     }
 }
+*/
 
 template<typename T>
 void launch_logcumsumexp_forward(
     T* out,
-    float* s_buf,
+    double* s_buf,
     const T* x,
     int T_total,
     int H,
@@ -594,7 +722,7 @@ void launch_logcumsumexp_backward(
     T* grad_x,
     const T* grad_out,
     const T* x,
-    const float* s_buf,
+    const double* s_buf,
     int T_total,
     int H,
     int B

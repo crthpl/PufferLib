@@ -166,16 +166,17 @@ public:
         auto out = torch::empty({B, T, H}, log_coeffs.options());
 
         // Intermediates: must be float32, but on same device!
-        auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-        auto a_star = torch::empty({B, T, H}, options_float);
-        auto s_vals = torch::empty({B, T, H}, options_float);
+        //auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+        auto a_star = torch::empty({B, T, H}, options_double);
+        auto s_vals = torch::empty({B, T, H}, options_double);
 
         // Launch kernel
         if (dtype == torch::kFloat32) {
             launch_fused_scan_forward<float>(
                 out.data_ptr<float>(),
-                a_star.data_ptr<float>(),  // float*
-                s_vals.data_ptr<float>(),  // float*
+                a_star.data_ptr<double>(),
+                s_vals.data_ptr<double>(),
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
                 static_cast<int>(T),
@@ -186,8 +187,8 @@ public:
         } else if (dtype == torch::kBFloat16) {
             launch_fused_scan_forward<at::BFloat16>(
                 out.data_ptr<at::BFloat16>(),
-                a_star.data_ptr<float>(),  // float* ← critical!
-                s_vals.data_ptr<float>(),  // float* ← critical!
+                a_star.data_ptr<double>(),
+                s_vals.data_ptr<double>(),
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
                 static_cast<int>(T),
@@ -200,6 +201,7 @@ public:
 
         // Save for backward (a_star and s_vals are float32, but that's fine)
         ctx->save_for_backward({log_coeffs, log_values, out, a_star, s_vals});
+            out = torch::nan_to_num(out, 0.0f, 0.0f, 0.0f);
 
         return {out};
     }
@@ -232,8 +234,8 @@ public:
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
                 out.data_ptr<float>(),
-                a_star_buf.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
+                a_star_buf.data_ptr<double>(),
+                s_vals.data_ptr<double>(),
                 static_cast<int>(T), // Probably not needed
                 static_cast<int>(H),
                 static_cast<int>(B)
@@ -246,8 +248,8 @@ public:
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
                 out.data_ptr<at::BFloat16>(),
-                a_star_buf.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
+                a_star_buf.data_ptr<double>(),
+                s_vals.data_ptr<double>(),
                 T, H, B
             );
         } else {
@@ -278,20 +280,21 @@ public:
         auto B = x.size(0), T = x.size(1), H = x.size(2);
 
         auto out = torch::empty({B, T, H}, x.options());
-        auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-        auto s_buf = torch::empty({B, T, H}, options_float);
+        //auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+        auto s_buf = torch::empty({B, T, H}, options_double);
 
         if (dtype == torch::kFloat32) {
             launch_logcumsumexp_forward<float>(
                 out.data_ptr<float>(),
-                s_buf.data_ptr<float>(),
+                s_buf.data_ptr<double>(),
                 x.data_ptr<float>(),
                 (int)T, (int)H, (int)B
             );
         } else if (dtype == torch::kBFloat16) {
             launch_logcumsumexp_forward<at::BFloat16>(
                 out.data_ptr<at::BFloat16>(),
-                s_buf.data_ptr<float>(),
+                s_buf.data_ptr<double>(),
                 x.data_ptr<at::BFloat16>(),
                 (int)T, (int)H, (int)B
             );
@@ -321,7 +324,7 @@ public:
                 grad_x.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
                 x.data_ptr<float>(),
-                s_buf.data_ptr<float>(),
+                s_buf.data_ptr<double>(),
                 (int)T, (int)H, (int)B
             );
         } else if (dtype == torch::kBFloat16) {
@@ -329,7 +332,7 @@ public:
                 grad_x.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
                 x.data_ptr<at::BFloat16>(),
-                s_buf.data_ptr<float>(),
+                s_buf.data_ptr<double>(),
                 (int)T, (int)H, (int)B
             );
         } else {

@@ -30,7 +30,7 @@ def parse_args(args):
             if arg.requires_grad:
                 backward = True
 
-            dtype = torch.float32 if arg.dtype == torch.float32 else arg.dtype
+            dtype = torch.float64 if arg.dtype == torch.float32 else arg.dtype
             py_args.append(arg.clone().detach().to(dtype).cuda().requires_grad_(arg.requires_grad))
             cpp_args.append(arg.clone().detach().cuda().requires_grad_(arg.requires_grad))
         else:
@@ -109,7 +109,9 @@ def test_mingru_gate():
     state = torch.randn(B, T, H)
     gate = torch.randn(B, T, H)
     hidden = torch.randn(B, T, H)
+    print('mingru_gate correctness')
     test_kernel(mingru_gate, _C.mingru_gate, state, gate, hidden)
+    print('mingru_gate forward')
     test_perf(mingru_gate, _C.mingru_gate, state, gate, hidden)
 
 def log_coeffs_and_values(gate, hidden):
@@ -128,6 +130,7 @@ def log_coeffs_and_values_loss(outputs):
 def test_log_coeffs_and_values():
     gate = torch.randn(B, T, H, requires_grad=True)
     hidden = torch.randn(B, T, H, requires_grad=True)
+    print('log_coeffs_and_values correctness')
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
     print('log_coeffs_and_values forward/backward')
     test_perf(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
@@ -154,6 +157,7 @@ def test_fused_scan():
 
     log_coeffs, log_values = log_coeffs_and_values(gate, hidden)
 
+    print('fused_scan correctness')
     test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
     print('fused_scan forward/backward')
     test_perf(fused_scan, _C.fused_scan, log_coeffs, log_values)
@@ -167,6 +171,7 @@ def logcumsumexp_loss(outputs):
 
 def test_logcumsumexp():
     x = torch.randn(B, T, H, requires_grad=True)
+    print('logcumsumexp correctness')
     test_kernel(logcumsumexp, _C.logcumsumexp_cuda, x)
     print('logcumsumexp forward/backward')
     test_perf(logcumsumexp, _C.logcumsumexp_cuda, x)
@@ -238,6 +243,7 @@ def test_fused_ppo_loss():
     args = (fused_ppo_loss, _C.fused_ppo_loss, logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, advantages.mean(), advantages.std(),
         clip_coef, vf_clip_coef, vf_coef, ent_coef)
+    print('fused_ppo_loss correctness')
     test_kernel(*args)
     print('fused_ppo_loss forward/backward')
     test_perf(*args)
@@ -245,7 +251,7 @@ def test_fused_ppo_loss():
 
 if __name__ == '__main__':
     test_mingru_gate()
-    #test_log_coeffs_and_values()
-    #test_logcumsumexp()
-    #test_fused_scan()
-    #test_fused_ppo_loss()
+    test_log_coeffs_and_values()
+    test_logcumsumexp()
+    test_fused_scan()
+    test_fused_ppo_loss()
