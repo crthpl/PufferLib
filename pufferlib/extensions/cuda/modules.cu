@@ -234,7 +234,9 @@ public:
                 out.data_ptr<float>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                T, H, B
+                static_cast<int>(T), // Probably not needed
+                static_cast<int>(H),
+                static_cast<int>(B)
             );
         } else if (dtype == torch::kBFloat16) {
             launch_fused_scan_backward<at::BFloat16>(
@@ -355,12 +357,12 @@ public:
         torch::Tensor prio,             // (N, 1) — importance weights
         torch::Tensor values,           // (N, T)
         torch::Tensor returns,          // (N, T)
-        torch::Tensor adv_mean,
-        torch::Tensor adv_std,
-        torch::Tensor clip_coef,
-        torch::Tensor vf_clip_coef,
-        torch::Tensor vf_coef,
-        torch::Tensor ent_coef
+        float adv_mean,
+        float adv_std,
+        float clip_coef,
+        float vf_clip_coef,
+        float vf_coef,
+        float ent_coef
     ) {
         TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
         auto dtype = logits.dtype();
@@ -373,12 +375,30 @@ public:
         auto A = logits.size(2);
 
         // Extract scalar hyperparams
+        /*
         float adv_mean_val = adv_mean.item<float>();
         float adv_std_val = adv_std.item<float>();
         float clip_coef_val = clip_coef.item<float>();
         float vf_clip_coef_val = vf_clip_coef.item<float>();
         float vf_coef_val = vf_coef.item<float>();
         float ent_coef_val = ent_coef.item<float>();
+        */
+
+        // DO NOT let the compiler know these values at compile time
+        /*
+        float adv_mean = rand() / static_cast<float>(RAND_MAX);
+        float adv_std = 0.5f + (rand() / static_cast<float>(RAND_MAX)) * 2.0f;  // [0.5, 2.5]
+        float clip_coef = (rand() / static_cast<float>(RAND_MAX)) * 0.4f;       // [0.0, 0.4]
+        float vf_clip_coef = (rand() / static_cast<float>(RAND_MAX)) * 0.4f;
+        float vf_coef = (rand() / static_cast<float>(RAND_MAX)) * 1.0f;
+        float ent_coef = (rand() / static_cast<float>(RAND_MAX)) * 0.1f;
+        float adv_mean= 1.0f;
+        float adv_std= 1.0f;
+        float clip_coef= 1.0f;
+        float vf_clip_coef= 1.0f;
+        float vf_coef= 1.0f;
+        float ent_coef= 1.0f;
+        */
 
         // Output: scalar loss
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
@@ -386,10 +406,6 @@ public:
 
         // Saved for backward: (N, T, 5) → but use (N*T, 5) for flat indexing
         auto saved_for_backward = torch::empty({N * T, 5}, options_float);
-
-        // Launch: one thread per (n, t)
-        int total = N * T;
-        int grid = (total + 255) / 256;
 
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_forward<float>(
@@ -403,12 +419,12 @@ public:
                 prio.data_ptr<float>(),      // (N, 1) → index as [n]
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
-                adv_mean_val,
-                adv_std_val,
-                clip_coef_val,
-                vf_clip_coef_val,
-                vf_coef_val,
-                ent_coef_val,
+                adv_mean,
+                adv_std,
+                clip_coef,
+                vf_clip_coef,
+                vf_coef,
+                ent_coef,
                 T, A, N
             );
         } else if (dtype == torch::kBFloat16) {
@@ -423,17 +439,18 @@ public:
                 prio.data_ptr<at::BFloat16>(),
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
-                adv_mean_val,
-                adv_std_val,
-                clip_coef_val,
-                vf_clip_coef_val,
-                vf_coef_val,
-                ent_coef_val,
+                adv_mean,
+                adv_std,
+                clip_coef,
+                vf_clip_coef,
+                vf_coef,
+                ent_coef,
                 T, A, N
             );
         }
 
         // Check errors
+        /*
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA kernel error: %s\n", cudaGetErrorString(err));
@@ -442,25 +459,26 @@ public:
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA sync error: %s\n", cudaGetErrorString(err));
         }
+        */
 
         // Compute mean loss: divide by (N * T)
-        float accumulated;
-        cudaMemcpy(&accumulated, loss_output.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
-        auto mean_loss = torch::tensor(accumulated / (N * T), options_float);
+        //float accumulated;
+        //cudaMemcpy(&accumulated, loss_output.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
+        //auto mean_loss = torch::tensor(accumulated / (N * T), options_float);
 
         // Save scalars
-        ctx->saved_data["adv_mean"] = adv_mean_val;
-        ctx->saved_data["adv_std"] = adv_std_val;
-        ctx->saved_data["clip_coef"] = clip_coef_val;
-        ctx->saved_data["vf_clip_coef"] = vf_clip_coef_val;
-        ctx->saved_data["vf_coef"] = vf_coef_val;
-        ctx->saved_data["ent_coef"] = ent_coef_val;
+        ctx->saved_data["adv_mean"] = adv_mean;
+        ctx->saved_data["adv_std"] = adv_std;
+        ctx->saved_data["clip_coef"] = clip_coef;
+        ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
+        ctx->saved_data["vf_coef"] = vf_coef;
+        ctx->saved_data["ent_coef"] = ent_coef;
 
         // Save inputs and intermediates
         ctx->save_for_backward({logits, values_pred, actions, old_logprobs, advantages,
                                 prio, values, returns, saved_for_backward});
 
-        return {mean_loss};
+        return {loss_output / (N * T)};
     }
     static torch::autograd::tensor_list backward(
         torch::autograd::AutogradContext* ctx,
@@ -495,9 +513,6 @@ public:
 
         auto grad_logits = torch::empty_like(logits);
         auto grad_values_pred = torch::empty_like(values_pred);
-
-        int total = N * T;
-        int grid = (total + 255) / 256;
 
         // TODO: Why are we passing grad loss in float?
         if (dtype == torch::kFloat32) {
@@ -570,18 +585,7 @@ torch::autograd::tensor_list fused_ppo_loss(
     float vf_coef,
     float ent_coef
 ) {
-    auto device = logits.device();
-    // TODO: Figure out how to pass without wrapping in tensors
-    auto adv_mean_t = torch::tensor(adv_mean, device=device);
-    auto adv_std_t = torch::tensor(adv_std, device=device);
-    auto clip_t = torch::tensor(clip_coef, device=device);
-    auto vf_clip_t = torch::tensor(vf_clip_coef, device=device);
-    auto vf_coef_t = torch::tensor(vf_coef, device=device);
-    auto ent_coef_t = torch::tensor(ent_coef, device=device);
-
-    auto result = PPOFusedLossFunction::apply(
-        logits, values_pred, actions, old_logprobs, advantages, prio, values, returns,
-        adv_mean_t, adv_std_t, clip_t, vf_clip_t, vf_coef_t, ent_coef_t
-    );
-    return result;
+    return PPOFusedLossFunction::apply(logits, values_pred, actions,
+        old_logprobs, advantages, prio, values, returns, adv_mean,
+        adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }

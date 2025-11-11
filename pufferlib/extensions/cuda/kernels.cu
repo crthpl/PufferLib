@@ -8,10 +8,13 @@
 
 #include <iostream>
 
-#define SEQ_SIZE 1
+#define SEQ_SIZE 32
 #define BLOCK_SIZE 256
 inline int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+}
+inline int seq_size(int N) {
+    return (N + SEQ_SIZE - 1) / SEQ_SIZE;
 }
 
 // If you can get this to work, go ahead. I tried.
@@ -127,8 +130,8 @@ __global__ void log_coeffs_and_values_backward_kernel(
     float grad_lc = float(grad_log_coeffs[idx]);
     float grad_lv = float(grad_log_values[idx]);
     float grad_g_from_lc = -softplus_bwd(grad_lc, g);
-    float grad_g_from_lz = -softplus_bwd(grad_lv, -g);
-    float grad_g_total = grad_g_from_lc + grad_lv * (-grad_g_from_lz);
+    float grad_g_from_lz = -softplus_bwd(-grad_lv, -g);
+    float grad_g_total = grad_g_from_lc + grad_g_from_lz;
     grad_gate[idx] = T(grad_g_total);
     float log_tilde_h;
     float grad_h_from_lt;
@@ -246,7 +249,7 @@ __global__ void fused_scan_forward_kernel(
     }
 }
 
-
+/*
 template<typename T>
 __global__ void fused_scan_backward_kernel(
     T* __restrict__ grad_log_coeffs,
@@ -305,7 +308,6 @@ __global__ void fused_scan_backward_kernel(
     }
 }
 
-/*
  template<typename T>
 __global__ void fused_scan_backward_kernel(
     T* __restrict__ grad_log_coeffs,
@@ -371,7 +373,62 @@ __global__ void fused_scan_backward_kernel(
     }
 }
 */
+// This one tests correct but asserts
+template<typename T>
+__global__ void fused_scan_backward_kernel(
+    T* __restrict__ grad_log_coeffs,
+    T* __restrict__ grad_log_values,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ log_coeffs,
+    const T* __restrict__ log_values,
+    const T* __restrict__ out,
+    const float* __restrict__ a_star_buf,
+    const float* __restrict__ s_buf,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
 
+    int b = idx / H;
+    int h = idx % H;
+
+    int base = b * T_total * H + h;
+
+    float grad_a_star[1025] = {0};  // Assuming T_total <= 1024
+    float W = 0.0f;  // Accumulates sum_{i=t}^{T-1} [grad_log_h[i] * exp(-s[i])]
+
+    for (int t = T_total - 1; t >= 0; t--) {
+        int curr = base + t * H;
+
+        float a_star = a_star_buf[curr];
+        float s_val = s_buf[curr];
+        float z_val = float(log_values[curr]) - a_star;
+
+        // Compute dL/d(log_h[t]) = dL/d(out[t]) * d(out[t])/d(log_h[t])
+        float grad_log_h = float(grad_out[curr]) * float(out[curr]);
+
+        // Update W: W[t] = grad_log_h[t] * exp(-s_val) + W[t+1]
+        W = grad_log_h * expf(-s_val) + W;
+
+        // Compute dL/d(z[t]) = exp(z_val) * W[t]
+        float grad_z = expf(z_val) * W;
+
+        // dL/d(log_values[t]) = dL/d(z[t]) * dz[t]/d(log_values[t]) = grad_z
+        grad_log_values[curr] = T(grad_z);
+
+        // dL/da_star[t] = dL/d(log_h[t]) - dL/d(z[t]) (due to chain rule)
+        grad_a_star[t] = grad_log_h - grad_z;
+    }
+
+    // Compute dL/d(log_coeffs) via cumulative sum of dL/da_star
+    float accum = 0.0f;
+    for (int t = T_total - 1; t >= 0; t--) {
+        accum += grad_a_star[t];
+        grad_log_coeffs[base + t * H] = T(accum);
+    }
+}
 
 template<typename T>
 void launch_fused_scan_forward(
@@ -385,9 +442,9 @@ void launch_fused_scan_forward(
     int B
 ) {
     int total = B * H;
-    int grid = grid_size(total);
+    int grid = seq_size(total);
 
-    fused_scan_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    fused_scan_forward_kernel<T><<<grid, SEQ_SIZE>>>(
         out,
         a_star,
         s_vals,
@@ -419,7 +476,7 @@ void launch_fused_scan_backward(
     int B
 ) {
     int total = B * H;
-    int grid = grid_size(total);
+    int grid = seq_size(total);
 
     fused_scan_backward_kernel<T><<<grid, SEQ_SIZE>>>(
         grad_log_coeffs,
@@ -521,9 +578,9 @@ void launch_logcumsumexp_forward(
     int B
 ) {
     int total = B * H;
-    int grid = (total + 255) / 256;
+    int grid = grid_size(total);
 
-    logcumsumexp_forward_kernel<T><<<grid, 256>>>(
+    logcumsumexp_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
         out, s_buf, x, T_total, H, B
     );
 
@@ -543,9 +600,9 @@ void launch_logcumsumexp_backward(
     int B
 ) {
     int total = B * H;
-    int grid = (total + 255) / 256;
+    int grid = grid_size(total);
 
-    logcumsumexp_backward_kernel<T><<<grid, 256>>>(
+    logcumsumexp_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
         grad_x, grad_out, x, s_buf, T_total, H, B
     );
 
@@ -556,7 +613,7 @@ void launch_logcumsumexp_backward(
 
 template<typename T>
 __global__ void ppo_loss_forward_kernel(
-    float* __restrict__ loss_output,
+    float* __restrict__ loss,
     float* __restrict__ saved_for_backward,
     const T* __restrict__ logits,
     const T* __restrict__ values_pred,
@@ -579,6 +636,7 @@ __global__ void ppo_loss_forward_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = N * T_seq;
     if (idx >= total_elements) return;
+    __shared__ float block_loss[BLOCK_SIZE];
 
     int n = idx / T_seq;  // batch index
     int t = idx % T_seq;  // timestep
@@ -643,7 +701,7 @@ __global__ void ppo_loss_forward_kernel(
     float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
 
     // === Step 6: total sample loss ===
-    float sample_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
+    float thread_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
 
     // === Save for backward ===
     float* saved_row = saved_for_backward + idx * 5;
@@ -653,8 +711,23 @@ __global__ void ppo_loss_forward_kernel(
     saved_row[3] = v_clipped;
     saved_row[4] = entropy;
 
+    // === Block-local reduction using shared memory ===
+    int tid = threadIdx.x;
+    block_loss[tid] = thread_loss;
+    __syncthreads();
+
+    // Reduce within block using tree reduction
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            block_loss[tid] += block_loss[tid + stride];
+        }
+        __syncthreads();
+    }
+
     // === Accumulate into loss_output (scalar via atomic add) ===
-    atomicAdd(loss_output, sample_loss);
+    if (tid == 0) {
+        atomicAdd(loss, block_loss[0]);
+    }
 }
 
 template<typename T>
@@ -796,7 +869,7 @@ __global__ void ppo_loss_backward_kernel(
 }
 
 template<typename T>
-void launch_ppo_loss_forward(
+inline void launch_ppo_loss_forward(
     float* loss_output,
     float* saved_for_backward,
     const T* logits,
@@ -818,9 +891,9 @@ void launch_ppo_loss_forward(
     int N
 ) {
     int total_elements = N * T_seq;
-    int grid = (total_elements + 255) / 256;
+    int grid = grid_size(total_elements);
 
-    ppo_loss_forward_kernel<T><<<grid, 256>>>(
+    ppo_loss_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
         loss_output,
         saved_for_backward,
         logits,
@@ -872,9 +945,9 @@ void launch_ppo_loss_backward(
     int N
 ) {
     int total_elements = N * T_seq;
-    int grid = (total_elements + 255) / 256;
+    int grid = grid_size(total_elements);
 
-    ppo_loss_backward_kernel<T><<<grid, 256>>>(
+    ppo_loss_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
         grad_logits,
         grad_values_pred,
         grad_loss,

@@ -44,7 +44,17 @@ torch::autograd::tensor_list fused_ppo_loss(
     float vf_clip_coef,
     float vf_coef,
     float ent_coef
+    /*
+    torch::Tensor adv_mean,
+    torch::Tensor adv_std,
+    torch::Tensor clip_coef,
+    torch::Tensor vf_clip_coef,
+    torch::Tensor vf_coef,
+    torch::Tensor ent_coef
+    */
 );
+
+auto DTYPE = torch::kFloat32;
 
 namespace pufferlib {
 
@@ -229,7 +239,7 @@ public:
                 -torch::nn::functional::softplus(-hidden));
             auto log_values = log_z + log_tilde_h;
             */
-            torch::autograd::tensor_list outputs = log_coeffs_and_values(gate, hidden);
+            torch::autograd::tensor_list outputs = log_coeffs_and_values(gate.contiguous(), hidden.contiguous());
             auto log_coeffs = outputs[0];
             auto log_values = outputs[1];
 
@@ -237,14 +247,12 @@ public:
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
-            /*
             auto a_star = log_coeffs.cumsum(1);
             auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
             auto log_h = a_star + log_h0_plus_b_star;
             out = log_h.exp();
-            */
 
-            out = fused_scan(log_coeffs, log_values)[0];
+            //out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
 
             out = out.narrow(1, out.size(1) - seq_len, seq_len);
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
@@ -652,7 +660,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 
     auto policy = new PolicyMinGRU(input_size, num_atns, hidden_size);
     policy->to(torch::kCUDA);
-    policy->to(torch::kBFloat16);
+    policy->to(DTYPE);
 
     auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
 
@@ -663,8 +671,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->max_epochs = max_epochs;
 
 
-    //pufferl->obs_buf = torch::zeros({4096, input_size}, torch::kBFloat16).to(torch::kCUDA);
-    //pufferl->state_in_buf = torch::zeros({4096, 2*hidden_size}, torch::kBFloat16).to(torch::kCUDA);
+    //pufferl->obs_buf = torch::zeros({4096, input_size}, DTYPE).to(torch::kCUDA);
+    //pufferl->state_in_buf = torch::zeros({4096, 2*hidden_size}, DTYPE).to(torch::kCUDA);
 
     //pufferl_init_cudagraph(pufferl.get());
     //pufferl_capture_forward(pufferl.get());
@@ -697,7 +705,7 @@ torch::Tensor compiled_evaluate(
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy = pufferl.policy;
 
-    state = state.to(torch::kBFloat16);
+    state = state.to(DTYPE);
 
     auto obs_buf = pufferl.obs_buf;
     auto state_in_buf = pufferl.state_in_buf;
@@ -708,8 +716,8 @@ torch::Tensor compiled_evaluate(
 
     for (int64_t i = 0; i < horizon; ++i) {
         /*
-        obs_buf.copy_(obs.to(torch::kBFloat16));
-        state_in_buf.copy_(state.to(torch::kBFloat16));
+        obs_buf.copy_(obs.to(DTYPE));
+        state_in_buf.copy_(state.to(DTYPE));
         pufferl_replay_forward(pufferl.get());
         state = pufferl->state_out_buf;
         auto logits = logits_buf;
@@ -717,8 +725,10 @@ torch::Tensor compiled_evaluate(
         auto state_out = state_out_buf;
         */
 
-        auto [logits, value, state_out] = policy->forward(obs.to(torch::kBFloat16), state);
+        auto [logits, value, state_out] = policy->forward(obs.to(DTYPE), state);
         state = state_out;
+
+        logits = torch::nan_to_num(logits);
 
         auto logprobs = torch::log_softmax(logits, 1);
         auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
@@ -802,9 +812,9 @@ void batched_forward(
         torch::Tensor mb_obs = observations.narrow(0, mb*minibatch_segments, minibatch_segments);
         torch::Tensor mb_state = torch::zeros(
             {minibatch_segments, 1, policy->hidden_size},
-            torch::kBFloat16
+            DTYPE
         ).to(device);
-        auto [logits, newvalue] = policy->forward_train(mb_obs.to(torch::kBFloat16)+rng, mb_state+rng);
+        auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE)+rng, mb_state+rng);
     }
 }
 
@@ -926,11 +936,11 @@ pybind11::dict compiled_train(
         // Initial LSTM states (zero or none)
         torch::Tensor mb_state= torch::zeros(
             {minibatch_segments, 1, policy->hidden_size},
-            torch::kBFloat16
+            DTYPE
         ).to(values.device());
 
         // Forward pass
-        auto [logits, newvalue] = policy->forward_train(mb_obs.to(torch::kBFloat16), mb_state);
+        auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
         /*
         std::cout << "Logits dtype: " << logits.dtype() << std::endl;
@@ -953,6 +963,8 @@ pybind11::dict compiled_train(
         */
 
         int BT = logits.size(0)*logits.size(1);
+        //torch::Tensor loss = torch::zeros({1}, logits.options());
+        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -969,8 +981,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
+        */
 
-        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -1031,8 +1043,6 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
-        */
-        
 
         // Backward pass
         loss.backward();
