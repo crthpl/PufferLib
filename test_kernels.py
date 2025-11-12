@@ -188,21 +188,17 @@ def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
     logprobs_new = torch.log_softmax(flat_logits, 1);
 
     probs_new = logprobs_new.exp();
-
-    newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-
-    newlogprob = newlogprob_flat.reshape(segments, horizon);
     entropy = - (probs_new * logprobs_new).sum(1).mean();
 
+    newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+    newlogprob = newlogprob_flat.reshape(segments, horizon);
     logratio = newlogprob - old_logprobs;
     ratio_new = logratio.exp();
 
     adv_normalized = prio.unsqueeze(1) * (advantages - adv_mean) / (adv_std + 1e-8);
-
     pg_loss1 = -adv_normalized * ratio_new;
     pg_loss2 = -adv_normalized * torch.clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
     pg_loss = torch.max(pg_loss1, pg_loss2).mean();
-
 
     newvalue = newvalue.view(returns.shape)
     v_clipped = values + torch.clamp(newvalue - values, -vf_clip_coef, vf_clip_coef);
@@ -210,6 +206,7 @@ def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
     v_loss_clipped = (v_clipped - returns).pow(2);
     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean();
 
+    # Entrop is a little off (1e-6)
     loss = pg_loss + vf_coef*v_loss - ent_coef*entropy
     return [loss]
 
@@ -233,12 +230,6 @@ def test_fused_ppo_loss():
     vf_clip_coef = torch.tensor(0.1)
     vf_coef = torch.tensor(0.1)
     ent_coef = torch.tensor(0.1)
-    '''
-    clip_coef = 0.1
-    vf_clip_coef = 0.1
-    vf_coef = 0.1
-    ent_coef = 0.1
-    '''
 
     args = (fused_ppo_loss, _C.fused_ppo_loss, logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, advantages.mean(), advantages.std(),

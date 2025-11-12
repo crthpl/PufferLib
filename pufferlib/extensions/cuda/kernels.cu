@@ -792,6 +792,7 @@ __global__ void ppo_loss_forward_kernel(
     logsumexp = max_logit + log(sum);
 
     // === Step 2: new_logprob[action] = logits[action] - logsumexp ===
+    // log_softmax = (logits - max_logit) - max_logit - logsumexp
     double new_logp = double(logits[logits_offset + act]) - logsumexp;
 
     // === Step 3: entropy = -sum_a p_a * log p_a ===
@@ -950,13 +951,15 @@ __global__ void ppo_loss_backward_kernel(
         double l = double(logits[logits_offset + a]);
         max_logit = fmax(max_logit, l);
     }
-    double sum_exp = 0.0;
+
+    double logsumexp = 0.0;
+    double sum = 0.0;
     for (int a = 0; a < A; a++) {
         double l = double(logits[logits_offset + a]);
-        sum_exp += exp(l - max_logit);
+        sum += exp(l - max_logit);
     }
-    double logsumexp = max_logit + log(sum_exp + 1e-8f);
-
+    logsumexp = max_logit + log(sum);
+ 
     // Zero grad_logits for this (n,t)
     for (int a = 0; a < A; a++) {
         grad_logits[logits_offset + a] = T(0.0f);
@@ -993,6 +996,9 @@ __global__ void ppo_loss_backward_kernel(
         d_logit -= p * d_new_logp;
 
         // Gradient from entropy
+        // TODO: Grad is a bit more off than I would like (1e-6)
+        // Probably need to check logsumexp (not cumulative) vs
+        // torch / actually look at the puffer 3 entropy impl
         double d_entropy_dlogit = p * (entropy - logp);
         d_logit += d_entropy_term * d_entropy_dlogit;
 
