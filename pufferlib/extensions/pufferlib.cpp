@@ -7,10 +7,76 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "../ocean/squared/squared.h"
+
 //#include <ATen/cuda/CUDAGraph.h>
 //#include <c10/cuda/CUDAGuard.h>
 
 #include <iostream>
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+create_squared_environments(int64_t num_envs, int64_t grid_size) {
+    auto envs_tensor = torch::empty({static_cast<int64_t>(num_envs * sizeof(Squared))}, torch::kUInt8);
+    auto obs = torch::zeros({num_envs, grid_size, grid_size}, torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+    auto actions = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+    auto rewards = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+    auto terminals = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+
+    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    for (int i = 0; i < num_envs; i++) {
+        Squared* env = &envs[i];
+        env->size = grid_size;
+        env->log = {0};
+        env->observations = obs.data_ptr<unsigned char>() + i * grid_size * grid_size;
+        env->actions = actions.data_ptr<int>() + i;
+        env->rewards = rewards.data_ptr<float>() + i;
+        env->terminals = terminals.data_ptr<unsigned char>() + i;
+        srand(i);
+        c_reset(env);
+    }
+    return std::make_tuple(envs_tensor, obs, actions, rewards, terminals);
+}
+
+void step_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
+    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    auto indices = indices_tensor.data_ptr<int>();
+    int num_envs = indices_tensor.size(0);
+    for (int i = 0; i < num_envs; i++) {
+        c_step(&envs[i]);
+    }
+}
+
+void reset_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
+    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    auto indices = indices_tensor.data_ptr<int>();
+    int num_reset = indices_tensor.size(0);
+    for (int i = 0; i < num_reset; i++) {
+        c_reset(&envs[indices[i]]);
+    }
+}
+
+Log log_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
+    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    auto indices = indices_tensor.data_ptr<int>();
+    int num_log = indices_tensor.size(0);
+    Log log = {0};
+    for (int i=0; i<num_log; i++) {
+        log.perf += envs[indices[i]].log.perf;
+        log.score += envs[indices[i]].log.score;
+        log.episode_return += envs[indices[i]].log.episode_return;
+        log.episode_length += envs[indices[i]].log.episode_length;
+        log.n += envs[indices[i]].log.n;
+    }
+    log.perf /= log.n;
+    log.score /= log.n;
+    log.episode_return /= log.n;
+    log.episode_length /= log.n;
+
+    for (int i = 0; i < num_log; i++) {
+        envs[indices[i]].log = {0};
+    }
+    return log;
+}
 
 namespace py = pybind11;
 
@@ -126,6 +192,7 @@ TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {
   m.impl("compute_puff_advantage", &compute_puff_advantage_cpu);
 }
 
+/*
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 create_squared_environments(int64_t num_envs, int64_t grid_size, torch::Tensor dummy);
 
@@ -142,6 +209,7 @@ void step_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_ten
 void reset_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
 
 Log log_environments_cuda(torch::Tensor envs_tensor, torch::Tensor indices_tensor);
+*/
 
 void compute_puff_advantage_cuda(
     torch::Tensor values,
@@ -714,6 +782,8 @@ torch::Tensor compiled_evaluate(
     auto state_out_buf = pufferl.state_out_buf;
     //auto forward_graph = pufferl.forward_graph;
 
+    auto device = torch::kCUDA;
+
     for (int64_t i = 0; i < horizon; ++i) {
         /*
         obs_buf.copy_(obs.to(DTYPE));
@@ -725,27 +795,30 @@ torch::Tensor compiled_evaluate(
         auto state_out = state_out_buf;
         */
 
-        auto [logits, value, state_out] = policy->forward(obs.to(DTYPE), state);
+        //auto [logits, value, state_out] = policy->forward(obs.to(device).to(DTYPE), state);
+        auto obs_cuda = obs.to(device);
+        auto [logits, value, state_out] = policy->forward(obs_cuda.to(DTYPE), state);
         state = state_out;
 
         logits = torch::nan_to_num(logits);
 
         auto logprobs = torch::log_softmax(logits, 1);
-        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
+        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1).to(torch::kInt32);
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store
-        obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
-        act_buffer.select(1, i).copy_(action.to(torch::kInt32));
+        obs_buffer.select(1, i).copy_(obs_cuda);
+        act_buffer.select(1, i).copy_(action);
         logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
         rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
         term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
         val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
 
-        actions.copy_(action);
+        actions.copy_(action.to(torch::kCPU));
         {
             pybind11::gil_scoped_release no_gil;
-            step_environments_cuda(envs_tensor, indices_tensor);
+            //step_environments_cuda(envs_tensor, indices_tensor);
+            step_environments(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
     }
@@ -1080,10 +1153,16 @@ pybind11::dict compiled_train(
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {
     m.def("create_squared_environments", &create_squared_environments);
+    m.def("step_environments", &step_environments);
+    m.def("reset_environments", &reset_environments);
+    m.def("log_environments", &log_environments);
+    /*
     m.def("step_environments", &step_environments_cuda);
     m.def("reset_environments", &reset_environments_cuda);
     m.def("log_environments", &log_environments_cuda);
+    */
     m.def("compiled_evaluate", &compiled_evaluate);
+
     //m.def("evaluate_step", &evaluate_step);
     m.def("compiled_train", &compiled_train);
     m.def("batched_forward", &batched_forward);

@@ -45,9 +45,11 @@ except ImportError:
 class SquaredEnv:
     def __init__(self, num_envs, grid_size):
         dummy = torch.zeros(5).cuda()
-        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size, dummy)
+        #self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size, dummy)
+        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size)
         self.observations = self.observations.view(num_envs, -1)
-        self.indices = torch.arange(num_envs).cuda().int()
+        #self.indices = torch.arange(num_envs).cuda().int()
+        self.indices = torch.arange(num_envs).int()
 
     def reset(self):
         _C.reset_environments(self.env, self.indices)
@@ -89,12 +91,13 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 
 class PuffeRL:
-    def __init__(self, config, logger=None, verbose=True):
+    def __init__(self, config, vecenv, logger=None, verbose=True):
         # Backend perf optimization
         num_envs = 4096
         self.num_envs = num_envs
         grid_size = 11
         dummy = torch.zeros(5).cuda()
+
         vecenv = SquaredEnv(num_envs, grid_size)
         vecenv.reset()
 
@@ -105,7 +108,7 @@ class PuffeRL:
         torch.manual_seed(seed)
 
         from gymnasium.spaces import Box, Discrete
-        obs_space = Box(low=-1, high=1, shape=(grid_size*grid_size,), dtype=np.float32)
+        obs_space = Box(low=0, high=2, shape=(grid_size*grid_size,), dtype=np.uint8)
         atn_space = Discrete(5)
         self.single_observation_space = obs_space
         self.single_action_space = atn_space
@@ -185,6 +188,7 @@ class PuffeRL:
         self.total_epochs = epochs
 
         self.pufferl_cpp = _C.create_pufferl(
+            #vecenv.envs[0].c_envs,
             grid_size*grid_size,
             5,
             128,
@@ -906,7 +910,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     train_config = dict(**args['train'])#, env=env_name)
     #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
-    pufferl = PuffeRL(train_config, logger, verbose)
+    pufferl = PuffeRL(train_config, vecenv, logger, verbose)
     pufferl.logger.init(args)
 
     all_logs = []
