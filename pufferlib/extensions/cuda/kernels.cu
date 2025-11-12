@@ -742,7 +742,7 @@ void launch_logcumsumexp_backward(
 template<typename T>
 __global__ void ppo_loss_forward_kernel(
     float* __restrict__ loss,
-    float* __restrict__ saved_for_backward,
+    double* __restrict__ saved_for_backward,
     const T* __restrict__ logits,
     const T* __restrict__ values_pred,
     const int64_t* __restrict__ actions,
@@ -751,12 +751,12 @@ __global__ void ppo_loss_forward_kernel(
     const T* __restrict__ prio,
     const T* __restrict__ values,
     const T* __restrict__ returns,
-    float adv_mean,
-    float adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef,
+    double adv_mean,
+    double adv_std,
+    double clip_coef,
+    double vf_clip_coef,
+    double vf_coef,
+    double ent_coef,
     int T_seq,
     int A,
     int N
@@ -777,62 +777,62 @@ __global__ void ppo_loss_forward_kernel(
     int act = actions[nt];  // action taken at (n,t)
 
     // Compute logsumexp: log(sum_a exp(logits[a]))
-    float max_logit = -INFINITY;
+    double max_logit = -INFINITY;
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        max_logit = fmaxf(max_logit, l);
+        double l = double(logits[logits_offset + a]);
+        max_logit = fmax(max_logit, l);
     }
 
-    float logsumexp = 0.0f;
-    float sum = 0.0f;
+    double logsumexp = 0.0;
+    double sum = 0.0;
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        sum += expf(l - max_logit);
+        double l = double(logits[logits_offset + a]);
+        sum += exp(l - max_logit);
     }
-    logsumexp = max_logit + logf(sum);
+    logsumexp = max_logit + log(sum);
 
     // === Step 2: new_logprob[action] = logits[action] - logsumexp ===
-    float new_logp = float(logits[logits_offset + act]) - logsumexp;
+    double new_logp = double(logits[logits_offset + act]) - logsumexp;
 
     // === Step 3: entropy = -sum_a p_a * log p_a ===
-    float entropy = 0.0f;
+    double entropy = 0.0;
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        float p = expf(l - logsumexp);
-        float logp = l - logsumexp;
+        double l = double(logits[logits_offset + a]);
+        double p = exp(l - logsumexp);
+        double logp = l - logsumexp;
         entropy -= p * logp;
     }
 
     // === Step 4: policy gradient loss ===
-    float old_logp = float(old_logprobs[nt]);
-    float adv = float(advantages[nt]);
-    float w = float(prio[n]);  // importance weight, per-sequence
-    float adv_normalized = (adv - adv_mean) / (adv_std + 1e-8);
+    double old_logp = double(old_logprobs[nt]);
+    double adv = double(advantages[nt]);
+    double w = double(prio[n]);  // importance weight, per-sequence
+    double adv_normalized = (adv - adv_mean) / (adv_std + 1e-8);
 
-    float logratio = new_logp - old_logp;
-    float ratio = expf(logratio);
+    double logratio = new_logp - old_logp;
+    double ratio = exp(logratio);
 
-    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-    float pg_loss1 = -w * adv_normalized * ratio;
-    float pg_loss2 = -w * adv_normalized * ratio_clipped;
-    float pg_loss = fmaxf(pg_loss1, pg_loss2);  // PPO clipped surrogate loss
+    double ratio_clipped = fmax(1.0 - clip_coef, fmin(1.0 + clip_coef, ratio));
+    double pg_loss1 = -w * adv_normalized * ratio;
+    double pg_loss2 = -w * adv_normalized * ratio_clipped;
+    double pg_loss = fmax(pg_loss1, pg_loss2);  // PPO clipped surrogate loss
 
     // === Step 5: value function loss ===
-    float val = float(values[nt]);
-    float ret = float(returns[nt]);
-    float val_pred = float(values_pred[nt]);
+    double val = double(values[nt]);
+    double ret = double(returns[nt]);
+    double val_pred = double(values_pred[nt]);
 
-    float v_error = val_pred - val;
-    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
-    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
-    float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
+    double v_error = val_pred - val;
+    double v_clipped = val + fmax(-vf_clip_coef, fmin(vf_clip_coef, v_error));
+    double v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    double v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    double v_loss = 0.5f * fmax(v_loss_unclipped, v_loss_clipped);
 
     // === Step 6: total sample loss ===
-    float thread_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
+    double thread_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
 
     // === Save for backward ===
-    float* saved_row = saved_for_backward + idx * 5;
+    double* saved_row = saved_for_backward + idx * 5;
     saved_row[0] = new_logp;
     saved_row[1] = ratio;
     saved_row[2] = val_pred;
@@ -870,13 +870,13 @@ __global__ void ppo_loss_backward_kernel(
     const T* __restrict__ prio,
     const T* __restrict__ values,
     const T* __restrict__ returns,
-    const float* __restrict__ saved_for_backward,
-    float adv_mean,
-    float adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef,
+    const double* __restrict__ saved_for_backward,
+    double adv_mean,
+    double adv_std,
+    double clip_coef,
+    double vf_clip_coef,
+    double vf_coef,
+    double ent_coef,
     int T_seq,
     int A,
     int N
@@ -885,7 +885,7 @@ __global__ void ppo_loss_backward_kernel(
     int total_elements = N * T_seq;
     if (idx >= total_elements) return;
 
-    float inv_NT = 1.0f / (N * T_seq);
+    double inv_NT = 1.0f / (N * T_seq);
     int n = idx / T_seq;
     int t = idx % T_seq;
 
@@ -894,43 +894,43 @@ __global__ void ppo_loss_backward_kernel(
     int logits_offset = n * T_seq * A + t * A;
 
     // === Retrieve saved values from forward pass ===
-    const float* saved = saved_for_backward + idx * 5;
-    float new_logp = saved[0];   // new log prob of selected action
-    float ratio = saved[1];      // exp(new_logp - old_logp)
-    float val_pred = saved[2];   // value prediction
-    float v_clipped = saved[3];  // clipped value target
-    float entropy = saved[4];    // entropy at (n,t)
+    const double* saved = saved_for_backward + idx * 5;
+    double new_logp = saved[0];   // new log prob of selected action
+    double ratio = saved[1];      // exp(new_logp - old_logp)
+    double val_pred = saved[2];   // value prediction
+    double v_clipped = saved[3];  // clipped value target
+    double entropy = saved[4];    // entropy at (n,t)
 
     // === Read inputs ===
-    float old_logp = float(old_logprobs[nt]);
-    float adv = float(advantages[nt]);
-    float w = float(prio[n]);  // importance weight
-    float val = float(values[nt]);
-    float ret = float(returns[nt]);
+    double old_logp = double(old_logprobs[nt]);
+    double adv = double(advantages[nt]);
+    double w = double(prio[n]);  // importance weight
+    double val = double(values[nt]);
+    double ret = double(returns[nt]);
 
     // === Normalize advantage (same as forward) ===
-    float adv_normalized = (adv - adv_mean) / (adv_std + 1e-8f);
+    double adv_normalized = (adv - adv_mean) / (adv_std + 1e-8f);
 
     // Total loss gradient (scalar from autograd)
-    float dL = grad_loss[0] * inv_NT;  // dL/dloss
+    double dL = grad_loss[0] * inv_NT;  // dL/dloss
 
     // Gradients w.r.t. components
-    float d_pg_loss = dL;                    // policy loss contributes dL
-    float d_v_loss = dL * vf_coef;           // value loss scaled by vf_coef
-    float d_entropy_term = dL * (-ent_coef); // entropy bonus gradient
+    double d_pg_loss = dL;                    // policy loss contributes dL
+    double d_v_loss = dL * vf_coef;           // value loss scaled by vf_coef
+    double d_entropy_term = dL * (-ent_coef); // entropy bonus gradient
 
     // ===================================================
     // 1. Gradient w.r.t. value function prediction
     // ===================================================
-    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    double v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    double v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
 
     // Which branch was taken in forward? (same logic as PyTorch: use unclipped if tie)
     bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
-    float d_val_pred = 0.0f;
+    double d_val_pred = 0.0;
 
     if (use_clipped_vf) {
-        float v_error = val_pred - val;
+        double v_error = val_pred - val;
         if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
             d_val_pred = v_clipped - ret;  // = val_pred - ret
         }
@@ -945,17 +945,17 @@ __global__ void ppo_loss_backward_kernel(
     // 2. Gradient w.r.t. policy and entropy (logits)
     // ===================================================
     // Recompute logsumexp for gradient
-    float max_logit = -INFINITY;
+    double max_logit = -INFINITY;
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        max_logit = fmaxf(max_logit, l);
+        double l = double(logits[logits_offset + a]);
+        max_logit = fmax(max_logit, l);
     }
-    float sum_exp = 0.0f;
+    double sum_exp = 0.0;
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        sum_exp += expf(l - max_logit);
+        double l = double(logits[logits_offset + a]);
+        sum_exp += exp(l - max_logit);
     }
-    float logsumexp = max_logit + logf(sum_exp + 1e-8f);
+    double logsumexp = max_logit + log(sum_exp + 1e-8f);
 
     // Zero grad_logits for this (n,t)
     for (int a = 0; a < A; a++) {
@@ -963,33 +963,37 @@ __global__ void ppo_loss_backward_kernel(
     }
 
     // --- Policy Loss Gradient ---
-    float logratio = new_logp - old_logp;
-    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-    float pg_loss1 = -w * adv_normalized * ratio;
-    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+    double logratio = new_logp - old_logp;
+    double ratio_clipped = fmax(1.0f - clip_coef, fmin(1.0f + clip_coef, ratio));
+    double pg_loss1 = -w * adv_normalized * ratio;
+    double pg_loss2 = -w * adv_normalized * ratio_clipped;
 
-    bool use_clipped_pg = (pg_loss2 < pg_loss1);  // min loss → use clipped
-    float d_ratio = -w * adv_normalized * d_pg_loss;
+    double d_ratio = -w * adv_normalized * d_pg_loss;
+    if (pg_loss2 > pg_loss1) {
+        if (ratio <= (1.0 - clip_coef) || ratio >= (1.0 + clip_coef)) {
+            d_ratio = 0.0;
+        }
+    }
 
     // d(ratio)/d(new_logp) = ratio
-    float d_new_logp = d_ratio * ratio;
+    double d_new_logp = d_ratio * ratio;
 
     // --- Entropy Gradient ---
     // dH/dlogits[a] = p_a * (entropy - log p_a)
     for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_offset + a]);
-        float p = expf(l - logsumexp);
-        float logp = l - logsumexp;
+        double l = double(logits[logits_offset + a]);
+        double p = exp(l - logsumexp);
+        double logp = l - logsumexp;
 
         // Gradient from policy loss: d/dlogits[a] new_logp = δ_{a,act} - p_a
-        float d_logit = 0.0f;
+        double d_logit = 0.0f;
         if (a == actions[nt]) {
             d_logit += d_new_logp;
         }
         d_logit -= p * d_new_logp;
 
         // Gradient from entropy
-        float d_entropy_dlogit = p * (entropy - logp);
+        double d_entropy_dlogit = p * (entropy - logp);
         d_logit += d_entropy_term * d_entropy_dlogit;
 
         grad_logits[logits_offset + a] = T(d_logit);
@@ -999,7 +1003,7 @@ __global__ void ppo_loss_backward_kernel(
 template<typename T>
 inline void launch_ppo_loss_forward(
     float* loss_output,
-    float* saved_for_backward,
+    double* saved_for_backward,
     const T* logits,
     const T* values_pred,
     const int64_t* actions,
@@ -1008,12 +1012,12 @@ inline void launch_ppo_loss_forward(
     const T* prio,
     const T* values,
     const T* returns,
-    float adv_mean,
-    float adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef,
+    double adv_mean,
+    double adv_std,
+    double clip_coef,
+    double vf_clip_coef,
+    double vf_coef,
+    double ent_coef,
     int T_seq,
     int A,
     int N
@@ -1061,13 +1065,13 @@ void launch_ppo_loss_backward(
     const T* prio,
     const T* values,
     const T* returns,
-    const float* saved_for_backward,
-    float adv_mean,
-    float adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef,
+    const double* saved_for_backward,
+    double adv_mean,
+    double adv_std,
+    double clip_coef,
+    double vf_clip_coef,
+    double vf_coef,
+    double ent_coef,
     int T_seq,
     int A,
     int N

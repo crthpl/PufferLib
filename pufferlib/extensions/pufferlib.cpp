@@ -223,10 +223,10 @@ public:
         //out = hidden*gate + state;
 
         if (seq_len == 1) {
-            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-            gate = gate.sigmoid();
-            out = torch::lerp(state, hidden, gate);
-            //out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+            //hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+            //gate = gate.sigmoid();
+            //out = torch::lerp(state, hidden, gate);
+            out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
             next_prev_hidden = out;
         } else {
             /*
@@ -964,7 +964,6 @@ pybind11::dict compiled_train(
 
         int BT = logits.size(0)*logits.size(1);
         //torch::Tensor loss = torch::zeros({1}, logits.options());
-        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -981,8 +980,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
-        */
 
+        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -1043,6 +1042,7 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
+        */
 
         // Backward pass
         loss.backward();

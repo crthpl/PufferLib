@@ -360,12 +360,12 @@ public:
         torch::Tensor prio,             // (N, 1) — importance weights
         torch::Tensor values,           // (N, T)
         torch::Tensor returns,          // (N, T)
-        float adv_mean,
-        float adv_std,
-        float clip_coef,
-        float vf_clip_coef,
-        float vf_coef,
-        float ent_coef
+        double adv_mean,
+        double adv_std,
+        double clip_coef,
+        double vf_clip_coef,
+        double vf_coef,
+        double ent_coef
     ) {
         TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
         auto dtype = logits.dtype();
@@ -405,15 +405,16 @@ public:
 
         // Output: scalar loss
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
         auto loss_output = torch::zeros({1}, options_float);
 
         // Saved for backward: (N, T, 5) → but use (N*T, 5) for flat indexing
-        auto saved_for_backward = torch::empty({N * T, 5}, options_float);
+        auto saved_for_backward = torch::empty({N * T, 5}, options_double);
 
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_forward<float>(
                 loss_output.data_ptr<float>(),
-                saved_for_backward.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
                 logits.data_ptr<float>(),
                 values_pred.data_ptr<float>(),
                 actions.data_ptr<int64_t>(),
@@ -433,7 +434,7 @@ public:
         } else if (dtype == torch::kBFloat16) {
             launch_ppo_loss_forward<at::BFloat16>(
                 loss_output.data_ptr<float>(),
-                saved_for_backward.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
                 logits.data_ptr<at::BFloat16>(),
                 values_pred.data_ptr<at::BFloat16>(),
                 actions.data_ptr<int64_t>(),
@@ -503,12 +504,12 @@ public:
         auto T = logits.size(1);
         auto A = logits.size(2);
 
-        float adv_mean = ctx->saved_data["adv_mean"].to<float>();
-        float adv_std = ctx->saved_data["adv_std"].to<float>();
-        float clip_coef = ctx->saved_data["clip_coef"].to<float>();
-        float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<float>();
-        float vf_coef = ctx->saved_data["vf_coef"].to<float>();
-        float ent_coef = ctx->saved_data["ent_coef"].to<float>();
+        float adv_mean = ctx->saved_data["adv_mean"].to<double>();
+        float adv_std = ctx->saved_data["adv_std"].to<double>();
+        float clip_coef = ctx->saved_data["clip_coef"].to<double>();
+        float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
+        float vf_coef = ctx->saved_data["vf_coef"].to<double>();
+        float ent_coef = ctx->saved_data["ent_coef"].to<double>();
 
         auto grad_out_scalar = grad_outputs[0].sum();  // dL/d(loss)
         auto grad_loss = torch::empty({1}, logits.options()).to(torch::kFloat32);
@@ -530,7 +531,7 @@ public:
                 prio.data_ptr<float>(),
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
-                saved_for_backward.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
                 adv_mean, adv_std, clip_coef,
                 vf_clip_coef, vf_coef, ent_coef,
                 T, A, N
@@ -547,7 +548,7 @@ public:
                 prio.data_ptr<at::BFloat16>(),
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
-                saved_for_backward.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
                 adv_mean, adv_std, clip_coef,
                 vf_clip_coef, vf_coef, ent_coef,
                 T, A, N
