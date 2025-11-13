@@ -31,22 +31,22 @@ def default_tensor_dtype(dtype):
         torch.set_default_dtype(old_dtype)
 
 class Space:
-    def __init__(self, min, max, scale, mean, is_integer=False):
+    def __init__(self, min, max, scale, is_integer=False):
         self.min = min
         self.max = max
         self.scale = scale
-        self.mean = mean # TODO: awkward to have just this normalized
         self.norm_min = self.normalize(min)
         self.norm_max = self.normalize(max)
-        self.norm_mean = self.normalize(mean)
+        # Since min/max are normalized from -1 to 1, just use 0 as a mean
+        self.norm_mean = 0
         self.is_integer = is_integer
 
 class Linear(Space):
-    def __init__(self, min, max, scale, mean, is_integer=False):
+    def __init__(self, min, max, scale, is_integer=False):
         if scale == 'auto':
             scale = 0.5
 
-        super().__init__(min, max, scale, mean, is_integer)
+        super().__init__(min, max, scale, is_integer)
 
     def normalize(self, value):
         #assert isinstance(value, (int, float))
@@ -61,12 +61,12 @@ class Linear(Space):
         return value
 
 class Pow2(Space):
-    def __init__(self, min, max, scale, mean, is_integer=False):
+    def __init__(self, min, max, scale, is_integer=False):
         if scale == 'auto':
             scale = 0.5
             #scale = 2 / (np.log2(max) - np.log2(min))
 
-        super().__init__(min, max, scale, mean, is_integer)
+        super().__init__(min, max, scale, is_integer)
 
     def normalize(self, value):
         #assert isinstance(value, (int, float))
@@ -83,14 +83,14 @@ class Pow2(Space):
 class Log(Space):
     base: int = 10
 
-    def __init__(self, min, max, scale, mean, is_integer=False):
+    def __init__(self, min, max, scale, is_integer=False):
         if scale == 'time':
             # TODO: Set scaling param intuitively based on number of jumps from min to max
             scale = 1 / (np.log2(max) - np.log2(min))
         elif scale == 'auto':
             scale = 0.5
 
-        super().__init__(min, max, scale, mean, is_integer)
+        super().__init__(min, max, scale, is_integer)
 
     def normalize(self, value):
         #assert isinstance(value, (int, float))
@@ -109,11 +109,11 @@ class Log(Space):
 class Logit(Space):
     base: int = 10
 
-    def __init__(self, min, max, scale, mean, is_integer=False):
+    def __init__(self, min, max, scale, is_integer=False):
         if scale == 'auto':
             scale = 0.5
 
-        super().__init__(min, max, scale, mean, is_integer)
+        super().__init__(min, max, scale, is_integer)
 
     def normalize(self, value):
         #assert isinstance(value, (int, float))
@@ -147,12 +147,10 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
         assert 'distribution' in param
         distribution = param['distribution']
-        search_center = param['mean']
         kwargs = dict(
             min=param['min'],
             max=param['max'],
             scale=param['scale'],
-            mean=search_center,
         )
         if distribution == 'uniform':
             space = Linear(**kwargs)
@@ -432,7 +430,6 @@ class Protein:
             num_random_samples = 10,
             global_search_scale = 1,
             suggestions_per_pareto = 256,
-            seed_with_search_center = True,
             expansion_rate = 0.25,
             gp_training_iter = 50,
             gp_learning_rate = 0.001,
@@ -452,7 +449,6 @@ class Protein:
         self.hyperparameters = Hyperparameters(sweep_config)
         self.global_search_scale = global_search_scale
         self.suggestions_per_pareto = suggestions_per_pareto
-        self.seed_with_search_center = seed_with_search_center
         self.resample_frequency = resample_frequency
         self.max_suggestion_cost = _max_suggestion_cost
         self.expansion_rate = expansion_rate
@@ -641,8 +637,8 @@ class Protein:
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in candidates])
-        num_sample = len(candidates) * self.suggestions_per_pareto
-        suggestions = self.hyperparameters.sample(num_sample, mu=search_centers)
+        suggestions = self.hyperparameters.sample(
+            len(candidates)*self.suggestions_per_pareto, mu=search_centers)
 
         dedup_indices = self._filter_near_duplicates(suggestions)
         suggestions = suggestions[dedup_indices]
