@@ -362,15 +362,19 @@ private:
     torch::nn::Sequential encoder{nullptr};
     torch::nn::Linear decoder{nullptr};
     torch::nn::Linear value{nullptr};
-    std::shared_ptr<MinGRULayer> mingru{nullptr};
+    //std::shared_ptr<MinGRULayer> mingru{nullptr};
+    torch::nn::ModuleList mingru{nullptr};
 
 public:
     int64_t input_size;
     int64_t hidden_size;
     int64_t num_atns;
+    int64_t num_layers;
+    float expansion_factor;
 
-    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128)
-        : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns) {
+    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t num_layers = 1)
+        : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns), num_layers(num_layers) {
+        expansion_factor = 1.;
         encoder = register_module("encoder", torch::nn::Sequential(
             torch::nn::Linear(input_size, hidden_size),
             torch::nn::GELU()
@@ -387,12 +391,17 @@ public:
         torch::nn::init::orthogonal_(value->weight, 1.0);
         torch::nn::init::constant_(value->bias, 0.0);
 
-        mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
+        //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
+        mingru = torch::nn::ModuleList();
+        for (int64_t i = 0; i < num_layers; ++i) {
+            mingru->push_back(MinGRULayer(hidden_size, 1));
+        }
+        register_module("mingru", mingru);
     }
 
     torch::Tensor initial_state(int64_t batch_size, torch::Device device) {
         return torch::zeros(
-            {1, batch_size, hidden_size},
+            {num_layers, batch_size, hidden_size},
             torch::dtype(torch::kFloat32).device(device)
         );
     }
@@ -404,26 +413,34 @@ public:
         // Ensure flat input: [B, input_size]
         TORCH_CHECK(observations.dim() == 2 && observations.size(1) == input_size,
             "Observations must be [B, input_size]");
-        TORCH_CHECK(state.dim() == 2 && state.size(0) == B && state.size(1) == hidden_size*mingru->expansion_factor,
-            "state must be [1, B, hidden_size]");
+
+        TORCH_CHECK(state.dim() == 3 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == hidden_size*expansion_factor,
+            "state must be [num_layers, B, hidden_size]");
 
         auto hidden = encoder->forward(observations);
 
         hidden = hidden.unsqueeze(1);
-        state = state.unsqueeze(1); // change to 2 for multi-layer
+        state = state.unsqueeze(2);
 
         std::tuple<torch::Tensor, torch::Tensor> mingru_out;
-        mingru_out = mingru->forward(hidden, state);
-        auto hidden_out = std::get<0>(mingru_out);
-        auto state_out = std::get<1>(mingru_out);
 
-        hidden_out = hidden_out.squeeze(1);
-        state_out = state_out.squeeze(1); // change to 2 for multi-layer
+        for (int64_t i = 0; i < num_layers; ++i) {
+            auto state_in = state.select(0, i);
+            auto layer = (*mingru)[i]->as<MinGRULayer>();
+            mingru_out = layer->forward(hidden, state_in);
+            hidden = std::get<0>(mingru_out);
+            auto state_out = std::get<1>(mingru_out);
+            state.select(0, i).copy_(state_out);
+        }
 
-        auto logits = decoder->forward(hidden_out);
-        auto values = value->forward(hidden_out);
 
-        return {logits, values, state_out};
+        hidden = hidden.squeeze(1);
+        state = state.squeeze(2);
+
+        auto logits = decoder->forward(hidden);
+        auto values = value->forward(hidden);
+
+        return {logits, values, state};
     }
 
     std::tuple<torch::Tensor, torch::Tensor> forward_train(
@@ -441,8 +458,8 @@ public:
         int64_t B = x_shape[0];
         int64_t TT = (x.dim() == 3) ? x_shape[1] : 1;
 
-        TORCH_CHECK(state.dim() == 3 && state.size(0) == B && state.size(2) == hidden_size*mingru->expansion_factor,
-                "state must be [B, seq, hidden_size]");
+        TORCH_CHECK(state.dim() == 4 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == 1 && state.size(3) == hidden_size*expansion_factor,
+            "state must be [num_layers, B, 1, hidden_size]");
 
         // Flatten time steps if needed
         if (x.dim() == 3) {
@@ -456,8 +473,12 @@ public:
         hidden = hidden.reshape({B, TT, hidden_size});
 
         std::tuple<torch::Tensor, torch::Tensor> mingru_out;
-        mingru_out = mingru->forward(hidden, state);
-        hidden = std::get<0>(mingru_out);
+        for (int64_t i = 0; i < num_layers; ++i) {
+            auto state_in = state.select(0, i);
+            auto layer = (*mingru)[i]->as<MinGRULayer>();
+            mingru_out = layer->forward(hidden, state_in);
+            hidden = std::get<0>(mingru_out);
+        }
 
         auto flat_hidden = hidden.reshape({-1, hidden_size});
         auto logits = decoder->forward(flat_hidden);
@@ -727,7 +748,8 @@ void capture_forward(std::unique_ptr<pufferlib::PuffeRL>& pufferl) {
 */
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
-        int64_t num_atns, int64_t hidden_size, double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
+        int64_t num_atns, int64_t hidden_size, int64_t num_layers,
+        double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
 
     // Seeding
     torch::manual_seed(42);
@@ -748,7 +770,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     // BF16 reduction (if using bfloat16)
     torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
-    auto policy = new PolicyMinGRU(input_size, num_atns, hidden_size);
+    auto policy = new PolicyMinGRU(input_size, num_atns, hidden_size, num_layers);
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
 
@@ -1031,7 +1053,7 @@ pybind11::dict compiled_train(
         // HARDCODED LSTM SIZE 128
         // Initial LSTM states (zero or none)
         torch::Tensor mb_state= torch::zeros(
-            {minibatch_segments, 1, policy->hidden_size},
+            {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
             DTYPE
         ).to(values.device());
 

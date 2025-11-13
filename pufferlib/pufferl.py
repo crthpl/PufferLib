@@ -187,11 +187,13 @@ class PuffeRL:
         epochs = config['total_timesteps'] // config['batch_size']
         self.total_epochs = epochs
 
+        self.num_layers = 3
         self.pufferl_cpp = _C.create_pufferl(
             #vecenv.envs[0].c_envs,
             118,
             3,
             128,
+            self.num_layers,
             config['learning_rate'],
             config['adam_beta1'],
             config['adam_beta2'],
@@ -240,9 +242,10 @@ class PuffeRL:
         if config['use_rnn']:
             n = self.agents_per_batch
             h = 128
+            layers = self.num_layers
             #h = self.policy.hidden_size
  
-            state = torch.zeros((n, h), device=device)
+            state = torch.zeros((layers, n, h), device=device)
 
 
         '''
