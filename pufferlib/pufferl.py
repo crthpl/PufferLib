@@ -1040,6 +1040,7 @@ def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
         raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
+    args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
 
     method = args['sweep'].pop('method')
     try:
