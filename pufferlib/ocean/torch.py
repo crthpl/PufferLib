@@ -13,7 +13,7 @@ import pufferlib
 import pufferlib.models
 
 from pufferlib.models import Default as Policy
-from pufferlib.models import MinGRU, Mamba
+from pufferlib.models import MinGRU, Mamba, GRU
 from pufferlib.models import Convolutional as Conv
 Recurrent = pufferlib.models.LSTMWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor

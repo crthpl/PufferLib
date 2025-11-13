@@ -51,6 +51,8 @@ class MinGRULayer(Module):
         self.to_out = Linear(dim_inner, dim, bias = False) if proj_out else Identity()
         #nn.init.orthogonal_(self.to_out.weight)
 
+        self.norm = torch.nn.RMSNorm(dim)
+
     def forward(self, x, prev_hidden = None):
         seq_len = x.shape[1]
         hidden, gate = self.to_hidden_and_gate(x).chunk(2, dim = -1)
@@ -79,6 +81,9 @@ class MinGRULayer(Module):
         next_prev_hidden = out[:, -1:]
 
         out = self.to_out(out)
+
+        out = out + x
+        out = self.norm(out)
 
         return out, next_prev_hidden
 
@@ -167,6 +172,7 @@ class Default(nn.Module):
 
         self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers=num_layers)
         self.cell = nn.ModuleList([torch.nn.LSTMCell(hidden_size, hidden_size) for _ in range(num_layers)])
+
         for i in range(num_layers):
             cell = self.cell[i]
 
@@ -223,6 +229,82 @@ class Default(nn.Module):
         logits, values = self.decoder(flat_hidden)
         values = values.reshape(B, TT)
         return logits, values
+
+class GRU(nn.Module):
+    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size
+        self.num_layers = num_layers
+        self.obs_shape = env.single_observation_space.shape
+        self.encoder = DefaultEncoder(env, hidden_size)
+        self.decoder = DefaultDecoder(env, hidden_size)
+
+        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=num_layers)
+        self.cell = nn.ModuleList([torch.nn.GRUCell(hidden_size, hidden_size) for _ in range(num_layers)])
+        self.norm = torch.nn.RMSNorm(hidden_size)
+
+        for i in range(num_layers):
+            cell = self.cell[i]
+
+            w_ih = getattr(self.gru, f'weight_ih_l{i}')
+            w_hh = getattr(self.gru, f'weight_hh_l{i}')
+            b_ih = getattr(self.gru, f'bias_ih_l{i}')
+            b_hh = getattr(self.gru, f'bias_hh_l{i}')
+
+            nn.init.orthogonal_(w_ih, 1.0)
+            nn.init.orthogonal_(w_hh, 1.0)
+            b_ih.data.zero_()
+            b_hh.data.zero_()
+
+            cell.weight_ih = w_ih
+            cell.weight_hh = w_hh
+            cell.bias_ih = b_ih
+            cell.bias_hh = b_hh
+
+    def initial_state(self, batch_size, device):
+        h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        return (h,)
+
+    def forward_eval(self, x, state):
+        '''Forward function for inference. 3x faster than using LSTM directly'''
+        assert state[0].shape[1] == x.shape[0]
+        h = self.encoder(x)
+        state = state[0]
+        for i in range(self.num_layers):
+            h_in = h    
+            h = self.cell[i](h, state[i])
+            state[i] = h
+            h = h + h_in
+            h = self.norm(h)
+
+        logits, values = self.decoder(h)
+        return logits, values, (state,)
+
+    def forward(self, x):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
+
+        B, TT = x_shape[:2]
+        x = x.reshape(B*TT, *space_shape)
+        h = self.encoder(x)
+        assert h.shape == (B*TT, self.input_size)
+        h = h.reshape(B, TT, self.input_size)
+
+        h = h.transpose(0, 1)
+        h_in = h
+        h, _ = self.gru.forward(h)
+        h = h + h_in
+        h = self.norm(h)
+        h = h.transpose(0, 1)
+
+        flat_hidden = h.reshape(B*TT, self.hidden_size)
+        logits, values = self.decoder(flat_hidden)
+        values = values.reshape(B, TT)
+        return logits, values
+
 
 class MinGRU(nn.Module):
     def __init__(self, env, hidden_size=128, num_layers=1, expansion_factor=2, **kwargs):
