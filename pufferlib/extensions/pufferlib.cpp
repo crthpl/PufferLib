@@ -7,7 +7,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "../ocean/squared/squared.h"
+#include "../ocean/breakout/breakout.h"
 
 //#include <ATen/cuda/CUDAGraph.h>
 //#include <c10/cuda/CUDAGuard.h>
@@ -15,20 +15,40 @@
 #include <iostream>
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-create_squared_environments(int64_t num_envs, int64_t grid_size) {
-    auto envs_tensor = torch::empty({static_cast<int64_t>(num_envs * sizeof(Squared))}, torch::kUInt8);
-    auto obs = torch::zeros({num_envs, grid_size, grid_size}, torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
-    auto actions = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+create_environments(int64_t num_envs) {
+    int num_obs = 118;
+    auto obs_dtype = torch::kFloat32;
+
+    auto envs_tensor = torch::zeros({static_cast<int64_t>(num_envs * sizeof(Breakout))}, torch::kUInt8);
+    auto obs = torch::zeros({num_envs, num_obs}, torch::TensorOptions().dtype(obs_dtype).pinned_memory(true));
+    auto actions = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
     auto rewards = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
     auto terminals = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
 
-    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
+    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
     for (int i = 0; i < num_envs; i++) {
-        Squared* env = &envs[i];
-        env->size = grid_size;
+        Breakout* env = &envs[i];
+        env->frameskip = 4;
+        env->width = 576;
+        env->height = 330;
+        env->initial_paddle_width = 62;
+        env->paddle_width = 62;
+        env->paddle_height = 8;
+        env->ball_width = 32;
+        env->ball_height = 32;
+        env->brick_width = 32;
+        env->brick_height = 12;
+        env->brick_rows = 6;
+        env->brick_cols = 18;
+        env->initial_ball_speed = 256;
+        env->max_ball_speed = 448;
+        env->paddle_speed = 620;
+        env->continuous = 0;
+        init(env);
+ 
         env->log = {0};
-        env->observations = obs.data_ptr<unsigned char>() + i * grid_size * grid_size;
-        env->actions = actions.data_ptr<int>() + i;
+        env->observations = obs.data_ptr<float>() + i*num_obs;
+        env->actions = actions.data_ptr<float>() + i;
         env->rewards = rewards.data_ptr<float>() + i;
         env->terminals = terminals.data_ptr<unsigned char>() + i;
         srand(i);
@@ -38,8 +58,7 @@ create_squared_environments(int64_t num_envs, int64_t grid_size) {
 }
 
 void step_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
-    auto indices = indices_tensor.data_ptr<int>();
+    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
     int num_envs = indices_tensor.size(0);
     for (int i = 0; i < num_envs; i++) {
         c_step(&envs[i]);
@@ -47,33 +66,36 @@ void step_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) 
 }
 
 void reset_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
-    auto indices = indices_tensor.data_ptr<int>();
-    int num_reset = indices_tensor.size(0);
-    for (int i = 0; i < num_reset; i++) {
-        c_reset(&envs[indices[i]]);
+    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
+    int num_envs = indices_tensor.size(0);
+    for (int i = 0; i < num_envs; i++) {
+        c_reset(&envs[i]);
     }
 }
 
+void render_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
+    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
+    c_render(&envs[0]);
+}
+
 Log log_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Squared* envs = reinterpret_cast<Squared*>(envs_tensor.data_ptr<unsigned char>());
-    auto indices = indices_tensor.data_ptr<int>();
-    int num_log = indices_tensor.size(0);
+    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
+    int num_envs = indices_tensor.size(0);
     Log log = {0};
-    for (int i=0; i<num_log; i++) {
-        log.perf += envs[indices[i]].log.perf;
-        log.score += envs[indices[i]].log.score;
-        log.episode_return += envs[indices[i]].log.episode_return;
-        log.episode_length += envs[indices[i]].log.episode_length;
-        log.n += envs[indices[i]].log.n;
+    for (int i=0; i<num_envs; i++) {
+        log.perf += envs[i].log.perf;
+        log.score += envs[i].log.score;
+        log.episode_return += envs[i].log.episode_return;
+        log.episode_length += envs[i].log.episode_length;
+        log.n += envs[i].log.n;
     }
     log.perf /= log.n;
     log.score /= log.n;
     log.episode_return /= log.n;
     log.episode_length /= log.n;
 
-    for (int i = 0; i < num_log; i++) {
-        envs[indices[i]].log = {0};
+    for (int i = 0; i < num_envs; i++) {
+        envs[i].log = {0};
     }
     return log;
 }
@@ -808,17 +830,18 @@ torch::Tensor compiled_evaluate(
 
         // Store
         obs_buffer.select(1, i).copy_(obs_cuda);
-        act_buffer.select(1, i).copy_(action);
+        act_buffer.select(1, i).copy_(action.to(torch::kInt64));
         logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
         rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
         term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
         val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
 
-        actions.copy_(action.to(torch::kCPU));
+        actions.copy_(action.to(torch::kCPU).to(torch::kFloat32));
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             step_environments(envs_tensor, indices_tensor);
+            //render_environments(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
     }
@@ -1152,7 +1175,7 @@ pybind11::dict compiled_train(
 
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {
-    m.def("create_squared_environments", &create_squared_environments);
+    m.def("create_environments", &create_environments);
     m.def("step_environments", &step_environments);
     m.def("reset_environments", &reset_environments);
     m.def("log_environments", &log_environments);

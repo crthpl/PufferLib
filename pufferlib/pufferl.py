@@ -42,11 +42,11 @@ except ImportError:
 #def meta_step_environments(envs):
 #    pass
 
-class SquaredEnv:
-    def __init__(self, num_envs, grid_size):
+class CPPEnv:
+    def __init__(self, num_envs):
         dummy = torch.zeros(5).cuda()
         #self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size, dummy)
-        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size)
+        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_environments(num_envs)
         self.observations = self.observations.view(num_envs, -1)
         #self.indices = torch.arange(num_envs).cuda().int()
         self.indices = torch.arange(num_envs).int()
@@ -95,10 +95,10 @@ class PuffeRL:
         # Backend perf optimization
         num_envs = 4096
         self.num_envs = num_envs
-        grid_size = 11
+        #grid_size = 11
         dummy = torch.zeros(5).cuda()
 
-        vecenv = SquaredEnv(num_envs, grid_size)
+        vecenv = CPPEnv(num_envs)
         vecenv.reset()
 
         # Reproducibility
@@ -108,8 +108,8 @@ class PuffeRL:
         torch.manual_seed(seed)
 
         from gymnasium.spaces import Box, Discrete
-        obs_space = Box(low=0, high=2, shape=(grid_size*grid_size,), dtype=np.uint8)
-        atn_space = Discrete(5)
+        obs_space = Box(low=0, high=2, shape=(118,), dtype=np.float32)
+        atn_space = Discrete(3)
         self.single_observation_space = obs_space
         self.single_action_space = atn_space
 
@@ -189,8 +189,8 @@ class PuffeRL:
 
         self.pufferl_cpp = _C.create_pufferl(
             #vecenv.envs[0].c_envs,
-            grid_size*grid_size,
-            5,
+            118,
+            3,
             128,
             config['learning_rate'],
             config['adam_beta1'],
@@ -290,11 +290,12 @@ class PuffeRL:
 
         torch.cuda.synchronize()
         logs = self.vecenv.log()
-        self.stats['perf'] = [logs.perf]
-        self.stats['score'] = [logs.score]
-        self.stats['episode_return'] = [logs.episode_return]
-        self.stats['episode_length'] = [logs.episode_length]
-        self.stats['n'] = [logs.n]
+        if logs.n > 0:
+            self.stats['perf'] = [logs.perf]
+            self.stats['score'] = [logs.score]
+            self.stats['episode_return'] = [logs.episode_return]
+            self.stats['episode_length'] = [logs.episode_length]
+            self.stats['n'] = [logs.n]
 
         self.global_step += config['batch_size']
         profile.end()

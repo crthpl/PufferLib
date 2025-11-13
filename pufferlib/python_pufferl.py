@@ -140,14 +140,15 @@ class PuffeRL:
 
         # heavyball_momentum=True introduced in heavyball 2.1.1
         # recovers heavyball-1.7.2 behaviour - previously swept hyperparameters work well
+        '''
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
             lr=config['learning_rate'],
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
         )
- 
         '''
+ 
         self.optimizer = ForeachMuon(
             self.policy.parameters(),
             lr=config['learning_rate'],
@@ -155,6 +156,7 @@ class PuffeRL:
             eps=config['adam_eps'],
             #heavyball_momentum=True,
         )
+        '''
         self.muon = torch.optim.Muon(
             [e for e in self.policy.parameters() if e.dim() == 2],
             lr=config['learning_rate'],
@@ -203,6 +205,8 @@ class PuffeRL:
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        def count_parameters(model):
+            return sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
 
     @property
@@ -992,10 +996,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
     state = {}
     if args['train']['use_rnn']:
-        state = dict(
-            lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
-            lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
-        )
+        state = policy.initial_state(num_agents, device)
 
     frames = []
     while True:
@@ -1017,7 +1018,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         with torch.no_grad():
             ob = torch.as_tensor(ob).to(device)
-            logits, value = policy.forward_eval(ob, state)
+            logits, value, state = policy.forward_eval(ob, state)
             action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
             action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
