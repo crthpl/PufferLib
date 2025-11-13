@@ -57,7 +57,15 @@ def evaluate(env_name, load_model_path):
     Episode length -- Avg: 21539.7, Max: 29680.3
     Merge score -- Avg: 618011.8, Max: 918755.8
     Reached 32768 prob: 68.25 %
-    Reached 65536 prob: 13.09 %    
+    Reached 65536 prob: 13.09 %
+
+    # hidden 512 (replication): https://wandb.ai/kywch/pufferlib/runs/5thsjr61?nw=nwuserkywch
+    Num episodes: 115652
+    Max tile avg: 31773.2
+    Episode length -- Avg: 22196.4, Max: 30316.5
+    Merge score -- Avg: 639395.6, Max: 909969.8
+    Reached 32768 prob: 71.22 %
+    Reached 65536 prob: 14.75 %
     """
 
 def finetune(env_name, load_model_path):
@@ -80,5 +88,5 @@ def finetune(env_name, load_model_path):
     pufferl.train(env_name, args)
 
 if __name__ == '__main__':
-    evaluate('puffer_g2048', load_model_path='puffer_g2048_2ch3my60.pt')
+    evaluate('puffer_g2048', load_model_path='puffer_g2048_5thsjr61.pt')
     # finetune('puffer_g2048', load_model_path='puffer_g2048_256_base.pt')
