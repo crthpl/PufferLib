@@ -659,8 +659,8 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 
 typedef struct {
     PolicyMinGRU* policy;
-    //torch::optim::Muon* optimizer;
-    torch::optim::Adam* optimizer;
+    torch::optim::Muon* optimizer;
+    //torch::optim::Adam* optimizer;
     double lr;
     int64_t max_epochs;
     torch::Tensor obs_buf;
@@ -778,8 +778,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
 
-    auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
-    //auto optimizer = new torch::optim::Muon(policy->parameters(), torch::optim::MuonOptions(lr).betas({beta1, beta2}).eps(eps));
+    //auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    auto optimizer = new torch::optim::Muon(policy->parameters(), torch::optim::MuonOptions(lr).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy = policy;
