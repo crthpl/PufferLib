@@ -147,7 +147,6 @@ class PuffeRL:
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
         )
-        '''
  
         self.optimizer = ForeachMuon(
             self.policy.parameters(),
@@ -169,7 +168,6 @@ class PuffeRL:
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
         )
-        '''
 
         # Logging
         self.logger = logger
@@ -332,9 +330,9 @@ class PuffeRL:
         if config['anneal_lr'] and self.epoch > 0:
             lr_ratio = self.epoch / self.total_epochs
             learning_rate = learning_rate * 0.5 * (1 + np.cos(np.pi * lr_ratio))
-            self.optimizer.param_groups[0]['lr'] = learning_rate
-            #self.muon.param_groups[0]['lr'] = learning_rate
-            #self.adam.param_groups[0]['lr'] = learning_rate
+            #self.optimizer.param_groups[0]['lr'] = learning_rate
+            self.muon.param_groups[0]['lr'] = learning_rate
+            self.adam.param_groups[0]['lr'] = learning_rate
 
         num_minibatches = config['num_minibatches']
         for mb in range(num_minibatches):
@@ -421,12 +419,12 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                #self.muon.step()
-                #self.adam.step()
-                #self.muon.zero_grad()
-                #self.adam.zero_grad()
+                #self.optimizer.step()
+                #self.optimizer.zero_grad()
+                self.muon.step()
+                self.adam.step()
+                self.muon.zero_grad()
+                self.adam.zero_grad()
 
         # Reprioritize experience
         profile('train_misc', epoch)

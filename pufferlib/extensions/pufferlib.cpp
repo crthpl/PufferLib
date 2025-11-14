@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <torch/optim/optimizer.h>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
@@ -8,11 +9,13 @@
 #include <pybind11/stl.h>
 
 #include "../ocean/breakout/breakout.h"
+#include "muon.h"
 
 //#include <ATen/cuda/CUDAGraph.h>
 //#include <c10/cuda/CUDAGuard.h>
 
 #include <iostream>
+#include <vector>
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 create_environments(int64_t num_envs) {
@@ -656,6 +659,7 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 
 typedef struct {
     PolicyMinGRU* policy;
+    //torch::optim::Muon* optimizer;
     torch::optim::Adam* optimizer;
     double lr;
     int64_t max_epochs;
@@ -775,6 +779,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     policy->to(DTYPE);
 
     auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    //auto optimizer = new torch::optim::Muon(policy->parameters(), torch::optim::MuonOptions(lr).betas({beta1, beta2}).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy = policy;

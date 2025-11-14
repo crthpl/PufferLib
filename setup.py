@@ -258,9 +258,11 @@ if not NO_TRAIN:
             torch_sources,
             include_dirs=[pybind11.get_include(), torch.utils.cpp_extension.include_paths()[0]],
             extra_compile_args = {
-                "cxx": cxx_args,
+                "cxx": extra_compile_args + cxx_args,
                 "nvcc": nvcc_args,
-            }
+            },
+            extra_link_args=extra_link_args,
+            extra_objects=[RAYLIB_A],
         ),
     ]
 
