@@ -88,5 +88,18 @@ def finetune(env_name, load_model_path):
     pufferl.train(env_name, args)
 
 if __name__ == '__main__':
-    evaluate('puffer_g2048', load_model_path='puffer_g2048_5thsjr61.pt')
+    import os
+    import wandb
+
+    # https://wandb.ai/kywch/pufferlib/runs/5thsjr61?nw=nwuserkywch
+    wandb_run_id = '5thsjr61'
+    wandb.init(id=wandb_run_id, project='pufferlib', entity='kywch')
+
+    artifact = wandb.use_artifact(f'{wandb_run_id}:latest')
+    data_dir = artifact.download()
+    model_file = max(os.listdir(data_dir))
+    model_path = f'{data_dir}/{model_file}'
+    wandb.finish()
+
+    evaluate('puffer_g2048', load_model_path=model_path)
     # finetune('puffer_g2048', load_model_path='puffer_g2048_256_base.pt')
