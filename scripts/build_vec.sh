@@ -21,8 +21,8 @@ FLAGS=(
     -Wno-error=incompatible-pointer-types-discards-qualifiers
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
-    -fsanitize=address,undefined,bounds,pointer-overflow,leak
-    -fno-omit-frame-pointer
+    #-fsanitize=address,undefined,bounds,pointer-overflow,leak
+    #-fno-omit-frame-pointer
     -fPIC
 )
 

@@ -98,8 +98,8 @@ class PuffeRL:
         #grid_size = 11
         dummy = torch.zeros(5).cuda()
 
-        vecenv = CPPEnv(num_envs)
-        vecenv.reset()
+        #vecenv = CPPEnv(num_envs)
+        #vecenv.reset()
 
         # Reproducibility
         seed = config['seed']
@@ -203,7 +203,7 @@ class PuffeRL:
 
         # Initializations
         self.config = config
-        self.vecenv = vecenv
+        #self.vecenv = vecenv
         self.epoch = 0
         self.global_step = 0
         self.last_log_step = 0
@@ -274,12 +274,12 @@ class PuffeRL:
 
         state = _C.compiled_evaluate(
             self.pufferl_cpp,
-            self.vecenv.env,
-            self.vecenv.indices,
-            self.vecenv.observations,
-            self.vecenv.actions,
-            self.vecenv.rewards,
-            self.vecenv.terminals,
+            #self.vecenv.env,
+            #self.vecenv.indices,
+            #self.vecenv.observations,
+            #self.vecenv.actions,
+            #self.vecenv.rewards,
+            #self.vecenv.terminals,
             state,
             self.observations,
             self.actions,
@@ -292,13 +292,13 @@ class PuffeRL:
         )
 
         torch.cuda.synchronize()
-        logs = self.vecenv.log()
-        if logs.n > 0:
-            self.stats['perf'] = [logs.perf]
-            self.stats['score'] = [logs.score]
-            self.stats['episode_return'] = [logs.episode_return]
-            self.stats['episode_length'] = [logs.episode_length]
-            self.stats['n'] = [logs.n]
+        logs = _C.log_environments(self.pufferl_cpp)
+        if logs:
+            self.stats['perf'] = [logs['perf']]
+            self.stats['score'] = [logs['score']]
+            self.stats['episode_return'] = [logs['episode_return']]
+            self.stats['episode_length'] = [logs['episode_length']]
+            self.stats['n'] = [logs['n']]
 
         self.global_step += config['batch_size']
         profile.end()
@@ -891,7 +891,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
     vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv, env_name)
+    #policy = policy or load_policy(args, vecenv, env_name)
 
     if 'LOCAL_RANK' in os.environ:
         args['train']['device'] = torch.cuda.current_device()

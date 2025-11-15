@@ -10,6 +10,8 @@
 #include <pybind11/stl.h>
 
 #include "../ocean/breakout/breakout.h"
+#include "vecenv.h"
+#include <dlfcn.h>
 //#include "muon.h"
 
 //#include <ATen/cuda/CUDAGraph.h>
@@ -18,49 +20,80 @@
 #include <iostream>
 #include <vector>
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+create_environments_fn create_envs;
+env_init_fn env_init;
+vec_reset_fn vec_reset;
+vec_step_fn vec_step;
+env_close_fn env_close;
+vec_close_fn vec_close;
+vec_log_fn vec_log;
+vec_render_fn vec_render;
+
+std::tuple<VecEnv, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 create_environments(int64_t num_envs) {
+    void* handle = dlopen("./test_binding.so", RTLD_NOW);
+    if (!handle) {
+        fprintf(stderr, "dlopen error: %s\n", dlerror());
+        exit(1);
+    }
+    dlerror();
+
+    // Load the function pointer
+    create_envs = (create_environments_fn)dlsym(handle, "create_environments");
+    env_init = (env_init_fn)dlsym(handle, "env_init");
+    vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
+    vec_step = (vec_step_fn)dlsym(handle, "vec_step");
+    env_close = (env_close_fn)dlsym(handle, "env_close");
+    vec_close = (vec_close_fn)dlsym(handle, "vec_close");
+    vec_log = (vec_log_fn)dlsym(handle, "vec_log");
+    vec_render = (vec_render_fn)dlsym(handle, "vec_render");
+    
+    const char* dlsym_error = dlerror();
+    if (dlsym_error) {
+        fprintf(stderr, "dlsym error: %s\n", dlsym_error);
+        dlclose(handle);
+        exit(1);
+    }
+
+    // Now call it!
+    Dict* kwargs = create_dict(32);
+    dict_set_int(kwargs, "frameskip", 4);
+    dict_set_int(kwargs, "width", 576);
+    dict_set_int(kwargs, "height", 330);
+    dict_set_int(kwargs, "paddle_width", 62);
+    dict_set_int(kwargs, "paddle_height", 8);
+    dict_set_int(kwargs, "ball_width", 32);
+    dict_set_int(kwargs, "ball_height", 32);
+    dict_set_int(kwargs, "brick_width", 32);
+    dict_set_int(kwargs, "brick_height", 12);
+    dict_set_int(kwargs, "brick_rows", 6);
+    dict_set_int(kwargs, "brick_cols", 18);
+    dict_set_int(kwargs, "initial_ball_speed", 256);
+    dict_set_int(kwargs, "max_ball_speed", 448);
+    dict_set_int(kwargs, "paddle_speed", 620);
+    dict_set_int(kwargs, "continuous", 0);
+
+
+    VecEnv vec = create_envs(num_envs, kwargs);
+    printf("Created VecEnv with %d environments\n", vec.size);
+
+    // Close the library
+    //dlclose(handle);
+ 
+
     int num_obs = 118;
     auto obs_dtype = torch::kFloat32;
 
-    auto envs_tensor = torch::zeros({static_cast<int64_t>(num_envs * sizeof(Breakout))}, torch::kUInt8);
-    auto obs = torch::zeros({num_envs, num_obs}, torch::TensorOptions().dtype(obs_dtype).pinned_memory(true));
-    auto actions = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
-    auto rewards = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
-    auto terminals = torch::zeros({num_envs}, torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+    auto obs = torch::from_blob(vec.observations, {num_envs, num_obs}, obs_dtype);
+    auto actions = torch::from_blob(vec.actions, {num_envs}, torch::kFloat32);
+    auto rewards = torch::from_blob(vec.rewards, {num_envs}, torch::kFloat32);
+    auto terminals = torch::from_blob(vec.terminals, {num_envs}, torch::kUInt8);
 
-    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
-    for (int i = 0; i < num_envs; i++) {
-        Breakout* env = &envs[i];
-        env->frameskip = 4;
-        env->width = 576;
-        env->height = 330;
-        env->initial_paddle_width = 62;
-        env->paddle_width = 62;
-        env->paddle_height = 8;
-        env->ball_width = 32;
-        env->ball_height = 32;
-        env->brick_width = 32;
-        env->brick_height = 12;
-        env->brick_rows = 6;
-        env->brick_cols = 18;
-        env->initial_ball_speed = 256;
-        env->max_ball_speed = 448;
-        env->paddle_speed = 620;
-        env->continuous = 0;
-        init(env);
- 
-        env->log = {0};
-        env->observations = obs.data_ptr<float>() + i*num_obs;
-        env->actions = actions.data_ptr<float>() + i;
-        env->rewards = rewards.data_ptr<float>() + i;
-        env->terminals = terminals.data_ptr<unsigned char>() + i;
-        srand(i);
-        c_reset(env);
-    }
-    return std::make_tuple(envs_tensor, obs, actions, rewards, terminals);
+    vec_reset(vec);
+    return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
 
+/*
 void step_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
     Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
     int num_envs = indices_tensor.size(0);
@@ -103,6 +136,7 @@ Log log_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
     }
     return log;
 }
+*/
 
 namespace py = pybind11;
 
@@ -687,6 +721,7 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 
 typedef struct {
     PolicyMinGRU* policy;
+    VecEnv vec;
     torch::optim::Muon* muon;
     torch::optim::Adam* adam;
     double lr;
@@ -696,8 +731,26 @@ typedef struct {
     torch::Tensor logits_buf;
     torch::Tensor value_buf;
     torch::Tensor state_out_buf;
+    torch::Tensor env_obs;
+    torch::Tensor env_actions;
+    torch::Tensor env_rewards;
+    torch::Tensor env_terminals;
     void* cudagraph;
 } PuffeRL;
+
+pybind11::dict log_environments(pybind11::object pufferl_obj) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& vec = pufferl.vec;
+
+    Dict* out = create_dict(32);
+    vec_log(vec, out);
+
+    pybind11::dict py_out;
+    for (int i = 0; i < out->size; i++) {
+        py_out[out->items[i].key] = out->items[i].float_value;
+    }
+    return py_out;
+}
 
 /*
 // Create graph
@@ -826,6 +879,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->lr = lr;
     pufferl->max_epochs = max_epochs;
 
+    auto [vec, obs, actions, rewards, terminals] = create_environments(4096);
+    pufferl->vec = vec;
+    pufferl->env_obs = obs;
+    pufferl->env_actions = actions;
+    pufferl->env_rewards = rewards;
+    pufferl->env_terminals = terminals;
 
     //pufferl->obs_buf = torch::zeros({4096, input_size}, DTYPE).to(torch::kCUDA);
     //pufferl->state_in_buf = torch::zeros({4096, 2*hidden_size}, DTYPE).to(torch::kCUDA);
@@ -839,12 +898,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 // Updated compiled_evaluate
 torch::Tensor compiled_evaluate(
     pybind11::object pufferl_obj,
-    torch::Tensor envs_tensor,
-    torch::Tensor indices_tensor,
-    torch::Tensor obs,
-    torch::Tensor actions,
-    torch::Tensor rewards,
-    torch::Tensor terminals,
     //torch::Tensor lstm_h,
     torch::Tensor state,
     torch::Tensor obs_buffer,
@@ -860,6 +913,12 @@ torch::Tensor compiled_evaluate(
 
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy = pufferl.policy;
+    auto& vec = pufferl.vec;
+
+    auto obs = pufferl.env_obs;
+    auto actions = pufferl.env_actions;
+    auto rewards = pufferl.env_rewards;
+    auto terminals = pufferl.env_terminals;
 
     state = state.to(DTYPE);
 
@@ -906,7 +965,7 @@ torch::Tensor compiled_evaluate(
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
-            step_environments(envs_tensor, indices_tensor);
+            vec_step(vec);
             //render_environments(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
@@ -1044,6 +1103,13 @@ pybind11::dict compiled_train(
 
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
     ratio.fill_(1.0);
+
+    /*
+    std::cout << "values shape: " << values.sizes() << std::endl;
+    std::cout << "rewards shape: " << rewards.sizes() << std::endl;
+    std::cout << "terminals shape: " << terminals.sizes() << std::endl;
+    std::cout << "ratio shape: " << ratio.sizes() << std::endl;
+    */
 
     auto advantages = torch::zeros_like(values);
     compute_puff_advantage_cuda(
@@ -1245,9 +1311,6 @@ pybind11::dict compiled_train(
 
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {
-    m.def("create_environments", &create_environments);
-    m.def("step_environments", &step_environments);
-    m.def("reset_environments", &reset_environments);
     m.def("log_environments", &log_environments);
     /*
     m.def("step_environments", &step_environments_cuda);
