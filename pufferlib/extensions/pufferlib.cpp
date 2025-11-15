@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch/optim/optimizer.h>
+#include <torch/optim/muon.h>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
@@ -274,11 +275,33 @@ struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
     }
 };
 
+class RMSNorm : public torch::nn::Module {
+private:
+    int64_t dim;
+    torch::Tensor weight{nullptr};
+
+public:
+    RMSNorm(int64_t dim)
+        : dim(dim) {
+
+        weight = register_parameter("weight", torch::ones(dim));
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        int ndim = x.dim();
+        TORCH_CHECK(x.size(ndim - 1) == dim, "Last dimension must match expected size");
+        auto mean_sq = (x*x).mean(ndim - 1, true);
+        return weight * x/mean_sq.sqrt();
+    }
+};
+
+
 class MinGRULayer : public torch::nn::Module {
 private:
     int64_t dim;
     torch::nn::Linear to_hidden_and_gate{nullptr};
     torch::nn::Linear to_out{nullptr};
+    std::shared_ptr<RMSNorm> rmsnorm{nullptr};
 
 public:
     int64_t expansion_factor;
@@ -288,14 +311,16 @@ public:
         int dim_inner = int(dim * expansion_factor);
         to_hidden_and_gate = register_module("to_hidden_and_gate",
                 torch::nn::Linear(torch::nn::LinearOptions(dim, 2*dim_inner).bias(false)));
-        torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
+        //torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
 
         // TODO: Is there a way to have this be identity to keep param count correct?
         //if (expansion_factor != 1.) {
         to_out = register_module("to_out",
                 torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
-        torch::nn::init::orthogonal_(to_out->weight);
+        //torch::nn::init::orthogonal_(to_out->weight);
         //}
+
+        rmsnorm = register_module("rmsnorm", std::make_shared<RMSNorm>(dim));
     }
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor x, torch::Tensor state = torch::Tensor()) {
@@ -355,6 +380,9 @@ public:
             out = to_out->forward(out);
         }
 
+        out = out + x;
+        out = rmsnorm->forward(out);
+
         return std::make_tuple(out, next_prev_hidden);
     }
 };
@@ -383,15 +411,15 @@ public:
             torch::nn::GELU()
         ));
         auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
-        torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
+        //torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
         torch::nn::init::constant_(encoder_linear->bias, 0.0);
 
         decoder = register_module("decoder", torch::nn::Linear(hidden_size, num_atns));
-        torch::nn::init::orthogonal_(decoder->weight, 0.01);
+        //torch::nn::init::orthogonal_(decoder->weight, 0.01);
         torch::nn::init::constant_(decoder->bias, 0.0);
 
         value = register_module("value", torch::nn::Linear(hidden_size, 1));
-        torch::nn::init::orthogonal_(value->weight, 1.0);
+        //torch::nn::init::orthogonal_(value->weight, 1.0);
         torch::nn::init::constant_(value->bias, 0.0);
 
         //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
@@ -659,8 +687,8 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 
 typedef struct {
     PolicyMinGRU* policy;
-    torch::optim::Muon* optimizer;
-    //torch::optim::Adam* optimizer;
+    torch::optim::Muon* muon;
+    torch::optim::Adam* adam;
     double lr;
     int64_t max_epochs;
     torch::Tensor obs_buf;
@@ -778,12 +806,23 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
 
-    //auto optimizer = new torch::optim::Adam(policy->parameters(), torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
-    auto optimizer = new torch::optim::Muon(policy->parameters(), torch::optim::MuonOptions(lr).eps(eps));
+    std::vector<torch::Tensor> params_2d;
+    std::vector<torch::Tensor> params_not_2d;
+    for (auto& param : policy->parameters()) {
+        if (param.dim() == 2) {
+            params_2d.push_back(param);
+        } else {
+            params_not_2d.push_back(param);
+        }
+    }
+
+    auto adam = new torch::optim::Adam(params_not_2d, torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
+    auto muon = new torch::optim::Muon(params_2d, torch::optim::MuonOptions(lr).eps(eps).match_rms_adamw(true));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy = policy;
-    pufferl->optimizer = optimizer;
+    pufferl->adam = adam;
+    pufferl->muon = muon;
     pufferl->lr = lr;
     pufferl->max_epochs = max_epochs;
 
@@ -988,14 +1027,16 @@ pybind11::dict compiled_train(
     {
     pybind11::gil_scoped_release no_gil;
     auto& policy = pufferl.policy;
-    auto& optimizer = pufferl.optimizer;
+    auto& adam = pufferl.adam;
+    auto& muon = pufferl.muon;
 
     auto device = values.device();
     auto terminals = terminals_input.to(torch::kFloat32);
 
     if (anneal_lr) {
         double lr = cosine_annealing(pufferl.lr, current_epoch, pufferl.max_epochs);
-        optimizer->param_groups().at(0).options().set_lr(lr);
+        adam->param_groups().at(0).options().set_lr(lr);
+        muon->param_groups().at(0).options().set_lr(lr);
     }
 
     // Annealed priority exponent
@@ -1173,8 +1214,10 @@ pybind11::dict compiled_train(
         // Gradient accumulation and step
         if ((mb + 1) % accumulate_minibatches == 0) {
             torch::nn::utils::clip_grad_norm_(policy->parameters(), max_grad_norm);
-            optimizer->step();
-            optimizer->zero_grad();
+            adam->step();
+            muon->step();
+            adam->zero_grad();
+            muon->zero_grad();
         }
     }
 
@@ -1234,7 +1277,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &pufferlib::PuffeRL::policy)
-        .def_readwrite("optimizer", &pufferlib::PuffeRL::optimizer);
+        .def_readwrite("adam", &pufferlib::PuffeRL::adam)
+        .def_readwrite("muon", &pufferlib::PuffeRL::muon);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
     cls.def(py::init<int64_t, int64_t, int64_t>());
