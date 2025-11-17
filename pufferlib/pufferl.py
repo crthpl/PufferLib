@@ -146,6 +146,11 @@ class PuffeRL:
             self.logger = Logger(config)
 
         epochs = config['total_timesteps'] // config['batch_size']
+        eta_min = config['learning_rate'] * config['min_lr_ratio']
+        
+        #TODO: Min LR in cpp!
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=eta_min)
         self.total_epochs = epochs
 
         self.num_layers = 4
@@ -725,6 +730,7 @@ class WandbLogger:
             resume=resume,
             config=args,
             tags = [args['tag']] if args['tag'] is not None else [],
+            settings=wandb.Settings(console="off"),  # stop sending dashboard to wandb
         )
         self.wandb = wandb
         self.run_id = wandb.run.id
@@ -1149,6 +1155,7 @@ def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
         raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
+    args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
 
     method = args['sweep'].pop('method')
     try:
@@ -1165,7 +1172,10 @@ def sweep(args=None, env_name=None):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        sweep.suggest(args)
+        # In the first run, skip sweep and use the train args specified in the config
+        if i > 0:
+            sweep.suggest(args)
+
         all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
         all_logs = [e for e in all_logs if target_key in e]
 
