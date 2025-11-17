@@ -38,35 +38,6 @@ try:
 except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
 
-#@torch.library.impl_abstract("squared::step_environments")
-#def meta_step_environments(envs):
-#    pass
-
-class CPPEnv:
-    def __init__(self, num_envs):
-        dummy = torch.zeros(5).cuda()
-        #self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_squared_environments(num_envs, grid_size, dummy)
-        self.env, self.observations, self.actions, self.rewards, self.terminals = _C.create_environments(num_envs)
-        self.observations = self.observations.view(num_envs, -1)
-        #self.indices = torch.arange(num_envs).cuda().int()
-        self.indices = torch.arange(num_envs).int()
-
-    def reset(self):
-        _C.reset_environments(self.env, self.indices)
-        return self.observations
-
-    def step(self, actions):
-        self.actions[:] = actions
-        _C.step_environments(self.env)
-        return self.observations, self.rewards, self.terminals
-
-    def log(self):
-        return _C.log_environments(self.env, self.indices)
-
-    def close(self):
-        # TODO
-        pass
-
 import rich
 import rich.traceback
 from rich.table import Table
@@ -113,9 +84,6 @@ class PuffeRL:
         self.single_observation_space = obs_space
         self.single_action_space = atn_space
 
-        #policy = _C.PolicyLSTM(grid_size*grid_size, 5, 128)
-        #policy.cuda()
-
         # Vecenv info
         #vecenv.async_reset(seed)
         #obs_space = vecenv.single_observation_space
@@ -160,13 +128,6 @@ class PuffeRL:
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
 
-        # LSTM
-        if config['use_rnn']:
-            n = self.agents_per_batch
-            h = 128
-            self.lstm_h = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
-            self.lstm_c = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
-
         # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
         max_minibatch_size = config['max_minibatch_size']
@@ -187,7 +148,7 @@ class PuffeRL:
         epochs = config['total_timesteps'] // config['batch_size']
         self.total_epochs = epochs
 
-        self.num_layers = 3
+        self.num_layers = 4
         self.pufferl_cpp = _C.create_pufferl(
             #vecenv.envs[0].c_envs,
             118,
@@ -239,47 +200,9 @@ class PuffeRL:
         config = self.config
         device = config['device']
 
-        if config['use_rnn']:
-            n = self.agents_per_batch
-            h = 128
-            layers = self.num_layers
-            #h = self.policy.hidden_size
- 
-            state = torch.zeros((layers, n, h), device=device)
-
-
-        '''
-        for t in range(self.config['bptt_horizon']):
-            lstm_h, lstm_c = _C.evaluate_step(
-                self.pufferl_cpp,
-                self.vecenv.env,
-                self.vecenv.indices,
-                self.vecenv.observations,
-                self.vecenv.actions,
-                self.vecenv.rewards,
-                self.vecenv.terminals,
-                lstm_h,
-                lstm_c,
-                self.observations,
-                self.actions,
-                self.logprobs,
-                self.rewards,
-                self.terminals,
-                self.values,
-                t
-            )
-            self.rewards[:, t].clamp_(-1.0, 1.0)
-            self.vecenv.step(self.actions[:, t])
-        '''
-
+        state = _C.initial_state(self.pufferl_cpp, self.agents_per_batch, torch.device(device))
         state = _C.compiled_evaluate(
             self.pufferl_cpp,
-            #self.vecenv.env,
-            #self.vecenv.indices,
-            #self.vecenv.observations,
-            #self.vecenv.actions,
-            #self.vecenv.rewards,
-            #self.vecenv.terminals,
             state,
             self.observations,
             self.actions,
@@ -323,7 +246,6 @@ class PuffeRL:
             self.truncations,
             self.ratio,
             self.values,
-            #self.scheduler if self.config['anneal_lr'] else None,
             self.total_minibatches,
             self.minibatch_segments,
             self.segments,  # Assuming self.segments = self.num_envs
@@ -346,7 +268,6 @@ class PuffeRL:
             self.epoch
         )
 
-        # Reprioritize experience
         profile('train_misc', epoch)
         profile.end()
         logs = None
