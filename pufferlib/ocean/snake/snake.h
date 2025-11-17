@@ -232,7 +232,7 @@ void step_snake(CSnake* env, int i) {
         env->rewards[i] = env->reward_death;
         env->snake_logs[i].episode_return += env->reward_death;
         env->snake_logs[i].score = env->snake_lengths[i];
-        env->snake_logs[i].perf = env->snake_logs[i].score / env->snake_logs[i].episode_length;
+        env->snake_logs[i].perf = fminf(env->snake_logs[i].score/120.0f, 1.0f);
         add_log(env, i);
         spawn_snake(env, i);
         return;

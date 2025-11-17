@@ -32,6 +32,7 @@ struct Log {
         float episode_return;
         float episode_length;
         float score;
+        float perf;
         float n;
 };
 
@@ -153,6 +154,7 @@ typedef struct PacmanEnv {
 
 void add_log(PacmanEnv *env) {
     env->log.score += env->score;
+    env->log.perf += (float)env->score / NUM_DOTS;
     env->log.episode_return += env->score;
     env->log.episode_length = env->step_count;
     env->log.n++;

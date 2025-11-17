@@ -13,6 +13,7 @@ import pufferlib
 import pufferlib.models
 
 from pufferlib.models import Default as Policy
+from pufferlib.models import MinGRU, Mamba, GRU
 from pufferlib.models import Convolutional as Conv
 Recurrent = pufferlib.models.LSTMWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
@@ -541,8 +542,8 @@ class TowerClimb(nn.Module):
 
 
 class ImpulseWarsLSTM(Recurrent):
-    def __init__(self, env: pufferlib.PufferEnv, policy: nn.Module, input_size: int = 512, hidden_size: int = 512):
-        super().__init__(env, policy, input_size, hidden_size)
+    def __init__(self, env, policy, hidden_size: int = 512, **kwargs):
+        super().__init__(env, policy, hidden_size)
 
 
 class ImpulseWarsPolicy(nn.Module):
@@ -551,7 +552,6 @@ class ImpulseWarsPolicy(nn.Module):
         env: pufferlib.PufferEnv,
         cnn_channels: int = 64,
         weapon_type_embedding_dims: int = 2,
-        input_size: int = 512,
         hidden_size: int = 512,
         batch_size: int = 131_072,
         num_drones: int = 2,
@@ -644,7 +644,7 @@ class ImpulseWarsPolicy(nn.Module):
         )
 
         self.encoder = nn.Sequential(
-            layer_init(nn.Linear(featuresSize, input_size)),
+            layer_init(nn.Linear(featuresSize, hidden_size)),
             nn.ReLU(),
         )
 

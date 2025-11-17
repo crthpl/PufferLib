@@ -11,6 +11,7 @@ import zipfile
 import tarfile
 import platform
 import shutil
+import pybind11
 
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
@@ -82,8 +83,12 @@ extra_link_args = [
 ]
 cxx_args = [
     '-fdiagnostics-color=always',
+    '-std=c++17',
 ]
-nvcc_args = []
+nvcc_args = [
+    '-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1',
+    '-std=c++17',
+]
 
 if DEBUG:
     extra_compile_args += [
@@ -167,14 +172,15 @@ class BuildExt(build_ext):
         self.run_command('build_torch')
         self.run_command('build_c')
 
+extnames = ["pufferlib._C", "squared_torch._C"]
 class CBuildExt(build_ext):
     def run(self, *args, **kwargs):
-        self.extensions = [e for e in self.extensions if e.name != "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name not in extnames]
         super().run(*args, **kwargs)
 
 class TorchBuildExt(cpp_extension.BuildExtension):
     def run(self):
-        self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
+        self.extensions = [e for e in self.extensions if e.name in extnames]
         super().run()
 
 INCLUDE = [f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
@@ -243,17 +249,24 @@ if not NO_TRAIN:
     if BUID_CUDA_EXT:
         extension = CUDAExtension
         torch_sources.append("pufferlib/extensions/cuda/pufferlib.cu")
+        torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
+        torch_sources.append("pufferlib/extensions/cuda/kernels.cu")
+        torch_sources.append("pufferlib/extensions/cuda/modules.cu")
     else:
         extension = CppExtension
 
+    import torch
     torch_extensions = [
        extension(
             "pufferlib._C",
             torch_sources,
+            include_dirs=[pybind11.get_include(), torch.utils.cpp_extension.include_paths()[0]],
             extra_compile_args = {
-                "cxx": cxx_args,
+                "cxx": extra_compile_args + cxx_args,
                 "nvcc": nvcc_args,
-            }
+            },
+            extra_link_args=extra_link_args,
+            extra_objects=[RAYLIB_A],
         ),
     ]
 
@@ -281,7 +294,7 @@ install_requires = [
 
 if not NO_TRAIN:
     install_requires += [
-        'torch',
+        'torch>=2.9',
         'psutil',
         'nvidia-ml-py',
         'rich',
