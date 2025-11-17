@@ -184,8 +184,9 @@ class PuffeRL:
 
         # Learning rate scheduler
         epochs = config['total_timesteps'] // config['batch_size']
+        eta_min = config['learning_rate'] * config['min_lr_ratio']
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=config['min_learning_rate'])
+            optimizer, T_max=epochs, eta_min=eta_min)
         self.total_epochs = epochs
 
         # Automatic mixed precision
@@ -879,6 +880,7 @@ class WandbLogger:
             resume=resume,
             config=args,
             tags = [args['tag']] if args['tag'] is not None else [],
+            settings=wandb.Settings(console="off"),  # stop sending dashboard to wandb
         )
         self.wandb = wandb
         self.run_id = wandb.run.id
