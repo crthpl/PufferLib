@@ -132,7 +132,7 @@ class PuffeRL:
         import heavyball
         from heavyball import ForeachMuon
         warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
-        heavyball.utils.compile_mode = "reduce-overhead"
+        heavyball.utils.compile_mode = "default"
 
         # # optionally a little bit better/faster alternative to newtonschulz iteration
         # import heavyball.utils
@@ -140,6 +140,7 @@ class PuffeRL:
 
         # heavyball_momentum=True introduced in heavyball 2.1.1
         # recovers heavyball-1.7.2 behaviour - previously swept hyperparameters work well
+
         '''
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
@@ -147,7 +148,6 @@ class PuffeRL:
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
         )
-        '''
  
         self.optimizer = ForeachMuon(
             self.policy.parameters(),
@@ -155,13 +155,15 @@ class PuffeRL:
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
             heavyball_momentum=True,
+            compile_step=False
         )
         '''
         self.muon = torch.optim.Muon(
             [e for e in self.policy.parameters() if e.dim() == 2],
             lr=config['learning_rate'],
             eps=config['adam_eps'],
-            adjust_lr_fn='match_rms_adamw'
+            weight_decay=0.0, #Why tf does this default to 0.1???
+            #adjust_lr_fn='match_rms_adamw'
         )
         self.adam = torch.optim.Adam(
             [e for e in self.policy.parameters() if e.dim() != 2],
@@ -169,7 +171,6 @@ class PuffeRL:
             betas=(config['adam_beta1'], config['adam_beta2']),
             eps=config['adam_eps'],
         )
-        '''
 
         # Logging
         self.logger = logger
@@ -335,9 +336,9 @@ class PuffeRL:
  
             #TODO: Min LR in cpp!
             learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
-            self.optimizer.param_groups[0]['lr'] = learning_rate
-            #self.muon.param_groups[0]['lr'] = learning_rate
-            #self.adam.param_groups[0]['lr'] = learning_rate
+            #self.optimizer.param_groups[0]['lr'] = learning_rate
+            self.muon.param_groups[0]['lr'] = learning_rate
+            self.adam.param_groups[0]['lr'] = learning_rate
 
         num_minibatches = config['num_minibatches']
         for mb in range(num_minibatches):
@@ -424,12 +425,12 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                #self.muon.step()
-                #self.adam.step()
-                #self.muon.zero_grad()
-                #self.adam.zero_grad()
+                #self.optimizer.step()
+                #self.optimizer.zero_grad()
+                self.muon.step()
+                self.adam.step()
+                self.muon.zero_grad()
+                self.adam.zero_grad()
 
         # Reprioritize experience
         profile('train_misc', epoch)
@@ -931,6 +932,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
             model.hidden_size = policy.hidden_size
 
         model.forward_eval = policy.forward_eval
+        model.initial_state = policy.initial_state
         policy = model.to(local_rank)
 
     if args['neptune']:
