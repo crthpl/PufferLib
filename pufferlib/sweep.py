@@ -711,15 +711,8 @@ class Protein:
                     p_success = self.success_classifier.predict_proba(suggestions)[:, 1]
                 suggestion_scores *= p_success
 
-        # Mask out high cost samples
-        # These tend to correlate with overconfident predictions
-        if self.max_cost > 0:
-            mask = gp_c > self.max_cost
-            suggestion_scores[mask.squeeze()] = -1e8
-
-        idxs = np.argsort(suggestion_scores)[::-1][:self.buffer_size]
+        idxs = np.argsort(suggestion_scores)[::-1]
         best_idx = idxs[0]
-        self.buffer = [suggestions[i].numpy() for i in idxs[1:]]
 
         info = dict(
             cost = gp_c[best_idx].item(),
