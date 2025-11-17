@@ -148,9 +148,6 @@ class PuffeRL:
         epochs = config['total_timesteps'] // config['batch_size']
         eta_min = config['learning_rate'] * config['min_lr_ratio']
         
-        #TODO: Min LR in cpp!
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=eta_min)
         self.total_epochs = epochs
 
         self.num_layers = 4

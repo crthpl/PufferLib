@@ -1,7 +1,6 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch/optim/optimizer.h>
-#include <torch/optim/muon.h>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
@@ -12,7 +11,7 @@
 #include "../ocean/breakout/breakout.h"
 #include "vecenv.h"
 #include <dlfcn.h>
-//#include "muon.h"
+#include "muon.h"
 
 //#include <ATen/cuda/CUDAGraph.h>
 //#include <c10/cuda/CUDAGuard.h>
@@ -752,6 +751,12 @@ pybind11::dict log_environments(pybind11::object pufferl_obj) {
     return py_out;
 }
 
+torch::Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::Device device) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& policy = pufferl.policy;
+    return policy->initial_state(batch_size, device);
+}
+
 /*
 // Create graph
 void pufferl_init_cudagraph(PuffeRL* pufferl) {
@@ -898,7 +903,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 // Updated compiled_evaluate
 torch::Tensor compiled_evaluate(
     pybind11::object pufferl_obj,
-    //torch::Tensor lstm_h,
     torch::Tensor state,
     torch::Tensor obs_buffer,
     torch::Tensor act_buffer,
@@ -919,8 +923,6 @@ torch::Tensor compiled_evaluate(
     auto actions = pufferl.env_actions;
     auto rewards = pufferl.env_rewards;
     auto terminals = pufferl.env_terminals;
-
-    state = state.to(DTYPE);
 
     auto obs_buf = pufferl.obs_buf;
     auto state_in_buf = pufferl.state_in_buf;
@@ -1324,11 +1326,22 @@ PYBIND11_MODULE(_C, m) {
     m.def("batched_forward", &batched_forward);
     m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
 
+    m.def("initial_state", &initial_state);
+
     // TODO: Why tf are these needed?
     m.def("mingru_gate", &mingru_gate);
     m.def("log_coeffs_and_values", &log_coeffs_and_values);
     m.def("fused_scan", &fused_scan);
     m.def("fused_ppo_loss", &fused_ppo_loss);
+
+    py::class_<torch::optim::MuonOptions>(m, "MuonOptions")
+        .def(py::init<double>());
+
+    py::class_<torch::optim::MuonParamState>(m, "MuonParamState")
+        .def(py::init<>());
+
+    py::class_<torch::optim::Muon>(m, "Muon")
+        .def(py::init<std::vector<torch::optim::OptimizerParamGroup>, torch::optim::MuonOptions>());
 
     py::class_<Log>(m, "Log")
     .def_readwrite("perf", &Log::perf)

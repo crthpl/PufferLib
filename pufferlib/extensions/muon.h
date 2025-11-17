@@ -33,8 +33,8 @@ struct TORCH_API MuonOptions : public OptimizerCloneableOptions<MuonOptions> {
   TORCH_ARG(bool, match_rms_adamw) = true;
 
  public:
-  void serialize(torch::serialize::InputArchive& archive) override;
-  void serialize(torch::serialize::OutputArchive& archive) const override;
+  //void serialize(torch::serialize::InputArchive& archive) override;
+  //void serialize(torch::serialize::OutputArchive& archive) const override;
   TORCH_API friend bool operator==(
       const MuonOptions& lhs,
       const MuonOptions& rhs);
@@ -48,8 +48,8 @@ struct TORCH_API MuonParamState
   TORCH_ARG(torch::Tensor, momentum_buffer);
 
  public:
-  void serialize(torch::serialize::InputArchive& archive) override;
-  void serialize(torch::serialize::OutputArchive& archive) const override;
+  //void serialize(torch::serialize::InputArchive& archive) override;
+  //void serialize(torch::serialize::OutputArchive& archive) const override;
   TORCH_API friend bool operator==(
       const MuonParamState& lhs,
       const MuonParamState& rhs);
@@ -72,13 +72,13 @@ class TORCH_API Muon : public Optimizer {
       : Muon({OptimizerParamGroup(std::move(params))}, std::move(defaults)) {}
 
   torch::Tensor step(LossClosure closure = nullptr) override;
-  void save(serialize::OutputArchive& archive) const override;
-  void load(serialize::InputArchive& archive) override;
+  //void save(serialize::OutputArchive& archive) const override;
+  //void load(serialize::InputArchive& archive) override;
 
- private:
-  template <typename Self, typename Archive>
-  static void serialize(Self& self, Archive& archive) {
-    _TORCH_OPTIM_SERIALIZE_WITH_TEMPLATE_ARG(Muon);
-  }
+ //private:
+ // template <typename Self, typename Archive>
+ // static void serialize(Self& self, Archive& archive) {
+ //   _TORCH_OPTIM_SERIALIZE_WITH_TEMPLATE_ARG(Muon);
+ // }
 };
 } // namespace torch::optim

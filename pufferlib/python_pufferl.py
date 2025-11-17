@@ -329,7 +329,10 @@ class PuffeRL:
         learning_rate = config['learning_rate']
         if config['anneal_lr'] and self.epoch > 0:
             lr_ratio = self.epoch / self.total_epochs
-            learning_rate = learning_rate * 0.5 * (1 + np.cos(np.pi * lr_ratio))
+            lr_min = config['learning_rate'] * config['min_lr_ratio']
+ 
+            #TODO: Min LR in cpp!
+            learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
             #self.optimizer.param_groups[0]['lr'] = learning_rate
             self.muon.param_groups[0]['lr'] = learning_rate
             self.adam.param_groups[0]['lr'] = learning_rate

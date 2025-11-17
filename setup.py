@@ -245,6 +245,7 @@ torch_extensions = []
 if not NO_TRAIN:
     torch_sources = [
         "pufferlib/extensions/pufferlib.cpp",
+        "pufferlib/extensions/muon.cpp",
     ]
     if BUID_CUDA_EXT:
         extension = CUDAExtension

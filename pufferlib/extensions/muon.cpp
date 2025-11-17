@@ -12,6 +12,8 @@
 #include <cmath>
 #include <functional>
 
+#include "muon.h"
+
 namespace torch::optim {
 
 MuonOptions::MuonOptions(double lr) : lr_(lr) {}
@@ -29,6 +31,7 @@ bool operator==(const MuonOptions& lhs, const MuonOptions& rhs) {
       (lhs.match_rms_adamw() == rhs.match_rms_adamw());
 }
 
+/*
 void MuonOptions::serialize(torch::serialize::OutputArchive& archive) const {
   _TORCH_OPTIM_SERIALIZE_TORCH_ARG(lr);
   _TORCH_OPTIM_SERIALIZE_TORCH_ARG(weight_decay);
@@ -50,6 +53,7 @@ void MuonOptions::serialize(torch::serialize::InputArchive& archive) {
   _TORCH_OPTIM_DESERIALIZE_TORCH_ARG(int, ns_steps);
   _TORCH_OPTIM_DESERIALIZE_TORCH_ARG(bool, match_rms_adamw);
 }
+*/
 
 double MuonOptions::get_lr() const {
   return lr();
@@ -64,6 +68,7 @@ bool operator==(const MuonParamState& lhs, const MuonParamState& rhs) {
       torch::equal(lhs.momentum_buffer(), rhs.momentum_buffer());
 }
 
+/*
 void MuonParamState::serialize(
     torch::serialize::OutputArchive& archive) const {
   _TORCH_OPTIM_SERIALIZE_TORCH_ARG(step);
@@ -74,6 +79,7 @@ void MuonParamState::serialize(torch::serialize::InputArchive& archive) {
   _TORCH_OPTIM_DESERIALIZE_TORCH_ARG(int64_t, step);
   _TORCH_OPTIM_DESERIALIZE_TORCH_ARG(Tensor, momentum_buffer);
 }
+*/
 
 Tensor _zeropower_via_newtonschulz(Tensor grad, std::tuple<double, double, double> ns_coefficients, int ns_steps, double eps) {
     TORCH_CHECK(ns_steps < 100, "Number of steps must be less than 100 for computational efficiency");
@@ -176,6 +182,7 @@ Tensor Muon::step(LossClosure closure) {
   return loss;
 }
 
+/*
 void Muon::save(serialize::OutputArchive& archive) const {
   serialize(*this, archive);
 }
@@ -204,4 +211,5 @@ void Muon::load(serialize::InputArchive& archive) {
     }
   }
 }
+*/
 } // namespace torch::optim
