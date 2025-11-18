@@ -143,6 +143,6 @@ class Muon(Optimizer):
                     grad *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5 # Matches heavyball and Keller
 
                 param.mul_(1 - lr * weight_decay)
-                param.sub_(lr*grad)
+                param.sub_(lr*grad.view(param.shape))
 
         return loss
