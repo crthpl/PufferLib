@@ -134,7 +134,8 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
         only_include = [p.strip() for p in sweep_config['sweep_only'].split(',')]
 
     for name, param in sweep_config.items():
-        if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only', 'max_suggestion_cost'):
+        if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only',
+                    'max_suggestion_cost', 'early_stop_lcb_beta', 'early_stop_min_cost'):
             continue
 
         assert isinstance(param, dict)
@@ -320,6 +321,10 @@ class Random:
             is_failure=is_failure,
         ))
 
+    def query_early_stop_threshold(self, cost):
+        return 0
+
+
 class ParetoGenetic:
     def __init__(self,
             sweep_config,
@@ -370,6 +375,9 @@ class ParetoGenetic:
             is_failure=is_failure,
         ))
 
+    def query_early_stop_threshold(self, cost):
+        return 0
+
 
 class ExactGPModel(ExactGP):
     def __init__(self, train_x, train_y, likelihood, x_dim):
@@ -419,6 +427,59 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     model.eval()
     likelihood.eval()
     return loss.item() if loss is not None else 0
+
+
+class PowerLawLCBFitter:
+    """
+    Fits Score ~ A + B * log(Cost) and provides a cost-only LCB threshold for early stopping
+    """
+    def __init__(self, beta=1.5, min_num_samples=50, min_allowed_cost=600):
+        self.beta = beta
+        self.min_num_samples = min_num_samples
+        self.min_allowed_cost = min_allowed_cost
+        self.is_fitted = False
+        self.A = None          # Intercept
+        self.B = None          # Slope (coefficient for log(Cost))
+        self.sigma = None      # Residual Standard Deviation
+
+    def fit(self, observations):
+        scores = np.array([e['output'] for e in observations])
+        costs = np.array([e['cost'] for e in observations])
+
+        valid_indices = (costs > 0) & np.isfinite(scores)
+        if np.sum(valid_indices) < self.min_num_samples:
+            self.is_fitted = False
+            return
+
+        y = scores[valid_indices]
+        c = costs[valid_indices]
+        x_log_c = np.log(np.maximum(c, EPSILON))
+
+        try:
+            # Score ~ A + B * log(Cost)
+            coefficients = np.polyfit(x_log_c, y, 1)
+            self.B, self.A = coefficients
+        except np.linalg.LinAlgError:
+            self.is_fitted = False
+            return
+
+        y_pred = self.A + self.B * x_log_c
+        residuals = y - y_pred
+        self.sigma = np.std(residuals)
+        self.is_fitted = True
+
+    def query_lcb(self, cost):
+        """
+        Returns the LCB score threshold for the given cost.
+        Returns -inf if the model hasn't been successfully fitted.
+        """
+        if not self.is_fitted or cost < self.min_allowed_cost:
+            return -np.inf
+
+        log_c = np.log(np.maximum(cost, EPSILON))
+        mu_pred = self.A + self.B * log_c
+        lcb_threshold = mu_pred - self.beta * self.sigma
+        return lcb_threshold
 
 
 # TODO: Eval defaults
@@ -482,6 +543,10 @@ class Protein:
         # Probably useful only when downsample=1 and each run is expensive.
         self.use_success_prob = sweep_config['downsample'] == 1
         self.success_classifier = LogisticRegression(class_weight='balanced')
+
+        # A simple model to suggest early stopping threshold
+        self.lcb_fitter = PowerLawLCBFitter(
+            beta=sweep_config['early_stop_lcb_beta'], min_allowed_cost=sweep_config['early_stop_min_cost'])
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
@@ -626,6 +691,8 @@ class Protein:
 
         score_loss, cost_loss = self._train_gp_models()
 
+        self.lcb_fitter.fit(self.success_observations)
+
         if self.optimizer_reset_frequency and self.suggestion_idx % self.optimizer_reset_frequency == 0:
             print(f'Resetting GP optimizers at suggestion {self.suggestion_idx}')
             self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
@@ -757,3 +824,6 @@ class Protein:
             return
 
         self.success_observations.append(new_observation)
+
+    def query_early_stop_threshold(self, cost):
+        return self.lcb_fitter.query_lcb(cost)

@@ -1053,6 +1053,16 @@ def sweep(args=None, env_name=None):
     sweep = sweep_cls(args['sweep'])
     points_per_run = args['sweep']['downsample']
     target_key = f'environment/{args["sweep"]["metric"]}'
+
+    def stop_if_perf_below(logs):
+        if stop_if_loss_nan(logs):
+            return True
+
+        if ('uptime' in logs and target_key in logs) and \
+           logs[target_key] < sweep.query_early_stop_threshold(logs['uptime']):
+            return True
+        return False
+
     for i in range(args['max_runs']):
         seed = time.time_ns() & 0xFFFFFFFF
         random.seed(seed)
@@ -1063,7 +1073,7 @@ def sweep(args=None, env_name=None):
         if i > 0:
             sweep.suggest(args)
 
-        all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
+        all_logs = train(env_name, args=args, should_stop_early=stop_if_perf_below)
         all_logs = [e for e in all_logs if target_key in e]
 
         if not all_logs:
