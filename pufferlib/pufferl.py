@@ -859,7 +859,8 @@ class NeptuneLogger:
     def upload_model(self, model_path):
         self.neptune['model'].track_files(model_path)
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.neptune['early_stop'] = early_stop
         if self.should_upload_model:
             self.upload_model(model_path)
         self.neptune.stop()
@@ -894,7 +895,8 @@ class WandbLogger:
         artifact.add_file(model_path)
         self.wandb.run.log_artifact(artifact)
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.wandb.run.summary['early_stop'] = early_stop
         if self.should_upload_model:
             self.upload_model(model_path)
         self.wandb.finish()
@@ -958,9 +960,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
                 all_logs.append(logs)
 
             if should_stop_early is not None and should_stop_early(logs):
-                all_logs.append({'early_stop': True})
                 model_path = pufferl.close()
-                pufferl.logger.close(model_path)
+                pufferl.logger.close(model_path, early_stop=True)
                 return all_logs
 
     # Final eval. You can reset the env here, but depending on
@@ -972,13 +973,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
             break
 
     logs = pufferl.mean_and_log()
-    logs.update({'early_stop': False})
     if logs is not None:
         all_logs.append(logs)
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
-    pufferl.logger.close(model_path)
+    pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
 def eval(env_name, args=None, vecenv=None, policy=None):
