@@ -907,7 +907,7 @@ class WandbLogger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_stop_early=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop_fn=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -956,10 +956,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
         logs = pufferl.train()
 
         if logs is not None:
+            should_stop_early = False
+            if early_stop_fn is not None:
+                should_stop_early = early_stop_fn(logs)
+                # This is hacky, but need to see if threshold looks reasonable
+                if 'early_stop_treshold' in logs:
+                    pufferl.logger.log({'environment/early_stop_treshold': logs['early_stop_treshold']}, logs['agent_steps'])
+
             if pufferl.global_step > 0.20*train_config['total_timesteps']:
                 all_logs.append(logs)
 
-            if should_stop_early is not None and should_stop_early(logs):
+            if should_stop_early:
                 model_path = pufferl.close()
                 pufferl.logger.close(model_path, early_stop=True)
                 return all_logs
@@ -1060,9 +1067,11 @@ def sweep(args=None, env_name=None):
         if stop_if_loss_nan(logs):
             return True
 
-        if ('uptime' in logs and target_key in logs) and \
-           logs[target_key] < sweep.query_early_stop_threshold(logs['uptime']):
-            return True
+        if ('uptime' in logs and target_key in logs):
+            threshold = sweep.query_early_stop_threshold(logs['uptime'])
+            logs['early_stop_treshold'] = max(threshold, 0)  # clipping for visualization
+            if logs[target_key] < threshold:
+                return True
         return False
 
     for i in range(args['max_runs']):
@@ -1075,7 +1084,7 @@ def sweep(args=None, env_name=None):
         if i > 0:
             sweep.suggest(args)
 
-        all_logs = train(env_name, args=args, should_stop_early=stop_if_perf_below)
+        all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
         all_logs = [e for e in all_logs if target_key in e]
 
         if not all_logs:
