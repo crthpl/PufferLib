@@ -14,23 +14,12 @@ class InputArchive;
 
 namespace torch::optim {
 
-const double EPS = 1e-7;
-const double DEFAULT_A = 3.4445;
-const double DEFAULT_B = -4.7750;
-const double DEFAULT_C = 2.0315;
-const double DEFAULT_NS_STEPS = 5;
-
 struct TORCH_API MuonOptions : public OptimizerCloneableOptions<MuonOptions> {
-  MuonOptions(double lr = 1e-3);
-  TORCH_ARG(double, lr) = 1e-3;
-  TORCH_ARG(double, weight_decay) = 0.1;
-  TORCH_ARG(double, momentum) = 0.95;
-  TORCH_ARG(bool, nesterov) = true;
-  typedef std::tuple<double, double, double> ns_coefficients_t;
-  TORCH_ARG(ns_coefficients_t, ns_coefficients) = std::make_tuple(DEFAULT_A, DEFAULT_B, DEFAULT_C);
-  TORCH_ARG(double, eps) = EPS;
-  TORCH_ARG(int, ns_steps) = DEFAULT_NS_STEPS;
-  TORCH_ARG(bool, match_rms_adamw) = true;
+  MuonOptions(double lr = 0.0025);
+  TORCH_ARG(double, lr) = 0.0025;
+  TORCH_ARG(double, weight_decay) = 0.0;
+  TORCH_ARG(double, momentum) = 0.9;
+  TORCH_ARG(double, eps) = 1e-8;
 
  public:
   //void serialize(torch::serialize::InputArchive& archive) override;

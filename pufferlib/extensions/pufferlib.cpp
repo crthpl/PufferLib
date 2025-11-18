@@ -370,40 +370,35 @@ public:
         torch::Tensor out;
         torch::Tensor next_prev_hidden;
 
-        //next_prev_hidden = hidden;
-        //out = hidden*gate + state;
-
         if (seq_len == 1) {
-            //hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-            //gate = gate.sigmoid();
-            //out = torch::lerp(state, hidden, gate);
-            out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+            gate = gate.sigmoid();
+            out = torch::lerp(state, hidden, gate);
+            //out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
             next_prev_hidden = out;
         } else {
-            /*
             auto log_coeffs = -torch::nn::functional::softplus(gate);
             auto log_z = -torch::nn::functional::softplus(-gate);
             auto log_tilde_h = torch::where(hidden >= 0,
                 (torch::nn::functional::relu(hidden) + 0.5).log(),
                 -torch::nn::functional::softplus(-hidden));
             auto log_values = log_z + log_tilde_h;
-            */
+            /*
             torch::autograd::tensor_list outputs = log_coeffs_and_values(gate.contiguous(), hidden.contiguous());
             auto log_coeffs = outputs[0];
             auto log_values = outputs[1];
+            */
 
             log_values = torch::cat({state.log(), log_values}, 1);
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
-            /*
             auto a_star = log_coeffs.cumsum(1);
             auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
             auto log_h = a_star + log_h0_plus_b_star;
             out = log_h.exp();
-            */
 
-            out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
+            //out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
 
             out = out.narrow(1, out.size(1) - seq_len, seq_len);
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
@@ -703,11 +698,11 @@ public:
     }
 };
 
-double cosine_annealing(double lr_base, int64_t t, int64_t T) {
+double cosine_annealing(double lr_base, double lr_min, int64_t t, int64_t T) {
     if (T == 0) return lr_base;  // avoid division by zero
     double ratio = static_cast<double>(t) / static_cast<double>(T);
     ratio = std::max(0.0, std::min(1.0, ratio));  // clamp to [0, 1]
-    return lr_base * 0.5 * (1 + std::cos(M_PI * ratio));
+    return lr_min + 0.5*(lr_base - lr_min)*(1 + std::cos(M_PI * ratio));
 }
 
 void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* policy_32) {
@@ -722,8 +717,8 @@ typedef struct {
     PolicyMinGRU* policy;
     VecEnv vec;
     torch::optim::Muon* muon;
-    torch::optim::Adam* adam;
     double lr;
+    double min_lr_ratio;
     int64_t max_epochs;
     torch::Tensor obs_buf;
     torch::Tensor state_in_buf;
@@ -839,7 +834,7 @@ void capture_forward(std::unique_ptr<pufferlib::PuffeRL>& pufferl) {
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
         int64_t num_atns, int64_t hidden_size, int64_t num_layers,
-        double lr, double beta1, double beta2, double eps, int64_t max_epochs) {
+        double lr, double min_lr_ratio, double beta1, double beta2, double eps, int64_t max_epochs) {
 
     // Seeding
     torch::manual_seed(42);
@@ -864,27 +859,16 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
 
-    std::vector<torch::Tensor> params_2d;
-    std::vector<torch::Tensor> params_not_2d;
-    for (auto& param : policy->parameters()) {
-        if (param.dim() == 2) {
-            params_2d.push_back(param);
-        } else {
-            params_not_2d.push_back(param);
-        }
-    }
-
-    auto adam = new torch::optim::Adam(params_not_2d, torch::optim::AdamOptions(lr).betas({beta1, beta2}).eps(eps));
-    auto muon = new torch::optim::Muon(params_2d, torch::optim::MuonOptions(lr).eps(eps).match_rms_adamw(true));
+    auto muon = new torch::optim::Muon(policy->parameters(), torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
 
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->policy = policy;
-    pufferl->adam = adam;
     pufferl->muon = muon;
     pufferl->lr = lr;
+    pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(4096);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1088,15 +1072,14 @@ pybind11::dict compiled_train(
     {
     pybind11::gil_scoped_release no_gil;
     auto& policy = pufferl.policy;
-    auto& adam = pufferl.adam;
     auto& muon = pufferl.muon;
 
     auto device = values.device();
     auto terminals = terminals_input.to(torch::kFloat32);
 
     if (anneal_lr) {
-        double lr = cosine_annealing(pufferl.lr, current_epoch, pufferl.max_epochs);
-        adam->param_groups().at(0).options().set_lr(lr);
+        double lr_min = pufferl.min_lr_ratio * pufferl.lr;
+        double lr = cosine_annealing(pufferl.lr, lr_min,current_epoch, pufferl.max_epochs);
         muon->param_groups().at(0).options().set_lr(lr);
     }
 
@@ -1105,13 +1088,6 @@ pybind11::dict compiled_train(
 
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
     ratio.fill_(1.0);
-
-    /*
-    std::cout << "values shape: " << values.sizes() << std::endl;
-    std::cout << "rewards shape: " << rewards.sizes() << std::endl;
-    std::cout << "terminals shape: " << terminals.sizes() << std::endl;
-    std::cout << "ratio shape: " << ratio.sizes() << std::endl;
-    */
 
     auto advantages = torch::zeros_like(values);
     compute_puff_advantage_cuda(
@@ -1123,8 +1099,6 @@ pybind11::dict compiled_train(
     float adv_std = advantages.std().item<float>();
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
-        //torch::Tensor mb_obs = observations.narrow(0, mb*minibatch_segments, minibatch_segments);
-
         advantages.fill_(0.0);
         compute_puff_advantage_cuda(
             values, rewards, terminals, ratio,
@@ -1154,18 +1128,6 @@ pybind11::dict compiled_train(
             mb_obs = mb_obs.reshape(flat_shape);
         }
 
-        /*
-        torch::Tensor mb_obs = observations.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_actions = actions.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_logprobs = logprobs.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_values = values.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_advantages = advantages.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_returns = mb_advantages + mb_values;
-        */
-
-
-        // HARDCODED LSTM SIZE 128
-        // Initial LSTM states (zero or none)
         torch::Tensor mb_state= torch::zeros(
             {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
             DTYPE
@@ -1174,28 +1136,8 @@ pybind11::dict compiled_train(
         // Forward pass
         auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
-        /*
-        std::cout << "Logits dtype: " << logits.dtype() << std::endl;
-        std::cout << "Values dtype: " << newvalue.dtype() << std::endl;
-        std::cout << "Actions dtype: " << mb_actions.dtype() << std::endl;
-        std::cout << "Logprobs dtype: " << mb_logprobs.dtype() << std::endl;
-        std::cout << "Advantages dtype: " << mb_advantages.dtype() << std::endl;
-        std::cout << "Prio dtype: " << mb_prio.dtype() << std::endl;
-        std::cout << "Values dtype: " << mb_values.dtype() << std::endl;
-        std::cout << "Returns dtype: " << mb_returns.dtype() << std::endl;
-
-        std::cout << "Logit shape: " << logits.sizes() << std::endl;
-        std::cout << "Values shape: " << newvalue.sizes() << std::endl;
-        std::cout << "Actions shape: " << mb_actions.sizes() << std::endl;
-        std::cout << "Logprobs shape: " << mb_logprobs.sizes() << std::endl;
-        std::cout << "Advantages shape: " << mb_advantages.sizes() << std::endl;
-        std::cout << "Prio shape: " << mb_prio.sizes() << std::endl;
-        std::cout << "Values shape: " << mb_values.sizes() << std::endl;
-        std::cout << "Returns shape: " << mb_returns.sizes() << std::endl;
-        */
-
-        int BT = logits.size(0)*logits.size(1);
         //torch::Tensor loss = torch::zeros({1}, logits.options());
+        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1212,8 +1154,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
+        */
 
-        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -1229,10 +1171,8 @@ pybind11::dict compiled_train(
         auto logratio = newlogprob - mb_logprobs;
         auto ratio_new = logratio.exp();
 
-        //auto loss = -ratio_new.mean();
-
         // Update global ratio and values in-place (matches Python)
-        //ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+        ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
 
         // Normalize advantages: (adv - mean) / std, then weight
         auto adv_normalized = mb_advantages;
@@ -1250,7 +1190,7 @@ pybind11::dict compiled_train(
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
-        //values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
+        values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
         // Total loss
         auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
@@ -1274,7 +1214,6 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
-        */
 
         // Backward pass
         loss.backward();
@@ -1282,9 +1221,7 @@ pybind11::dict compiled_train(
         // Gradient accumulation and step
         if ((mb + 1) % accumulate_minibatches == 0) {
             torch::nn::utils::clip_grad_norm_(policy->parameters(), max_grad_norm);
-            adam->step();
             muon->step();
-            adam->zero_grad();
             muon->zero_grad();
         }
     }
@@ -1314,11 +1251,6 @@ pybind11::dict compiled_train(
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 PYBIND11_MODULE(_C, m) {
     m.def("log_environments", &log_environments);
-    /*
-    m.def("step_environments", &step_environments_cuda);
-    m.def("reset_environments", &reset_environments_cuda);
-    m.def("log_environments", &log_environments_cuda);
-    */
     m.def("compiled_evaluate", &compiled_evaluate);
 
     //m.def("evaluate_step", &evaluate_step);
@@ -1353,7 +1285,6 @@ PYBIND11_MODULE(_C, m) {
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &pufferlib::PuffeRL::policy)
-        .def_readwrite("adam", &pufferlib::PuffeRL::adam)
         .def_readwrite("muon", &pufferlib::PuffeRL::muon);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");

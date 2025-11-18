@@ -64,7 +64,7 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 class PuffeRL:
     def __init__(self, config, vecenv, logger=None, verbose=True):
         # Backend perf optimization
-        num_envs = 4096
+        num_envs = 8192
         self.num_envs = num_envs
         #grid_size = 11
         dummy = torch.zeros(5).cuda()
@@ -158,6 +158,7 @@ class PuffeRL:
             128,
             self.num_layers,
             config['learning_rate'],
+            config['min_lr_ratio'],
             config['adam_beta1'],
             config['adam_beta2'],
             config['adam_eps'],
