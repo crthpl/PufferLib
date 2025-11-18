@@ -958,6 +958,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
                 all_logs.append(logs)
 
             if should_stop_early is not None and should_stop_early(logs):
+                all_logs.append({'early_stop': True})
                 model_path = pufferl.close()
                 pufferl.logger.close(model_path)
                 return all_logs
@@ -971,6 +972,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
             break
 
     logs = pufferl.mean_and_log()
+    logs.update({'early_stop': False})
     if logs is not None:
         all_logs.append(logs)
 
