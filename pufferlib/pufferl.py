@@ -946,7 +946,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
     train_config = { **args['train'], 'env': env_name }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
+    # Sweep needs data for early stopped runs, so send data when steps > 100M
+    logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
     all_logs = []
+
     while pufferl.global_step < train_config['total_timesteps']:
         if train_config['device'] == 'cuda':
             torch.compiler.cudagraph_mark_step_begin()
@@ -963,7 +966,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
                 if 'early_stop_treshold' in logs:
                     pufferl.logger.log({'environment/early_stop_treshold': logs['early_stop_treshold']}, logs['agent_steps'])
 
-            if pufferl.global_step > 0.20*train_config['total_timesteps']:
+            if pufferl.global_step > logging_threshold:
                 all_logs.append(logs)
 
             if should_stop_early:
