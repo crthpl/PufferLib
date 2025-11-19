@@ -15,6 +15,7 @@ from gpytorch.kernels import MaternKernel, PolynomialKernel, ScaleKernel, Additi
 from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import LogNormalPrior
+from scipy.optimize import minimize
 from scipy.stats.qmc import Sobol
 from scipy.spatial import KDTree
 from sklearn.linear_model import LogisticRegression
@@ -135,7 +136,7 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only',
-                    'max_suggestion_cost', 'early_stop_lcb_beta', 'early_stop_min_cost'):
+                    'max_suggestion_cost', 'early_stop_quantile', 'early_stop_min_cost'):
             continue
 
         assert isinstance(param, dict)
@@ -429,58 +430,64 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     return loss.item() if loss is not None else 0
 
 
-class LogCostLCBModel:
+class RobustLogCostModel:
     """
-    Fits Score ~ A + B * log(Cost) and provides a cost-only LCB threshold for early stopping
+    Fits Score ~ A + B * log(Cost) using Quantile Regression (Median)
+    and provides a cost-only threshold for early stopping.
     """
-    def __init__(self, beta=1.5, min_num_samples=50, min_allowed_cost=600):
+    def __init__(self, beta=1.5, min_num_samples=50, min_allowed_cost=600, quantile=0.25):
         self.beta = beta
         self.min_num_samples = min_num_samples
         self.min_allowed_cost = min_allowed_cost
+        self.quantile = quantile  # 0.5 = Median regression, 0.25 = bottom quarter
         self.is_fitted = False
-        self.A = None          # Intercept
-        self.B = None          # Slope (coefficient for log(Cost))
-        self.sigma = None      # Residual Standard Deviation
+        self.A = None          
+        self.B = None          
+
+    def _quantile_loss(self, params, x, y, q):
+        # Pinball loss function for quantile regression
+        a, b = params
+        y_pred = a + b * x
+        residuals = y - y_pred
+        return np.sum(np.maximum(q * residuals, (q - 1) * residuals))
 
     def fit(self, observations):
+        self.is_fitted = False
         scores = np.array([e['output'] for e in observations])
         costs = np.array([e['cost'] for e in observations])
 
         valid_indices = (costs > 0) & np.isfinite(scores)
         if np.sum(valid_indices) < self.min_num_samples:
-            self.is_fitted = False
             return
 
         y = scores[valid_indices]
         c = costs[valid_indices]
         x_log_c = np.log(np.maximum(c, EPSILON))
 
+        # Initial guess using standard Polyfit (OLS) just to get in the ballpark
         try:
-            # Score ~ A + B * log(Cost)
-            coefficients = np.polyfit(x_log_c, y, 1)
-            self.B, self.A = coefficients
+            b_init, a_init = np.polyfit(x_log_c, y, 1)
         except np.linalg.LinAlgError:
-            self.is_fitted = False
-            return
+            # Fallback guess
+            b_init, a_init = 0.0, np.mean(y)
 
-        y_pred = self.A + self.B * x_log_c
-        residuals = y - y_pred
-        self.sigma = np.std(residuals)
+        # Minimize the Quantile Loss (L1 for median)
+        res = minimize(
+            self._quantile_loss, 
+            x0=[a_init, b_init], 
+            args=(x_log_c, y, self.quantile),
+            method='Nelder-Mead' # Robust solver for non-differentiable functions
+        )
+        
+        self.A, self.B = res.x
         self.is_fitted = True
 
     def get_threshold(self, cost):
-        """
-        Returns the LCB score threshold for the given cost.
-        Returns -inf if the model hasn't been successfully fitted.
-        """
         if not self.is_fitted or cost < self.min_allowed_cost:
             return -np.inf
 
         log_c = np.log(np.maximum(cost, EPSILON))
-        mu_pred = self.A + self.B * log_c
-        lcb_threshold = mu_pred - self.beta * self.sigma
-        return lcb_threshold
-
+        return self.A + self.B * log_c
 
 # TODO: Eval defaults
 class Protein:
@@ -545,8 +552,8 @@ class Protein:
         self.success_classifier = LogisticRegression(class_weight='balanced')
 
         # A simple model to suggest an early stopping threshold
-        self.stop_threshold_model = LogCostLCBModel(
-            beta=sweep_config.get('early_stop_lcb_beta', 1.5), min_allowed_cost=sweep_config.get('early_stop_min_cost', 600))
+        self.stop_threshold_model = RobustLogCostModel(
+            quantile=sweep_config['early_stop_quantile'], min_allowed_cost=sweep_config['early_stop_min_cost'])
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
