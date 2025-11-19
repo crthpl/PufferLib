@@ -1068,7 +1068,7 @@ def sweep(args=None, env_name=None):
             return True
 
         if ('uptime' in logs and target_key in logs):
-            threshold = sweep.query_early_stop_threshold(logs['uptime'])
+            threshold = sweep.get_early_stop_threshold(logs['uptime'])
             logs['early_stop_treshold'] = max(threshold, 0)  # clipping for visualization
             if logs[target_key] < threshold:
                 return True

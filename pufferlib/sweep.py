@@ -321,7 +321,7 @@ class Random:
             is_failure=is_failure,
         ))
 
-    def query_early_stop_threshold(self, cost):
+    def get_early_stop_threshold(self, cost):
         return 0
 
 
@@ -375,7 +375,7 @@ class ParetoGenetic:
             is_failure=is_failure,
         ))
 
-    def query_early_stop_threshold(self, cost):
+    def get_early_stop_threshold(self, cost):
         return 0
 
 
@@ -429,7 +429,7 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     return loss.item() if loss is not None else 0
 
 
-class PowerLawLCBFitter:
+class LogCostLCBModel:
     """
     Fits Score ~ A + B * log(Cost) and provides a cost-only LCB threshold for early stopping
     """
@@ -468,7 +468,7 @@ class PowerLawLCBFitter:
         self.sigma = np.std(residuals)
         self.is_fitted = True
 
-    def query_lcb(self, cost):
+    def get_threshold(self, cost):
         """
         Returns the LCB score threshold for the given cost.
         Returns -inf if the model hasn't been successfully fitted.
@@ -544,9 +544,9 @@ class Protein:
         self.use_success_prob = sweep_config['downsample'] == 1
         self.success_classifier = LogisticRegression(class_weight='balanced')
 
-        # A simple model to suggest early stopping threshold
-        self.lcb_fitter = PowerLawLCBFitter(
-            beta=sweep_config['early_stop_lcb_beta'], min_allowed_cost=sweep_config['early_stop_min_cost'])
+        # A simple model to suggest an early stopping threshold
+        self.stop_threshold_model = LogCostLCBModel(
+            beta=sweep_config.get('early_stop_lcb_beta', 1.5), min_allowed_cost=sweep_config.get('early_stop_min_cost', 600))
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
@@ -691,7 +691,7 @@ class Protein:
 
         score_loss, cost_loss = self._train_gp_models()
 
-        self.lcb_fitter.fit(self.success_observations)
+        self.stop_threshold_model.fit(self.success_observations)
 
         if self.optimizer_reset_frequency and self.suggestion_idx % self.optimizer_reset_frequency == 0:
             print(f'Resetting GP optimizers at suggestion {self.suggestion_idx}')
@@ -825,5 +825,5 @@ class Protein:
 
         self.success_observations.append(new_observation)
 
-    def query_early_stop_threshold(self, cost):
-        return self.lcb_fitter.query_lcb(cost)
+    def get_early_stop_threshold(self, cost):
+        return self.stop_threshold_model.get_threshold(cost)
