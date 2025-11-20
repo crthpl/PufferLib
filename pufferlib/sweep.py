@@ -437,6 +437,7 @@ class ParetoLogCostModel:
     def __init__(self, min_allowed_cost=600):
         self.min_allowed_cost = min(min_allowed_cost, EPSILON)
         self.min_log_cost = np.log(min_allowed_cost)
+        self.max_threshold_fraction = 0.8
         self.is_fitted = False
         self.A = None
         self.B = None
@@ -470,10 +471,10 @@ class ParetoLogCostModel:
         cost_range = self.max_log_cost - self.min_log_cost
         if cost_range <= EPSILON:
             # Somehow sweep found an excellent hyperparam that solves within min cost
-            threshold_fraction = 0.8
+            threshold_fraction = self.max_threshold_fraction
         else:
             threshold_fraction = (log_c - self.min_log_cost) / cost_range
-            threshold_fraction = np.clip(threshold_fraction, 0, 1)
+            threshold_fraction = np.clip(threshold_fraction, 0, self.max_threshold_fraction)
 
         return threshold_fraction * predicted_pareto_score
 
