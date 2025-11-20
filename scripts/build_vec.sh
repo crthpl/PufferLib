@@ -9,7 +9,7 @@ FLAGS=(
     -shared
     -Wall
     -I./$RAYLIB_NAME/include
-    "pufferlib/extensions/test_binding.c" -o "test_binding.so"
+    "pufferlib/extensions/breakout.c" -o "breakout.so"
     $LINK_ARCHIVES
     -lGL
     -lm
@@ -21,6 +21,7 @@ FLAGS=(
     -Wno-error=incompatible-pointer-types-discards-qualifiers
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
+    -fms-extensions
     #-fsanitize=address,undefined,bounds,pointer-overflow,leak
     #-fno-omit-frame-pointer
     -fPIC

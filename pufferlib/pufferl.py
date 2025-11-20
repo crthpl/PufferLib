@@ -843,10 +843,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     pufferl.logger.init(args)
 
     all_logs = []
+    max_cost = args['train'].get('max_cost', -1)
     while pufferl.global_step < train_config['total_timesteps']:
-        if pufferl.uptime > args['sweep']['max_cost']:
+        if pufferl.uptime > max_cost and max_cost > 0:
             break
-
         if train_config['device'] == 'cuda':
             torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()

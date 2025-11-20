@@ -4,7 +4,7 @@
 
 
 int main() {
-    void* handle = dlopen("./test_binding.so", RTLD_NOW);
+    void* handle = dlopen("./breakout.so", RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
         return 1;
@@ -48,15 +48,22 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-
-    VecEnv vec = create_environments(4, kwargs);
+    VecEnv* vec = create_environments(1024, 8, kwargs);
     vec_reset(vec);
     for (int i = 0; i < 300; i++) {
+        for (int j = 0; j < vec->size; j++) {
+            vec->actions[j] = rand() % 3;
+        }
         vec_step(vec);
+        float reward_sum = 0;
+        for (int j = 0; j < vec->size; j++) {
+            reward_sum += vec->rewards[j];
+        }
+        printf("Reward sum: %f\n", reward_sum);
         vec_render(vec, 0);
     }
 
-    printf("Created VecEnv with %d environments\n", vec.size);
+    printf("Created VecEnv with %d environments\n", vec->size);
 
     // TODO: Add a `close_vecenv` function to clean up
     // vec.envs, etc.

@@ -8,7 +8,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "../ocean/breakout/breakout.h"
+#include <atomic>
 #include "vecenv.h"
 #include <dlfcn.h>
 #include "muon.h"
@@ -28,9 +28,22 @@ vec_close_fn vec_close;
 vec_log_fn vec_log;
 vec_render_fn vec_render;
 
-std::tuple<VecEnv, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-create_environments(int64_t num_envs) {
-    void* handle = dlopen("./test_binding.so", RTLD_NOW);
+torch::Dtype to_torch_dtype(int dtype) {
+    if (dtype == FLOAT) {
+        return torch::kFloat32;
+    } else if (dtype == INT) {
+        return torch::kInt32;
+    } else if (dtype == UNSIGNED_CHAR) {
+        return torch::kUInt8;
+    } else {
+        assert(false && "to_torch_dtype failed to convert dtype");
+    }
+    return torch::kFloat32;
+}
+
+std::tuple<VecEnv*, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+create_environments(int64_t num_envs, int threads) {
+    void* handle = dlopen("./breakout.so", RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
         exit(1);
@@ -46,6 +59,10 @@ create_environments(int64_t num_envs) {
     vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log = (vec_log_fn)dlsym(handle, "vec_log");
     vec_render = (vec_render_fn)dlsym(handle, "vec_render");
+    int obs_n = *(int*)dlsym(handle, "OBS_N");
+    int act_n = *(int*)dlsym(handle, "ACT_N");
+    int obs_t = *(int*)dlsym(handle, "OBS_T");
+    int act_t = *(int*)dlsym(handle, "ACT_T");
     
     const char* dlsym_error = dlerror();
     if (dlsym_error) {
@@ -54,7 +71,6 @@ create_environments(int64_t num_envs) {
         exit(1);
     }
 
-    // Now call it!
     Dict* kwargs = create_dict(32);
     dict_set_int(kwargs, "frameskip", 4);
     dict_set_int(kwargs, "width", 576);
@@ -72,21 +88,30 @@ create_environments(int64_t num_envs) {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
+    /*
+    Dict* kwargs = create_dict(32);
+    dict_set_int(kwargs, "can_go_over_65536", 0);
+    dict_set_float(kwargs, "reward_scaler", 0.67);
+    dict_set_float(kwargs, "endgame_env_prob", 0.05);
+    dict_set_float(kwargs, "scaffolding_ratio", 0.67);
+    dict_set_int(kwargs, "use_heuristic_rewards", 1);
+    dict_set_float(kwargs, "snake_reward_weight", 0.0005);
+    dict_set_int(kwargs, "use_sparse_reward", 0);
+    */
 
-    VecEnv vec = create_envs(num_envs, kwargs);
-    printf("Created VecEnv with %d environments\n", vec.size);
+    VecEnv* vec = create_envs(num_envs, threads, kwargs);
+    printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
     //dlclose(handle);
  
+    auto obs_dtype = to_torch_dtype(obs_t);
+    auto atn_dtype = to_torch_dtype(act_t);
 
-    int num_obs = 118;
-    auto obs_dtype = torch::kFloat32;
-
-    auto obs = torch::from_blob(vec.observations, {num_envs, num_obs}, obs_dtype);
-    auto actions = torch::from_blob(vec.actions, {num_envs}, torch::kFloat32);
-    auto rewards = torch::from_blob(vec.rewards, {num_envs}, torch::kFloat32);
-    auto terminals = torch::from_blob(vec.terminals, {num_envs}, torch::kUInt8);
+    auto obs = torch::from_blob(vec->observations, {num_envs, obs_n}, obs_dtype);
+    auto actions = torch::from_blob(vec->actions, {num_envs}, atn_dtype);
+    auto rewards = torch::from_blob(vec->rewards, {num_envs}, torch::kFloat32);
+    auto terminals = torch::from_blob(vec->terminals, {num_envs}, torch::kUInt8);
 
     vec_reset(vec);
     return std::make_tuple(vec, obs, actions, rewards, terminals);
@@ -715,7 +740,7 @@ void sync_fp16_fp32(pufferlib::PolicyLSTM* policy_16, pufferlib::PolicyLSTM* pol
 
 typedef struct {
     PolicyMinGRU* policy;
-    VecEnv vec;
+    VecEnv* vec;
     torch::optim::Muon* muon;
     double lr;
     double min_lr_ratio;
@@ -868,7 +893,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -949,9 +974,13 @@ torch::Tensor compiled_evaluate(
 
         actions.copy_(action.to(torch::kCPU).to(torch::kFloat32));
         {
-            pybind11::gil_scoped_release no_gil;
+            //pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             vec_step(vec);
+            float reward_sum = 0;
+            for (int j = 0; j < vec->size; j++) {
+                reward_sum += vec->rewards[j];
+            }
             //render_environments(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
@@ -1274,13 +1303,6 @@ PYBIND11_MODULE(_C, m) {
 
     py::class_<torch::optim::Muon>(m, "Muon")
         .def(py::init<std::vector<torch::optim::OptimizerParamGroup>, torch::optim::MuonOptions>());
-
-    py::class_<Log>(m, "Log")
-    .def_readwrite("perf", &Log::perf)
-    .def_readwrite("score", &Log::score)
-    .def_readwrite("episode_return", &Log::episode_return)
-    .def_readwrite("episode_length", &Log::episode_length)
-    .def_readwrite("n", &Log::n);
 
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")

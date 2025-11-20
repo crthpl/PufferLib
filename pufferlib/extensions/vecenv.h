@@ -1,6 +1,12 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#define FLOAT 1
+#define INT 2
+#define UNSIGNED_CHAR 3
 
 typedef struct {
     const char* key;
@@ -16,6 +22,7 @@ typedef struct {
 } Dict;
 
 typedef struct Env Env;
+typedef struct Threading Threading;
 
 typedef struct {
     Env* envs;
@@ -24,6 +31,7 @@ typedef struct {
     float* actions;
     float* rewards;
     unsigned char* terminals;
+    Threading* threading;
 } VecEnv;
 
 Dict* create_dict(int capacity) {
@@ -102,15 +110,15 @@ void my_log(Log* log, Dict* out);
 // Define function types to be exported to the shared library
 // You don't need these, but you have to do some really gross
 // casts after loading the library without them.
-typedef VecEnv (*create_environments_fn)(int num_envs, Dict* kwargs);
+typedef VecEnv* (*create_environments_fn)(int num_envs, int threads, Dict* kwargs);
 typedef Env* (*env_init_fn)(float* observations, float* actions, float* rewards,
         unsigned char* terminals, int seed, Dict* kwargs);
-typedef void (*vec_reset_fn)(VecEnv vec);
-typedef void (*vec_step_fn)(VecEnv vec);
+typedef void (*vec_reset_fn)(VecEnv* vec);
+typedef void (*vec_step_fn)(VecEnv* vec);
 typedef void (*env_close_fn)(Env* env);
-typedef void (*vec_close_fn)(VecEnv vec);
-typedef void (*vec_render_fn)(VecEnv vec, int env_idx);
-typedef void (*vec_log_fn)(VecEnv vec, Dict* out);
+typedef void (*vec_close_fn)(VecEnv* vec);
+typedef void (*vec_render_fn)(VecEnv* vec, int env_idx);
+typedef void (*vec_log_fn)(VecEnv* vec, Dict* out);
 
 typedef void (*c_reset_fn)(Env* env);
 typedef void (*c_step_fn)(Env* env);

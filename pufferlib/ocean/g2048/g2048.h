@@ -39,7 +39,7 @@ static inline float calculate_perf(unsigned char max_tile) {
     return perf;
 }
 
-typedef struct {
+typedef struct Log {
     float perf;
     float score;
     float merge_score;
@@ -54,7 +54,7 @@ typedef struct {
     float n;
 } Log;
 
-typedef struct {
+typedef struct Game {
     Log log;                        // Required
     unsigned char* observations;    // Cheaper in memory if encoded in uint_8
     int* actions;                   // Required
