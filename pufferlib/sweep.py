@@ -135,7 +135,7 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only',
-                    'max_suggestion_cost', 'early_stop_pareto_fraction', 'early_stop_min_cost'):
+                    'max_suggestion_cost', 'early_stop_min_cost'):
             continue
 
         assert isinstance(param, dict)
@@ -434,25 +434,29 @@ class ParetoLogCostModel:
     Fits Score ~ A + B * log(Cost) to the Pareto Frontier.
     Returns a fraction of the predicted Pareto score as the stop threshold.
     """
-    def __init__(self, threshold_fraction=0.5, min_allowed_cost=600):
-        self.threshold_fraction = threshold_fraction
-        self.min_allowed_cost = min_allowed_cost
+    def __init__(self, min_allowed_cost=600):
+        self.min_allowed_cost = min(min_allowed_cost, EPSILON)
+        self.min_log_cost = np.log(min_allowed_cost)
         self.is_fitted = False
-        self.A = None          
-        self.B = None          
+        self.A = None
+        self.B = None
+        self.max_log_cost = None
 
     def fit(self, pareto_obs):
         self.is_fitted = False
+        if len(pareto_obs) < 2:
+            return
 
         # Assume pareto obs is "clean" for regression
         scores = np.array([e['output'] for e in pareto_obs])
         costs = np.array([e['cost'] for e in pareto_obs])
         x_log_c = np.log(np.maximum(costs, EPSILON))
+        self.max_log_cost = x_log_c.max()
 
         try:
             self.B, self.A = np.polyfit(x_log_c, scores, 1)
             self.is_fitted = True
-        except np.linalg.LinAlgError:
+        except (np.linalg.LinAlgError, ValueError):
             pass        
 
     def get_threshold(self, cost):
@@ -461,9 +465,17 @@ class ParetoLogCostModel:
 
         log_c = np.log(np.maximum(cost, EPSILON))
         predicted_pareto_score = self.A + self.B * log_c
-        
-        # Return the fraction (e.g. 50%) of the estimated "perfect" run
-        return self.threshold_fraction * predicted_pareto_score
+
+        # Threshold increases as cost increases: lenient on early exploration, strict on later phase.
+        cost_range = self.max_log_cost - self.min_log_cost
+        if cost_range <= EPSILON:
+            # Somehow sweep found an excellent hyperparam that solves within min cost
+            threshold_fraction = 0.8
+        else:
+            threshold_fraction = (log_c - self.min_log_cost) / cost_range
+            threshold_fraction = np.clip(threshold_fraction, 0, 1)
+
+        return threshold_fraction * predicted_pareto_score
 
 
 # TODO: Eval defaults
@@ -529,8 +541,7 @@ class Protein:
         self.success_classifier = LogisticRegression(class_weight='balanced')
 
         # A simple model to suggest an early stopping threshold
-        self.stop_threshold_model = ParetoLogCostModel(
-            threshold_fraction=sweep_config['early_stop_pareto_fraction'], min_allowed_cost=sweep_config['early_stop_min_cost'])
+        self.stop_threshold_model = ParetoLogCostModel(min_allowed_cost=sweep_config['early_stop_min_cost'])
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
