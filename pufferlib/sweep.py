@@ -15,7 +15,6 @@ from gpytorch.kernels import MaternKernel, PolynomialKernel, ScaleKernel, Additi
 from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import LogNormalPrior
-from scipy.optimize import minimize
 from scipy.stats.qmc import Sobol
 from scipy.spatial import KDTree
 from sklearn.linear_model import LogisticRegression
@@ -136,7 +135,7 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only',
-                    'max_suggestion_cost', 'early_stop_quantile', 'early_stop_min_cost'):
+                    'max_suggestion_cost', 'early_stop_pareto_fraction', 'early_stop_min_cost'):
             continue
 
         assert isinstance(param, dict)
@@ -430,64 +429,42 @@ def train_gp_model(model, likelihood, mll, optimizer, train_x, train_y, training
     return loss.item() if loss is not None else 0
 
 
-class RobustLogCostModel:
+class ParetoLogCostModel:
     """
-    Fits Score ~ A + B * log(Cost) using Quantile Regression (Median)
-    and provides a cost-only threshold for early stopping.
+    Fits Score ~ A + B * log(Cost) to the Pareto Frontier.
+    Returns a fraction of the predicted Pareto score as the stop threshold.
     """
-    def __init__(self, beta=1.5, min_num_samples=50, min_allowed_cost=600, quantile=0.25):
-        self.beta = beta
-        self.min_num_samples = min_num_samples
+    def __init__(self, threshold_fraction=0.5, min_allowed_cost=600):
+        self.threshold_fraction = threshold_fraction
         self.min_allowed_cost = min_allowed_cost
-        self.quantile = quantile  # 0.5 = Median regression, 0.25 = bottom quarter
         self.is_fitted = False
         self.A = None          
         self.B = None          
 
-    def _quantile_loss(self, params, x, y, q):
-        # Pinball loss function for quantile regression
-        a, b = params
-        y_pred = a + b * x
-        residuals = y - y_pred
-        return np.sum(np.maximum(q * residuals, (q - 1) * residuals))
-
-    def fit(self, observations):
+    def fit(self, pareto_obs):
         self.is_fitted = False
-        scores = np.array([e['output'] for e in observations])
-        costs = np.array([e['cost'] for e in observations])
 
-        valid_indices = (costs > 0) & np.isfinite(scores)
-        if np.sum(valid_indices) < self.min_num_samples:
-            return
+        # Assume pareto obs is "clean" for regression
+        scores = np.array([e['output'] for e in pareto_obs])
+        costs = np.array([e['cost'] for e in pareto_obs])
+        x_log_c = np.log(np.maximum(costs, EPSILON))
 
-        y = scores[valid_indices]
-        c = costs[valid_indices]
-        x_log_c = np.log(np.maximum(c, EPSILON))
-
-        # Initial guess using standard Polyfit (OLS) just to get in the ballpark
         try:
-            b_init, a_init = np.polyfit(x_log_c, y, 1)
+            self.B, self.A = np.polyfit(x_log_c, scores, 1)
+            self.is_fitted = True
         except np.linalg.LinAlgError:
-            # Fallback guess
-            b_init, a_init = 0.0, np.mean(y)
-
-        # Minimize the Quantile Loss (L1 for median)
-        res = minimize(
-            self._quantile_loss, 
-            x0=[a_init, b_init], 
-            args=(x_log_c, y, self.quantile),
-            method='Nelder-Mead' # Robust solver for non-differentiable functions
-        )
-        
-        self.A, self.B = res.x
-        self.is_fitted = True
+            pass        
 
     def get_threshold(self, cost):
         if not self.is_fitted or cost < self.min_allowed_cost:
             return -np.inf
 
         log_c = np.log(np.maximum(cost, EPSILON))
-        return self.A + self.B * log_c
+        predicted_pareto_score = self.A + self.B * log_c
+        
+        # Return the fraction (e.g. 50%) of the estimated "perfect" run
+        return self.threshold_fraction * predicted_pareto_score
+
 
 # TODO: Eval defaults
 class Protein:
@@ -552,8 +529,8 @@ class Protein:
         self.success_classifier = LogisticRegression(class_weight='balanced')
 
         # A simple model to suggest an early stopping threshold
-        self.stop_threshold_model = RobustLogCostModel(
-            quantile=sweep_config['early_stop_quantile'], min_allowed_cost=sweep_config['early_stop_min_cost'])
+        self.stop_threshold_model = ParetoLogCostModel(
+            threshold_fraction=sweep_config['early_stop_pareto_fraction'], min_allowed_cost=sweep_config['early_stop_min_cost'])
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
@@ -698,8 +675,6 @@ class Protein:
 
         score_loss, cost_loss = self._train_gp_models()
 
-        self.stop_threshold_model.fit(self.success_observations)
-
         if self.optimizer_reset_frequency and self.suggestion_idx % self.optimizer_reset_frequency == 0:
             print(f'Resetting GP optimizers at suggestion {self.suggestion_idx}')
             self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
@@ -708,6 +683,8 @@ class Protein:
         candidates, pareto_idxs = pareto_points(self.success_observations)
         if self.prune_pareto:
             candidates = prune_pareto_front(candidates)
+
+        self.stop_threshold_model.fit(pareto_obs=candidates)
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in candidates])
