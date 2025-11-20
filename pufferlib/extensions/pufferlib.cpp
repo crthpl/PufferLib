@@ -108,10 +108,10 @@ create_environments(int64_t num_envs, int threads) {
     auto obs_dtype = to_torch_dtype(obs_t);
     auto atn_dtype = to_torch_dtype(act_t);
 
-    auto obs = torch::from_blob(vec->observations, {num_envs, obs_n}, obs_dtype);
-    auto actions = torch::from_blob(vec->actions, {num_envs}, atn_dtype);
-    auto rewards = torch::from_blob(vec->rewards, {num_envs}, torch::kFloat32);
-    auto terminals = torch::from_blob(vec->terminals, {num_envs}, torch::kUInt8);
+    auto obs = torch::from_blob(vec->observations, {num_envs, obs_n}, obs_dtype).pin_memory();
+    auto actions = torch::from_blob(vec->actions, {num_envs}, atn_dtype).pin_memory();
+    auto rewards = torch::from_blob(vec->rewards, {num_envs}, torch::kFloat32).pin_memory();
+    auto terminals = torch::from_blob(vec->terminals, {num_envs}, torch::kUInt8).pin_memory();
 
     vec_reset(vec);
     return std::make_tuple(vec, obs, actions, rewards, terminals);
@@ -369,12 +369,12 @@ public:
         int dim_inner = int(dim * expansion_factor);
         to_hidden_and_gate = register_module("to_hidden_and_gate",
                 torch::nn::Linear(torch::nn::LinearOptions(dim, 2*dim_inner).bias(false)));
-        //torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
+        torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
 
         // TODO: Is there a way to have this be identity to keep param count correct?
         //if (expansion_factor != 1.) {
-        to_out = register_module("to_out",
-                torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
+        //to_out = register_module("to_out",
+        //        torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
         //torch::nn::init::orthogonal_(to_out->weight);
         //}
 
@@ -396,40 +396,42 @@ public:
         torch::Tensor next_prev_hidden;
 
         if (seq_len == 1) {
-            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-            gate = gate.sigmoid();
-            out = torch::lerp(state, hidden, gate);
-            //out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+            //hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+            //gate = gate.sigmoid();
+            //out = torch::lerp(state, hidden, gate);
+            out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
             next_prev_hidden = out;
         } else {
+            /*
             auto log_coeffs = -torch::nn::functional::softplus(gate);
             auto log_z = -torch::nn::functional::softplus(-gate);
             auto log_tilde_h = torch::where(hidden >= 0,
                 (torch::nn::functional::relu(hidden) + 0.5).log(),
                 -torch::nn::functional::softplus(-hidden));
             auto log_values = log_z + log_tilde_h;
-            /*
+            */
             torch::autograd::tensor_list outputs = log_coeffs_and_values(gate.contiguous(), hidden.contiguous());
             auto log_coeffs = outputs[0];
             auto log_values = outputs[1];
-            */
 
             log_values = torch::cat({state.log(), log_values}, 1);
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
+            /*
             auto a_star = log_coeffs.cumsum(1);
             auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
             auto log_h = a_star + log_h0_plus_b_star;
             out = log_h.exp();
+            */
 
-            //out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
+            out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
 
             out = out.narrow(1, out.size(1) - seq_len, seq_len);
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
         }
 
-        if (expansion_factor == 1) {
+        if (expansion_factor != 1) {
             out = to_out->forward(out);
         }
 
@@ -464,15 +466,15 @@ public:
             torch::nn::GELU()
         ));
         auto encoder_linear = (*encoder)[0]->as<torch::nn::LinearImpl>();
-        //torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
+        torch::nn::init::orthogonal_(encoder_linear->weight, std::sqrt(2.0));
         torch::nn::init::constant_(encoder_linear->bias, 0.0);
 
         decoder = register_module("decoder", torch::nn::Linear(hidden_size, num_atns));
-        //torch::nn::init::orthogonal_(decoder->weight, 0.01);
+        torch::nn::init::orthogonal_(decoder->weight, 0.01);
         torch::nn::init::constant_(decoder->bias, 0.0);
 
         value = register_module("value", torch::nn::Linear(hidden_size, 1));
-        //torch::nn::init::orthogonal_(value->weight, 1.0);
+        torch::nn::init::orthogonal_(value->weight, 1.0);
         torch::nn::init::constant_(value->bias, 0.0);
 
         //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
@@ -1201,7 +1203,8 @@ pybind11::dict compiled_train(
         auto ratio_new = logratio.exp();
 
         // Update global ratio and values in-place (matches Python)
-        ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+        // This one can be commented, doesn't matter much on breakout
+        //ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
 
         // Normalize advantages: (adv - mean) / std, then weight
         auto adv_normalized = mb_advantages;
@@ -1219,6 +1222,7 @@ pybind11::dict compiled_train(
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
+        // This one matters a lot even on breakout
         values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
         // Total loss

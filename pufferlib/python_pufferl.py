@@ -130,6 +130,19 @@ class PuffeRL:
             self.policy.forward_eval = torch.compile(policy.forward_eval, mode=config['compile_mode'])
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
+        '''
+        import heavyball
+        from heavyball import ForeachMuon
+        warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
+        heavyball.utils.compile_mode = "default"
+        self.optimizer = ForeachMuon(
+            self.policy.parameters(),
+            lr=config['learning_rate'],
+            betas=(config['adam_beta1'], config['adam_beta2']),
+            eps=config['adam_eps'],
+            heavyball_momentum=True,
+        )
+        '''
 
         self.optimizer = Muon(
             self.policy.parameters(),

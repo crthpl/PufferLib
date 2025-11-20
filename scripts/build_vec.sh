@@ -9,11 +9,13 @@ FLAGS=(
     -shared
     -Wall
     -I./$RAYLIB_NAME/include
+    -I/usr/local/cuda/include
     "pufferlib/extensions/breakout.c" -o "breakout.so"
     $LINK_ARCHIVES
     -lGL
     -lm
     -lpthread
+    #-L/usr/local/cuda/lib64 -lcudart
     -ferror-limit=3
     -DPLATFORM_DESKTOP
     # Bite me

@@ -18,7 +18,7 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    VecEnv vec = create_environments(8, kwargs);
+    VecEnv* vec = create_environments(8, kwargs);
     vec_reset(vec);
     vec_step(vec);
 

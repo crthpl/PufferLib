@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <cuda_runtime.h>
+
 #include "vecenv.h"
 
 #define FLOAT 1
@@ -126,10 +128,20 @@ VecEnv* create_environments(int num_envs, int threads, Dict* kwargs) {
         num_agents += 1;
     }
 
+    /*
     vec->observations = (float*)calloc(num_agents*OBS_SIZE, sizeof(float));
     vec->actions = (float*)calloc(num_agents*ACT_SIZE, sizeof(float));
     vec->rewards = (float*)calloc(num_agents, sizeof(float));
     vec->terminals = (unsigned char*)calloc(num_agents, sizeof(unsigned char));
+    */
+    cudaHostAlloc((void**)&vec->observations, num_agents*OBS_SIZE*sizeof(float), cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->actions, num_agents*ACT_SIZE*sizeof(float), cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->rewards, num_agents*sizeof(float), cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->terminals, num_agents*sizeof(unsigned char), cudaHostAllocPortable);
+    memset(vec->observations, 0, num_agents*OBS_SIZE*sizeof(float));
+    memset(vec->actions, 0, num_agents*ACT_SIZE*sizeof(float));
+    memset(vec->rewards, 0, num_agents*sizeof(float));
+    memset(vec->terminals, 0, num_agents*sizeof(unsigned char));
 
     int agent = 0;
     for (int i = 0; i < num_envs; i++) {
