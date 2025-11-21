@@ -440,8 +440,10 @@ class RobustLogCostModel:
         self.min_allowed_cost = min_allowed_cost
         self.quantile = quantile  # 0.5 = Median regression
         self.is_fitted = False
-        self.A = None          
-        self.B = None          
+        self.A = None
+        self.B = None
+        self.max_score = None
+        self.max_cost = None
 
     def _quantile_loss(self, params, x, y, q):
         # Pinball loss function for quantile regression
@@ -454,6 +456,8 @@ class RobustLogCostModel:
         self.is_fitted = False
         scores = np.array([e['output'] for e in observations])
         costs = np.array([e['cost'] for e in observations])
+        self.max_score = scores.max()
+        self.max_cost = costs.max()
 
         valid_indices = (costs > EPSILON) & np.isfinite(scores)
         if np.sum(valid_indices) < self.min_num_samples:
@@ -481,9 +485,13 @@ class RobustLogCostModel:
         self.A, self.B = res.x
         self.is_fitted = True
 
-    def get_threshold(self, cost):
+    def get_threshold(self, cost, upper_bound=1.5):
         if not self.is_fitted or cost < self.min_allowed_cost:
             return -np.inf
+
+        # Do not run training longer than 1.5x pareto max
+        if cost > upper_bound * self.max_cost:
+            return upper_bound * self.max_score
 
         log_c = np.log(np.maximum(cost, EPSILON))
         return self.A + self.B * log_c
