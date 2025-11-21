@@ -435,7 +435,7 @@ class RobustLogCostModel:
     Fits Score ~ A + B * log(Cost) using Quantile Regression (Median)
     and provides a cost-only threshold for early stopping.
     """
-    def __init__(self, min_num_samples=50, min_allowed_cost=600, quantile=0.3):
+    def __init__(self, min_num_samples=30, min_allowed_cost=600, quantile=0.3):
         self.min_num_samples = min_num_samples
         self.min_allowed_cost = min_allowed_cost
         self.quantile = quantile  # 0.5 = Median regression
