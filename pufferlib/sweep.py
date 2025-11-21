@@ -452,12 +452,12 @@ class RobustLogCostModel:
         residuals = y - y_pred
         return np.sum(np.maximum(q * residuals, (q - 1) * residuals))
 
-    def fit(self, observations):
+    def fit(self, observations, pareto_max_cost=None):
         self.is_fitted = False
         scores = np.array([e['output'] for e in observations])
         costs = np.array([e['cost'] for e in observations])
         self.max_score = scores.max()
-        self.max_cost = costs.max()
+        self.max_cost = pareto_max_cost or costs.max()
 
         valid_indices = (costs > EPSILON) & np.isfinite(scores)
         if np.sum(valid_indices) < self.min_num_samples:
@@ -485,13 +485,13 @@ class RobustLogCostModel:
         self.A, self.B = res.x
         self.is_fitted = True
 
-    def get_threshold(self, cost, upper_bound=1.5):
-        # Do not run training longer than 1.5x pareto max
-        if cost > upper_bound * self.max_cost:
-            return upper_bound * self.max_score
-
+    def get_threshold(self, cost):
         if not self.is_fitted or cost < self.min_allowed_cost:
             return -np.inf
+
+        # Let the training continue, if it can beat the current max more than 5%
+        if cost > 1.2 * self.max_cost:
+            return 1.05 * self.max_score
 
         log_c = np.log(np.maximum(cost, EPSILON))
         return self.A + self.B * log_c
@@ -706,16 +706,17 @@ class Protein:
 
         score_loss, cost_loss = self._train_gp_models()
 
-        self.stop_threshold_model.fit(self.success_observations)
-
         if self.optimizer_reset_frequency and self.suggestion_idx % self.optimizer_reset_frequency == 0:
             print(f'Resetting GP optimizers at suggestion {self.suggestion_idx}')
             self.score_opt = torch.optim.Adam(self.gp_score.parameters(), lr=self.gp_learning_rate, amsgrad=True)
             self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
        
-        candidates, pareto_idxs = pareto_points(self.success_observations)
-        if self.prune_pareto:
-            candidates = prune_pareto_front(candidates)
+        pareto_front, pareto_idxs = pareto_points(self.success_observations)
+        pruned_front = prune_pareto_front(pareto_front)
+        candidates = pruned_front if self.prune_pareto else pareto_front
+
+        # Use the max cost from the pruned pareto to avoid inefficiently long runs
+        self.stop_threshold_model.fit(self.success_observations, pareto_max_cost=pruned_front[-1]['cost'])
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in candidates])
