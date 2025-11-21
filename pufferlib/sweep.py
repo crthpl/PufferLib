@@ -279,8 +279,8 @@ def prune_pareto_front(pareto, efficiency_threshold=0.5, pruning_stop_score_frac
 
     max_pareto_score = scores[-1] if scores.size > 0 else -np.inf
 
-    for i in range(len(sorted_pareto) - 1, 0, -1):
-        if scores[i] < pruning_stop_score_fraction * max_pareto_score:
+    for i in range(len(sorted_pareto) - 1, 1, -1):
+        if scores[i-1] < pruning_stop_score_fraction * max_pareto_score:
             break
 
         norm_score_gain = (scores[i] - scores[i-1]) / score_range
@@ -550,7 +550,7 @@ class Protein:
         self.cost_param_idx = self.hyperparameters.get_flat_idx(cost_param)
         self.cost_random_suggestion = None
         if self.cost_param_idx is not None:
-            self.cost_random_suggestion = self.hyperparameters.search_centers[self.cost_param_idx]
+            self.cost_random_suggestion = -0.8  # In norm cost space. Make arg if necessary
 
         self.gp_max_obs = gp_max_obs  # train time bumps after 800?
         self.infer_batch_size = infer_batch_size
