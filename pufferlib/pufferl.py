@@ -1064,7 +1064,7 @@ def sweep(args=None, env_name=None):
 
     sweep = sweep_cls(args['sweep'])
     target_key = f'environment/{args["sweep"]["metric"]}'
-    max_score = 0
+    points_per_run = args['sweep']['downsample']
 
     def stop_if_perf_below(logs):
         if stop_if_loss_nan(logs):
@@ -1085,12 +1085,9 @@ def sweep(args=None, env_name=None):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        points_per_run = args['sweep']['downsample']
         # In the first run, skip sweep and use the train args specified in the config
-        # Then, sample a lot of points to get the starting pareto curve
         if i > 0:
             sweep.suggest(args)
-            points_per_run *= 3
 
         all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
         all_logs = [e for e in all_logs if target_key in e]
@@ -1099,19 +1096,13 @@ def sweep(args=None, env_name=None):
             sweep.observe(args, 0, 0, is_failure=True)
             continue
 
-        is_final_loss_nan = all_logs[-1].get('is_loss_nan', False)
-        curr_score = all_logs[-1][target_key]
-        if not is_final_loss_nan and curr_score > max_score:
-            max_score = curr_score
-            # Sample more points from the new best run
-            points_per_run *= 3
-
         total_timesteps = args['train']['total_timesteps']
 
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
 
+        is_final_loss_nan = all_logs[-1].get('is_loss_nan', False)
         if is_final_loss_nan:
             s = scores.pop()
             c = costs.pop()
