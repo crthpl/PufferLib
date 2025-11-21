@@ -486,12 +486,12 @@ class RobustLogCostModel:
         self.is_fitted = True
 
     def get_threshold(self, cost, upper_bound=1.5):
-        if not self.is_fitted or cost < self.min_allowed_cost:
-            return -np.inf
-
         # Do not run training longer than 1.5x pareto max
         if cost > upper_bound * self.max_cost:
             return upper_bound * self.max_score
+
+        if not self.is_fitted or cost < self.min_allowed_cost:
+            return -np.inf
 
         log_c = np.log(np.maximum(cost, EPSILON))
         return self.A + self.B * log_c
