@@ -504,7 +504,7 @@ class Protein:
             max_suggestion_cost = 3600,
             resample_frequency = 0,
             num_random_samples = 10,
-            num_keep_top_obs = 10,
+            num_keep_top_obs = 5,
             global_search_scale = 1,
             suggestions_per_pareto = 256,
             expansion_rate = 0.25,
