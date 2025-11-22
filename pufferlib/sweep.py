@@ -506,7 +506,7 @@ class Protein:
             num_random_samples = 10,
             num_keep_top_obs = 10,
             global_search_scale = 1,
-            suggestions_per_pareto = 128,
+            suggestions_per_pareto = 256,
             expansion_rate = 0.25,
             gp_training_iter = 50,
             gp_learning_rate = 0.001,
@@ -690,7 +690,7 @@ class Protein:
         if self.cost_param_idx is None:
             return params
 
-        # Add the same params with less cost to the search center
+        # Add the same params with less cost to the search center, and not the original
         original_costs_norm = params[:, self.cost_param_idx]
 
         params_1 = np.copy(params)
@@ -700,7 +700,7 @@ class Protein:
         cost_norm_2 = original_costs_norm - (original_costs_norm - (-1)) / 3
         params_2[:, self.cost_param_idx] = cost_norm_2
 
-        return np.vstack([params, params_1, params_2])
+        return np.vstack([params_1, params_2])
 
     def suggest(self, fill):
         info = {}
