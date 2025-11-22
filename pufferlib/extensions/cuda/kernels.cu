@@ -199,6 +199,22 @@ void launch_log_coeffs_and_values_backward(
     }
 }
 
+__device__ __forceinline__ double logcumsumexp_forward(double x, double acc) {
+    if (acc == -INFINITY) {
+        return x;
+    } else {
+        double min_val = fmin(acc, x);
+        double max_val = fmax(acc, x);
+        return max_val + log1pf(expf(min_val - max_val));
+    }
+}
+
+__device__ __forceinline__ double logcumsumexp_backward(double x, double* acc, double grad, double s, double* s_nxt) {
+    *acc = grad + *acc * exp(s - *s_nxt);
+    *s_nxt = s;
+    return *acc * exp(x - s);
+}
+
 template<typename T>
 __global__ void fused_scan_forward_kernel(
     T* __restrict__ out,
@@ -224,26 +240,24 @@ __global__ void fused_scan_forward_kernel(
     for (int t = 0; t < T_total; t++) {
         int curr = base + t * H;
 
-        // Step 1: Update a_star[t] = sum_{i=0}^t log_coeffs[i]
+        // a_star[t] = sum_{i=0}^t log_coeffs[i]
         a_star += double(log_coeffs[curr]);
 
-        // Step 2: Compute z[t] = log_values[t] - a_star[t]
-        double z_val = double(log_values[curr]) - a_star;
+        double z = double(log_values[curr]) - a_star;
 
-        // Step 3: logcumsumexp on z — EXACTLY as in logcumsumexp_forward_kernel
         if (s == -INFINITY) {
-            s = z_val;
+            s = z;
         } else {
-            double max_val = fmax(s, z_val);
-            double diff = fabs(s - z_val);
-            s = max_val + log1p(exp(-diff));
+            double min_val = fmin(s, z);
+            double max_val = fmax(s, z);
+            s = max_val + log1pf(expf(min_val - max_val));
         }
 
-        // Step 4: log_h[t] = a_star[t] + s[t], then out[t] = exp(log_h[t])
-        double log_h = a_star + s;
-        out[curr] = T(exp(log_h));
+        //s = logcumsumexp_forward(z, s);
 
-        // Step 5: Save intermediates (same as before)
+        double log_h = a_star + s;
+        out[curr] = T(expf(log_h));
+
         a_star_buf[curr] = a_star;
         s_buf[curr] = s;
     }
@@ -253,8 +267,8 @@ template<typename T>
 __global__ void fused_scan_backward_kernel(
     T* __restrict__ grad_log_coeffs,
     T* __restrict__ grad_log_values,
-    const T* __restrict__ d_out,
-    const T* __restrict__ out,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ out_buf,
     const double* __restrict__ a_star_buf,
     const double* __restrict__ s_buf,
     const T* __restrict__ log_values,
@@ -270,39 +284,114 @@ __global__ void fused_scan_backward_kernel(
 
     int base = b * T_total * H + h;
 
-    double carry_d_a = 0.0;
-    double carry_d_s = 0.0;
+    double acc = 0.0;
+    double s_val_next = 0.0;
+    double carry_grad_a = 0.0;
 
     for (int t = T_total - 1; t >= 0; --t) {
         int curr = base + t * H;
 
-        double A = a_star_buf[curr];
-        double S = s_buf[curr];
-        double Z = double(log_values[curr]) - A;
-        double out_val = double(out[curr]);
-        double d_log_h = double(d_out[curr]) * out_val;
+        double a_star = a_star_buf[curr];
+        double z = double(log_values[curr]) - a_star;
+        double s = s_buf[curr];
 
-        double d_S = d_log_h + carry_d_s;
+        double grad_log_h = double(grad_out[curr]) * double(out_buf[curr]); // out_buf[t] = exp(log_h[t])
+        double grad_s = grad_log_h;
 
-        double S_prev = (t == 0) ? -INFINITY : s_buf[base + (t - 1) * H];
+        if (t == T_total - 1) {
+            acc = grad_s;
+        } else {
+            acc = grad_s + acc*exp(s - s_val_next);
+        }
+        double grad_z = acc * exp(z - s);
+        s_val_next = s;
 
-        double max_val = fmax(S_prev, Z);
-        double exp_prev = (S_prev == -INFINITY) ? 0.0 : exp(S_prev - max_val);
-        double exp_z = (Z == -INFINITY) ? 0.0 : exp(Z - max_val);
+        //double grad_z = logcumsumexp_backward(z, &acc, grad_s, s, &s_val_next);
+        double grad_a = grad_log_h + carry_grad_a - grad_z;
+
+        carry_grad_a = grad_a;
+
+        grad_log_coeffs[curr] = T(grad_a);
+        grad_log_values[curr] = T(grad_z);
+    }
+}
+
+/*
+template<typename T>
+__global__ void fused_scan_backward_kernel(
+    T* __restrict__ grad_log_coeffs,
+    T* __restrict__ grad_log_values,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ out_buf,
+    const double* __restrict__ a_star_buf,
+    const double* __restrict__ s_buf,
+    const T* __restrict__ log_values,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int base = b * T_total * H + h;
+
+    double carry_grad_a = 0.0;
+    double carry_grad_s = 0.0;
+
+    for (int t = T_total - 1; t >= 0; --t) {
+        int curr = base + t * H;
+
+        double a_star = a_star_buf[curr];
+        double s = s_buf[curr];
+        double z = double(log_values[curr]) - a_star;
+        double grad_log_h = double(grad_out[curr]) * double(out_buf[curr]); // out_buf[t] = exp(log_h[t])
+
+        double grad_s = grad_log_h + carry_grad_s;
+
+        double s_prev = -INFINITY;
+        if (t > 0) {
+            s_prev = s_buf[base + (t - 1) * H];
+        }
+
+        double max_val = fmax(s_prev, z);
+
+        double exp_prev = 0.0;
+        if (s_prev != -INFINITY) {
+            exp_prev = exp(s_prev - max_val);
+        }
+
+        double exp_z = 0.0;
+        if (z != -INFINITY) {
+            exp_z = exp(z - max_val);
+        }
+
         double denom = exp_prev + exp_z;
-        double frac_prev = (denom == 0.0) ? 0.0 : exp_prev / denom;
-        double frac_z = (denom == 0.0) ? 0.0 : exp_z / denom;
 
-        double d_Z = frac_z * d_S;
-        double d_A = d_log_h + carry_d_a - d_Z;
+        double frac_prev = 0.0;
+        double frac_z = 0.0;
+        if (denom != 0.0) {
+            frac_prev = exp_prev / denom;
+            frac_z = exp_z / denom;
+        }
+
+        // grad_z = (grad_log_h + carry_grad_s) * exp(z - max_val) / (exp(s_prev - max_val) + exp(z - max_val))
+        // grad_z = (grad_log_h + exp(s - exp_nxt)) * exp(z - s) 
+
+        double d_Z = frac_z * grad_s;
+        double d_A = grad_log_h + carry_grad_a - d_Z;
 
         grad_log_values[curr] = T(d_Z);
         grad_log_coeffs[curr] = T(d_A);
 
-        carry_d_a = d_A;
-        carry_d_s = frac_prev * d_S;
+        carry_grad_a = d_A;
+        carry_grad_s = frac_prev * grad_s;
     }
 }
+*/
+
 
 /*
 template<typename T>
@@ -586,7 +675,8 @@ __device__ __forceinline__ double log_add_exp(const double a, const double b) {
 __device__ __forceinline__ double log_add_exp_backward(double x, double s) {
     return exp(x - s);
 }
-  
+
+ 
 // This exactly matches pytorch in double, but not in float
 template<typename T>
 __global__ void logcumsumexp_forward_kernel(
@@ -610,13 +700,7 @@ __global__ void logcumsumexp_forward_kernel(
     for (int t = 0; t < T_total; t++) {
         int curr = base + t * H;
         double x_val = double(x[curr]);
-
-        if (s == -INFINITY) {
-            s = x_val;
-        } else {
-            s = log_add_exp(s, x_val);
-        }
-
+        s = logcumsumexp_forward(x_val, s);
         out[curr] = T(s);
         s_buf[curr] = s;
     }
@@ -624,7 +708,7 @@ __global__ void logcumsumexp_forward_kernel(
 template<typename T>
 __global__ void logcumsumexp_backward_kernel(
     T* __restrict__ grad_x,
-    const T* __restrict__ grad_s,
+    const T* __restrict__ grad_out,
     const T* __restrict__ x,
     const double* __restrict__ s_buf,
     int T_total,
@@ -640,22 +724,15 @@ __global__ void logcumsumexp_backward_kernel(
     int base = b * T_total * H + h;
 
     double acc = 0.0;
+    double s_val_next = 0.0;
 
     for (int t = T_total - 1; t >= 0; --t) {
         int curr = base + t * H;
 
         double x_val = double(x[curr]);
         double s_val = double(s_buf[curr]);
-        double g_val = double(grad_s[curr]);
-
-        if (t == T_total - 1) {
-            acc = g_val;
-        } else {
-            double s_next_val = double(s_buf[curr + H]);
-            acc = g_val + acc*log_add_exp_backward(s_val, s_next_val);
-        }
-
-        grad_x[curr] = T(acc*log_add_exp_backward(x_val, s_val));
+        double g_val = double(grad_out[curr]);
+        grad_x[curr] = T(logcumsumexp_backward(x_val, &acc, g_val, s_val, &s_val_next));
     }
 }
 /*
