@@ -505,7 +505,7 @@ class Protein:
             resample_frequency = 0,
             num_random_samples = 10,
             global_search_scale = 1,
-            suggestions_per_pareto = 256,
+            suggestions_per_pareto = 128,
             expansion_rate = 0.25,
             gp_training_iter = 50,
             gp_learning_rate = 0.001,
@@ -535,6 +535,7 @@ class Protein:
 
         self.success_observations = []
         self.failure_observations = []
+        self.top_20_observations = []
 
         self.suggestion_idx = 0
         self.min_score, self.max_score = math.inf, -math.inf
@@ -713,15 +714,20 @@ class Protein:
        
         pareto_front, pareto_idxs = pareto_points(self.success_observations)
         pruned_front = prune_pareto_front(pareto_front)
-        candidates = pruned_front if self.prune_pareto else pareto_front
+        pareto_observations = pruned_front if self.prune_pareto else pareto_front
 
         # Use the max cost from the pruned pareto to avoid inefficiently long runs
         self.stop_threshold_model.fit(self.success_observations, pareto_max_cost=pruned_front[-1]['cost'])
 
         ### Sample suggestions
-        search_centers = np.stack([e['input'] for e in candidates])
+        search_centers = np.stack([e['input'] for e in pareto_observations])
+        if self.top_20_observations:
+            # Add top 20 observations by score to search centers for diversity
+            top_20_params = np.stack([e['input'] for e in self.top_20_observations])
+            search_centers = np.vstack([search_centers, top_20_params])
+
         suggestions = self.hyperparameters.sample(
-            len(candidates)*self.suggestions_per_pareto, mu=search_centers)
+            len(search_centers)*self.suggestions_per_pareto, mu=search_centers)
 
         dedup_indices = self._filter_near_duplicates(suggestions)
         suggestions = suggestions[dedup_indices]
@@ -840,6 +846,15 @@ class Protein:
             return
 
         self.success_observations.append(new_observation)
+
+        # Update top_20_observations without sorting the full list every time
+        if len(self.top_20_observations) < 20:
+            self.top_20_observations.append(new_observation)
+            self.top_20_observations.sort(key=lambda x: x['output'], reverse=True)
+        elif score > self.top_20_observations[-1]['output']:
+            self.top_20_observations.pop()
+            self.top_20_observations.append(new_observation)
+            self.top_20_observations.sort(key=lambda x: x['output'], reverse=True)
 
     def get_early_stop_threshold(self, cost):
         return self.stop_threshold_model.get_threshold(cost)
