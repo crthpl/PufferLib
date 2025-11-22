@@ -504,6 +504,7 @@ class Protein:
             max_suggestion_cost = 3600,
             resample_frequency = 0,
             num_random_samples = 10,
+            num_keep_top_obs = 10,
             global_search_scale = 1,
             suggestions_per_pareto = 128,
             expansion_rate = 0.25,
@@ -535,7 +536,8 @@ class Protein:
 
         self.success_observations = []
         self.failure_observations = []
-        self.top_20_observations = []
+        self.num_keep_top_obs = num_keep_top_obs
+        self.top_observations = []
 
         self.suggestion_idx = 0
         self.min_score, self.max_score = math.inf, -math.inf
@@ -680,6 +682,26 @@ class Protein:
 
         return score_loss, cost_loss
 
+    def _get_top_obs_params(self):
+        if not self.top_observations:
+            return np.array([])
+        
+        params = np.array([e['input'] for e in self.top_observations])
+        if self.cost_param_idx is None:
+            return params
+
+        # Add the same params with less cost to the search center
+        original_costs_norm = params[:, self.cost_param_idx]
+
+        params_1 = np.copy(params)
+        cost_norm_1 = original_costs_norm - (original_costs_norm - (-1)) / 2
+        params_1[:, self.cost_param_idx] = cost_norm_1
+        params_2 = np.copy(params)
+        cost_norm_2 = original_costs_norm - (original_costs_norm - (-1)) / 3
+        params_2[:, self.cost_param_idx] = cost_norm_2
+
+        return np.vstack([params, params_1, params_2])
+
     def suggest(self, fill):
         info = {}
         self.suggestion_idx += 1
@@ -721,10 +743,9 @@ class Protein:
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in pareto_observations])
-        if self.top_20_observations:
-            # Add top 20 observations by score to search centers for diversity
-            top_20_params = np.stack([e['input'] for e in self.top_20_observations])
-            search_centers = np.vstack([search_centers, top_20_params])
+        if self.top_observations:
+            # Add top observations by score to search centers for diversity
+            search_centers = np.vstack([search_centers, self._get_top_obs_params()])
 
         suggestions = self.hyperparameters.sample(
             len(search_centers)*self.suggestions_per_pareto, mu=search_centers)
@@ -847,14 +868,14 @@ class Protein:
 
         self.success_observations.append(new_observation)
 
-        # Update top_20_observations without sorting the full list every time
-        if len(self.top_20_observations) < 20:
-            self.top_20_observations.append(new_observation)
-            self.top_20_observations.sort(key=lambda x: x['output'], reverse=True)
-        elif score > self.top_20_observations[-1]['output']:
-            self.top_20_observations.pop()
-            self.top_20_observations.append(new_observation)
-            self.top_20_observations.sort(key=lambda x: x['output'], reverse=True)
+        # Update top_observations without sorting the full list every time
+        if len(self.top_observations) < self.num_keep_top_obs:
+            self.top_observations.append(new_observation)
+            self.top_observations.sort(key=lambda x: x['output'], reverse=True)
+        elif score > self.top_observations[-1]['output']:
+            self.top_observations.pop()
+            self.top_observations.append(new_observation)
+            self.top_observations.sort(key=lambda x: x['output'], reverse=True)
 
     def get_early_stop_threshold(self, cost):
         return self.stop_threshold_model.get_threshold(cost)
