@@ -452,12 +452,12 @@ class RobustLogCostModel:
         residuals = y - y_pred
         return np.sum(np.maximum(q * residuals, (q - 1) * residuals))
 
-    def fit(self, observations, pareto_max_cost=None):
+    def fit(self, observations, upper_cost_threshold=None):
         self.is_fitted = False
         scores = np.array([e['output'] for e in observations])
         costs = np.array([e['cost'] for e in observations])
         self.max_score = scores.max()
-        self.max_cost = pareto_max_cost or costs.max()
+        self.upper_cost_threshold = upper_cost_threshold or costs.max()
 
         valid_indices = (costs > EPSILON) & np.isfinite(scores)
         if np.sum(valid_indices) < self.min_num_samples:
@@ -490,7 +490,7 @@ class RobustLogCostModel:
             return -np.inf
 
         # Let the training continue, if it can beat the current max more than 5%
-        if cost > 1.2 * self.max_cost:
+        if cost > 1.2 * self.upper_cost_threshold:
             return 1.05 * self.max_score
 
         log_c = np.log(np.maximum(cost, EPSILON))
@@ -565,6 +565,7 @@ class Protein:
         # This model is conservative. Aggressive early stopping hampers GP model learning. 
         self.stop_threshold_model = RobustLogCostModel(
             quantile=sweep_config['early_stop_quantile'], min_allowed_cost=sweep_config['early_stop_min_cost'])
+        self.upper_cost_threshold = -np.inf
 
         # Use 64 bit for GP regression
         with default_tensor_dtype(torch.float64):
@@ -739,7 +740,9 @@ class Protein:
         pareto_observations = pruned_front if self.prune_pareto else pareto_front
 
         # Use the max cost from the pruned pareto to avoid inefficiently long runs
-        self.stop_threshold_model.fit(self.success_observations, pareto_max_cost=pruned_front[-1]['cost'])
+        if self.upper_cost_threshold < pareto_front[-1]['cost']:
+            self.upper_cost_threshold = pareto_front[-1]['cost']
+        self.stop_threshold_model.fit(self.success_observations, self.upper_cost_threshold)
 
         ### Sample suggestions
         search_centers = np.stack([e['input'] for e in pareto_observations])
