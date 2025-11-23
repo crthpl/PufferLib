@@ -554,6 +554,7 @@ class Protein:
         self.cost_random_suggestion = None
         if self.cost_param_idx is not None:
             self.cost_random_suggestion = -0.8  # In norm cost space. Make arg if necessary
+        self.target_cost_ratio = []
 
         self.gp_max_obs = gp_max_obs  # train time bumps after 800?
         self.infer_batch_size = infer_batch_size
@@ -703,6 +704,13 @@ class Protein:
 
         return np.vstack([params_1, params_2])
 
+    def _sample_target_cost_ratio(self, expansion_rate, target_ratios=(0.16, 0.32, 0.48, 0.64, 0.8, 1.0)):
+        if not self.target_cost_ratio:
+            self.target_cost_ratio = list(target_ratios)
+            random.shuffle(self.target_cost_ratio)
+        target_ratio = np.clip(self.target_cost_ratio.pop() + 0.1 * np.random.randn(), 0, 1)
+        return (1 + expansion_rate) * target_ratio
+
     def suggest(self, fill):
         info = {}
         self.suggestion_idx += 1
@@ -803,8 +811,8 @@ class Protein:
 
         # Then, decide the budget for this session and favor closer suggestions
         max_c_mask = gp_c < self.max_suggestion_cost
-        target = (1 + self.expansion_rate)*np.random.rand()
-        weight = 1 - abs(target - gp_log_c_norm)
+        target_cost = self._sample_target_cost_ratio(self.expansion_rate)
+        weight = 1 - abs(target_cost - gp_log_c_norm)
         suggestion_scores *= max_c_mask * weight
 
         # Then, consider the prob of training success, only when downsample = 1
