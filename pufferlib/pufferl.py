@@ -1063,8 +1063,9 @@ def sweep(args=None, env_name=None):
         raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
 
     sweep = sweep_cls(args['sweep'])
-    target_key = f'environment/{args["sweep"]["metric"]}'
     points_per_run = args['sweep']['downsample']
+    target_key = f'environment/{args["sweep"]["metric"]}'
+    running_target_buffer = deque(maxlen=30)
 
     def stop_if_perf_below(logs):
         if stop_if_loss_nan(logs):
@@ -1072,9 +1073,12 @@ def sweep(args=None, env_name=None):
             return True
 
         if ('uptime' in logs and target_key in logs):
+            running_target_buffer.append(logs[target_key])
+            target_running_mean = np.mean(running_target_buffer)
             threshold = sweep.get_early_stop_threshold(logs['uptime'])
             logs['early_stop_treshold'] = max(threshold, 0)  # clipping for visualization
-            if logs[target_key] < threshold:
+
+            if target_running_mean < threshold:
                 logs['is_loss_nan'] = False
                 return True
         return False

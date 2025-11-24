@@ -489,12 +489,11 @@ class RobustLogCostModel:
         if not self.is_fitted or cost < self.min_allowed_cost:
             return -np.inf
 
-        # Let the training continue, if it can beat the current max more than 5%
+        # Stop long long train runs that don't do very well enough
         if cost > 1.2 * self.upper_cost_threshold:
-            return 1.05 * self.max_score
+            return 0.9 * self.max_score
 
-        log_c = np.log(np.maximum(cost, EPSILON))
-        return self.A + self.B * log_c
+        return self.A + self.B * np.log(cost)
 
 
 # TODO: Eval defaults
