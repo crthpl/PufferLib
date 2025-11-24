@@ -1078,7 +1078,7 @@ def sweep(args=None, env_name=None):
             threshold = sweep.get_early_stop_threshold(logs['uptime'])
             logs['early_stop_treshold'] = max(threshold, 0)  # clipping for visualization
 
-            if target_running_mean < threshold:
+            if max(target_running_mean, logs[target_key]) < threshold:
                 logs['is_loss_nan'] = False
                 return True
         return False
