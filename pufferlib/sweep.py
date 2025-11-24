@@ -748,8 +748,11 @@ class Protein:
         pareto_observations = pruned_front if self.prune_pareto else pareto_front
 
         # Use the max cost from the pruned pareto to avoid inefficiently long runs
-        if self.upper_cost_threshold < pareto_front[-1]['cost']:
+        if self.upper_cost_threshold < 0:
             self.upper_cost_threshold = pareto_front[-1]['cost']
+        # Try to change the threshold slowly
+        elif self.upper_cost_threshold < pareto_front[-1]['cost']:
+            self.upper_cost_threshold *= 1.01
         self.stop_threshold_model.fit(self.success_observations, self.upper_cost_threshold)
 
         ### Sample suggestions
