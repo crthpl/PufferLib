@@ -506,7 +506,7 @@ class Protein:
             num_keep_top_obs = 5,
             global_search_scale = 1,
             suggestions_per_pareto = 256,
-            expansion_rate = 0.25,
+            expansion_rate = 0.1,
             gp_training_iter = 50,
             gp_learning_rate = 0.001,
             gp_max_obs = 750,  # gp train time jumps after 800
@@ -622,7 +622,8 @@ class Protein:
 
         c = np.array([e['cost'] for e in observations])
         log_c = np.log(np.maximum(c, EPSILON))
-        self.log_c_min, self.log_c_max = log_c.min(), log_c.max()
+        self.log_c_min = log_c.min()
+        self.log_c_max = np.quantile(log_c, 0.97)  # Make it less sensitive to outlier points
 
         # When the data is scare, also use failed observations
         if len(observations) < 100 and self.failure_observations:
