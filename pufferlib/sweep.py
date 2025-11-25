@@ -135,8 +135,8 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
         only_include = [p.strip() for p in sweep_config['sweep_only'].split(',')]
 
     for name, param in sweep_config.items():
-        if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only',
-                    'max_suggestion_cost', 'early_stop_quantile', 'early_stop_min_cost'):
+        if name in ('method', 'metric', 'metric_distribution', 'goal', 'downsample', 'use_gpu', 'prune_pareto',
+                    'sweep_only', 'max_suggestion_cost', 'early_stop_quantile'):
             continue
 
         assert isinstance(param, dict)
@@ -444,6 +444,7 @@ class RobustLogCostModel:
         self.B = None
         self.max_score = None
         self.max_cost = None
+        self.upper_cost_threshold = None
 
     def _quantile_loss(self, params, x, y, q):
         # Pinball loss function for quantile regression
@@ -485,8 +486,13 @@ class RobustLogCostModel:
         self.A, self.B = res.x
         self.is_fitted = True
 
-    def get_threshold(self, cost):
-        if not self.is_fitted or cost < self.min_allowed_cost:
+    def get_threshold(self, cost, min_cost_fraction=0.3, abs_min_cost=10):
+        if not self.is_fitted or self.upper_cost_threshold is None:
+            return -np.inf
+
+        # NOTE: min_allowed_cost seems vary a lot from env to env, so dynamically set here
+        min_allowed_cost = self.upper_cost_threshold * min_cost_fraction + abs_min_cost
+        if cost < min_allowed_cost:
             return -np.inf
 
         # Stop long long train runs that don't do very well enough
@@ -523,6 +529,7 @@ class Protein:
 
         self.device = torch.device("cuda:0" if _use_gpu and torch.cuda.is_available() else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
+        self.metric_distribution = sweep_config['metric_distribution']
         self.global_search_scale = global_search_scale
         self.suggestions_per_pareto = suggestions_per_pareto
         self.resample_frequency = resample_frequency
@@ -562,9 +569,8 @@ class Protein:
         self.use_success_prob = sweep_config['downsample'] == 1
         self.success_classifier = LogisticRegression(class_weight='balanced')
 
-        # This model is conservative. Aggressive early stopping hampers GP model learning. 
-        self.stop_threshold_model = RobustLogCostModel(
-            quantile=sweep_config['early_stop_quantile'], min_allowed_cost=sweep_config['early_stop_min_cost'])
+        # This model is conservative. Aggressive early stopping interferes with and hampers GP model learning.
+        self.stop_threshold_model = RobustLogCostModel(quantile=sweep_config['early_stop_quantile'])
         self.upper_cost_threshold = -np.inf
 
         # Use 64 bit for GP regression
