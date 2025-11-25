@@ -62,7 +62,7 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 
 class PuffeRL:
-    def __init__(self, config, vecenv, logger=None, verbose=True):
+    def __init__(self, config, logger=None, verbose=True):
         # Backend perf optimization
         num_envs = 8192
         self.num_envs = num_envs
@@ -217,7 +217,7 @@ class PuffeRL:
             self.num_envs
         )
 
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
         logs = _C.log_environments(self.pufferl_cpp)
         if logs:
             self.stats['perf'] = [logs['perf']]
@@ -560,8 +560,8 @@ class Profile:
         if (epoch + 1) % self.frequency != 0:
             return
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        #if torch.cuda.is_available():
+        #    torch.cuda.synchronize()
 
         tick = time.time()
         if len(self.stack) != 0 and not nest:
@@ -578,8 +578,8 @@ class Profile:
         profile['elapsed'] += delta * self.frequency
 
     def end(self):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        #if torch.cuda.is_available():
+        #    torch.cuda.synchronize()
 
         end = time.time()
         for i in range(len(self.stack)):
@@ -839,7 +839,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     train_config = dict(**args['train'])#, env=env_name)
     #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
-    pufferl = PuffeRL(train_config, vecenv, logger, verbose)
+    pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 
     all_logs = []
@@ -1201,23 +1201,66 @@ def sweep(args=None, env_name=None):
         args['train']['total_timesteps'] = total_timesteps
 
 def profile(args=None, env_name=None, vecenv=None, policy=None):
-    args = load_config()
-    vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv)
+    args = load_config(env_name)
+    #vecenv = vecenv or load_env(env_name, args)
+    #policy = policy or load_policy(args, vecenv)
 
-    train_config = dict(**args['train'], env=args['env_name'], tag=args['tag'])
-    pufferl = PuffeRL(train_config, vecenv, policy, neptune=args['neptune'], wandb=args['wandb'])
+    #train_config = dict(**args['train'], env=args['env_name'], tag=args['tag'])
+    train_config = dict(**args['train'])
+    #pufferl = PuffeRL(train_config, vecenv, policy, neptune=args['neptune'], wandb=args['wandb'])
+    pufferl = PuffeRL(train_config)
+
+    # Warmup
+    for _ in range(5):
+        stats = pufferl.evaluate()
+        pufferl.train()
+
+    torch.cuda.synchronize()
+    torch._C._cuda_clearCublasWorkspaces()      # optional, clears cuBLAS heuristics
+    torch.compiler.cudagraph_mark_step_begin()  # forces any pending CUDA graph/JIT work to finish
+    torch.cuda.synchronize()
+
+    pufferl.evaluate()
+    pufferl.train()
+    torch.cuda.synchronize()
 
     import torchvision.models as models
-    from torch.profiler import profile, record_function, ProfilerActivity
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("model_inference"):
-            for _ in range(10):
+    from torch.profiler import profile, record_function, ProfilerActivity, schedule
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(
+            skip_first=15,
+            wait=5,
+            warmup=10,
+            active=5,
+            repeat=1
+        )
+    ) as prof:
+        for _ in range(35):  # 15 + 5 + 10 + 5 
+            with record_function("full_step"):
+                pufferl.evaluate()
+                pufferl.train()
+            prof.step()
+
+    '''
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
+        with record_function("full_step"):
+            for _ in range(5):
                 stats = pufferl.evaluate()
                 pufferl.train()
+                prof.step()
+    '''
 
-    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
-    prof.export_chrome_trace("trace.json")
+    print(prof.key_averages(group_by_input_shape=False).table(
+        sort_by="self_cpu_time_total",
+        row_limit=50,
+    ))
+    #prof.export_chrome_trace("trace.json")
 
 def export(args=None, env_name=None, vecenv=None, policy=None):
     args = args or load_config(env_name)

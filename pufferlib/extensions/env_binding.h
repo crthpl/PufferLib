@@ -83,11 +83,14 @@ static void* c_threadstep(void* arg)
             }
         }
         while (index > 0);
+        atomic_fetch_sub_explicit(num_running_threads, 1, memory_order_relaxed);
+        /*
         if (atomic_fetch_sub_explicit(num_running_threads, 1, memory_order_relaxed) == 1) {
             pthread_mutex_lock(&threading->all_done_mutex);
             pthread_cond_signal(&threading->all_done_cond);
             pthread_mutex_unlock(&threading->all_done_mutex);
         }
+        */
     }
     return NULL;
 }
@@ -194,11 +197,14 @@ void vec_step(VecEnv* vec) {
     atomic_store_explicit(&threading->num_running_threads, threading->num_threads, memory_order_relaxed);
     atomic_store_explicit(&threading->work_index, vec->size-1, memory_order_relaxed);
     pthread_cond_broadcast(&threading->wake_cond);
+    while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {}
+    /*
     pthread_mutex_lock(&threading->all_done_mutex);
     while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {
         pthread_cond_wait(&threading->all_done_cond, &threading->all_done_mutex);
     }
     pthread_mutex_unlock(&threading->all_done_mutex);
+    */
 }
 
 void env_close(Env* env) {

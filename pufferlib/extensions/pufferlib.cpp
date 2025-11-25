@@ -41,6 +41,57 @@ torch::Dtype to_torch_dtype(int dtype) {
     return torch::kFloat32;
 }
 
+// Torch is stupid. Had to clip out a redundant cuda sync.
+void clip_grad_norm_(
+    const std::vector<torch::Tensor>& parameters,
+    double max_norm,
+    double norm_type = 2.0
+    ) {
+  std::vector<torch::Tensor> params_with_grad;
+
+  for (const auto& param : parameters) {
+    auto& grad = param.grad();
+    if (grad.defined()) {
+      params_with_grad.push_back(param);
+    }
+  }
+
+  if (params_with_grad.empty()) {
+    return;
+  }
+
+  torch::Tensor total_norm_tensor;
+  if (norm_type == std::numeric_limits<double>::infinity()) {
+    std::vector<torch::Tensor> norms;
+    norms.reserve(params_with_grad.size());
+
+    for (const auto& param : params_with_grad) {
+      norms.emplace_back(param.grad().data().abs().max());
+    }
+    total_norm_tensor =
+        (norms.size() == 1) ? norms[0] : torch::max(torch::stack(norms));
+  } else if (norm_type == 0) {
+    total_norm_tensor =
+        torch::full({}, static_cast<double>(params_with_grad.size()));
+  } else {
+    std::vector<torch::Tensor> norms;
+    norms.reserve(params_with_grad.size());
+
+    for (const auto& param : params_with_grad) {
+      norms.emplace_back(param.grad().data().norm(norm_type));
+    }
+    total_norm_tensor =
+        (norms.size() == 1) ? norms[0] : torch::stack(norms).norm(norm_type);
+  }
+
+  auto clip_coef = max_norm / (total_norm_tensor + 1e-6);
+  auto clip_coef_clamped =
+      torch::clamp(clip_coef, std::nullopt /* min */, 1.0 /* max */);
+  for (auto& param : params_with_grad) {
+    param.grad().data().mul_(clip_coef_clamped);
+  }
+}
+
 std::tuple<VecEnv*, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 create_environments(int64_t num_envs, int threads) {
     void* handle = dlopen("./breakout.so", RTLD_NOW);
@@ -204,6 +255,24 @@ torch::autograd::tensor_list fused_ppo_loss(
     */
 );
 
+/*
+torch::autograd::tensor_list rmsnorm(
+    torch::Tensor x,
+    torch::Tensor weight,
+    double eps
+);
+class RMSNormImpl : public torch::nn::Module {
+public:
+    explicit RMSNormImpl(int64_t hidden_size, double eps = 1e-5);
+    torch::Tensor forward(torch::Tensor x);
+    double eps{1e-5};
+    torch::Tensor weight;
+};
+
+TORCH_MODULE(RMSNorm);
+*/
+
+
 auto DTYPE = torch::kFloat32;
 
 namespace pufferlib {
@@ -348,8 +417,10 @@ public:
     torch::Tensor forward(torch::Tensor x) {
         int ndim = x.dim();
         TORCH_CHECK(x.size(ndim - 1) == dim, "Last dimension must match expected size");
-        auto mean_sq = (x*x).mean(ndim - 1, true);
-        return weight * x/mean_sq.sqrt();
+        return torch::nn::functional::normalize(
+            x, torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(-1).eps(0)) * weight;
+        //auto mean_sq = (x*x).mean(ndim - 1, true);
+        //return weight * x/mean_sq.sqrt();
     }
 };
 
@@ -359,6 +430,8 @@ private:
     int64_t dim;
     torch::nn::Linear to_hidden_and_gate{nullptr};
     torch::nn::Linear to_out{nullptr};
+    //torch::Tensor rmsnorm_weight{nullptr};
+    //RMSNorm rmsnorm{nullptr};
     std::shared_ptr<RMSNorm> rmsnorm{nullptr};
 
 public:
@@ -372,13 +445,13 @@ public:
         torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
 
         // TODO: Is there a way to have this be identity to keep param count correct?
-        //if (expansion_factor != 1.) {
-        //to_out = register_module("to_out",
-        //        torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
-        //torch::nn::init::orthogonal_(to_out->weight);
-        //}
-
+        //if (expansion_factor != 1.) 
+        to_out = register_module("to_out",
+                torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
+        torch::nn::init::orthogonal_(to_out->weight);
         rmsnorm = register_module("rmsnorm", std::make_shared<RMSNorm>(dim));
+
+        //rmsnorm_weight = register_parameter("rmsnorm_weight", torch::ones({dim}));
     }
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor x, torch::Tensor state = torch::Tensor()) {
@@ -435,8 +508,9 @@ public:
             out = to_out->forward(out);
         }
 
-        out = out + x;
-        out = rmsnorm->forward(out);
+        //out = out + x;
+        //out = rmsnorm->forward(out);
+        //out = rmsnorm(out, rmsnorm_weight, 1e-5)[0];
 
         return std::make_tuple(out, next_prev_hidden);
     }
@@ -509,19 +583,21 @@ public:
         state = state.unsqueeze(2);
 
         std::tuple<torch::Tensor, torch::Tensor> mingru_out;
+        std::vector<torch::Tensor> state_out;
 
         for (int64_t i = 0; i < num_layers; ++i) {
             auto state_in = state.select(0, i);
             auto layer = (*mingru)[i]->as<MinGRULayer>();
             mingru_out = layer->forward(hidden, state_in);
             hidden = std::get<0>(mingru_out);
-            auto state_out = std::get<1>(mingru_out);
-            state.select(0, i).copy_(state_out);
+            //auto state_out = std::get<1>(mingru_out);
+            //state.select(0, i).copy_(state_out);
+            state_out.push_back(std::get<1>(mingru_out));
         }
 
-
         hidden = hidden.squeeze(1);
-        state = state.squeeze(2);
+        //state = state.squeeze(2);
+        state = torch::stack(state_out, 0).squeeze(2);
 
         auto logits = decoder->forward(hidden);
         auto values = value->forward(hidden);
@@ -966,23 +1042,24 @@ torch::Tensor compiled_evaluate(
         auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1).to(torch::kInt32);
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
-        // Store
-        obs_buffer.select(1, i).copy_(obs_cuda);
-        act_buffer.select(1, i).copy_(action.to(torch::kInt64));
-        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
-        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
-        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
-        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
+        // Store with non-blocking copies
+        obs_buffer.select(1, i).copy_(obs_cuda, true);
+        act_buffer.select(1, i).copy_(action.to(torch::kInt64), true);
+        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32), true);
+        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32), true);
+        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32), true);
+        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32), true);
 
         actions.copy_(action.to(torch::kCPU).to(torch::kFloat32));
         {
-            //pybind11::gil_scoped_release no_gil;
+            pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
+            // Losing 1m sps here
             vec_step(vec);
-            float reward_sum = 0;
-            for (int j = 0; j < vec->size; j++) {
-                reward_sum += vec->rewards[j];
-            }
+            //float reward_sum = 0;
+            //for (int j = 0; j < vec->size; j++) {
+            //    reward_sum += vec->rewards[j];
+            //}
             //render_environments(envs_tensor, indices_tensor);
         }
         rewards.clamp_(-1.0f, 1.0f);
@@ -1091,14 +1168,15 @@ pybind11::dict compiled_train(
 
     // Accumulators
     auto device = values.device();
-    torch::Tensor pg_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor v_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor ent_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor total_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor old_approx_kl_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor approx_kl_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor clipfrac_sum = torch::zeros({}, torch::kFloat32).to(device);
-    torch::Tensor importance_sum = torch::zeros({}, torch::kFloat32).to(device);
+    auto scalar_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    torch::Tensor pg_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor v_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor ent_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor total_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor old_approx_kl_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor approx_kl_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor clipfrac_sum = torch::zeros({}, scalar_opts);
+    torch::Tensor importance_sum = torch::zeros({}, scalar_opts);
 
     {
     pybind11::gil_scoped_release no_gil;
@@ -1126,6 +1204,7 @@ pybind11::dict compiled_train(
         advantages, gamma, gae_lambda,
         vtrace_rho_clip, vtrace_c_clip
     );
+
     float adv_mean = advantages.mean().item<float>();
     float adv_std = advantages.std().item<float>();
 
@@ -1159,16 +1238,15 @@ pybind11::dict compiled_train(
             mb_obs = mb_obs.reshape(flat_shape);
         }
 
-        torch::Tensor mb_state= torch::zeros(
+        torch::Tensor mb_state = torch::zeros(
             {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
-            DTYPE
-        ).to(values.device());
+            torch::dtype(DTYPE).device(values.device())
+        );
 
         // Forward pass
         auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
         //torch::Tensor loss = torch::zeros({1}, logits.options());
-        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1185,8 +1263,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
-        */
 
+        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -1247,13 +1325,15 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
+        */
 
-        // Backward pass
         loss.backward();
 
         // Gradient accumulation and step
+        // ~10% overhead in this impl. Can save a ton of launches
         if ((mb + 1) % accumulate_minibatches == 0) {
-            torch::nn::utils::clip_grad_norm_(policy->parameters(), max_grad_norm);
+            // We use our version that doesn't sync for no reason
+            clip_grad_norm_(policy->parameters(), max_grad_norm);
             muon->step();
             muon->zero_grad();
         }
@@ -1268,6 +1348,7 @@ pybind11::dict compiled_train(
     }
     // Return losses (averaged)
     pybind11::dict losses;
+    /*
     losses["pg_loss"] = pg_sum.item<float>() / total_minibatches;
     losses["value_loss"] = v_sum.item<float>() / total_minibatches;
     losses["entropy"] = ent_sum.item<float>() / total_minibatches;
@@ -1276,6 +1357,7 @@ pybind11::dict compiled_train(
     losses["approx_kl"] = approx_kl_sum.item<float>() / total_minibatches;
     losses["clipfrac"] = clipfrac_sum.item<float>() / total_minibatches;
     losses["importance"] = importance_sum.item<float>() / total_minibatches;
+    */
     //losses["explained_variance"] = explained_var;
 
     return losses;
@@ -1298,6 +1380,19 @@ PYBIND11_MODULE(_C, m) {
     m.def("log_coeffs_and_values", &log_coeffs_and_values);
     m.def("fused_scan", &fused_scan);
     m.def("fused_ppo_loss", &fused_ppo_loss);
+    //m.def("rmsnorm", &rmsnorm);
+
+    /*
+    py::class_<RMSNorm, torch::nn::ModuleHolder<RMSNormImpl>>(m, "RMSNorm")
+        .def(py::init<int64_t, double>(),
+             py::arg("hidden_size"),
+             py::arg("eps") = 1e-5)
+        .def("forward", &RMSNorm::forward)
+        .def("__call__", &RMSNorm::operator())
+        .def_readwrite("weight", &RMSNormImpl::weight)
+        .def_readonly("eps", &RMSNormImpl::eps);
+    */
+
 
     py::class_<torch::optim::MuonOptions>(m, "MuonOptions")
         .def(py::init<double>());

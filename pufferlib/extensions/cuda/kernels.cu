@@ -42,6 +42,188 @@ void dispatch_and_launch(const at::Tensor& example_tensor, Args... args) {
 */
 
 template<typename T>
+__global__ void rmsnorm_forward_kernel(
+    T* __restrict__ out,
+    float* __restrict__ inv_norm_buf,
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    double eps,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * T_total) return;
+
+    int b = idx / T_total;
+    int t = idx % T_total;
+    int base = b*T_total*H + t*H;
+
+    float sum_sq = 0.0f;
+    for (int h = 0; h < H; h++) {
+        int curr = base + h;
+        float x_val = float(x[curr]);
+        sum_sq += x_val * x_val;
+    }
+
+    float rms = sqrtf(sum_sq/H + eps);
+    float inv_rms = 1.0f / rms;
+    inv_norm_buf[idx] = inv_rms;
+
+    for (int h = 0; h < H; h++) {
+        int curr = base + h;
+        out[curr] = T(weight[h] * x[curr] * inv_rms);
+    }
+}
+
+template<typename T>
+__global__ void rmsnorm_backward_kernel(
+    T* __restrict__ grad_x,
+    T* __restrict__ grad_weight,
+    const T* __restrict__ grad_out,
+    const float* __restrict__ inv_norm_buf,
+    const T* __restrict__ x_buf,
+    const T* __restrict__ weight,
+    double eps,
+    int T_total,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T_total*H*B) return;
+    int base = idx % H;
+    int norm_idx = idx / H;
+
+    float inv_rms = inv_norm_buf[norm_idx];
+    float inv_rms_3 = inv_rms * inv_rms * inv_rms;
+
+    grad_x[idx] = weight[base] * grad_out[idx] * inv_rms;
+    grad_weight[idx] = grad_out[idx] * inv_rms;
+
+    float wg_x = 0.0f;
+    for (int h=0; h<H; h++) {
+        float x = x_buf[base + h];
+        float w = weight[h];
+        float g = grad_out[base + h];
+        wg_x += w*g*x;
+    }
+    float x = x_buf[idx];
+    grad_x[idx] -= x*wg_x*inv_rms_3/float(H);
+}
+
+/*
+template<typename T>
+__global__ void rmsnorm_backward_kernel(
+    T* grad_x,
+    T* grad_weight,
+    const T* grad_out,
+    const float* inv_norm_buf,
+    const T* x,
+    const T* weight,
+    double eps,
+    int T_total,
+    int H,
+    int B
+) {
+    int total_elements = B * T_total * H;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    int h = idx % H;
+    int vec_idx = idx / H;                    // index of the vector (b,t)
+    int offset = vec_idx * H;
+
+    float inv_rms = inv_norm_buf[vec_idx];
+    float inv_rms3 = inv_rms * inv_rms * inv_rms;
+
+    // ∂L/∂γ_h += grad_out * (x / rms)
+    float gw = grad_out[idx] * (float)x[idx] * inv_rms;
+    atomicAdd((float*)&grad_weight[h], gw);
+
+    // Compute reduction: sum_h weight[h] * grad_out[h] * x[h]
+    float sum = 0.0f;
+    for (int i = 0; i < H; ++i) {
+        sum += (float)weight[i] * (float)grad_out[offset + i] * (float)x[offset + i];
+    }
+    float reduction = sum * inv_rms;  // = σ γ g hat_x
+
+    float dx = (float)weight[h] * (float)grad_out[idx] * inv_rms
+               - (float)x[idx] * reduction * inv_rms3 / H;
+
+    grad_x[idx] = T(dx);
+}
+*/
+
+template<typename T>
+void launch_rmsnorm_forward(
+    T* __restrict__ out,
+    float* __restrict__ inv_norm_buf,
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    double eps,
+    int T_total,
+    int H,
+    int B
+) {
+    int total = B * T_total;
+    int grid = grid_size(total);
+
+    rmsnorm_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
+        out,
+        inv_norm_buf,
+        x,
+        weight,
+        eps,
+        T_total,
+        H,
+        B
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel launch error in forward: %s\n", cudaGetErrorString(err));
+    }
+}
+
+template<typename T>
+void launch_rmsnorm_backward(
+    T* __restrict__ grad_x,
+    T* __restrict__ grad_weight,
+    const T* __restrict__ grad_out,
+    const float* __restrict__ inv_norm_buf,
+    const T* __restrict__ x_buf,
+    const T* __restrict__ weight,
+    double eps,
+    int T_total,
+    int H,
+    int B
+) {
+    // The backward is fully parallel
+    // since the inv norm is cached
+    int total = B * T_total * H;
+    int grid = grid_size(total);
+
+    rmsnorm_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
+        grad_x,
+        grad_weight,
+        grad_out,
+        inv_norm_buf,
+        x_buf,
+        weight,
+        eps,
+        T_total,
+        H,
+        B
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel launch error in backward: %s\n", cudaGetErrorString(err));
+    }
+}
+
+
+template<typename T>
 __global__ void mingru_gate_inference_kernel(
     T* out,
     const T* gate_in,
@@ -218,8 +400,8 @@ __device__ __forceinline__ double logcumsumexp_backward(double x, double* acc, d
 template<typename T>
 __global__ void fused_scan_forward_kernel(
     T* __restrict__ out,
-    double* __restrict__ a_star_buf,
-    double* __restrict__ s_buf,
+    float* __restrict__ a_star_buf,
+    float* __restrict__ s_buf,
     const T* __restrict__ log_coeffs,
     const T* __restrict__ log_values,
     int T_total,
@@ -234,28 +416,28 @@ __global__ void fused_scan_forward_kernel(
 
     int base = b * T_total * H + h;
 
-    double a_star = 0.0f;
-    double s = -INFINITY;  // this will be logcumsumexp(z[0..t])
+    float a_star = 0.0f;
+    float s = -INFINITY;  // this will be logcumsumexp(z[0..t])
 
     for (int t = 0; t < T_total; t++) {
         int curr = base + t * H;
 
         // a_star[t] = sum_{i=0}^t log_coeffs[i]
-        a_star += double(log_coeffs[curr]);
+        a_star += float(log_coeffs[curr]);
 
-        double z = double(log_values[curr]) - a_star;
+        float z = float(log_values[curr]) - a_star;
 
         if (s == -INFINITY) {
             s = z;
         } else {
-            double min_val = fmin(s, z);
-            double max_val = fmax(s, z);
+            float min_val = fminf(s, z);
+            float max_val = fmaxf(s, z);
             s = max_val + log1pf(expf(min_val - max_val));
         }
 
         //s = logcumsumexp_forward(z, s);
 
-        double log_h = a_star + s;
+        float log_h = a_star + s;
         out[curr] = T(expf(log_h));
 
         a_star_buf[curr] = a_star;
@@ -269,8 +451,8 @@ __global__ void fused_scan_backward_kernel(
     T* __restrict__ grad_log_values,
     const T* __restrict__ grad_out,
     const T* __restrict__ out_buf,
-    const double* __restrict__ a_star_buf,
-    const double* __restrict__ s_buf,
+    const float* __restrict__ a_star_buf,
+    const float* __restrict__ s_buf,
     const T* __restrict__ log_values,
     int T_total,
     int H,
@@ -284,30 +466,30 @@ __global__ void fused_scan_backward_kernel(
 
     int base = b * T_total * H + h;
 
-    double acc = 0.0;
-    double s_val_next = 0.0;
-    double carry_grad_a = 0.0;
+    float acc = 0.0;
+    float s_val_next = 0.0;
+    float carry_grad_a = 0.0;
 
     for (int t = T_total - 1; t >= 0; --t) {
         int curr = base + t * H;
 
-        double a_star = a_star_buf[curr];
-        double z = double(log_values[curr]) - a_star;
-        double s = s_buf[curr];
+        float a_star = a_star_buf[curr];
+        float z = float(log_values[curr]) - a_star;
+        float s = s_buf[curr];
 
-        double grad_log_h = double(grad_out[curr]) * double(out_buf[curr]); // out_buf[t] = exp(log_h[t])
-        double grad_s = grad_log_h;
+        float grad_log_h = float(grad_out[curr]) * float(out_buf[curr]); // out_buf[t] = exp(log_h[t])
+        float grad_s = grad_log_h;
 
         if (t == T_total - 1) {
             acc = grad_s;
         } else {
-            acc = grad_s + acc*exp(s - s_val_next);
+            acc = grad_s + acc*expf(s - s_val_next);
         }
-        double grad_z = acc * exp(z - s);
+        float grad_z = acc * expf(z - s);
         s_val_next = s;
 
         //double grad_z = logcumsumexp_backward(z, &acc, grad_s, s, &s_val_next);
-        double grad_a = grad_log_h + carry_grad_a - grad_z;
+        float grad_a = grad_log_h + carry_grad_a - grad_z;
 
         carry_grad_a = grad_a;
 
@@ -580,8 +762,8 @@ __global__ void fused_scan_backward_kernel(
 template<typename T>
 void launch_fused_scan_forward(
     T* out,
-    double* a_star,
-    double* s_vals,
+    float* a_star,
+    float* s_vals,
     const T* log_coeffs,
     const T* log_values,
     int T_seq,
@@ -616,8 +798,8 @@ void launch_fused_scan_backward(
     const T* log_coeffs,
     const T* log_values,
     const T* out,
-    const double* a_star_buf,
-    const double* s_buf,
+    const float* a_star_buf,
+    const float* s_buf,
     int T_seq,
     int H,
     int B
