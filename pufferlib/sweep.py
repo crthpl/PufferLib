@@ -855,7 +855,8 @@ class Protein:
 
     def logit_transform(self, value, epsilon=1e-9):
         value = np.clip(value, epsilon, 1 - epsilon)
-        return math.log(value / (1 - value))
+        logit = math.log(value / (1 - value))
+        return np.clip(logit, -5, 100)
 
     def observe(self, hypers, score, cost, is_failure=False):
         params = self.hyperparameters.from_dict(hypers)
