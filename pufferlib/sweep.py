@@ -473,7 +473,8 @@ class RobustLogCostModel:
             self._quantile_loss, 
             x0=[a_init, b_init], 
             args=(x_log_c, y, self.quantile),
-            method='Nelder-Mead' # Robust solver for non-differentiable functions
+            method='Nelder-Mead', # Robust solver for non-differentiable functions
+            bounds=[(None, None), (0, None)] # B should be positive
         )
         
         self.A, self.B = res.x
