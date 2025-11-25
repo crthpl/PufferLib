@@ -828,7 +828,7 @@ class NoLogger:
     def log(self, logs, step):
         pass
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
         pass
 
 class NeptuneLogger:
@@ -1072,13 +1072,19 @@ def sweep(args=None, env_name=None):
             logs['is_loss_nan'] = True
             return True
 
-        if ('uptime' in logs and target_key in logs):
-            running_target_buffer.append(logs[target_key])
-            target_running_mean = np.mean(running_target_buffer)
-            threshold = sweep.get_early_stop_threshold(logs['uptime'])
-            logs['early_stop_treshold'] = max(threshold, 0)  # clipping for visualization
+        if method != 'Protein':
+            return False
 
-            if max(target_running_mean, logs[target_key]) < threshold:
+        if ('uptime' in logs and target_key in logs):
+            metric_val, cost = logs[target_key], logs['uptime']
+            running_target_buffer.append(metric_val)
+            target_running_mean = np.mean(running_target_buffer)
+            
+            # If metric distribution is percentile, threshold is also logit transformed
+            threshold = sweep.get_early_stop_threshold(cost)
+            logs['early_stop_treshold'] = max(threshold, -5)  # clipping for visualization
+
+            if sweep.should_stop(max(target_running_mean, metric_val), cost):
                 logs['is_loss_nan'] = False
                 return True
         return False

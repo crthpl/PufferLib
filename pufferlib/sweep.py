@@ -322,9 +322,6 @@ class Random:
             is_failure=is_failure,
         ))
 
-    def get_early_stop_threshold(self, cost):
-        return 0
-
 
 class ParetoGenetic:
     def __init__(self,
@@ -375,9 +372,6 @@ class ParetoGenetic:
             cost=cost,
             is_failure=is_failure,
         ))
-
-    def get_early_stop_threshold(self, cost):
-        return 0
 
 
 class ExactGPModel(ExactGP):
@@ -435,10 +429,9 @@ class RobustLogCostModel:
     Fits Score ~ A + B * log(Cost) using Quantile Regression (Median)
     and provides a cost-only threshold for early stopping.
     """
-    def __init__(self, min_num_samples=30, min_allowed_cost=600, quantile=0.3):
-        self.min_num_samples = min_num_samples
-        self.min_allowed_cost = min_allowed_cost
+    def __init__(self, quantile=0.3, min_num_samples=30):
         self.quantile = quantile  # 0.5 = Median regression
+        self.min_num_samples = min_num_samples
         self.is_fitted = False
         self.A = None
         self.B = None
@@ -860,8 +853,16 @@ class Protein:
         best = suggestions[best_idx]
         return self.hyperparameters.to_dict(best, fill), info
 
+    def logit_transform(self, value, epsilon=1e-9):
+        value = np.clip(value, epsilon, 1 - epsilon)
+        return math.log(value / (1 - value))
+
     def observe(self, hypers, score, cost, is_failure=False):
         params = self.hyperparameters.from_dict(hypers)
+
+        if self.metric_distribution == 'percentile':
+            score = self.logit_transform(score)
+
         new_observation = dict(
             input=params,
             output=score,
@@ -899,3 +900,11 @@ class Protein:
 
     def get_early_stop_threshold(self, cost):
         return self.stop_threshold_model.get_threshold(cost)
+
+    def should_stop(self, score, cost):
+        threshold = self.get_early_stop_threshold(cost)
+
+        if self.metric_distribution == 'percentile':
+            score = self.logit_transform(score)
+
+        return score < threshold
