@@ -80,6 +80,7 @@ FLAGS=(
     -DPLATFORM_DESKTOP
     # Bite me
     -Werror=incompatible-pointer-types
+    -Werror=return-type
     -Wno-error=incompatible-pointer-types-discards-qualifiers
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
