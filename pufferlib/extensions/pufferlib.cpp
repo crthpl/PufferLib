@@ -23,6 +23,8 @@ create_environments_fn create_envs;
 env_init_fn env_init;
 vec_reset_fn vec_reset;
 vec_step_fn vec_step;
+vec_send_fn vec_send;
+vec_recv_fn vec_recv;
 env_close_fn env_close;
 vec_close_fn vec_close;
 vec_log_fn vec_log;
@@ -106,6 +108,8 @@ create_environments(int64_t num_envs, int threads) {
     env_init = (env_init_fn)dlsym(handle, "env_init");
     vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
     vec_step = (vec_step_fn)dlsym(handle, "vec_step");
+    vec_send = (vec_send_fn)dlsym(handle, "vec_send");
+    vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
     env_close = (env_close_fn)dlsym(handle, "env_close");
     vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log = (vec_log_fn)dlsym(handle, "vec_log");
@@ -150,7 +154,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 1, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -159,10 +163,10 @@ create_environments(int64_t num_envs, int threads) {
     auto obs_dtype = to_torch_dtype(obs_t);
     auto atn_dtype = to_torch_dtype(act_t);
 
-    auto obs = torch::from_blob(vec->observations, {num_envs, obs_n}, obs_dtype).pin_memory();
-    auto actions = torch::from_blob(vec->actions, {num_envs}, atn_dtype).pin_memory();
-    auto rewards = torch::from_blob(vec->rewards, {num_envs}, torch::kFloat32).pin_memory();
-    auto terminals = torch::from_blob(vec->terminals, {num_envs}, torch::kUInt8).pin_memory();
+    auto obs = torch::from_blob(vec->gpu_observations, {num_envs, obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
+    auto actions = torch::from_blob(vec->gpu_actions, {num_envs}, torch::dtype(atn_dtype).device(torch::kCUDA));
+    auto rewards = torch::from_blob(vec->gpu_rewards, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    auto terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
 
     vec_reset(vec);
     return std::make_tuple(vec, obs, actions, rewards, terminals);
@@ -1021,6 +1025,7 @@ torch::Tensor compiled_evaluate(
     auto device = torch::kCUDA;
 
     for (int64_t i = 0; i < horizon; ++i) {
+        vec_recv(vec, 0);
         /*
         obs_buf.copy_(obs.to(DTYPE));
         state_in_buf.copy_(state.to(DTYPE));
@@ -1055,7 +1060,7 @@ torch::Tensor compiled_evaluate(
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
-            vec_step(vec);
+            vec_send(vec, 0);
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];

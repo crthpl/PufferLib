@@ -96,17 +96,23 @@ static void* c_threadstep(void* arg)
 }
 
 __attribute__((visibility("default")))
-VecEnv* create_environments(int num_envs, int threads, Dict* kwargs) {
+VecEnv* create_environments(int num_envs, int threads, int buffers, Dict* kwargs) {
     Env* envs = (Env*)calloc(num_envs, sizeof(Env));
     VecEnv* vec = (VecEnv*)calloc(1, sizeof(VecEnv));
     vec->envs = envs;
     vec->size = num_envs;
+    vec->buffers = buffers;
     vec->threading = calloc(1, sizeof(Threading));
 
     Threading* threading = vec->threading;
     threading->num_threads = threads;
 
     if (threads > 0) {
+        vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
+        for (int i = 0; i < buffers; i++) {
+            cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+        }
+
         threading->threads = (pthread_t*)calloc(threads, sizeof(pthread_t));
         assert(threading->threads != NULL && "create_vecenv failed to allocate memory for threads\n");
         assert(pthread_cond_init(&threading->wake_cond, NULL) == 0 && "create_vecenv failed to initialize wake_cond\n");
@@ -121,6 +127,7 @@ VecEnv* create_environments(int num_envs, int threads, Dict* kwargs) {
 
         // Wait for all threads to initialize
         while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) < threading->num_threads) {}
+        atomic_store(&threading->num_running_threads, 0);
     }
 
     int num_agents = 0;
@@ -145,6 +152,11 @@ VecEnv* create_environments(int num_envs, int threads, Dict* kwargs) {
     memset(vec->actions, 0, num_agents*ACT_SIZE*sizeof(float));
     memset(vec->rewards, 0, num_agents*sizeof(float));
     memset(vec->terminals, 0, num_agents*sizeof(unsigned char));
+
+    cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(float));
+    cudaMalloc((void**)&vec->gpu_actions, num_agents*ACT_SIZE*sizeof(float));
+    cudaMalloc((void**)&vec->gpu_rewards, num_agents*sizeof(float));
+    cudaMalloc((void**)&vec->gpu_terminals, num_agents*sizeof(unsigned char));
 
     int agent = 0;
     for (int i = 0; i < num_envs; i++) {
@@ -183,7 +195,17 @@ void vec_reset(VecEnv* vec) {
     }
 }
 
-void vec_step(VecEnv* vec) {
+void vec_send(VecEnv* vec, int buffer) {
+    int block_size = vec->size / vec->buffers;
+    int start = buffer * block_size;
+
+    cudaMemcpy(
+        &vec->actions[start],
+        &vec->gpu_actions[start],
+        block_size*ACT_SIZE*sizeof(float),
+        cudaMemcpyDeviceToHost
+    );
+
     // Single threaded
     Threading* threading = vec->threading;
     if (threading->num_threads == 0) {
@@ -197,7 +219,34 @@ void vec_step(VecEnv* vec) {
     atomic_store_explicit(&threading->num_running_threads, threading->num_threads, memory_order_relaxed);
     atomic_store_explicit(&threading->work_index, vec->size-1, memory_order_relaxed);
     pthread_cond_broadcast(&threading->wake_cond);
+}
+
+void vec_recv(VecEnv* vec, int buffer) {
+    Threading* threading = vec->threading;
     while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {}
+
+    int block_size = vec->size / vec->buffers;
+    int start = buffer * block_size;
+
+    cudaMemcpy(
+        &vec->gpu_observations[start],
+        &vec->observations[start],
+        block_size*OBS_SIZE*sizeof(float),
+        cudaMemcpyHostToDevice
+    );
+    cudaMemcpy(
+        &vec->gpu_rewards[start],
+        &vec->rewards[start],
+        block_size*sizeof(float),
+        cudaMemcpyHostToDevice
+    );
+    cudaMemcpy(
+        &vec->gpu_terminals[start],
+        &vec->terminals[start],
+        block_size*sizeof(unsigned char),
+        cudaMemcpyHostToDevice
+    );
+
     /*
     pthread_mutex_lock(&threading->all_done_mutex);
     while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {
@@ -205,6 +254,11 @@ void vec_step(VecEnv* vec) {
     }
     pthread_mutex_unlock(&threading->all_done_mutex);
     */
+}
+
+void vec_step(VecEnv* vec, int buffer) {
+    vec_send(vec, buffer);
+    vec_recv(vec, buffer);
 }
 
 void env_close(Env* env) {

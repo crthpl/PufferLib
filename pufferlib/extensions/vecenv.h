@@ -3,6 +3,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <cuda_runtime.h>
 
 #define FLOAT 1
 #define INT 2
@@ -31,7 +32,13 @@ typedef struct {
     float* actions;
     float* rewards;
     unsigned char* terminals;
+    float* gpu_observations;
+    float* gpu_actions;
+    float* gpu_rewards;
+    unsigned char* gpu_terminals;
     Threading* threading;
+    cudaStream_t* streams;
+    int buffers;
 } VecEnv;
 
 Dict* create_dict(int capacity) {
@@ -110,11 +117,13 @@ void my_log(Log* log, Dict* out);
 // Define function types to be exported to the shared library
 // You don't need these, but you have to do some really gross
 // casts after loading the library without them.
-typedef VecEnv* (*create_environments_fn)(int num_envs, int threads, Dict* kwargs);
+typedef VecEnv* (*create_environments_fn)(int num_envs, int threads, int buffers, Dict* kwargs);
 typedef Env* (*env_init_fn)(float* observations, float* actions, float* rewards,
         unsigned char* terminals, int seed, Dict* kwargs);
 typedef void (*vec_reset_fn)(VecEnv* vec);
 typedef void (*vec_step_fn)(VecEnv* vec);
+typedef void (*vec_recv_fn)(VecEnv* vec, int buffer);
+typedef void (*vec_send_fn)(VecEnv* vec, int buffer);
 typedef void (*env_close_fn)(Env* env);
 typedef void (*vec_close_fn)(VecEnv* vec);
 typedef void (*vec_render_fn)(VecEnv* vec, int env_idx);
