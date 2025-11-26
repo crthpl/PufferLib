@@ -13,6 +13,7 @@ import pufferlib
 import pufferlib.models
 
 from pufferlib.models import Default as Policy
+from pufferlib.models import MinGRU, Mamba, GRU, MinGRULayer
 from pufferlib.models import Convolutional as Conv
 Recurrent = pufferlib.models.LSTMWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
@@ -541,8 +542,8 @@ class TowerClimb(nn.Module):
 
 
 class ImpulseWarsLSTM(Recurrent):
-    def __init__(self, env: pufferlib.PufferEnv, policy: nn.Module, input_size: int = 512, hidden_size: int = 512):
-        super().__init__(env, policy, input_size, hidden_size)
+    def __init__(self, env, policy, hidden_size: int = 512, **kwargs):
+        super().__init__(env, policy, hidden_size)
 
 
 class ImpulseWarsPolicy(nn.Module):
@@ -551,7 +552,6 @@ class ImpulseWarsPolicy(nn.Module):
         env: pufferlib.PufferEnv,
         cnn_channels: int = 64,
         weapon_type_embedding_dims: int = 2,
-        input_size: int = 512,
         hidden_size: int = 512,
         batch_size: int = 131_072,
         num_drones: int = 2,
@@ -644,7 +644,7 @@ class ImpulseWarsPolicy(nn.Module):
         )
 
         self.encoder = nn.Sequential(
-            layer_init(nn.Linear(featuresSize, input_size)),
+            layer_init(nn.Linear(featuresSize, hidden_size)),
             nn.ReLU(),
         )
 
@@ -963,3 +963,183 @@ class G2048(nn.Module):
         logits = self.decoder(hidden)
         values = self.value(hidden)
         return logits, values
+
+class G2048LSTM(nn.Module):
+    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size
+        self.num_layers = num_layers
+        self.obs_shape = env.single_observation_space.shape
+
+        self.g2048 = G2048(env, hidden_size)
+
+        self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers=num_layers)
+        self.cell = nn.ModuleList([torch.nn.LSTMCell(hidden_size, hidden_size) for _ in range(num_layers)])
+
+        for i in range(num_layers):
+            cell = self.cell[i]
+
+            w_ih = getattr(self.lstm, f'weight_ih_l{i}')
+            w_hh = getattr(self.lstm, f'weight_hh_l{i}')
+            b_ih = getattr(self.lstm, f'bias_ih_l{i}')
+            b_hh = getattr(self.lstm, f'bias_hh_l{i}')
+
+            nn.init.orthogonal_(w_ih, 1.0)
+            nn.init.orthogonal_(w_hh, 1.0)
+            b_ih.data.zero_()
+            b_hh.data.zero_()
+
+            cell.weight_ih = w_ih
+            cell.weight_hh = w_hh
+            cell.bias_ih = b_ih
+            cell.bias_hh = b_hh
+
+    def initial_state(self, batch_size, device):
+        h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        c = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        return h, c
+
+    def forward_eval(self, x, state):
+        '''Forward function for inference. 3x faster than using LSTM directly'''
+        assert state[0].shape[1] == state[1].shape[1] == x.shape[0], 'LSTM state must be (h, c)'
+        h = self.g2048.encode_observations(x)
+        lstm_h, lstm_c = state
+        for i in range(self.num_layers):
+            h, c = self.cell[i](h, (lstm_h[i], lstm_c[i]))
+            lstm_h[i] = h
+            lstm_c[i] = c
+
+        logits, values = self.g2048.decode_actions(h)
+        return logits, values, (lstm_h, lstm_c)
+
+    def forward(self, x):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
+
+        B, TT = x_shape[:2]
+        x = x.reshape(B*TT, *space_shape)
+        h = self.g2048.encode_observations(x)
+        assert h.shape == (B*TT, self.input_size)
+        h = h.reshape(B, TT, self.input_size)
+
+        h = h.transpose(0, 1)
+        h, (lstm_h, lstm_c) = self.lstm.forward(h)
+        h = h.transpose(0, 1)
+
+        flat_hidden = h.reshape(B*TT, self.hidden_size)
+        logits, values = self.g2048.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        return logits, values
+
+class G2048MinGRU(nn.Module):
+    def __init__(self, env, hidden_size=128, num_layers=1, expansion_factor=2, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size
+        self.expansion_factor = expansion_factor
+        self.obs_shape = env.single_observation_space.shape
+
+        self.g2048 = G2048(env, hidden_size)
+        self.expansion_factor = expansion_factor
+        self.num_layers = num_layers
+        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
+
+    def initial_state(self, batch_size, device):
+        state = torch.zeros(self.num_layers, batch_size, self.hidden_size*self.expansion_factor, device=device)
+        return (state,)
+
+    def forward_eval(self, x, state):
+        state = state[0]
+        assert state.shape[1] == x.shape[0]
+        h = self.g2048.encode_observations(x)
+        h = h.unsqueeze(1)
+        state = state.unsqueeze(2)
+        state_out = []
+        for i in range(self.num_layers):
+            h, s = self.mingru[i](h, state[i])
+            state_out.append(s)
+
+        h = h.squeeze(1)
+        state = torch.stack(state_out, 0).squeeze(2)
+        logits, values = self.g2048.decode_actions(h)
+        return logits, values, (state,)
+
+    def forward(self, x):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
+
+        B, TT = x_shape[:2]
+        x = x.reshape(B*TT, *space_shape)
+        h = self.g2048.encode_observations(x)
+        assert h.shape == (B*TT, self.input_size)
+        h = h.reshape(B, TT, self.input_size)
+
+        state = self.initial_state(B, h.device)[0].unsqueeze(2)
+        for i in range(self.num_layers):
+            h, _ = self.mingru[i](h, state[i])
+
+        flat_hidden = h.reshape(B*TT, self.hidden_size)
+        logits, values = self.g2048.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        return logits, values
+
+class NMMO3MinGRU(nn.Module):
+    def __init__(self, env, hidden_size=128, num_layers=1, expansion_factor=2, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size
+        self.expansion_factor = expansion_factor
+        self.obs_shape = env.single_observation_space.shape
+
+        self.nmmo3 = NMMO3(env, hidden_size)
+        self.expansion_factor = expansion_factor
+        self.num_layers = num_layers
+        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
+
+    def initial_state(self, batch_size, device):
+        state = torch.zeros(self.num_layers, batch_size, self.hidden_size*self.expansion_factor, device=device)
+        return (state,)
+
+    def forward_eval(self, x, state):
+        state = state[0]
+        assert state.shape[1] == x.shape[0]
+        h = self.nmmo3.encode_observations(x)
+        h = h.unsqueeze(1)
+        state = state.unsqueeze(2)
+        state_out = []
+        for i in range(self.num_layers):
+            h, s = self.mingru[i](h, state[i])
+            state_out.append(s)
+
+        h = h.squeeze(1)
+        state = torch.stack(state_out, 0).squeeze(2)
+        logits, values = self.nmmo3.decode_actions(h)
+        return logits, values, (state,)
+
+    def forward(self, x):
+        '''Forward function for training. Uses LSTM for fast time-batching'''
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
+
+        B, TT = x_shape[:2]
+        x = x.reshape(B*TT, *space_shape)
+        h = self.nmmo3.encode_observations(x)
+        assert h.shape == (B*TT, self.input_size)
+        h = h.reshape(B, TT, self.input_size)
+
+        state = self.initial_state(B, h.device)[0].unsqueeze(2)
+        for i in range(self.num_layers):
+            h, _ = self.mingru[i](h, state[i])
+
+        flat_hidden = h.reshape(B*TT, self.hidden_size)
+        logits, values = self.nmmo3.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        return logits, values
+
+

@@ -2,6 +2,7 @@
 
 #define Env MOBA
 #define MY_SHARED
+#define MY_SHARED_CLOSE
 #include "../env_binding.h"
 
 static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
@@ -21,6 +22,44 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyDict_SetItemString(state, "game_map", game_map_handle);
     return PyLong_FromVoidPtr(state);
 }
+
+static PyObject* my_shared_close(PyObject* self, PyObject* args) {
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "state handle must be an integer");
+        return NULL;
+    }
+
+    PyObject* state_dict = (PyObject*)PyLong_AsVoidPtr(handle_obj);
+
+    PyObject* ai_path_buffer_handle = PyDict_GetItemString(state_dict, "ai_path_buffer");
+    if (ai_path_buffer_handle == NULL) {
+        PyErr_SetString(PyExc_KeyError, "Key 'ai_path_buffer' not found in state");
+        return NULL;
+    }
+    int* ai_path_buffer = (int*)PyLong_AsVoidPtr(ai_path_buffer_handle);
+    free(ai_path_buffer);
+
+    PyObject* ai_paths_handle = PyDict_GetItemString(state_dict, "ai_paths");
+    if (ai_paths_handle == NULL) {
+        PyErr_SetString(PyExc_KeyError, "Key 'ai_paths' not found in state");
+        return NULL;
+    }
+    unsigned char* ai_paths = (unsigned char*)PyLong_AsVoidPtr(ai_paths_handle);
+    free(ai_paths);
+
+    PyObject* game_map_handle = PyDict_GetItemString(state_dict, "game_map");
+    if (game_map_handle == NULL) {
+        PyErr_SetString(PyExc_KeyError, "Key 'game_map' not found in state");
+        return NULL;
+    }
+    unsigned char* game_map = (unsigned char*)PyLong_AsVoidPtr(game_map_handle);
+    free(game_map);
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->vision_range = unpack(kwargs, "vision_range");

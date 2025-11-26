@@ -711,7 +711,9 @@ class Protein:
                     p_success = self.success_classifier.predict_proba(suggestions)[:, 1]
                 suggestion_scores *= p_success
 
-        best_idx = np.argmax(suggestion_scores)
+        idxs = np.argsort(suggestion_scores)[::-1]
+        best_idx = idxs[0]
+
         info = dict(
             cost = gp_c[best_idx].item(),
             score = gp_y[best_idx].item(),

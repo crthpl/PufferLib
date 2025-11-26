@@ -12,6 +12,13 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
 }
 #endif
 
+static PyObject* my_shared_close(PyObject* self, PyObject* args);
+#ifndef MY_SHARED_CLOSE
+static PyObject* my_shared_close(PyObject* self, PyObject* args) {
+    return 0;
+}
+#endif
+
 static PyObject* my_get(PyObject* dict, Env* env);
 #ifndef MY_GET
 static PyObject* my_get(PyObject* dict, Env* env) {
@@ -657,6 +664,7 @@ static PyMethodDef methods[] = {
     {"vec_render", vec_render, METH_VARARGS, "Render the vector of environments"},
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
+    {"shared_close", my_shared_close, METH_VARARGS, "Close shared state"},
     MY_METHODS,
     {NULL, NULL, 0, NULL}
 };
