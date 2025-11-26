@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include "vecenv.h"
+#include <stdatomic.h>
 
 #define FLOAT 1
 #define INT 2
@@ -17,14 +18,17 @@ __attribute__((visibility("default"))) const int OBS_T = OBS_TYPE;
 __attribute__((visibility("default"))) const int ACT_T = ACT_TYPE;
 
 typedef struct Threading {
-    atomic_int work_index;
-    atomic_int num_running_threads;
+    atomic_long work_index;
+    long start_index;
+    atomic_long end_index;
     int num_threads;
     pthread_cond_t wake_cond;
     pthread_mutex_t wake_mutex;
     pthread_cond_t all_done_cond;
     pthread_mutex_t all_done_mutex;
     pthread_t* threads;
+    bool* actions_ready_on_gpu;
+    bool* obs_ready_on_cpu;
 } Threading;
 
 // Forward declarations for env-specific functions supplied by user
@@ -62,39 +66,91 @@ static void* c_threadstep(void* arg)
     VecEnv* vec = (VecEnv*)arg;
     Threading* threading = vec->threading;
 
-    atomic_int* work_index = &threading->work_index;
-    atomic_int* num_running_threads = &threading->num_running_threads;
+    int num_envs = vec->size;
+    atomic_long* work_index = &threading->work_index;
+    atomic_long* end_index = &threading->end_index;
     int index;
-    atomic_fetch_add_explicit(num_running_threads, 1, memory_order_relaxed);
     while (1) {
         // Wait for work
         pthread_mutex_lock(&threading->wake_mutex);
         pthread_cond_wait(&threading->wake_cond, &threading->wake_mutex);
         pthread_mutex_unlock(&threading->wake_mutex);
+        int end = atomic_load_explicit(end_index, memory_order_relaxed);
         do
         {
             // This is important: Go do a bunch of work in our thread, without context switches or locks
             // or any new allocs. This is the main speedup and core to ensuring the threads do as little work
             // as part of their main loop as possible. We can afford to this as the load balancing naturally happens
             // with mutually exclusive index values spread across threads.
-            index = atomic_fetch_sub_explicit(work_index, 1, memory_order_relaxed);
-            if (index >= 0) {
-                c_step(&vec->envs[index]);
+
+            index = atomic_fetch_add_explicit(work_index, 1, memory_order_relaxed);
+            if (index < end) {
+                c_step(&vec->envs[index % num_envs]);
             }
         }
-        while (index > 0);
-        atomic_fetch_sub_explicit(num_running_threads, 1, memory_order_relaxed);
-        /*
-        if (atomic_fetch_sub_explicit(num_running_threads, 1, memory_order_relaxed) == 1) {
-            pthread_mutex_lock(&threading->all_done_mutex);
-            pthread_cond_signal(&threading->all_done_cond);
-            pthread_mutex_unlock(&threading->all_done_mutex);
-        }
-        */
+        while (index < end);
     }
     return NULL;
 }
 
+static void* c_threadmanager(void* arg) {
+    VecEnv* vec = (VecEnv*)arg;
+    Threading* threading = vec->threading;
+
+    atomic_long* work_index = &threading->work_index;
+    atomic_long* end_index = &threading->end_index;
+ 
+    int block_size = vec->size / vec->buffers;
+    bool* actions_ready_on_gpu = threading->actions_ready_on_gpu;
+    bool* obs_ready_on_cpu = threading->obs_ready_on_cpu;
+
+
+    // TODO: Init?
+    while (1) {
+        for (int buf=0; buf < vec->buffers; buf++) {
+            if (threading->actions_ready_on_gpu[buf] && cudaStreamQuery(vec->streams[buf]) == cudaSuccess) {
+                // Actions are ready on CPU
+                atomic_fetch_add_explicit(end_index, block_size, memory_order_relaxed);
+                pthread_cond_broadcast(&threading->wake_cond);
+                actions_ready_on_gpu[buf] = false;
+            }
+
+            // TODO: race?
+            int work = atomic_load_explicit(work_index, memory_order_relaxed);
+            if ( work >= block_size + threading->start_index) {
+                threading->start_index += block_size;
+
+                // Observations are ready on CPU
+                int block_size = vec->size / vec->buffers;
+                int start = buf * block_size;
+
+                cudaMemcpyAsync(
+                    &vec->gpu_observations[start],
+                    &vec->observations[start],
+                    block_size*OBS_SIZE*sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                cudaMemcpyAsync(
+                    &vec->gpu_rewards[start],
+                    &vec->rewards[start],
+                    block_size*sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                cudaMemcpyAsync(
+                    &vec->gpu_terminals[start],
+                    &vec->terminals[start],
+                    block_size*sizeof(unsigned char),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                obs_ready_on_cpu[buf] = true;
+            }
+        }
+    }
+}
+ 
 __attribute__((visibility("default")))
 VecEnv* create_environments(int num_envs, int threads, int buffers, Dict* kwargs) {
     Env* envs = (Env*)calloc(num_envs, sizeof(Env));
@@ -106,6 +162,8 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, Dict* kwargs
 
     Threading* threading = vec->threading;
     threading->num_threads = threads;
+    threading->actions_ready_on_gpu = (bool*)calloc(threads, sizeof(bool));
+    threading->obs_ready_on_cpu = (bool*)calloc(threads, sizeof(bool));
 
     if (threads > 0) {
         vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
@@ -113,21 +171,21 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, Dict* kwargs
             cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
         }
 
-        threading->threads = (pthread_t*)calloc(threads, sizeof(pthread_t));
+        threading->threads = (pthread_t*)calloc(threads + 1, sizeof(pthread_t));
         assert(threading->threads != NULL && "create_vecenv failed to allocate memory for threads\n");
         assert(pthread_cond_init(&threading->wake_cond, NULL) == 0 && "create_vecenv failed to initialize wake_cond\n");
         assert(pthread_mutex_init(&threading->wake_mutex, NULL) == 0 && "create_vecenv failed to initialize wake_mutex\n");
-        atomic_store(&threading->num_running_threads, 0);
-        atomic_store(&threading->work_index, -1);
+        atomic_store(&threading->end_index, 0);
+        atomic_store(&threading->work_index, 0);
 
         for (int i = 0; i < threads; i++) {
             int err = pthread_create(&threading->threads[i], NULL, c_threadstep, (void*)(vec));
             assert(err == 0 && "create_vecenv failed to create thread\n");
         }
 
-        // Wait for all threads to initialize
-        while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) < threading->num_threads) {}
-        atomic_store(&threading->num_running_threads, 0);
+        // Last thread manages host device syncs
+        int err = pthread_create(&threading->threads[threads], NULL, c_threadmanager, (void*)(vec));
+        assert(err == 0 && "create_vecenv failed to create manager thread\n");
     }
 
     int num_agents = 0;
@@ -193,21 +251,53 @@ void vec_reset(VecEnv* vec) {
         Env* env = &vec->envs[i];
         c_reset(env);
     }
+    bool* obs_ready_on_cpu = vec->threading->obs_ready_on_cpu;
+    for (int buf=0; buf < vec->buffers; buf++) {
+        int block_size = vec->size / vec->buffers;
+        int start = buf * block_size;
+
+        cudaMemcpyAsync(
+            &vec->gpu_observations[start],
+            &vec->observations[start],
+            block_size*OBS_SIZE*sizeof(float),
+            cudaMemcpyHostToDevice,
+            vec->streams[buf]
+        );
+        cudaMemcpyAsync(
+            &vec->gpu_rewards[start],
+            &vec->rewards[start],
+            block_size*sizeof(float),
+            cudaMemcpyHostToDevice,
+            vec->streams[buf]
+        );
+        cudaMemcpyAsync(
+            &vec->gpu_terminals[start],
+            &vec->terminals[start],
+            block_size*sizeof(unsigned char),
+            cudaMemcpyHostToDevice,
+            vec->streams[buf]
+        );
+        obs_ready_on_cpu[buf] = true;
+    }
 }
 
 void vec_send(VecEnv* vec, int buffer) {
     int block_size = vec->size / vec->buffers;
     int start = buffer * block_size;
 
-    cudaMemcpy(
+    cudaMemcpyAsync(
         &vec->actions[start],
         &vec->gpu_actions[start],
         block_size*ACT_SIZE*sizeof(float),
-        cudaMemcpyDeviceToHost
+        cudaMemcpyDeviceToHost,
+        vec->streams[buffer]
     );
 
-    // Single threaded
     Threading* threading = vec->threading;
+    bool* actions_ready_on_gpu = threading->actions_ready_on_gpu;
+    actions_ready_on_gpu[buffer] = true;
+
+    // Single threaded
     if (threading->num_threads == 0) {
         for (int i = 0; i < vec->size; i++) {
             Env* env = &vec->envs[i];
@@ -215,45 +305,14 @@ void vec_send(VecEnv* vec, int buffer) {
         }
         return;
     }
-
-    atomic_store_explicit(&threading->num_running_threads, threading->num_threads, memory_order_relaxed);
-    atomic_store_explicit(&threading->work_index, vec->size-1, memory_order_relaxed);
-    pthread_cond_broadcast(&threading->wake_cond);
 }
 
 void vec_recv(VecEnv* vec, int buffer) {
     Threading* threading = vec->threading;
-    while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {}
-
-    int block_size = vec->size / vec->buffers;
-    int start = buffer * block_size;
-
-    cudaMemcpy(
-        &vec->gpu_observations[start],
-        &vec->observations[start],
-        block_size*OBS_SIZE*sizeof(float),
-        cudaMemcpyHostToDevice
-    );
-    cudaMemcpy(
-        &vec->gpu_rewards[start],
-        &vec->rewards[start],
-        block_size*sizeof(float),
-        cudaMemcpyHostToDevice
-    );
-    cudaMemcpy(
-        &vec->gpu_terminals[start],
-        &vec->terminals[start],
-        block_size*sizeof(unsigned char),
-        cudaMemcpyHostToDevice
-    );
-
-    /*
-    pthread_mutex_lock(&threading->all_done_mutex);
-    while (atomic_load_explicit(&threading->num_running_threads, memory_order_relaxed) > 0) {
-        pthread_cond_wait(&threading->all_done_cond, &threading->all_done_mutex);
-    }
-    pthread_mutex_unlock(&threading->all_done_mutex);
-    */
+    // TODO: Single stream architecture requires busy waiting here
+    while (!threading->obs_ready_on_cpu[buffer]) {}
+    cudaStreamSynchronize(vec->streams[buffer]);
+    threading->obs_ready_on_cpu[buffer] = false;
 }
 
 void vec_step(VecEnv* vec, int buffer) {

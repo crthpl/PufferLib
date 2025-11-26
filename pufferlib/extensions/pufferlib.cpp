@@ -154,7 +154,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, 1, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 2, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -1024,8 +1024,11 @@ torch::Tensor compiled_evaluate(
 
     auto device = torch::kCUDA;
 
-    for (int64_t i = 0; i < horizon; ++i) {
-        vec_recv(vec, 0);
+    int num_buffers = 2;
+    int block_size = num_envs / num_buffers;
+    for (int64_t i = 0; i < num_buffers*horizon; ++i) {
+        int buf = i % num_buffers;
+        vec_recv(vec, buf);
         /*
         obs_buf.copy_(obs.to(DTYPE));
         state_in_buf.copy_(state.to(DTYPE));
@@ -1037,9 +1040,11 @@ torch::Tensor compiled_evaluate(
         */
 
         //auto [logits, value, state_out] = policy->forward(obs.to(device).to(DTYPE), state);
-        auto obs_cuda = obs.to(device);
-        auto [logits, value, state_out] = policy->forward(obs_cuda.to(DTYPE), state);
-        state = state_out;
+        //auto obs_cuda = obs.to(device);
+        auto obs_batch = obs.narrow(0, buf*block_size, block_size);
+        auto state_batch = state.narrow(1, buf*block_size, block_size);
+        auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
+        state_batch.copy_(state_out);
 
         logits = torch::nan_to_num(logits);
 
@@ -1048,19 +1053,23 @@ torch::Tensor compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store with non-blocking copies
-        obs_buffer.select(1, i).copy_(obs_cuda, true);
-        act_buffer.select(1, i).copy_(action.to(torch::kInt64), true);
-        logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32), true);
-        rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32), true);
-        term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32), true);
-        val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32), true);
+        obs_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
+        act_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), true);
+        logprob_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), true);
+        val_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), true);
 
-        actions.copy_(action.to(torch::kCPU).to(torch::kFloat32));
+        auto rewards_batch = rewards.narrow(0, buf*block_size, block_size).to(torch::kFloat32);
+        rew_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
+
+        auto terminals_batch = terminals.narrow(0, buf*block_size, block_size).to(torch::kFloat32);
+        term_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
+
+        actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), true);
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
-            vec_send(vec, 0);
+            vec_send(vec, buf);
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];
