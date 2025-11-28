@@ -1028,6 +1028,7 @@ torch::Tensor compiled_evaluate(
     int block_size = num_envs / num_buffers;
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
+	int h = i / num_buffers;
         vec_recv(vec, buf);
         /*
         obs_buf.copy_(obs.to(DTYPE));
@@ -1053,16 +1054,16 @@ torch::Tensor compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store with non-blocking copies
-        obs_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
-        act_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), true);
-        logprob_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), true);
-        val_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), true);
+        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
+        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action, true);
+        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob, true);
+        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten(), true);
 
-        auto rewards_batch = rewards.narrow(0, buf*block_size, block_size).to(torch::kFloat32);
-        rew_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
+        auto rewards_batch = rewards.narrow(0, buf*block_size, block_size);
+        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
 
-        auto terminals_batch = terminals.narrow(0, buf*block_size, block_size).to(torch::kFloat32);
-        term_buffer.select(1, i).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
+        auto terminals_batch = terminals.narrow(0, buf*block_size, block_size);
+        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
 
         actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), true);
         {
@@ -1076,6 +1077,8 @@ torch::Tensor compiled_evaluate(
             //}
             //render_environments(envs_tensor, indices_tensor);
         }
+
+	// Bad clamp
         rewards.clamp_(-1.0f, 1.0f);
     }
 

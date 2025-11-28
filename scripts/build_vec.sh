@@ -26,7 +26,7 @@ FLAGS=(
     -fms-extensions
     #-fsanitize=address,undefined,bounds,pointer-overflow,leak
     #-fno-omit-frame-pointer
-    -fsanitize=thread
+    #-fsanitize=thread
     -fPIC
 )
 

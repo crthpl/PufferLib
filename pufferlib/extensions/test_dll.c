@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #include "vecenv.h"
 
 
@@ -50,8 +51,8 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 1024;
-    int threads = 8;
+    int num_envs = 16;
+    int threads = 4;
     int buffers = 2;
 
     VecEnv* vec = create_environments(num_envs, threads, buffers, kwargs);
@@ -59,10 +60,14 @@ int main() {
 
     float* gpu_actions = vec->gpu_actions;
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 10000; i++) {
         int buf = i % buffers;
         vec_recv(vec, buf);
         vec_send(vec, buf);
+	if (i % 100 == 0) {
+	    printf("%d\n", i);
+	}
+	//sleep(3);
 
         /*
         Env* env = &vec.envs[0];

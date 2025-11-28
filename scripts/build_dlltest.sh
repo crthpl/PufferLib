@@ -14,6 +14,7 @@ FLAGS=(
     -lGL
     -lm
     -lpthread
+    -L/usr/local/cuda/lib64 -lcudart
     -ferror-limit=3
     -DPLATFORM_DESKTOP
     # Bite me
@@ -22,7 +23,7 @@ FLAGS=(
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
     #-fsanitize=address,undefined,bounds,pointer-overflow,leak
-    -fsanitize=thread
+    #-fsanitize=thread
     -fno-omit-frame-pointer
 )
 

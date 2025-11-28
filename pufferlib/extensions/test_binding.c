@@ -25,7 +25,7 @@ int main() {
     VecEnv* vec = create_environments(num_envs, threads, buffers, kwargs);
     vec_reset(vec);
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 10000; i++) {
         int buf = i % buffers;
         vec_recv(vec, buf);
         for (int j = 0; j < num_envs; j++) {
