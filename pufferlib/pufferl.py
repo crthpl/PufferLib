@@ -828,7 +828,7 @@ class NoLogger:
     def log(self, logs, step):
         pass
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
         pass
 
 class NeptuneLogger:
@@ -859,7 +859,8 @@ class NeptuneLogger:
     def upload_model(self, model_path):
         self.neptune['model'].track_files(model_path)
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.neptune['early_stop'] = early_stop
         if self.should_upload_model:
             self.upload_model(model_path)
         self.neptune.stop()
@@ -894,7 +895,8 @@ class WandbLogger:
         artifact.add_file(model_path)
         self.wandb.run.log_artifact(artifact)
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.wandb.run.summary['early_stop'] = early_stop
         if self.should_upload_model:
             self.upload_model(model_path)
         self.wandb.finish()
@@ -905,7 +907,7 @@ class WandbLogger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_stop_early=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop_fn=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -944,7 +946,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
     train_config = { **args['train'], 'env': env_name }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
+    # Sweep needs data for early stopped runs, so send data when steps > 100M
+    logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
     all_logs = []
+
     while pufferl.global_step < train_config['total_timesteps']:
         if train_config['device'] == 'cuda':
             torch.compiler.cudagraph_mark_step_begin()
@@ -954,12 +959,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
         logs = pufferl.train()
 
         if logs is not None:
-            if pufferl.global_step > 0.20*train_config['total_timesteps']:
+            should_stop_early = False
+            if early_stop_fn is not None:
+                should_stop_early = early_stop_fn(logs)
+                # This is hacky, but need to see if threshold looks reasonable
+                if 'early_stop_threshold' in logs:
+                    pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
+
+            if pufferl.global_step > logging_threshold:
                 all_logs.append(logs)
 
-            if should_stop_early is not None and should_stop_early(logs):
+            if should_stop_early:
                 model_path = pufferl.close()
-                pufferl.logger.close(model_path)
+                pufferl.logger.close(model_path, early_stop=True)
                 return all_logs
 
     # Final eval. You can reset the env here, but depending on
@@ -976,7 +988,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, should_sto
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
-    pufferl.logger.close(model_path)
+    pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
 def eval(env_name, args=None, vecenv=None, policy=None):
@@ -1053,6 +1065,30 @@ def sweep(args=None, env_name=None):
     sweep = sweep_cls(args['sweep'])
     points_per_run = args['sweep']['downsample']
     target_key = f'environment/{args["sweep"]["metric"]}'
+    running_target_buffer = deque(maxlen=30)
+
+    def stop_if_perf_below(logs):
+        if stop_if_loss_nan(logs):
+            logs['is_loss_nan'] = True
+            return True
+
+        if method != 'Protein':
+            return False
+
+        if ('uptime' in logs and target_key in logs):
+            metric_val, cost = logs[target_key], logs['uptime']
+            running_target_buffer.append(metric_val)
+            target_running_mean = np.mean(running_target_buffer)
+            
+            # If metric distribution is percentile, threshold is also logit transformed
+            threshold = sweep.get_early_stop_threshold(cost)
+            logs['early_stop_threshold'] = max(threshold, -5)  # clipping for visualization
+
+            if sweep.should_stop(max(target_running_mean, metric_val), cost):
+                logs['is_loss_nan'] = False
+                return True
+        return False
+
     for i in range(args['max_runs']):
         seed = time.time_ns() & 0xFFFFFFFF
         random.seed(seed)
@@ -1063,7 +1099,7 @@ def sweep(args=None, env_name=None):
         if i > 0:
             sweep.suggest(args)
 
-        all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
+        all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
         all_logs = [e for e in all_logs if target_key in e]
 
         if not all_logs:
@@ -1076,7 +1112,8 @@ def sweep(args=None, env_name=None):
         costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
 
-        if len(timesteps) > 0 and timesteps[-1] < 0.7 * total_timesteps:  # 0.7 is arbitrary
+        is_final_loss_nan = all_logs[-1].get('is_loss_nan', False)
+        if is_final_loss_nan:
             s = scores.pop()
             c = costs.pop()
             args['train']['total_timesteps'] = timesteps.pop()
