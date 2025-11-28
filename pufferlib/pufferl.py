@@ -963,8 +963,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
             if early_stop_fn is not None:
                 should_stop_early = early_stop_fn(logs)
                 # This is hacky, but need to see if threshold looks reasonable
-                if 'early_stop_treshold' in logs:
-                    pufferl.logger.log({'environment/early_stop_treshold': logs['early_stop_treshold']}, logs['agent_steps'])
+                if 'early_stop_threshold' in logs:
+                    pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
 
             if pufferl.global_step > logging_threshold:
                 all_logs.append(logs)
@@ -1082,7 +1082,7 @@ def sweep(args=None, env_name=None):
             
             # If metric distribution is percentile, threshold is also logit transformed
             threshold = sweep.get_early_stop_threshold(cost)
-            logs['early_stop_treshold'] = max(threshold, -5)  # clipping for visualization
+            logs['early_stop_threshold'] = max(threshold, -5)  # clipping for visualization
 
             if sweep.should_stop(max(target_running_mean, metric_val), cost):
                 logs['is_loss_nan'] = False
