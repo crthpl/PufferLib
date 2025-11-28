@@ -1271,17 +1271,19 @@ def load_policy(args, vecenv, env_name=''):
     module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
     env_module = importlib.import_module(module_name)
 
-    device = args['train']['device']
-    policy_cls = getattr(env_module.torch, args['policy_name'])
-    policy = policy_cls(vecenv.driver_env, **args['policy'])
-
-    '''
+    # NOTE: LSTM API is changing. Trying to make it work now, but should revisit later.
     rnn_name = args['rnn_name']
     if rnn_name is not None:
+        policy_cls = getattr(env_module.torch, args['policy_name'])
+        def make_policy():
+            return policy_cls(vecenv.driver_env, **args['policy'])
         rnn_cls = getattr(env_module.torch, args['rnn_name'])
-        policy = rnn_cls(vecenv.driver_env, policy, **args['policy'])
-    '''
+        policy = rnn_cls(vecenv.driver_env, make_policy, **args['rnn'])
+    else:
+        policy_cls = getattr(env_module.torch, args['policy_name'])
+        policy = policy_cls(vecenv.driver_env, **args['policy'])
 
+    device = args['train']['device']
     policy = policy.to(device)
 
     load_id = args['load_id']
