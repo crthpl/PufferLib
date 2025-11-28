@@ -485,10 +485,6 @@ class TrashPickup(nn.Module):
         value = self.value_fn(flat_hidden)
         return action, value
 
-class TowerClimbLSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, input_size = 256, hidden_size = 256):
-        super().__init__(env, policy, input_size, hidden_size)
-
 class TowerClimb(nn.Module):
     def __init__(self, env, cnn_channels=16, hidden_size = 256, **kwargs):
         self.hidden_size = hidden_size
@@ -539,7 +535,6 @@ class TowerClimb(nn.Module):
         value = self.value_fn(flat_hidden)
         
         return action, value
-
 
 class ImpulseWarsLSTM(Recurrent):
     def __init__(self, env, policy, hidden_size: int = 512, **kwargs):
@@ -1141,5 +1136,3 @@ class NMMO3MinGRU(nn.Module):
         logits, values = self.nmmo3.decode_actions(flat_hidden)
         values = values.reshape(B, TT)
         return logits, values
-
-
