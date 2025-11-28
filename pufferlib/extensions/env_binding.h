@@ -104,11 +104,12 @@ static void* c_threadmanager(void* arg) {
     bool* actions_ready_on_gpu = threading->actions_ready_on_gpu;
     bool* obs_ready_on_cpu = threading->obs_ready_on_cpu;
 
-
+    printf("Thread manager initialized\n");
     // TODO: Init?
     while (1) {
         for (int buf=0; buf < vec->buffers; buf++) {
             if (threading->actions_ready_on_gpu[buf] && cudaStreamQuery(vec->streams[buf]) == cudaSuccess) {
+                printf("Actions ready on CPU\n");
                 // Actions are ready on CPU
                 atomic_fetch_add_explicit(end_index, block_size, memory_order_relaxed);
                 pthread_cond_broadcast(&threading->wake_cond);
@@ -119,6 +120,7 @@ static void* c_threadmanager(void* arg) {
             int work = atomic_load_explicit(work_index, memory_order_relaxed);
             if ( work >= block_size + threading->start_index) {
                 threading->start_index += block_size;
+                printf("Observations ready on CPU\n");
 
                 // Observations are ready on CPU
                 int block_size = vec->size / vec->buffers;
@@ -256,26 +258,23 @@ void vec_reset(VecEnv* vec) {
         int block_size = vec->size / vec->buffers;
         int start = buf * block_size;
 
-        cudaMemcpyAsync(
+        cudaMemcpy(
             &vec->gpu_observations[start],
             &vec->observations[start],
             block_size*OBS_SIZE*sizeof(float),
-            cudaMemcpyHostToDevice,
-            vec->streams[buf]
+            cudaMemcpyHostToDevice
         );
-        cudaMemcpyAsync(
+        cudaMemcpy(
             &vec->gpu_rewards[start],
             &vec->rewards[start],
             block_size*sizeof(float),
-            cudaMemcpyHostToDevice,
-            vec->streams[buf]
+            cudaMemcpyHostToDevice
         );
-        cudaMemcpyAsync(
+        cudaMemcpy(
             &vec->gpu_terminals[start],
             &vec->terminals[start],
             block_size*sizeof(unsigned char),
-            cudaMemcpyHostToDevice,
-            vec->streams[buf]
+            cudaMemcpyHostToDevice
         );
         obs_ready_on_cpu[buf] = true;
     }

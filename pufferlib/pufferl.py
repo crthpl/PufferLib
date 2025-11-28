@@ -839,7 +839,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     train_config = dict(**args['train'])#, env=env_name)
     #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
-    pufferl = PuffeRL(train_config, logger, verbose)
+    pufferl = PuffeRL(train_config, logger, verbose=False)
     pufferl.logger.init(args)
 
     all_logs = []

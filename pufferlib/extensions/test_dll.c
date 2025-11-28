@@ -18,6 +18,8 @@ int main() {
     env_init_fn env_init = (env_init_fn)dlsym(handle, "env_init");
     vec_reset_fn vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
     vec_step_fn vec_step = (vec_step_fn)dlsym(handle, "vec_step");
+    vec_send_fn vec_send = (vec_send_fn)dlsym(handle, "vec_send");
+    vec_recv_fn vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
     env_close_fn env_close = (env_close_fn)dlsym(handle, "env_close");
     vec_close_fn vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log_fn vec_log = (vec_log_fn)dlsym(handle, "vec_log");
@@ -48,21 +50,28 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    VecEnv* vec = create_environments(1024, 8, kwargs);
-    vec_reset(vec);
-    for (int i = 0; i < 300; i++) {
-        for (int j = 0; j < vec->size; j++) {
-            vec->actions[j] = rand() % 3;
-        }
-        vec_step(vec);
-        float reward_sum = 0;
-        for (int j = 0; j < vec->size; j++) {
-            reward_sum += vec->rewards[j];
-        }
-        printf("Reward sum: %f\n", reward_sum);
-        vec_render(vec, 0);
-    }
+    int num_envs = 1024;
+    int threads = 8;
+    int buffers = 2;
 
+    VecEnv* vec = create_environments(num_envs, threads, buffers, kwargs);
+    vec_reset(vec);
+
+    float* gpu_actions = vec->gpu_actions;
+
+    for (int i = 0; i < 256; i++) {
+        int buf = i % buffers;
+        vec_recv(vec, buf);
+        vec_send(vec, buf);
+
+        /*
+        Env* env = &vec.envs[0];
+        c_render(env);
+        env->actions[0] = rand() % 3;
+        c_step(env);
+        */
+    }
+ 
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // TODO: Add a `close_vecenv` function to clean up

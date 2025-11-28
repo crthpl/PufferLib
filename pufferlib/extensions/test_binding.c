@@ -18,15 +18,28 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    VecEnv* vec = create_environments(8, kwargs);
-    vec_reset(vec);
-    vec_step(vec);
+    int num_envs = 1024;
+    int threads = 8;
+    int buffers = 2;
 
-    for (int i = 0; i < 300; i++) {
+    VecEnv* vec = create_environments(num_envs, threads, buffers, kwargs);
+    vec_reset(vec);
+
+    for (int i = 0; i < 256; i++) {
+        int buf = i % buffers;
+        vec_recv(vec, buf);
+        for (int j = 0; j < num_envs; j++) {
+            Env* env = &vec->envs[j];
+            env->actions[j] = rand() % 3;
+        }
+        vec_send(vec, buf);
+
+        /*
         Env* env = &vec.envs[0];
         c_render(env);
         env->actions[0] = rand() % 3;
         c_step(env);
+        */
     }
     return 0;
 }

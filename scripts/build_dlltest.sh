@@ -8,6 +8,7 @@ LINK_ARCHIVES="./$RAYLIB_NAME/lib/libraylib.a"
 FLAGS=(
     -Wall
     -I./$RAYLIB_NAME/include
+    -I/usr/local/cuda/include
     "pufferlib/extensions/test_dll.c" -o "test_dll"
     $LINK_ARCHIVES
     -lGL
@@ -20,7 +21,8 @@ FLAGS=(
     -Wno-error=incompatible-pointer-types-discards-qualifiers
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
-    -fsanitize=address,undefined,bounds,pointer-overflow,leak
+    #-fsanitize=address,undefined,bounds,pointer-overflow,leak
+    -fsanitize=thread
     -fno-omit-frame-pointer
 )
 
