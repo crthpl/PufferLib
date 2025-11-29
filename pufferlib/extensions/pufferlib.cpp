@@ -154,7 +154,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, 2, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 2, 256, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -975,7 +975,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 0);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1028,7 +1028,7 @@ torch::Tensor compiled_evaluate(
     int block_size = num_envs / num_buffers;
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
-	int h = i / num_buffers;
+	    int h = i / num_buffers;
         vec_recv(vec, buf);
         /*
         obs_buf.copy_(obs.to(DTYPE));
@@ -1054,23 +1054,26 @@ torch::Tensor compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store with non-blocking copies
-        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
-        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action, true);
-        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob, true);
-        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten(), true);
+        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, false);
+        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), false);
+        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), false);
+        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), false);
 
         auto rewards_batch = rewards.narrow(0, buf*block_size, block_size);
-        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
+        auto rewards_clamped = torch::clamp(rewards_batch, -1.0f, 1.0f);
+        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_clamped.to(torch::kFloat32), false);
 
         auto terminals_batch = terminals.narrow(0, buf*block_size, block_size);
-        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
+        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch.to(torch::kFloat32), false);
 
-        actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), true);
+        actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), false);
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
+            cudaDeviceSynchronize();
             vec_send(vec, buf);
+            cudaDeviceSynchronize();
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];
@@ -1079,7 +1082,7 @@ torch::Tensor compiled_evaluate(
         }
 
 	// Bad clamp
-        rewards.clamp_(-1.0f, 1.0f);
+    //    rewards.clamp_(-1.0f, 1.0f);
     }
 
     return state;
@@ -1264,6 +1267,7 @@ pybind11::dict compiled_train(
         auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
         //torch::Tensor loss = torch::zeros({1}, logits.options());
+        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1280,8 +1284,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
+        */
 
-        /*
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
         auto flat_actions = mb_actions.reshape({-1});
@@ -1342,7 +1346,6 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
-        */
 
         loss.backward();
 

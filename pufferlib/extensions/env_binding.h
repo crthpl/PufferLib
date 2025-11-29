@@ -308,7 +308,7 @@ void vec_reset(VecEnv* vec) {
             block_size*sizeof(unsigned char),
             cudaMemcpyHostToDevice
         );
-	atomic_store(&obs_ready_on_cpu[buf], true);
+	    atomic_store(&obs_ready_on_cpu[buf], true);
     }
 }
 
@@ -320,27 +320,53 @@ void vec_send(VecEnv* vec, int buffer) {
     //int val = rand() % 8192;
     //cudaMemset(&vec->gpu_actions[start], val, block_size*ACT_SIZE*sizeof(float));
 
-    cudaMemcpyAsync(
-        &vec->actions[start],
-        &vec->gpu_actions[start],
-        block_size*ACT_SIZE*sizeof(float),
-        cudaMemcpyDeviceToHost,
-        vec->streams[buffer]
-    );
-
     Threading* threading = vec->threading;
-    atomic_bool* actions_ready_on_gpu = threading->actions_ready_on_gpu;
-    atomic_store(&actions_ready_on_gpu[buffer], true);
-    //printf("vec_send initiated actions->CPU\n");
 
     // Single threaded
     if (threading->num_threads == 0) {
-        cudaStreamSynchronize(vec->streams[buffer]);
+        cudaMemcpy(
+            &vec->actions[start],
+            &vec->gpu_actions[start],
+            block_size*ACT_SIZE*sizeof(float),
+            cudaMemcpyDeviceToHost
+        );
         for (int i = start; i < start + block_size; i++) {
             Env* env = &vec->envs[i];
             c_step(env);
         }
+        cudaMemcpy(
+            &vec->gpu_observations[start],
+            &vec->observations[start],
+            block_size*OBS_SIZE*sizeof(float),
+            cudaMemcpyHostToDevice
+        );
+        cudaMemcpy(
+            &vec->gpu_rewards[start],
+            &vec->rewards[start],
+            block_size*sizeof(float),
+            cudaMemcpyHostToDevice
+        );
+        cudaMemcpy(
+            &vec->gpu_terminals[start],
+            &vec->terminals[start],
+            block_size*sizeof(unsigned char),
+            cudaMemcpyHostToDevice
+        );
+    } else {
+        cudaMemcpyAsync(
+            &vec->actions[start],
+            &vec->gpu_actions[start],
+            block_size*ACT_SIZE*sizeof(float),
+            cudaMemcpyDeviceToHost,
+            vec->streams[buffer]
+        );
+
+        atomic_bool* actions_ready_on_gpu = threading->actions_ready_on_gpu;
+        atomic_store(&actions_ready_on_gpu[buffer], true);
+        //printf("vec_send initiated actions->CPU\n");
     }
+
+
 }
 
 void vec_recv(VecEnv* vec, int buffer) {
