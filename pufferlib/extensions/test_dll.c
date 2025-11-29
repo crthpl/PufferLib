@@ -3,7 +3,24 @@
 #include <unistd.h>
 #include "vecenv.h"
 
+vec_send_fn vec_send;
+vec_recv_fn vec_recv;
 
+int timeout = 10;
+ 
+float perf_test(VecEnv* vec, int buffers) {
+    int start = time(NULL);
+    int i = 0;
+    while (time(NULL) - start < timeout) {
+        int buf = i % buffers;
+        vec_recv(vec, buf);
+        vec_send(vec, buf);
+        i++;
+    }
+
+    return (float)i / (float)timeout;
+}
+ 
 int main() {
     void* handle = dlopen("./breakout.so", RTLD_NOW);
     if (!handle) {
@@ -19,8 +36,8 @@ int main() {
     env_init_fn env_init = (env_init_fn)dlsym(handle, "env_init");
     vec_reset_fn vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
     vec_step_fn vec_step = (vec_step_fn)dlsym(handle, "vec_step");
-    vec_send_fn vec_send = (vec_send_fn)dlsym(handle, "vec_send");
-    vec_recv_fn vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
+    vec_send = (vec_send_fn)dlsym(handle, "vec_send");
+    vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
     env_close_fn env_close = (env_close_fn)dlsym(handle, "env_close");
     vec_close_fn vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log_fn vec_log = (vec_log_fn)dlsym(handle, "vec_log");
@@ -51,33 +68,19 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 16;
-    int threads = 4;
-    int buffers = 2;
+    int num_envs = 16384;
+    int threads = 8;
+    int buffers = 4;
+    int block_size = 256;
 
-    VecEnv* vec = create_environments(num_envs, threads, buffers, kwargs);
+    VecEnv* vec = create_environments(num_envs, threads, buffers, block_size, kwargs);
     vec_reset(vec);
 
     float* gpu_actions = vec->gpu_actions;
 
-    for (int i = 0; i < 10000; i++) {
-        int buf = i % buffers;
-        vec_recv(vec, buf);
-        vec_send(vec, buf);
-	if (i % 100 == 0) {
-	    printf("%d\n", i);
-	}
-	//sleep(3);
-
-        /*
-        Env* env = &vec.envs[0];
-        c_render(env);
-        env->actions[0] = rand() % 3;
-        c_step(env);
-        */
-    }
- 
     printf("Created VecEnv with %d environments\n", vec->size);
+    float sps = perf_test(vec, buffers) * num_envs / (float)buffers;
+    printf("Performance: %f\n SPS\n", sps);
 
     // TODO: Add a `close_vecenv` function to clean up
     // vec.envs, etc.
