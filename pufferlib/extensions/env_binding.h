@@ -192,8 +192,8 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     Threading* threading = vec->threading;
     threading->num_threads = threads;
     threading->block_size = block_size;
-    threading->actions_ready_on_gpu = (atomic_bool*)calloc(threads, sizeof(bool));
-    threading->obs_ready_on_cpu = (atomic_bool*)calloc(threads, sizeof(bool));
+    threading->actions_ready_on_gpu = (atomic_bool*)calloc(buffers, sizeof(bool));
+    threading->obs_ready_on_cpu = (atomic_bool*)calloc(buffers, sizeof(bool));
 
     vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
     for (int i = 0; i < buffers; i++) {
@@ -243,10 +243,14 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     memset(vec->rewards, 0, num_agents*sizeof(float));
     memset(vec->terminals, 0, num_agents*sizeof(unsigned char));
 
-    cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(float));
-    cudaMalloc((void**)&vec->gpu_actions, num_agents*ACT_SIZE*sizeof(float));
-    cudaMalloc((void**)&vec->gpu_rewards, num_agents*sizeof(float));
-    cudaMalloc((void**)&vec->gpu_terminals, num_agents*sizeof(unsigned char));
+    CHECK_CUDA(cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&vec->gpu_actions, num_agents*ACT_SIZE*sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&vec->gpu_rewards, num_agents*sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&vec->gpu_terminals, num_agents*sizeof(unsigned char)));
+    cudaMemset(vec->gpu_observations, 0, num_agents*OBS_SIZE*sizeof(float));
+    cudaMemset(vec->gpu_actions, 0, num_agents*ACT_SIZE*sizeof(float));
+    cudaMemset(vec->gpu_rewards, 0, num_agents*sizeof(float));
+    cudaMemset(vec->gpu_terminals, 0, num_agents*sizeof(unsigned char));
 
     int agent = 0;
     for (int i = 0; i < num_envs; i++) {
@@ -259,7 +263,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         agent += 1;
     }
 
-    printf("Finished creating envs\n");
+    printf("Finished creating %d envs\n", num_envs);
 
     return vec;
 }
@@ -308,7 +312,7 @@ void vec_reset(VecEnv* vec) {
             block_size*sizeof(unsigned char),
             cudaMemcpyHostToDevice
         );
-	    atomic_store(&obs_ready_on_cpu[buf], true);
+	    //atomic_store(&obs_ready_on_cpu[buf], true);
     }
 }
 
@@ -324,9 +328,11 @@ void vec_send(VecEnv* vec, int buffer) {
 
     // Single threaded
     if (threading->num_threads == 0) {
+        //float val = rand()%3;
+        //cudaMemcpy(&vec->gpu_actions[start], &val, sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(
-            &vec->actions[start],
-            &vec->gpu_actions[start],
+            &vec->actions[start*ACT_SIZE],
+            &vec->gpu_actions[start*ACT_SIZE],
             block_size*ACT_SIZE*sizeof(float),
             cudaMemcpyDeviceToHost
         );
@@ -335,8 +341,8 @@ void vec_send(VecEnv* vec, int buffer) {
             c_step(env);
         }
         cudaMemcpy(
-            &vec->gpu_observations[start],
-            &vec->observations[start],
+            &vec->gpu_observations[start*OBS_SIZE],
+            &vec->observations[start*OBS_SIZE],
             block_size*OBS_SIZE*sizeof(float),
             cudaMemcpyHostToDevice
         );
@@ -354,8 +360,8 @@ void vec_send(VecEnv* vec, int buffer) {
         );
     } else {
         cudaMemcpyAsync(
-            &vec->actions[start],
-            &vec->gpu_actions[start],
+            &vec->actions[start*ACT_SIZE],
+            &vec->gpu_actions[start*ACT_SIZE],
             block_size*ACT_SIZE*sizeof(float),
             cudaMemcpyDeviceToHost,
             vec->streams[buffer]
