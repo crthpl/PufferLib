@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <assert.h>
 #include "vecenv.h"
 
 vec_send_fn vec_send;
@@ -42,6 +43,10 @@ int main() {
     vec_close_fn vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log_fn vec_log = (vec_log_fn)dlsym(handle, "vec_log");
     vec_render_fn vec_render = (vec_render_fn)dlsym(handle, "vec_render");
+    int obs_n = *(int*)dlsym(handle, "OBS_N");
+    int act_n = *(int*)dlsym(handle, "ACT_N");
+    int obs_t = *(int*)dlsym(handle, "OBS_T");
+    int act_t = *(int*)dlsym(handle, "ACT_T");
     
     const char* dlsym_error = dlerror();
     if (dlsym_error) {
@@ -50,7 +55,6 @@ int main() {
         return 1;
     }
 
-    // Now call it!
     Dict* kwargs = create_dict(32);
     dict_set_int(kwargs, "frameskip", 4);
     dict_set_int(kwargs, "width", 576);
@@ -68,22 +72,88 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 16384;
-    int threads = 8;
-    int buffers = 4;
+    int num_envs = 8192;
+    int threads = 2;
+    int buffers = 2;
     int block_size = 256;
 
+    /*
+    int num_envs = 32;
+    int threads = 0;
+    int buffers = 2;
+    int block_size = 2;
+    */
+
+    VecEnv* vec1 = create_environments(num_envs, threads, 2, block_size, kwargs);
+    vec_reset(vec1);
+
+    VecEnv* vec2 = create_environments(num_envs, threads, 2, block_size, kwargs);
+    vec_reset(vec2);
+    /*
+    for (int i = 0; i < vec1->size; i++) {
+        float* obs = vec1->observations + i*obs_n;
+        obs[0] = i;
+
+        obs = vec2->observations + i*obs_n;
+        obs[0] = i;
+    }
+    */
+
+    for (int i = 0; i < 10000; i++) {
+        vec_recv(vec1, i%2);
+        vec_recv(vec2, i%2);
+
+        /*
+        if (i % 2 == 0) {
+            vec_recv(vec1, 0);
+         }
+        vec_recv(vec2, i%2);
+        */
+
+        int start = (i % 2) * (num_envs / buffers);
+        int end = start + num_envs / buffers;
+        for (int j = start; j < end; j++) {
+            float* obs1 = vec1->observations + j*obs_n;
+            float* obs2 = vec2->observations + j*obs_n;
+            for (int k = 0; k < obs_n; k++) {
+                if (obs1[k] != obs2[k]) {
+                    printf("Observation mismatch at index %d\n", j);
+                    exit(1);
+                }
+            }
+            assert(vec1->actions[j] == vec2->actions[j]);
+            assert(vec1->rewards[j] == vec2->rewards[j]);
+            assert(vec1->terminals[j] == vec2->terminals[j]);
+        }
+        printf("Passed %d\n", i);
+
+        /*
+        if (i % 2 == 1) {
+            vec_send(vec1, 0);
+        }
+        vec_send(vec2, i%2);
+        */
+        vec_send(vec1, i%2);
+        vec_send(vec2, i%2);
+    }
+
+    /*
     VecEnv* vec = create_environments(num_envs, threads, buffers, block_size, kwargs);
-    vec_reset(vec);
+    for (int i = 0; i < 10000; i++) {
+        int buf = i % buffers;
+        vec_recv(vec, buf);
+        vec_render(vec, 0);
+        vec_send(vec, buf);
+    }
+    */
 
-    float* gpu_actions = vec->gpu_actions;
-
-    printf("Created VecEnv with %d environments\n", vec->size);
-    float sps = perf_test(vec, buffers) * num_envs / (float)buffers;
-    printf("Performance: %f\n SPS\n", sps);
+    //printf("Created VecEnv with %d environments\n", vec->size);
+    //float sps = perf_test(vec, buffers) * num_envs / (float)buffers;
+    //printf("Performance: %f\n SPS\n", sps);
 
     // TODO: Add a `close_vecenv` function to clean up
     // vec.envs, etc.
+    printf("Done\n");
 
     // Close the library
     dlclose(handle);
