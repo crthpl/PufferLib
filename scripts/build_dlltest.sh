@@ -27,4 +27,4 @@ FLAGS=(
     -fno-omit-frame-pointer
 )
 
-clang -g -O2 ${FLAGS[@]}
+clang -g -O0 ${FLAGS[@]}

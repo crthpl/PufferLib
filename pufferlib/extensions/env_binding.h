@@ -29,7 +29,7 @@ __attribute__((visibility("default"))) const int ACT_T = ACT_TYPE;
 
 typedef struct Threading {
     atomic_long work_index;
-    atomic_long* completion_indices;
+    atomic_long* buffer_tasks;
     long start_index;
     atomic_long end_index;
     int num_threads;
@@ -41,6 +41,8 @@ typedef struct Threading {
     atomic_bool* actions_ready_on_gpu;
     atomic_bool* obs_ready_on_cpu;
     int block_size;
+    int num_envs;
+    int num_buffers;
 } Threading;
 
 typedef struct WorkerArg {
@@ -88,28 +90,29 @@ static void* c_threadstep(void* arg)
     int block_size = threading->block_size;
     int num_envs = vec->size;
     atomic_long* work_index = &threading->work_index;
-    atomic_long* completed_index = &threading->completion_indices[idx];
     atomic_long* end_index = &threading->end_index;
+    atomic_long* buffer_tasks = threading->buffer_tasks;
     int index, end;
     while (1) {
         pthread_mutex_lock(&threading->wake_mutex);
         pthread_cond_wait(&threading->wake_cond, &threading->wake_mutex);
         pthread_mutex_unlock(&threading->wake_mutex);
-        long completed = atomic_load(completed_index);
         long end = atomic_load(end_index);
-        while (completed < end) {
-            long block_start = atomic_fetch_add(work_index, block_size);
+        long block_start;
+        do {
+            block_start = atomic_fetch_add(work_index, block_size);
             if (block_start >= end) {
                 atomic_fetch_sub(work_index, block_size);
-                atomic_store(completed_index, block_start);
                 break;
             }
 
             for (int i = block_start; i < block_start + block_size && i < end; i++) {
                 c_step(&vec->envs[i % num_envs]);
             }
-            atomic_store(completed_index, block_start + block_size);
-       }
+
+            int buf = (block_start % threading->num_envs) / (threading->num_envs / threading->num_buffers);
+            atomic_fetch_sub(buffer_tasks + buf, block_size);
+       } while (block_start < end);
     }
     return NULL;
 }
@@ -118,7 +121,7 @@ static void* c_threadmanager(void* arg) {
     VecEnv* vec = (VecEnv*)arg;
     Threading* threading = vec->threading;
 
-    atomic_long* completion_indices = threading->completion_indices;
+    atomic_long* buffer_tasks = threading->buffer_tasks;
     atomic_long* end_index = &threading->end_index;
  
     int block_size = vec->size / vec->buffers;
@@ -133,20 +136,14 @@ static void* c_threadmanager(void* arg) {
             if (atomic_load(&actions_ready_on_gpu[buf]) && cudaStreamQuery(vec->streams[buf]) == cudaSuccess) {
                 // Actions are ready on CPU
                 atomic_fetch_add(end_index, block_size);
+                atomic_store(buffer_tasks + buf, block_size);
                 //printf("Buffer %d Actions ready on CPU. end idx: %d \n", buf, atomic_load(end_index));
                 pthread_cond_broadcast(&threading->wake_cond);
 		        atomic_store(&actions_ready_on_gpu[buf], false);
             }
 
-	        // Note: you can skip blocks (I think?) if you have waaay too many threads or only a few envs
-            long min_completed = LLONG_MAX;
-            for (int i = 0; i < threading->num_threads; i++) {
-                long completed = atomic_load(completion_indices + i);
-                if (completed < min_completed) {
-                    min_completed = completed;
-                }
-            }
-            if ( min_completed >= block_size + threading->start_index) {
+            long tasks_remaining = atomic_load(buffer_tasks + buf);
+            if ( tasks_remaining == 0 && !actions_ready_on_gpu[buf]) {
                 //printf("Buffer %d Observations ready on CPU. start_index = %d, completed = %d\n", done_buf, threading->start_index, completed);
                 threading->start_index += block_size;
 
@@ -196,7 +193,9 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     threading->block_size = block_size;
     threading->actions_ready_on_gpu = (atomic_bool*)calloc(buffers, sizeof(bool));
     threading->obs_ready_on_cpu = (atomic_bool*)calloc(buffers, sizeof(bool));
-    threading->completion_indices = (atomic_long*)calloc(threads, sizeof(atomic_long));
+    threading->buffer_tasks = (atomic_long*)calloc(buffers, sizeof(atomic_long));
+    threading->num_envs = num_envs;
+    threading->num_buffers = buffers;
 
     vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
     for (int i = 0; i < buffers; i++) {
@@ -227,8 +226,10 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         assert(err == 0 && "create_vecenv failed to create manager thread\n");
     }
 
+    printf("Init env\n");
     int num_agents = 0;
     for (int i = 0; i < num_envs; i++) {
+        printf("Init env %d\n", i);
         srand(i);
         my_init(&envs[i], kwargs);
         //num_agents += envs[i].num_agents;
@@ -242,6 +243,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     vec->terminals = (unsigned char*)calloc(num_agents, sizeof(unsigned char));
     */
     //printf("Size of alloc: %d\n", num_agents*OBS_SIZE*sizeof(float));
+    printf("Before allocated mem host\n");
     cudaSetDevice(0);
     CHECK_CUDA(cudaHostAlloc((void**)&vec->observations, num_agents*OBS_SIZE*sizeof(float), cudaHostAllocPortable));
     CHECK_CUDA(cudaHostAlloc((void**)&vec->actions, num_agents*ACT_SIZE*sizeof(float), cudaHostAllocPortable));
@@ -251,6 +253,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     memset(vec->actions, 0, num_agents*ACT_SIZE*sizeof(float));
     memset(vec->rewards, 0, num_agents*sizeof(float));
     memset(vec->terminals, 0, num_agents*sizeof(unsigned char));
+    printf("allocated mem host\n");
 
     CHECK_CUDA(cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(float)));
     CHECK_CUDA(cudaMalloc((void**)&vec->gpu_actions, num_agents*ACT_SIZE*sizeof(float)));
