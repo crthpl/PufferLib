@@ -8,7 +8,7 @@ except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
 
 
-B = 2048
+B = 512
 T = 64
 H = 128
 TIMEOUT = 3
@@ -31,7 +31,10 @@ def parse_args(args):
             if arg.requires_grad:
                 backward = True
 
-            dtype = torch.float64 if arg.dtype == torch.float32 else arg.dtype
+            # VERY IMPORTANT: You have to set requires_grad AFTER moving to GPU
+            # Otherwise torch moves grads back to CPU and crushes perf
+            #dtype = torch.float64 if arg.dtype == torch.float32 else arg.dtype
+            dtype = torch.float32 if arg.dtype == torch.float32 else arg.dtype
             py_args.append(arg.clone().detach().to(dtype).cuda().requires_grad_(arg.requires_grad))
             cpp_args.append(arg.clone().detach().cuda().requires_grad_(arg.requires_grad))
         else:
@@ -74,6 +77,7 @@ def time_sps(func, *args, loss=None):
         if loss is not None:
             loss(outputs).backward()
 
+    torch.cuda.synchronize()
     start = time.time()
     steps = 0
     while time.time() - start < TIMEOUT:
@@ -82,6 +86,7 @@ def time_sps(func, *args, loss=None):
         if loss is not None:
             loss(outputs).backward()
 
+    torch.cuda.synchronize()
     sps = B*T*steps/(time.time() - start)
     if sps < 1e3:
         return f'{sps:.2f} steps/s'
@@ -93,7 +98,6 @@ def time_sps(func, *args, loss=None):
     return f'{sps/1e9:.2f} B steps/s'
 
 def test_perf(py_func, cpp_func, *args, loss=None):
-    return
     py_args, cpp_args, backward = parse_args(args)
 
     py_sps = time_sps(py_func, *py_args, loss=loss)
@@ -134,6 +138,7 @@ def test_log_coeffs_and_values():
     print('log_coeffs_and_values correctness')
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
     print('log_coeffs_and_values forward/backward')
+
     test_perf(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
     test_perf(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden, loss=log_coeffs_and_values_loss)
 
@@ -150,13 +155,8 @@ def fused_scan_loss(outputs):
 def test_fused_scan():
     # Numerically unstable function. Must be called with the distribution
     # that is used in the full network.
-    #log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
-    #log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
-
-    hidden = torch.randn(B, T+1, H, requires_grad=True)
-    gate = torch.randn(B, T+1, H, requires_grad=True)
-
-    log_coeffs, log_values = log_coeffs_and_values(gate, hidden)
+    log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
+    log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
 
     print('fused_scan correctness')
     test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
@@ -263,6 +263,6 @@ if __name__ == '__main__':
     #test_mingru_gate()
     #test_log_coeffs_and_values()
     #test_logcumsumexp()
-    #test_fused_scan()
+    test_fused_scan()
     #test_fused_ppo_loss()
-    test_rmsnorm()
+    #test_rmsnorm()
