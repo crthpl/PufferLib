@@ -74,10 +74,10 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 512;
+    int num_envs = 4096;
     int threads = 8;
-    int buffers = 4;
-    int block_size = 32;
+    int buffers = 8;
+    int block_size = 256;
 
     /*
     int num_envs = 32;
@@ -91,6 +91,12 @@ int main() {
 
     VecEnv* vec2 = create_environments(num_envs, threads, buffers, block_size, false, 1, kwargs);
     vec_reset(vec2);
+
+    float sps = perf_test(vec1, buffers) * num_envs / (float)buffers;
+    printf("Performance: %f\n SPS\n", sps);
+    exit(0);
+
+
     /*
     for (int i = 0; i < vec1->size; i++) {
         float* obs = vec1->observations + i*obs_n;
@@ -152,9 +158,6 @@ int main() {
     */
 
     //printf("Created VecEnv with %d environments\n", vec->size);
-    //float sps = perf_test(vec, buffers) * num_envs / (float)buffers;
-    //printf("Performance: %f\n SPS\n", sps);
-
     // TODO: Add a `close_vecenv` function to clean up
     // vec.envs, etc.
     printf("Done\n");

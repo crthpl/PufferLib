@@ -44,13 +44,14 @@ typedef struct Threading {
     pthread_cond_t all_done_cond;
     pthread_mutex_t all_done_mutex;
     pthread_t* threads;
-    int* buffer_states;
+    atomic_int* buffer_states;
     int block_size;
     int num_envs;
     int num_buffers;
     bool use_gpu;
     int test_idx;
     long min_expected;
+    int iters;
 } Threading;
 
 typedef struct WorkerArg {
@@ -89,9 +90,9 @@ int my_put(Env* env, Dict* kwargs) {
 #endif
 
 void update_buffer_state(Threading* threading, int buf, int val) {
-    int* states = threading->buffer_states;
-    int old_val = states[buf];
-    states[buf] = val;
+    atomic_int* states = threading->buffer_states;
+    int old_val = atomic_load(&states[buf]);
+    atomic_store(&states[buf], val);
     //printf("Updated vecenv %d buf %d from %d to %d \n", threading->test_idx, buf, old_val, val);
 }
 
@@ -135,7 +136,7 @@ static void* c_threadmanager(void* arg) {
     Threading* threading = vec->threading;
 
     int buffer_size = vec->size / vec->buffers;
-    int* buffer_states = threading->buffer_states;
+    atomic_int* buffer_states = threading->buffer_states;
     long iters = 0;
     int curr_buf = 0;
 
@@ -143,7 +144,7 @@ static void* c_threadmanager(void* arg) {
     // TODO: Init?
     while (1) {
         for (int buf=0; buf < vec->buffers; buf++) {
-            int state = buffer_states[buf];
+            int state = atomic_load(&buffer_states[buf]);
             bool cuda_ready = !threading->use_gpu || cudaStreamQuery(vec->streams[buf]) == cudaSuccess;
             if (state == ATN_READY_ON_GPU && cuda_ready) {
                 update_buffer_state(threading, buf, ATN_READY_ON_CPU);
@@ -177,6 +178,7 @@ static void* c_threadmanager(void* arg) {
             if (state == ATN_READY_ON_CPU) {
                 curr_buf = (curr_buf + 1) % vec->buffers;
                 iters++;
+                threading->iters = iters;
 
                 update_buffer_state(threading, buf, OBS_READY_ON_CPU);
                 //buffer_states[buf] = OBS_READY_ON_CPU;
@@ -243,7 +245,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     vec->terminals = (unsigned char*)calloc(num_agents, sizeof(unsigned char));
     */
     //printf("Size of alloc: %d\n", num_agents*OBS_SIZE*sizeof(float));
-    printf("Before allocated mem host\n");
+    //printf("Before allocated mem host\n");
     if (use_gpu) {
         cudaSetDevice(0);
         CHECK_CUDA(cudaHostAlloc((void**)&vec->observations, num_agents*OBS_SIZE*sizeof(float), cudaHostAllocPortable));
@@ -261,7 +263,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     memset(vec->actions, 0, num_agents*ACT_SIZE*sizeof(float));
     memset(vec->rewards, 0, num_agents*sizeof(float));
     memset(vec->terminals, 0, num_agents*sizeof(unsigned char));
-    printf("allocated mem host\n");
+    //printf("allocated mem host\n");
 
     if (use_gpu) {
         CHECK_CUDA(cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(float)));
@@ -290,12 +292,12 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         agent += 1;
     }
 
-    printf("Finished creating %d envs\n", num_envs);
+    //printf("Finished creating %d envs\n", num_envs);
     Threading* threading = vec->threading;
     threading->num_threads = threads;
     threading->block_size = block_size;
     threading->completed = (atomic_long*)calloc(threads, sizeof(atomic_long));
-    threading->buffer_states = (int*)calloc(buffers, sizeof(int));
+    threading->buffer_states = (atomic_int*)calloc(buffers, sizeof(atomic_int));
     threading->num_envs = num_envs;
     threading->num_buffers = buffers;
 
@@ -355,7 +357,7 @@ void vec_reset(VecEnv* vec) {
         Env* env = &vec->envs[i];
         c_reset(env);
     }
-    int* buffer_states = vec->threading->buffer_states;
+    atomic_int* buffer_states = vec->threading->buffer_states;
     for (int buf=0; buf < vec->buffers; buf++) {
         int block_size = vec->size / vec->buffers;
 
@@ -440,7 +442,7 @@ void vec_send(VecEnv* vec, int buffer) {
             */
         }
 
-        int* buffer_states = threading->buffer_states;
+        atomic_int* buffer_states = threading->buffer_states;
         update_buffer_state(threading, buffer, ATN_READY_ON_GPU);
         //buffer_states[buffer] = ATN_READY_ON_GPU;
         //printf("vec_send initiated actions->CPU\n");
@@ -454,9 +456,9 @@ void vec_recv(VecEnv* vec, int buffer) {
     // TODO: Single stream architecture requires busy waiting here
     //printf("Recv buf %d\n", buffer);
     if (threading->num_threads > 0) {
-        int* buffer_states = threading->buffer_states;
+        atomic_int* buffer_states = threading->buffer_states;
         //printf("vec_recv waiting on CPU obs\n");
-        while (buffer_states[buffer] != OBS_READY_ON_CPU) {}
+        while (atomic_load(&buffer_states[buffer]) != OBS_READY_ON_CPU) {}
         //printf("vec_recv waiting on obs->GPU\n");
         if (threading->use_gpu) {
             cudaStreamSynchronize(vec->streams[buffer]);
