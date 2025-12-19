@@ -2,6 +2,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <assert.h>
+#include <stdbool.h>
+#include <time.h>
 #include "vecenv.h"
 
 vec_send_fn vec_send;
@@ -72,10 +74,10 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 8192;
-    int threads = 2;
-    int buffers = 2;
-    int block_size = 256;
+    int num_envs = 32;
+    int threads = 1;
+    int buffers = 1;
+    int block_size = 8;
 
     /*
     int num_envs = 32;
@@ -84,10 +86,10 @@ int main() {
     int block_size = 2;
     */
 
-    VecEnv* vec1 = create_environments(num_envs, threads, 2, block_size, kwargs);
+    VecEnv* vec1 = create_environments(num_envs, threads, buffers, block_size, false, 0, kwargs);
     vec_reset(vec1);
 
-    VecEnv* vec2 = create_environments(num_envs, threads, 2, block_size, kwargs);
+    VecEnv* vec2 = create_environments(num_envs, threads, buffers, block_size, false, 1, kwargs);
     vec_reset(vec2);
     /*
     for (int i = 0; i < vec1->size; i++) {
@@ -100,8 +102,8 @@ int main() {
     */
 
     for (int i = 0; i < 10000; i++) {
-        vec_recv(vec1, i%2);
-        vec_recv(vec2, i%2);
+        vec_recv(vec1, i%buffers);
+        vec_recv(vec2, i%buffers);
 
         /*
         if (i % 2 == 0) {
@@ -110,13 +112,15 @@ int main() {
         vec_recv(vec2, i%2);
         */
 
-        int start = (i % 2) * (num_envs / buffers);
+        int start = (i % buffers) * (num_envs / buffers);
         int end = start + num_envs / buffers;
+        // Doesnt work for 1 buffer (bad end index)
         for (int j = start; j < end; j++) {
             float* obs1 = vec1->observations + j*obs_n;
             float* obs2 = vec2->observations + j*obs_n;
             for (int k = 0; k < obs_n; k++) {
                 if (obs1[k] != obs2[k]) {
+                    sleep(1);
                     printf("Observation mismatch at index %d\n", j);
                     exit(1);
                 }
@@ -133,8 +137,8 @@ int main() {
         }
         vec_send(vec2, i%2);
         */
-        vec_send(vec1, i%2);
-        vec_send(vec2, i%2);
+        vec_send(vec1, i%buffers);
+        vec_send(vec2, i%buffers);
     }
 
     /*
@@ -156,6 +160,6 @@ int main() {
     printf("Done\n");
 
     // Close the library
-    dlclose(handle);
+    //dlclose(handle);
     return 0;
 }
