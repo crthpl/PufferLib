@@ -1257,7 +1257,7 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
     '''
 
     print(prof.key_averages(group_by_input_shape=False).table(
-        sort_by="self_cpu_time_total",
+        sort_by="self_cuda_time_total",
         row_limit=50,
     ))
     #prof.export_chrome_trace("trace.json")

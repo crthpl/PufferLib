@@ -1270,7 +1270,6 @@ pybind11::dict compiled_train(
         auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
         //torch::Tensor loss = torch::zeros({1}, logits.options());
-        /*
         auto loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1287,7 +1286,8 @@ pybind11::dict compiled_train(
             vf_coef,
             ent_coef
         )[0];
-        */
+
+        /*
 
         // Flatten for action lookup
         auto flat_logits = logits.reshape({-1, logits.size(-1)});
@@ -1349,6 +1349,7 @@ pybind11::dict compiled_train(
             clipfrac_sum += cf.detach();
             importance_sum += imp.detach();
         }
+        */
 
         loss.backward();
 
