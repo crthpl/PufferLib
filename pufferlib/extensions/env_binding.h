@@ -50,6 +50,7 @@ typedef struct Threading {
     int num_buffers;
     bool use_gpu;
     int test_idx;
+    long min_expected;
 } Threading;
 
 typedef struct WorkerArg {
@@ -91,7 +92,7 @@ void update_buffer_state(Threading* threading, int buf, int val) {
     int* states = threading->buffer_states;
     int old_val = states[buf];
     states[buf] = val;
-    printf("Updated vecenv %d buf %d from %d to %d \n", threading->test_idx, buf, old_val, val);
+    //printf("Updated vecenv %d buf %d from %d to %d \n", threading->test_idx, buf, old_val, val);
 }
 
 static void* c_threadstep(void* arg)
@@ -106,9 +107,10 @@ static void* c_threadstep(void* arg)
     long end = 0;
     long block_start = 0;
     while (1) {
-        atomic_store(completed, threading->start_index);
         pthread_mutex_lock(&threading->wake_mutex);
         while (threading->start_index >= threading->end_index) {
+            atomic_store(completed, threading->start_index);
+            //printf("Min completed %d on thread %d. end %d test idx %d\n", threading->start_index, worker_arg->idx, threading->end_index, threading->test_idx);
             pthread_cond_wait(&threading->wake_cond, &threading->wake_mutex);
         }
  
@@ -148,7 +150,7 @@ static void* c_threadmanager(void* arg) {
                 pthread_mutex_lock(&threading->wake_mutex);
                 threading->end_index += buffer_size;
                 // Actions are ready on CPU
-                printf("Buffer %d Actions ready on CPU. end idx: %d \n", buf, threading->end_index);
+                //printf("Buffer %d Actions ready on CPU. end idx: %d \n", buf, threading->end_index);
                 pthread_cond_broadcast(&threading->wake_cond);
                 pthread_mutex_unlock(&threading->wake_mutex);
             }
@@ -158,6 +160,7 @@ static void* c_threadmanager(void* arg) {
             }
 
             long min_expected = (iters + 1) * buffer_size;
+            threading->min_expected = min_expected;
             long min_completed = LONG_MAX;
             for (int i=0; i<threading->num_threads; i++) {
                 long completed = atomic_load(threading->completed + i);
@@ -170,10 +173,11 @@ static void* c_threadmanager(void* arg) {
             if (min_completed < min_expected) {
                 continue;
             }
-            curr_buf = (curr_buf + 1) % vec->buffers;
-            iters++;
 
             if (state == ATN_READY_ON_CPU) {
+                curr_buf = (curr_buf + 1) % vec->buffers;
+                iters++;
+
                 update_buffer_state(threading, buf, OBS_READY_ON_CPU);
                 //buffer_states[buf] = OBS_READY_ON_CPU;
                 //printf("Buffer %d Observations ready on CPU. start_index = %d, end_index = %d, completed = %d, min_expected = %d\n", buf, threading->start_index, threading->end_index, min_completed, min_expected);
@@ -206,6 +210,8 @@ static void* c_threadmanager(void* arg) {
                     );
                 }
                 //atomic_store(buffer_tasks + buf,  buffer_size);
+            } else {
+                //printf("Somehow messed up\n");
             }
         }
     }
@@ -446,6 +452,7 @@ void vec_send(VecEnv* vec, int buffer) {
 void vec_recv(VecEnv* vec, int buffer) {
     Threading* threading = vec->threading;
     // TODO: Single stream architecture requires busy waiting here
+    //printf("Recv buf %d\n", buffer);
     if (threading->num_threads > 0) {
         int* buffer_states = threading->buffer_states;
         //printf("vec_recv waiting on CPU obs\n");
@@ -456,7 +463,7 @@ void vec_recv(VecEnv* vec, int buffer) {
         }
         update_buffer_state(vec->threading, buffer, OBS_READY_ON_GPU);
         //buffer_states[buffer] = OBS_READY_ON_GPU;
-        printf("vec_recv got obs on GPU for buffer %d\n", buffer);
+        //printf("vec_recv got obs on GPU for buffer %d\n", buffer);
     }
 }
 

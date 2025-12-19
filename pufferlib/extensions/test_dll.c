@@ -74,10 +74,10 @@ int main() {
     dict_set_int(kwargs, "paddle_speed", 620);
     dict_set_int(kwargs, "continuous", 0);
 
-    int num_envs = 32;
-    int threads = 1;
-    int buffers = 1;
-    int block_size = 8;
+    int num_envs = 512;
+    int threads = 8;
+    int buffers = 4;
+    int block_size = 32;
 
     /*
     int num_envs = 32;
