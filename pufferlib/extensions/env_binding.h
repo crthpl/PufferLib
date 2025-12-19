@@ -189,26 +189,26 @@ static void* c_threadmanager(void* arg) {
                 int start = buf * buffer_size;
 
                 if (threading->use_gpu) {
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         &vec->gpu_observations[start*OBS_SIZE],
                         &vec->observations[start*OBS_SIZE],
                         buffer_size*OBS_SIZE*sizeof(float),
-                        cudaMemcpyHostToDevice
-                        //vec->streams[done_buf]
+                        cudaMemcpyHostToDevice,
+                        vec->streams[buf]
                     );
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         &vec->gpu_rewards[start],
                         &vec->rewards[start],
                         buffer_size*sizeof(float),
-                        cudaMemcpyHostToDevice
-                        //vec->streams[done_buf]
+                        cudaMemcpyHostToDevice,
+                        vec->streams[buf]
                     );
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         &vec->gpu_terminals[start],
                         &vec->terminals[start],
                         buffer_size*sizeof(unsigned char),
-                        cudaMemcpyHostToDevice
-                        //vec->streams[done_buf]
+                        cudaMemcpyHostToDevice,
+                        vec->streams[buf]
                     );
                 }
                 //atomic_store(buffer_tasks + buf,  buffer_size);
@@ -431,15 +431,13 @@ void vec_send(VecEnv* vec, int buffer) {
         );
     } else {
         if (threading->use_gpu) {
-            /*
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 &vec->actions[start*ACT_SIZE],
                 &vec->gpu_actions[start*ACT_SIZE],
                 block_size*ACT_SIZE*sizeof(float),
-                cudaMemcpyDeviceToHost
-                //vec->streams[buffer]
+                cudaMemcpyDeviceToHost,
+                vec->streams[buffer]
             );
-            */
         }
 
         atomic_int* buffer_states = threading->buffer_states;

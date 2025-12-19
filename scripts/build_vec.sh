@@ -30,4 +30,4 @@ FLAGS=(
     -fPIC
 )
 
-clang -g -O0 ${FLAGS[@]}
+clang -g -O2 ${FLAGS[@]}

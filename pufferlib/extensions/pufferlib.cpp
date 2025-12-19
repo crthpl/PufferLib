@@ -154,7 +154,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, 2, 256, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library

@@ -76,7 +76,7 @@ int main() {
 
     int num_envs = 4096;
     int threads = 8;
-    int buffers = 8;
+    int buffers = 4;
     int block_size = 256;
 
     /*
@@ -86,14 +86,14 @@ int main() {
     int block_size = 2;
     */
 
-    VecEnv* vec1 = create_environments(num_envs, threads, buffers, block_size, false, 0, kwargs);
+    VecEnv* vec1 = create_environments(num_envs, threads, buffers, block_size, true, 0, kwargs);
     vec_reset(vec1);
 
-    VecEnv* vec2 = create_environments(num_envs, threads, buffers, block_size, false, 1, kwargs);
+    VecEnv* vec2 = create_environments(num_envs, threads, buffers, block_size, true, 1, kwargs);
     vec_reset(vec2);
 
     float sps = perf_test(vec1, buffers) * num_envs / (float)buffers;
-    printf("Performance: %f\n SPS\n", sps);
+    printf("Performance: %f\n M SPS (%f GB/s)\n", sps/1e6f, 118.0f*sps/1e9f);
     exit(0);
 
 

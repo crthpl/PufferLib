@@ -1273,6 +1273,7 @@ def load_policy(args, vecenv, env_name=''):
 
     # NOTE: LSTM API is changing. Trying to make it work now, but should revisit later.
     rnn_name = args['rnn_name']
+    '''
     if rnn_name is not None:
         policy_cls = getattr(env_module.torch, args['policy_name'])
         def make_policy():
@@ -1280,8 +1281,9 @@ def load_policy(args, vecenv, env_name=''):
         rnn_cls = getattr(env_module.torch, args['rnn_name'])
         policy = rnn_cls(vecenv.driver_env, make_policy, **args['rnn'])
     else:
-        policy_cls = getattr(env_module.torch, args['policy_name'])
-        policy = policy_cls(vecenv.driver_env, **args['policy'])
+    '''
+    policy_cls = getattr(env_module.torch, args['policy_name'])
+    policy = policy_cls(vecenv.driver_env, **args['policy'])
 
     device = args['train']['device']
     policy = policy.to(device)

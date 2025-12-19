@@ -39,7 +39,7 @@ static void* worker_step(void* void_arg) {
         arg->idx = end;
         pthread_mutex_unlock(mutex);
         usleep(arg->block_size);
-        atomic_store(&arg->completed[wrapped_arg->id], end);
+        //atomic_store(&arg->completed[wrapped_arg->id], end);
         //printf("Thread %d completed %d\n", wrapped_arg->id, end);
     }
     return NULL;
@@ -75,17 +75,12 @@ int main() {
     int iter = 0;
 
     while (time(NULL) - start < timeout) {
-        long min_completed = LONG_MAX;
+        long min_expected = (iter - buffers) * chunk_size;
         for (int i=0; i<n_threads; i++) {
             long completed = atomic_load(&arg.completed[i]);
-            if (completed < min_completed) {
-                min_completed = completed;
+            if (completed < min_expected) {
+                continue; // Bad, fix
             }
-        }
-
-        long min_expected = (iter - buffers) * chunk_size;
-        if (min_completed < min_expected) {
-            continue;
         }
 
         pthread_mutex_lock(&arg.mutex);
