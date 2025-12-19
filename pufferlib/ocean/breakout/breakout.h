@@ -430,11 +430,9 @@ void step_frame(Breakout* env, float action) {
 
         env->ball_vy = cos(direction) * env->ball_speed * TICK_RATE;
         env->ball_vx = sin(direction) * env->ball_speed * TICK_RATE;
-        /*
         if (rand() % 2 == 0) {
             env->ball_vx = -env->ball_vx;
         }
-        */
     }   
      else if (action == LEFT) {
         act = -1.0;

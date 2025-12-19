@@ -975,7 +975,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 0);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1054,26 +1054,30 @@ torch::Tensor compiled_evaluate(
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store with non-blocking copies
-        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, false);
-        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), false);
-        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), false);
-        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), false);
+        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
+        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), true);
+        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), true);
+        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), true);
 
         auto rewards_batch = rewards.narrow(0, buf*block_size, block_size);
         auto rewards_clamped = torch::clamp(rewards_batch, -1.0f, 1.0f);
-        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_clamped.to(torch::kFloat32), false);
+        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_clamped.to(torch::kFloat32), true);
 
         auto terminals_batch = terminals.narrow(0, buf*block_size, block_size);
-        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch.to(torch::kFloat32), false);
+        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch.to(torch::kFloat32), true);
 
-        actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), false);
+        actions.narrow(0, buf*block_size, block_size).copy_(action.to(torch::kFloat32), true);
+
+        // TODO: There should be a lighter way to sync. You need to make sure the torch data streams
+        // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
+        cudaDeviceSynchronize();
+        //c10::cuda::getCurrentCUDAStream().synchronize();
+
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
-            cudaDeviceSynchronize();
             vec_send(vec, buf);
-            cudaDeviceSynchronize();
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];
