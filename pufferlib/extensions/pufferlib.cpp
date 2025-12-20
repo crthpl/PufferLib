@@ -1357,6 +1357,7 @@ pybind11::dict compiled_train(
         // ~10% overhead in this impl. Can save a ton of launches
         if ((mb + 1) % accumulate_minibatches == 0) {
             // We use our version that doesn't sync for no reason
+            // 2m+ sps right here on clip + step!
             clip_grad_norm_(policy->parameters(), max_grad_norm);
             muon->step();
             muon->zero_grad();

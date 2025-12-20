@@ -76,26 +76,25 @@ void MuonParamState::serialize(torch::serialize::InputArchive& archive) {
 }
 */
 
+//TODO: You actually want this in bfloat16. Still seems slow
 Tensor _zeropower_via_newtonschulz(Tensor G) {
-    auto x = G;
+    auto x = G.to(torch::kBFloat16);
     if (G.size(-2) > G.size(-1)) {
         x = x.mT();
     }
 
     // Heavyball hardcodes 1e-7
-    G.div_(G.norm().clamp(1e-7));
+    x.div_(x.norm().clamp(1e-7));
 
     for (int i = 0; i < 5; ++i) {
         auto a = coeffs[i][0];
         auto b = coeffs[i][1];
         auto c = coeffs[i][2];
 
-        auto s = x.mm(x.mT());
-        auto y = c * s;
-        y.diagonal(0, -2, -1).add_(b);
-        y = y.mm(s);
-        y.diagonal(0, -2, -1).add_(a);
-        x = y.mm(x);
+        // Changed this to be fewer ops. It's faster. I don't know if it introduces any numerical issues.
+        auto A = x.mm(x.mT());
+        auto gram_update = at::addmm(A, A, A, b, c);  // beta=b, alpha=c
+        x = at::addmm(x, gram_update, x, a, 1.0);
     }
 
     if (G.size(-2) > G.size(-1)) {
