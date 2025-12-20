@@ -837,6 +837,12 @@ typedef struct {
     torch::Tensor env_rewards;
     torch::Tensor env_terminals;
     void* cudagraph;
+    torch::Tensor obs_input;
+    torch::Tensor state_input;
+    torch::Tensor logits_output;
+    torch::Tensor value_output;
+    torch::Tensor state_output;
+    bool captured;
 } PuffeRL;
 
 pybind11::dict log_environments(pybind11::object pufferl_obj) {
@@ -857,6 +863,24 @@ torch::Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, to
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     auto& policy = pufferl.policy;
     return policy->initial_state(batch_size, device);
+}
+
+void pufferl_capture_forward(PuffeRL* pufferl, torch::Tensor obs, torch::Tensor state) {
+    auto obs_replay = torch::zeros_like(obs);
+    auto state_replay = torch::zeros_like(state);
+    auto policy = pufferl->policy;
+
+    at::cuda::CUDAGraph graph;
+    graph.capture_begin();
+    auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
+    graph.capture_end();
+
+    pufferl->obs_input = obs;
+    pufferl->state_input = state;
+    pufferl->logits_output = logits;
+    pufferl->value_output = value;
+    pufferl->state_output = state_out;
+    pufferl->captured = true;
 }
 
 /*
@@ -987,6 +1011,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
 
     //pufferl_init_cudagraph(pufferl.get());
     //pufferl_capture_forward(pufferl.get());
+    pufferl->captured = false;
 
     return pufferl;
 }
@@ -1044,6 +1069,13 @@ torch::Tensor compiled_evaluate(
         //auto obs_cuda = obs.to(device);
         auto obs_batch = obs.narrow(0, buf*block_size, block_size);
         auto state_batch = state.narrow(1, buf*block_size, block_size);
+
+        /*
+        if (!pufferl->captured) {
+            pufferl_capture_forward(pufferl, obs_batch, state_batch);
+        }
+        */
+
         auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
         state_batch.copy_(state_out);
 
