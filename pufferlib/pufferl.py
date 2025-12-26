@@ -35,6 +35,7 @@ import pufferlib.vector
 import pufferlib.pytorch
 try:
     from pufferlib import _C
+    from pufferlib import fake_tensors
 except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
 
@@ -152,7 +153,8 @@ class PuffeRL:
 
         self.num_layers = 4
         self.pufferl_cpp = _C.create_pufferl(
-            #vecenv.envs[0].c_envs,
+            segments,
+            horizon,
             118,
             3,
             128,
@@ -184,6 +186,9 @@ class PuffeRL:
         #self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
 
+        #self.compiled_evaluate = torch.compile(_C.compiled_evaluate)
+        #self.eval_forward = torch.compile(self.pufferl_cpp.policy.forward, mode='reduce-overhead')
+
     @property
     def uptime(self):
         return time.time() - self.start_time
@@ -194,6 +199,7 @@ class PuffeRL:
             return 0
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
+
 
     def evaluate(self):
         profile = self.profile
@@ -216,6 +222,47 @@ class PuffeRL:
             self.config['bptt_horizon'],
             self.num_envs
         )
+
+        '''
+        obs, act, rew, term = _C.env_buffers(self.pufferl_cpp)
+
+        num_buffers = 2
+        block_size = int(self.num_envs / num_buffers)
+        with torch.no_grad():
+            for i in range(self.config['bptt_horizon']):
+                buf = i % num_buffers
+                h = int(i / num_buffers)
+                _C.python_vec_recv(self.pufferl_cpp, buf)
+
+                start = int(block_size * buf)
+                obs_batch = obs.narrow(0, start, block_size)
+                state_batch = state.narrow(1, start, block_size)
+                logits, value, state_out = self.eval_forward(obs_batch.cuda(), state_batch)
+                state_batch.copy_(state_out)
+
+                logits = torch.nan_to_num(logits)
+                logprobs = torch.log_softmax(logits, dim=1)
+                action = torch.multinomial(logprobs.exp(), 1, True).squeeze(1).to(torch.int32)
+                logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1)
+
+                self.observations.select(1, h).narrow(0, start, block_size).copy_(obs_batch, True)
+                self.actions.select(1, h).narrow(0, start, block_size).copy_(action.to(torch.int64), True)
+                self.logprobs.select(1, h).narrow(0, start, block_size).copy_(logprob.to(torch.float32), True)
+                self.values.select(1, h).narrow(0, start, block_size).copy_(value.flatten().to(torch.float32), True)
+
+                rewards_batch = rew.narrow(0, start, block_size)
+                rewards_clamped = torch.clamp(rewards_batch, -1, 1)
+
+                self.rewards.select(1, h).narrow(0, start, block_size).copy_(rewards_clamped.to(torch.float32), True)
+
+                terminals_batch = term.narrow(0, start, block_size)
+                self.terminals.select(1, h).narrow(0, start, block_size).copy_(terminals_batch.to(torch.float32), True)
+
+                act.narrow(0, start, block_size).copy_(action.to(torch.float32), True)
+
+                torch.cuda.synchronize()
+                _C.python_vec_send(self.pufferl_cpp, buf)
+        '''
 
         #torch.cuda.synchronize()
         logs = _C.log_environments(self.pufferl_cpp)

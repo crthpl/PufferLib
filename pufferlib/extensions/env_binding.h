@@ -292,6 +292,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         agent += 1;
     }
 
+    /*
     //printf("Finished creating %d envs\n", num_envs);
     Threading* threading = vec->threading;
     threading->num_threads = threads;
@@ -331,6 +332,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         int err = pthread_create(&threading->threads[threads], NULL, c_threadmanager, (void*)(vec));
         assert(err == 0 && "create_vecenv failed to create manager thread\n");
     }
+    */
 
 
     return vec;
