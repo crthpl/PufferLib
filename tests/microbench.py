@@ -1,4 +1,6 @@
 import time
+import rich
+
 import torch
 
 import pufferlib
@@ -11,16 +13,20 @@ except ImportError:
 B = 512
 T = 64
 H = 128
-TIMEOUT = 3
+TIMEOUT = 1
 
-def assert_close(a, b, rtol=1e-3, atol=1e-4):
-    max_diff = (a - b).abs().max()
-    passed = torch.allclose(a, b, rtol=rtol, atol=atol)
-    if not passed:
-        print(f'FAILED: {max_diff}')
-        #raise AssertionError('Max diff: {}'.format(max_diff))
-    else:
-        print(f'PASSED: {max_diff}')
+def check_close(a, b, rtol=1e-3, atol=1e-4):
+    output = []
+    assert len(a) == len(b)
+    for a, b in zip(a, b):
+        a = a.float()
+        b = b.float()
+        max_diff = (a - b).abs().max()
+        passed = torch.allclose(a, b, rtol=rtol, atol=atol)
+        color = 'green' if passed else 'red'
+        output.append(f'[{color}]{max_diff:.2e}[/{color}]')
+
+    return ' '.join(output)
 
 def parse_args(args):
     py_args = []
@@ -43,7 +49,13 @@ def parse_args(args):
 
     return py_args, cpp_args, backward
 
-def test_kernel(py_func, cpp_func, *args):
+def test_loss(outputs):
+    if type(outputs) == torch.Tensor:
+        return outputs.sum()
+
+    return sum([o.sum() for o in outputs])/len(outputs)
+
+def test_kernel(py_func, cpp_func, *args, benchmark=True):
     py_args, cpp_args, backward = parse_args(args)
 
     py_out = py_func(*py_args)
@@ -54,28 +66,40 @@ def test_kernel(py_func, cpp_func, *args):
     if not isinstance(cpp_out, (tuple, list)):
         cpp_out = [cpp_out]
 
-    for py_o, cpp_o in zip(py_out, cpp_out):
-        assert_close(py_o.float(), cpp_o)
+    output = check_close(py_out, cpp_out)
+    rich.print('\tForward check:', output)
 
-    if not backward:
-        return
+    if backward:
+        py_loss = test_loss(py_out)
+        cpp_loss = test_loss(cpp_out)
 
-    py_loss = sum([o.sum() for o in py_out])/len(py_out)
-    cpp_loss = sum([o.sum() for o in cpp_out])/len(cpp_out)
+        py_loss.backward()
+        cpp_loss.backward()
 
-    py_loss.backward()
-    cpp_loss.backward()
+        has_grad = lambda v: [e.grad for e in v if isinstance(e, torch.Tensor) and e.grad is not None]
+        py_grad = has_grad(py_args)
+        cpp_grad = has_grad(cpp_args)
 
-    for py_arg, cpp_arg in zip(py_args, cpp_args):
-        if isinstance(py_arg, torch.Tensor) and py_arg.grad is not None:
-            assert_close(py_arg.grad.float(), cpp_arg.grad)
 
-def time_sps(func, *args, loss=None):
+        output = check_close(py_grad, cpp_grad)
+        rich.print('\tBackward check:', output)
+
+    if benchmark:
+        py_sps = time_sps(py_func, *py_args)
+        cpp_sps = time_sps(cpp_func, *cpp_args)
+        print(f'\tForward sps: {py_sps} (naive) {cpp_sps} (C++)')
+
+        if backward:
+            py_sps = time_sps(py_func, *py_args, backward=True)
+            cpp_sps = time_sps(cpp_func, *cpp_args, backward=True)
+            print(f'\tBackward sps: {py_sps} (naive) {cpp_sps} (C++)')
+
+def time_sps(func, *args, backward=False):
     # Warm up
     for i in range(3):
         outputs = func(*args)
-        if loss is not None:
-            loss(outputs).backward()
+        if backward:
+            test_loss(outputs).backward()
 
     torch.cuda.synchronize()
     start = time.time()
@@ -83,26 +107,19 @@ def time_sps(func, *args, loss=None):
     while time.time() - start < TIMEOUT:
         steps += 1
         outputs = func(*args)
-        if loss is not None:
-            loss(outputs).backward()
+        if backward:
+            test_loss(outputs).backward()
 
     torch.cuda.synchronize()
     sps = B*T*steps/(time.time() - start)
     if sps < 1e3:
-        return f'{sps:.2f} steps/s'
+        return f'{sps:.2f}'
     if sps < 1e6:
-        return f'{sps/1e3:.2f} K steps/s'
+        return f'{sps/1e3:.2f} K'
     if sps < 1e9:
-        return f'{sps/1e6:.2f} M steps/s'
+        return f'{sps/1e6:.2f} M'
 
-    return f'{sps/1e9:.2f} B steps/s'
-
-def test_perf(py_func, cpp_func, *args, loss=None):
-    py_args, cpp_args, backward = parse_args(args)
-
-    py_sps = time_sps(py_func, *py_args, loss=loss)
-    cpp_sps = time_sps(cpp_func, *cpp_args, loss=loss)
-    print(f'PyTorch: {py_sps}', f'C++: {cpp_sps}')
+    return f'{sps/1e9:.2f} B'
 
 def mingru_gate(state, gate, hidden):
     hidden = torch.where(hidden >= 0, hidden + 0.5, hidden.sigmoid())
@@ -114,10 +131,8 @@ def test_mingru_gate():
     state = torch.randn(B, T, H)
     gate = torch.randn(B, T, H)
     hidden = torch.randn(B, T, H)
-    print('mingru_gate correctness')
+    print('mingru_gate')
     test_kernel(mingru_gate, _C.mingru_gate, state, gate, hidden)
-    print('mingru_gate forward')
-    test_perf(mingru_gate, _C.mingru_gate, state, gate, hidden)
 
 def log_coeffs_and_values(gate, hidden):
     log_coeffs = -torch.nn.functional.softplus(gate)
@@ -135,12 +150,8 @@ def log_coeffs_and_values_loss(outputs):
 def test_log_coeffs_and_values():
     gate = torch.randn(B, T, H, requires_grad=True)
     hidden = torch.randn(B, T, H, requires_grad=True)
-    print('log_coeffs_and_values correctness')
+    print('log_coeffs_and_values')
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
-    print('log_coeffs_and_values forward/backward')
-
-    test_perf(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
-    test_perf(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden, loss=log_coeffs_and_values_loss)
 
 def fused_scan(log_coeffs, log_values):
     a_star = log_coeffs.cumsum(1)
@@ -158,11 +169,8 @@ def test_fused_scan():
     log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
     log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
 
-    print('fused_scan correctness')
+    print('fused_scan')
     test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
-    print('fused_scan forward/backward')
-    test_perf(fused_scan, _C.fused_scan, log_coeffs, log_values)
-    test_perf(fused_scan, _C.fused_scan, log_coeffs, log_values, loss=fused_scan_loss)
 
 def logcumsumexp(x):
     return [torch.log(torch.exp(x).cumsum(1))]
@@ -172,11 +180,8 @@ def logcumsumexp_loss(outputs):
 
 def test_logcumsumexp():
     x = torch.randn(B, T, H, requires_grad=True)
-    print('logcumsumexp correctness')
+    print('logcumsumexp')
     test_kernel(logcumsumexp, _C.logcumsumexp_cuda, x)
-    print('logcumsumexp forward/backward')
-    test_perf(logcumsumexp, _C.logcumsumexp_cuda, x)
-    test_perf(logcumsumexp, _C.logcumsumexp_cuda, x, loss=logcumsumexp_loss)
 
 def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
         advantages, prio, values, returns, adv_mean, adv_std,
@@ -209,10 +214,7 @@ def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
 
     # Entrop is a little off (1e-6)
     loss = pg_loss + vf_coef*v_loss - ent_coef*entropy
-    return [loss]
-
-def fused_ppo_loss_loss(outputs):
-    return outputs[0]
+    return loss
 
 def test_fused_ppo_loss():
     A = 4
@@ -235,11 +237,8 @@ def test_fused_ppo_loss():
     args = (fused_ppo_loss, _C.fused_ppo_loss, logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, advantages.mean(), advantages.std(),
         clip_coef, vf_clip_coef, vf_coef, ent_coef)
-    print('fused_ppo_loss correctness')
+    print('fused_ppo_loss')
     test_kernel(*args)
-    print('fused_ppo_loss forward/backward')
-    test_perf(*args)
-    test_perf(*args, loss=fused_ppo_loss_loss)
 
 def rmsnorm(x, weight, eps):
     shape = (x.shape[-1],)
@@ -255,14 +254,11 @@ def test_rmsnorm():
 
     print('rmsnorm correctness')
     test_kernel(rmsnorm, _C.rmsnorm, x, weight, eps)
-    print('rmsnorm forward/backward')
-    test_perf(rmsnorm, _C.rmsnorm, x, weight, eps)
-    test_perf(rmsnorm, _C.rmsnorm, x, weight, eps, loss=rmsnorm_loss)
 
 if __name__ == '__main__':
-    #test_mingru_gate()
-    #test_log_coeffs_and_values()
-    #test_logcumsumexp()
+    test_mingru_gate()
+    test_log_coeffs_and_values()
+    test_logcumsumexp()
     test_fused_scan()
-    #test_fused_ppo_loss()
+    test_fused_ppo_loss()
     #test_rmsnorm()

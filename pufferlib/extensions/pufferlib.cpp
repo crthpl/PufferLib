@@ -13,7 +13,7 @@
 #include <dlfcn.h>
 #include "muon.h"
 
-//#include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/CUDAGraph.h>
 //#include <c10/cuda/CUDAGuard.h>
 
 #include <iostream>
@@ -827,15 +827,21 @@ typedef struct {
     double lr;
     double min_lr_ratio;
     int64_t max_epochs;
-    torch::Tensor obs_buf;
-    torch::Tensor state_in_buf;
-    torch::Tensor logits_buf;
-    torch::Tensor value_buf;
-    torch::Tensor state_out_buf;
+    torch::Tensor observations;
+    torch::Tensor actions;
+    torch::Tensor values;
+    torch::Tensor logprobs;
+    torch::Tensor rewards;
+    torch::Tensor terminals;
+    torch::Tensor ratio;
+    torch::Tensor importance;
     torch::Tensor env_obs;
     torch::Tensor env_actions;
     torch::Tensor env_rewards;
     torch::Tensor env_terminals;
+    torch::Tensor env_state; // These ones are for graph capture
+    torch::Tensor env_value;
+    torch::Tensor env_logits;
     void* cudagraph;
 } PuffeRL;
 
@@ -859,7 +865,6 @@ torch::Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, to
     return policy->initial_state(batch_size, device);
 }
 
-/*
 // Create graph
 void pufferl_init_cudagraph(PuffeRL* pufferl) {
     auto graph = new at::cuda::CUDAGraph();
@@ -868,34 +873,98 @@ void pufferl_init_cudagraph(PuffeRL* pufferl) {
 
 // Capture
 void pufferl_capture_forward(PuffeRL* pufferl) {
-    auto& obs = pufferl->obs_buf;
-    auto& state = pufferl->state_in_buf;
+    torch::NoGradGuard no_grad;
+
+    auto& obs = pufferl->env_obs;
+    auto& state = pufferl->env_state;
     auto* policy = pufferl->policy;
 
     c10::cuda::CUDAGuard device_guard(obs.device());
-
     auto* graph = static_cast<at::cuda::CUDAGraph*>(pufferl->cudagraph);
 
-    // Warm up
-    for (int i = 0; i < 3; ++i) {
-        auto output = policy->forward(obs.contiguous(), state.contiguous());
-        torch::cuda::synchronize();
-    }
+    auto stream = c10::cuda::getStreamFromPool(false, obs.device().index());
+    c10::cuda::CUDAStreamGuard stream_guard(stream);
+
+    std::cout << "obs shape: " << obs.sizes() << std::endl;
+    std::cout << "state shape: " << state.sizes() << std::endl;
 
     // Ensure tensors are contiguous
     auto obs_contig = obs.contiguous();
     auto state_contig = state.contiguous();
 
-    // Begin capture
+    auto net = torch::nn::Linear(118, 128).to(torch::kCUDA);
+    for (int i = 0; i < 10; ++i) {
+        auto output = net->forward(obs_contig);
+        stream.synchronize();
+    }
+    torch::cuda::synchronize();
     graph->capture_begin();  // Uses current stream
+    try {
+        auto output = net->forward(obs_contig);
+        graph->capture_end();
+    } catch (const c10::Error& e) {
+        std::cerr << "what(): " << e.what() << std::endl;
+        std::cerr << "msg(): " << e.msg() << std::endl;
+        
+        // Get the actual CUDA error
+        cudaError_t cuda_err = cudaGetLastError();
+        std::cerr << "CUDA error: " << cudaGetErrorString(cuda_err) 
+                  << " (code " << cuda_err << ")" << std::endl;
+
+        graph->reset();
+        throw;
+    }
+    exit(0);
+
+    TORCH_CHECK(obs_contig.is_contiguous());
+    TORCH_CHECK(state_contig.is_contiguous());
+    //TORCH_CHECK(obs_contig.strides().vec().all([](int64_t s) { return s >= 0; }), "negative strides");
+    TORCH_CHECK(!obs_contig.requires_grad() || obs_contig.is_floating_point());  // basic sanity
+
+    std::cout << "obs_contig: " << obs_contig.sizes() << " " << obs_contig.strides() 
+              << " dtype=" << obs_contig.dtype() << " finite=" << torch::isfinite(obs_contig).all().item<bool>() << std::endl;
+    std::cout << "state_contig: similar checks..." << std::endl;
+
+    // Check model params
+    for (auto& p : policy->parameters()) {
+        TORCH_CHECK(p.is_contiguous());
+        TORCH_CHECK(p.device() == obs_contig.device());
+    }
+
+    // Warm up
+    for (int i = 0; i < 10; ++i) {
+        auto output = policy->forward(obs_contig, state_contig);
+        stream.synchronize();
+    }
+
+    torch::cuda::synchronize();
+
+    // Begin capture
+    //graph->capture_begin();  // Uses current stream
+    graph->capture_begin(c10::cuda::MempoolId_t{0, 0});
 
     try {
         auto output_tuple = policy->forward(obs_contig, state_contig);
-        pufferl->logits_buf   = std::get<0>(output_tuple);
-        pufferl->value_buf    = std::get<1>(output_tuple);
-        pufferl->state_out_buf = std::get<2>(output_tuple);
+
+        cudaError_t peek = cudaPeekAtLastError();
+        if (peek != cudaSuccess) {
+            std::cerr << "ERROR after forward (peek): " 
+                      << cudaGetErrorString(peek) << " (" << peek << ")" << std::endl;
+        }
+
+        pufferl->env_logits = std::get<0>(output_tuple);
+        pufferl->env_value = std::get<1>(output_tuple);
+        pufferl->env_state = std::get<2>(output_tuple);
         graph->capture_end();
-    } catch (...) {
+    } catch (const c10::Error& e) {
+        std::cerr << "what(): " << e.what() << std::endl;
+        std::cerr << "msg(): " << e.msg() << std::endl;
+        
+        // Get the actual CUDA error
+        cudaError_t cuda_err = cudaGetLastError();
+        std::cerr << "CUDA error: " << cudaGetErrorString(cuda_err) 
+                  << " (code " << cuda_err << ")" << std::endl;
+
         graph->reset();
         throw;
     }
@@ -907,6 +976,7 @@ void pufferl_replay_forward(PuffeRL* pufferl) {
     graph->replay();  // Updates outputs in place
 }
 
+/*
 // Destroy
 void pufferl_destroy_cudagraph(PuffeRL* pufferl) {
     auto* graph = static_cast<at::cuda::CUDAGraph*>(pufferl->cudagraph);
@@ -939,7 +1009,7 @@ void capture_forward(std::unique_ptr<pufferlib::PuffeRL>& pufferl) {
 }
 */
 
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
+std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t horizon, int64_t input_size,
         int64_t num_atns, int64_t hidden_size, int64_t num_layers,
         double lr, double min_lr_ratio, double beta1, double beta2, double eps, int64_t max_epochs) {
 
@@ -975,6 +1045,23 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
 
+    // Allocate buffers
+    // TODO: Match env type, alloc on gpu native
+    pufferl->observations = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->actions = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->values = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->logprobs = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->rewards = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->terminals = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->ratio = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->importance = torch::zeros({segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+
+    // Shapes?
+    pufferl->env_state = policy->initial_state(8192, torch::kCUDA);
+    pufferl->env_value = torch::zeros({segments, horizon}, DTYPE).to(torch::kCUDA);
+    pufferl->env_logits = torch::zeros({segments, horizon, 3}, DTYPE).to(torch::kCUDA);
+
+
     auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
@@ -985,10 +1072,28 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t input_size,
     //pufferl->obs_buf = torch::zeros({4096, input_size}, DTYPE).to(torch::kCUDA);
     //pufferl->state_in_buf = torch::zeros({4096, 2*hidden_size}, DTYPE).to(torch::kCUDA);
 
-    //pufferl_init_cudagraph(pufferl.get());
-    //pufferl_capture_forward(pufferl.get());
+    pufferl_init_cudagraph(pufferl.get());
+    pufferl_capture_forward(pufferl.get());
 
     return pufferl;
+}
+
+void python_vec_recv(pybind11::object pufferl_obj, int buf) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& vec = pufferl.vec;
+    vec_recv(vec, buf);
+}
+
+void python_vec_send(pybind11::object pufferl_obj, int buf) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& vec = pufferl.vec;
+    vec_send(vec, buf);
+}
+
+torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto& vec = pufferl.vec;
+    return {pufferl.env_obs, pufferl.env_actions, pufferl.env_rewards, pufferl.env_terminals};
 }
 
 // Updated compiled_evaluate
@@ -1015,12 +1120,15 @@ torch::Tensor compiled_evaluate(
     auto rewards = pufferl.env_rewards;
     auto terminals = pufferl.env_terminals;
 
-    auto obs_buf = pufferl.obs_buf;
-    auto state_in_buf = pufferl.state_in_buf;
-    auto logits_buf = pufferl.logits_buf;
-    auto value_buf = pufferl.value_buf;
-    auto state_out_buf = pufferl.state_out_buf;
-    //auto forward_graph = pufferl.forward_graph;
+    auto env_obs = pufferl.env_obs;
+    auto env_actions = pufferl.env_actions;
+    auto env_rewards = pufferl.env_rewards;
+    auto env_terminals = pufferl.env_terminals;
+    auto env_state = pufferl.env_state;
+    auto env_value = pufferl.env_value;
+    auto env_logits = pufferl.env_logits;
+
+    auto forward_graph = pufferl.cudagraph;
 
     auto device = torch::kCUDA;
 
@@ -1040,24 +1148,27 @@ torch::Tensor compiled_evaluate(
         auto state_out = state_out_buf;
         */
 
-        //auto [logits, value, state_out] = policy->forward(obs.to(device).to(DTYPE), state);
-        //auto obs_cuda = obs.to(device);
+        /*
         auto obs_batch = obs.narrow(0, buf*block_size, block_size);
         auto state_batch = state.narrow(1, buf*block_size, block_size);
         auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
         state_batch.copy_(state_out);
+        */
 
-        logits = torch::nan_to_num(logits);
+        // Replay graph
+        pufferl_replay_forward(&pufferl);
+
+        auto logits = torch::nan_to_num(env_logits);
 
         auto logprobs = torch::log_softmax(logits, 1);
         auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1).to(torch::kInt32);
         auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
         // Store with non-blocking copies
-        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(obs_batch, true);
+        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(env_obs, true);
         act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(action.to(torch::kInt64), true);
         logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(logprob.to(torch::kFloat32), true);
-        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(value.flatten().to(torch::kFloat32), true);
+        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(env_value.flatten().to(torch::kFloat32), true);
 
         auto rewards_batch = rewards.narrow(0, buf*block_size, block_size);
         auto rewards_clamped = torch::clamp(rewards_batch, -1.0f, 1.0f);
@@ -1387,7 +1498,16 @@ pybind11::dict compiled_train(
     return losses;
 }
 
+
 // PYBIND11_MODULE with the extension name (pufferlib._C)
+TORCH_LIBRARY(_C, m) {
+    m.def("mingru_gate(Tensor state, Tensor gate, Tensor hidden) -> Tensor");
+    m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
+    m.def("fused_scan(Tensor log_coeffs, Tensor log_values) -> Tensor");
+    m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, float adv_mean, float adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
+    m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
+}
+
 PYBIND11_MODULE(_C, m) {
     m.def("log_environments", &log_environments);
     m.def("compiled_evaluate", &compiled_evaluate);
@@ -1396,6 +1516,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("compiled_train", &compiled_train);
     m.def("batched_forward", &batched_forward);
     m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
+    m.def("policy_forward", &PolicyMinGRU::forward);
 
     m.def("initial_state", &initial_state);
 
@@ -1406,6 +1527,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("fused_ppo_loss", &fused_ppo_loss);
     //m.def("rmsnorm", &rmsnorm);
 
+    m.def("python_vec_recv", &python_vec_recv);
+    m.def("python_vec_send", &python_vec_send);
+    m.def("env_buffers", &env_buffers);
     /*
     py::class_<RMSNorm, torch::nn::ModuleHolder<RMSNormImpl>>(m, "RMSNorm")
         .def(py::init<int64_t, double>(),
