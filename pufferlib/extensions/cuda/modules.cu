@@ -514,8 +514,8 @@ public:
         torch::Tensor prio,             // (N, 1) — importance weights
         torch::Tensor values,           // (N, T)
         torch::Tensor returns,          // (N, T)
-        double adv_mean,
-        double adv_std,
+        torch::Tensor adv_mean,         // (1)
+        torch::Tensor adv_std,          // (1)
         double clip_coef,
         double vf_clip_coef,
         double vf_coef,
@@ -577,8 +577,8 @@ public:
                 prio.data_ptr<float>(),      // (N, 1) → index as [n]
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
-                adv_mean,
-                adv_std,
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
                 clip_coef,
                 vf_clip_coef,
                 vf_coef,
@@ -597,8 +597,8 @@ public:
                 prio.data_ptr<at::BFloat16>(),
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
-                adv_mean,
-                adv_std,
+                adv_mean.data_ptr<float>(), // TODO: is this correct?
+                adv_std.data_ptr<float>(),
                 clip_coef,
                 vf_clip_coef,
                 vf_coef,
@@ -625,8 +625,6 @@ public:
         //auto mean_loss = torch::tensor(accumulated / (N * T), options_float);
 
         // Save scalars
-        ctx->saved_data["adv_mean"] = adv_mean;
-        ctx->saved_data["adv_std"] = adv_std;
         ctx->saved_data["clip_coef"] = clip_coef;
         ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
         ctx->saved_data["vf_coef"] = vf_coef;
@@ -634,7 +632,7 @@ public:
 
         // Save inputs and intermediates
         ctx->save_for_backward({logits, values_pred, actions, old_logprobs, advantages,
-                                prio, values, returns, saved_for_backward});
+                                prio, values, returns, adv_mean, adv_std, saved_for_backward});
 
         return {loss_output / (N * T)};
     }
@@ -651,15 +649,15 @@ public:
         auto prio = saved[5].contiguous();             // (N, 1)
         auto values = saved[6].contiguous();           // (N, T)
         auto returns = saved[7].contiguous();          // (N, T)
-        auto saved_for_backward = saved[8].contiguous();  // (N*T, 5)
+        auto adv_mean = saved[8].contiguous();         // (1)
+        auto adv_std = saved[9].contiguous();          // (1)
+        auto saved_for_backward = saved[10].contiguous();  // (N*T, 5)
 
         auto dtype = logits.dtype();
         auto N = logits.size(0);
         auto T = logits.size(1);
         auto A = logits.size(2);
 
-        float adv_mean = ctx->saved_data["adv_mean"].to<double>();
-        float adv_std = ctx->saved_data["adv_std"].to<double>();
         float clip_coef = ctx->saved_data["clip_coef"].to<double>();
         float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
         float vf_coef = ctx->saved_data["vf_coef"].to<double>();
@@ -687,8 +685,10 @@ public:
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
                 saved_for_backward.data_ptr<double>(),
-                adv_mean, adv_std, clip_coef,
-                vf_clip_coef, vf_coef, ent_coef,
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                clip_coef, vf_clip_coef,
+                vf_coef, ent_coef,
                 T, A, N
             );
         } else if (dtype == torch::kBFloat16) {
@@ -704,8 +704,10 @@ public:
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
                 saved_for_backward.data_ptr<double>(),
-                adv_mean, adv_std, clip_coef,
-                vf_clip_coef, vf_coef, ent_coef,
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                clip_coef, vf_clip_coef,
+                vf_coef, ent_coef,
                 T, A, N
             );
         }
@@ -739,8 +741,8 @@ torch::autograd::tensor_list fused_ppo_loss(
     torch::Tensor prio,
     torch::Tensor values,
     torch::Tensor returns,
-    float adv_mean,
-    float adv_std,
+    torch::Tensor adv_mean,
+    torch::Tensor adv_std,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,

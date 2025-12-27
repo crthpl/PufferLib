@@ -1022,8 +1022,8 @@ __global__ void ppo_loss_forward_kernel(
     const T* __restrict__ prio,
     const T* __restrict__ values,
     const T* __restrict__ returns,
-    double adv_mean,
-    double adv_std,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_std,
     double clip_coef,
     double vf_clip_coef,
     double vf_coef,
@@ -1079,7 +1079,7 @@ __global__ void ppo_loss_forward_kernel(
     double old_logp = double(old_logprobs[nt]);
     double adv = double(advantages[nt]);
     double w = double(prio[n]);  // importance weight, per-sequence
-    double adv_normalized = (adv - adv_mean) / (adv_std + 1e-8);
+    double adv_normalized = (adv - adv_mean[0]) / (adv_std[0] + 1e-8);
 
     double logratio = new_logp - old_logp;
     double ratio = exp(logratio);
@@ -1143,8 +1143,8 @@ __global__ void ppo_loss_backward_kernel(
     const T* __restrict__ values,
     const T* __restrict__ returns,
     const double* __restrict__ saved_for_backward,
-    double adv_mean,
-    double adv_std,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_std,
     double clip_coef,
     double vf_clip_coef,
     double vf_coef,
@@ -1181,7 +1181,7 @@ __global__ void ppo_loss_backward_kernel(
     double ret = double(returns[nt]);
 
     // === Normalize advantage (same as forward) ===
-    double adv_normalized = (adv - adv_mean) / (adv_std + 1e-8f);
+    double adv_normalized = (adv - adv_mean[0]) / (adv_std[0] + 1e-8f);
 
     // Total loss gradient (scalar from autograd)
     double dL = grad_loss[0] * inv_NT;  // dL/dloss
@@ -1289,8 +1289,8 @@ inline void launch_ppo_loss_forward(
     const T* prio,
     const T* values,
     const T* returns,
-    double adv_mean,
-    double adv_std,
+    const float* adv_mean,
+    const float* adv_std,
     double clip_coef,
     double vf_clip_coef,
     double vf_coef,
@@ -1344,8 +1344,8 @@ void launch_ppo_loss_backward(
     const T* values,
     const T* returns,
     const double* saved_for_backward,
-    double adv_mean,
-    double adv_std,
+    const float* adv_mean,
+    const float* adv_std,
     double clip_coef,
     double vf_clip_coef,
     double vf_coef,

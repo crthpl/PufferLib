@@ -245,8 +245,8 @@ torch::autograd::tensor_list fused_ppo_loss(
     torch::Tensor prio,
     torch::Tensor values,
     torch::Tensor returns,
-    float adv_mean,
-    float adv_std,
+    torch::Tensor adv_mean,
+    torch::Tensor adv_std,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -868,8 +868,8 @@ typedef struct {
     torch::Tensor value_output;
     torch::Tensor state_output;
     bool captured;
-    float adv_mean;
-    float adv_std;
+    torch::Tensor adv_mean;
+    torch::Tensor adv_std;
     double clip_coef;
     double vf_clip_coef;
     double vf_coef;
@@ -951,7 +951,6 @@ void train_forward_call(PuffeRL* pufferl) {
 
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
-    /*
     auto loss = fused_ppo_loss(
         logits,
         newvalue,
@@ -968,8 +967,8 @@ void train_forward_call(PuffeRL* pufferl) {
         vf_coef,
         ent_coef
     )[0];
-    */
 
+    /*
     // Flatten for action lookup
     auto flat_logits = logits.reshape({-1, logits.size(-1)});
     auto flat_actions = mb_actions.reshape({-1});
@@ -1010,7 +1009,6 @@ void train_forward_call(PuffeRL* pufferl) {
 
     // Total loss
     auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
-    /*
     {
         torch::NoGradGuard no_grad;
 
@@ -1034,9 +1032,9 @@ void train_forward_call(PuffeRL* pufferl) {
     */
 
     loss.backward();
-    //clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
+    clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
     pufferl->muon->step();
-    pufferl->muon->zero_grad(false);
+    pufferl->muon->zero_grad();
 
     //return std::make_tuple(logits, newvalue);
 
@@ -1204,6 +1202,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t hor
     pufferl->graph_train_mb_prio = torch::zeros({minibatch_segments, 1}, options);
     pufferl->graph_train_mb_values = torch::zeros({minibatch_segments, horizon}, options);
     pufferl->graph_train_mb_returns = torch::zeros({minibatch_segments, horizon}, options);
+    pufferl->adv_mean = torch::zeros({1}, options);
+    pufferl->adv_std = torch::ones({1}, options);
 
     /*
     std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
@@ -1514,8 +1514,8 @@ pybind11::dict compiled_train(
         vtrace_rho_clip, vtrace_c_clip
     );
 
-    auto adv_mean = advantages.mean().detach();
-    auto adv_std = advantages.std().detach();
+    pufferl.adv_mean.copy_(advantages.mean().detach());
+    pufferl.adv_std.copy_(advantages.std().detach());
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
@@ -1676,7 +1676,7 @@ TORCH_LIBRARY(_C, m) {
     m.def("mingru_gate(Tensor state, Tensor gate, Tensor hidden) -> Tensor");
     m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
     m.def("fused_scan(Tensor log_coeffs, Tensor log_values) -> Tensor");
-    m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, float adv_mean, float adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
+    m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
     m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
 }
 
