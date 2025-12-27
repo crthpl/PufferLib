@@ -499,7 +499,7 @@ public:
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
-            /*
+            /*            
             auto a_star = log_coeffs.cumsum(1);
             auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
             auto log_h = a_star + log_h0_plus_b_star;
@@ -529,11 +529,11 @@ class PolicyMinGRU : public torch::nn::Module {
 private:
     torch::nn::Sequential encoder{nullptr};
     torch::nn::Linear decoder{nullptr};
-    torch::nn::Linear value{nullptr};
     //std::shared_ptr<MinGRULayer> mingru{nullptr};
     torch::nn::ModuleList mingru{nullptr};
 
 public:
+    torch::nn::Linear value{nullptr};
     int64_t input_size;
     int64_t hidden_size;
     int64_t num_atns;
@@ -849,14 +849,42 @@ typedef struct {
     torch::Tensor graph_state_out;
     torch::Tensor graph_value;
     torch::Tensor graph_logprobs;
+    torch::Tensor graph_train_mb_obs;
+    torch::Tensor graph_train_mb_state;
+    torch::Tensor graph_train_mb_actions;
+    torch::Tensor graph_train_mb_logprobs;
+    torch::Tensor graph_train_mb_advantages;
+    torch::Tensor graph_train_mb_prio;
+    torch::Tensor graph_train_mb_values;
+    torch::Tensor graph_train_mb_returns;
+    torch::Tensor graph_train_logits;
+    torch::Tensor graph_train_newvalue;
     //void* cudagraphs;
-    at::cuda::CUDAGraph cudagraph;
+    at::cuda::CUDAGraph rollout_graph;
+    at::cuda::CUDAGraph train_forward_graph;
     torch::Tensor obs_input;
     torch::Tensor state_input;
     torch::Tensor logits_output;
     torch::Tensor value_output;
     torch::Tensor state_output;
     bool captured;
+    float adv_mean;
+    float adv_std;
+    double clip_coef;
+    double vf_clip_coef;
+    double vf_coef;
+    double ent_coef;
+    double max_grad_norm;
+    int64_t minibatch_segments;
+    int64_t horizon;
+    double prio_beta0;
+    double prio_alpha;
+    double gamma;
+    double gae_lambda;
+    double vtrace_rho_clip;
+    double vtrace_c_clip;
+    bool use_rnn;
+    bool anneal_lr;
 } PuffeRL;
 
 pybind11::dict log_environments(pybind11::object pufferl_obj) {
@@ -879,12 +907,9 @@ torch::Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, to
     return policy->initial_state(batch_size, device);
 }
 
-// Create graph
-void pufferl_init_cudagraph(PuffeRL* pufferl) {
-    pufferl->cudagraph = new at::cuda::CUDAGraph();
-}
-
 void forward_call(PuffeRL* pufferl) {
+    torch::NoGradGuard no_grad;
+
     torch::Tensor obs = pufferl->graph_obs;
     torch::Tensor state = pufferl->graph_state;
     auto* policy = pufferl->policy;
@@ -903,74 +928,154 @@ void forward_call(PuffeRL* pufferl) {
     pufferl->graph_state_out.copy_(state_out, false);
 }
 
+//std::tuple<torch::Tensor, torch::Tensor> train_forward_call(PuffeRL* pufferl) {
+void train_forward_call(PuffeRL* pufferl) {
+    torch::Tensor mb_obs = pufferl->graph_train_mb_obs;
+    torch::Tensor mb_state = pufferl->graph_train_mb_state;
+    torch::Tensor mb_actions = pufferl->graph_train_mb_actions;
+    torch::Tensor mb_logprobs = pufferl->graph_train_mb_logprobs;
+    torch::Tensor mb_advantages = pufferl->graph_train_mb_advantages;
+    torch::Tensor mb_prio = pufferl->graph_train_mb_prio;
+    torch::Tensor mb_values = pufferl->graph_train_mb_values;
+    torch::Tensor mb_returns = pufferl->graph_train_mb_returns;
+    auto minibatch_segments = pufferl->minibatch_segments;
+    auto horizon = pufferl->horizon;
+    auto adv_mean = pufferl->adv_mean;
+    auto adv_std = pufferl->adv_std;
+    auto clip_coef = pufferl->clip_coef;
+    auto vf_clip_coef = pufferl->vf_clip_coef;
+    auto vf_coef = pufferl->vf_coef;
+    auto ent_coef = pufferl->ent_coef;
+
+    auto* policy = pufferl->policy;
+
+    auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
+
+    /*
+    auto loss = fused_ppo_loss(
+        logits,
+        newvalue,
+        mb_actions,
+        mb_logprobs.to(logits.dtype()),
+        mb_advantages.to(logits.dtype()),
+        mb_prio.to(logits.dtype()),
+        mb_values.to(logits.dtype()),
+        mb_returns.to(logits.dtype()),
+        adv_mean,
+        adv_std,
+        clip_coef,
+        vf_clip_coef,
+        vf_coef,
+        ent_coef
+    )[0];
+    */
+
+    // Flatten for action lookup
+    auto flat_logits = logits.reshape({-1, logits.size(-1)});
+    auto flat_actions = mb_actions.reshape({-1});
+    auto logprobs_new = torch::log_softmax(flat_logits, 1);
+    auto probs_new = logprobs_new.exp();
+
+    // Gather logprobs for taken actions
+    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+    auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
+    auto entropy = - (probs_new * logprobs_new).sum(1).mean();
+
+    // Compute ratio
+    auto logratio = newlogprob - mb_logprobs;
+    auto ratio_new = logratio.exp();
+
+    // Update global ratio and values in-place (matches Python)
+    // This one can be commented, doesn't matter much on breakout
+    //ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+
+    // Normalize advantages: (adv - mean) / std, then weight
+    auto adv_normalized = mb_advantages;
+    adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
+
+    // Policy loss
+    auto pg_loss1 = -adv_normalized * ratio_new;
+    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+
+    // Value loss
+    newvalue = newvalue.view(mb_returns.sizes());
+    auto v_clipped = mb_values + torch::clamp(newvalue - mb_values, -vf_clip_coef, vf_clip_coef);
+    auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
+    auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
+    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+
+    // This one matters a lot even on breakout
+    //values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
+
+    // Total loss
+    auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
+    /*
+    {
+        torch::NoGradGuard no_grad;
+
+        // Accumulate stats
+        pg_sum += pg_loss.detach();
+        v_sum += v_loss.detach();
+        ent_sum += entropy.detach();
+        total_sum += loss.detach();
+
+        // KL and clipping diagnostics (matches Python)
+        auto old_kl = (-logratio).mean();
+        auto kl = ((ratio_new - 1) - logratio).mean();
+        auto cf = (ratio_new - 1.0).abs().gt(clip_coef).to(torch::kFloat32).mean();
+        auto imp = ratio_new.mean();
+
+        old_approx_kl_sum += old_kl.detach();
+        approx_kl_sum += kl.detach();
+        clipfrac_sum += cf.detach();
+        importance_sum += imp.detach();
+    }
+    */
+
+    loss.backward();
+    //clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
+    pufferl->muon->step();
+    pufferl->muon->zero_grad(false);
+
+    //return std::make_tuple(logits, newvalue);
+
+    //std::cout << "call logits sizes: " << pufferl->graph_train_logits.sizes() << std::endl;
+    //std::cout << "call newvalue sizes: " << pufferl->graph_train_newvalue.sizes() << std::endl;
+
+    //pufferl->graph_train_logits.copy_(logits, false);
+    //pufferl->graph_train_newvalue.copy_(newvalue, false);
+}
 
 // Capture
-void pufferl_capture_forward(PuffeRL* pufferl) {
+void pufferl_capture_graph(PuffeRL* pufferl, at::cuda::CUDAGraph* graph, void (*func)(PuffeRL*)) {
     /* Checklist for avoiding diabolical capture bugs:
      * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
      * 2. Make sure input/output buffer pointers don't change
      * 3. Make sure to restore the original stream after tracing
      * 4. All custom kernels need to use the default torch stream
      * 5. Make sure you are using the torch stream fns, not the c10 ones.
+     * 6. Scalars get captured by value. They cannot change between calls.
      */
     at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-
-    auto* graph = static_cast<at::cuda::CUDAGraph*>(&pufferl->cudagraph);
-    torch::NoGradGuard no_grad;
 
     at::cuda::CUDAStream warmup_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(warmup_stream);
     for (int i = 0; i < 10; ++i) {
-        forward_call(pufferl);
+        func(pufferl);
     }
     warmup_stream.synchronize();
 
     auto cap_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(cap_stream);
     graph->capture_begin();
-    forward_call(pufferl);
+    func(pufferl);
     graph->capture_end();
     cap_stream.synchronize();
 
     cudaDeviceSynchronize();
 
     at::cuda::setCurrentCUDAStream(current_stream);
-
-    /*
-    auto obs_contig = torch::zeros({1, 118}, torch::kFloat32).to(torch::kCUDA);
-    auto net = torch::nn::Linear(118, 128);
-    net->to(torch::kCUDA);
-    at::cuda::CUDAGraph graph;
-
-    // Warmup on side stream
-    auto warmup_stream = at::cuda::getStreamFromPool();
-    at::cuda::setCurrentCUDAStream(warmup_stream);
-
-    for (int i = 0; i < 10; ++i) {
-        auto output = net->forward(obs_contig);
-    }
-
-    warmup_stream.synchronize();  // Or torch::cuda::synchronize();
-
-    // Capture on different side stream
-    auto cap_stream = at::cuda::getStreamFromPool();
-    at::cuda::setCurrentCUDAStream(cap_stream);
-
-    graph.capture_begin();
-    auto output = net->forward(obs_contig);
-    graph.capture_end();
-
-    // Success! Now you can replay with graph.replay();
-    std::cout << "Capture succeeded!" << std::endl;
-    exit(0);
-    */
-
-}
-
-// Replay
-void pufferl_replay_forward(PuffeRL* pufferl) {
-    auto* graph = static_cast<at::cuda::CUDAGraph*>(&pufferl->cudagraph);
-    graph->replay();  // Updates outputs in place
 }
 
 /*
@@ -1007,8 +1112,12 @@ void capture_forward(std::unique_ptr<pufferlib::PuffeRL>& pufferl) {
 */
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t horizon, int64_t input_size,
-        int64_t num_atns, int64_t hidden_size, int64_t num_layers,
-        double lr, double min_lr_ratio, double beta1, double beta2, double eps, int64_t max_epochs) {
+        int64_t num_atns, int64_t hidden_size, int64_t num_layers, int64_t minibatch_segments,
+        double lr, double min_lr_ratio, double beta1, double beta2, double eps, int64_t max_epochs,
+        double prio_beta0, double prio_alpha, double clip_coef, double vf_clip_coef,
+        double gamma, double gae_lambda, double vtrace_rho_clip, double vtrace_c_clip,
+        double vf_coef, double ent_coef, double max_grad_norm, bool use_rnn, bool anneal_lr
+        ) {
 
     // Seeding
     torch::manual_seed(42);
@@ -1041,6 +1150,21 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t hor
     pufferl->lr = lr;
     pufferl->min_lr_ratio = min_lr_ratio;
     pufferl->max_epochs = max_epochs;
+    pufferl->minibatch_segments = minibatch_segments;
+    pufferl->horizon = horizon;
+    pufferl->prio_beta0 = prio_beta0;
+    pufferl->prio_alpha = prio_alpha;
+    pufferl->clip_coef = clip_coef;
+    pufferl->vf_clip_coef = vf_clip_coef;
+    pufferl->gamma = gamma;
+    pufferl->gae_lambda = gae_lambda;
+    pufferl->vtrace_rho_clip = vtrace_rho_clip;
+    pufferl->vtrace_c_clip = vtrace_c_clip;
+    pufferl->vf_coef = vf_coef;
+    pufferl->ent_coef = ent_coef;
+    pufferl->max_grad_norm = max_grad_norm;
+    pufferl->use_rnn = use_rnn;
+    pufferl->anneal_lr = anneal_lr;
 
     // Allocate buffers
     // TODO: Match env type, alloc on gpu native
@@ -1062,9 +1186,46 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t hor
     pufferl->graph_state = policy->initial_state(batch, torch::kCUDA);
     pufferl->graph_state_out = policy->initial_state(batch, torch::kCUDA);
 
+    pufferl->graph_train_mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
+    pufferl->graph_train_mb_state = torch::zeros(
+        {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
+        torch::dtype(DTYPE).device(torch::kCUDA)
+    );
+
+    auto options = torch::TensorOptions()
+    .dtype(DTYPE)
+    .device(torch::kCUDA);
+
+    //pufferl->graph_train_logits = torch::zeros({minibatch_segments, horizon, num_atns}, options);
+    //pufferl->graph_train_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
+    pufferl->graph_train_mb_actions = torch::zeros({minibatch_segments, horizon}, options).to(torch::kInt64);
+    pufferl->graph_train_mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
+    pufferl->graph_train_mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
+    pufferl->graph_train_mb_prio = torch::zeros({minibatch_segments, 1}, options);
+    pufferl->graph_train_mb_values = torch::zeros({minibatch_segments, horizon}, options);
+    pufferl->graph_train_mb_returns = torch::zeros({minibatch_segments, horizon}, options);
+
+    /*
+    std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
+    {
+        pybind11::gil_scoped_release no_gil;
+        train_forward_call(pufferl.get());
+    }
+    std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
+    */
+
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
-    pufferl_init_cudagraph(pufferl.get());
-    pufferl_capture_forward(pufferl.get());
+    pufferl->rollout_graph = at::cuda::CUDAGraph();
+    pufferl->train_forward_graph = at::cuda::CUDAGraph();
+    pufferl_capture_graph(pufferl.get(), &pufferl->rollout_graph, forward_call);
+    {
+        pybind11::gil_scoped_release no_gil;
+        pufferl_capture_graph(pufferl.get(), &pufferl->train_forward_graph, train_forward_call);
+    }
+    std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
+    //pufferl->graph_train_logits.detach_();
+    //pufferl->graph_train_newvalue.detach_();
+    //muon->zero_grad();
 
     auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
@@ -1165,7 +1326,7 @@ torch::Tensor compiled_evaluate(
         pufferl.graph_state.copy_(buf_state, false);
         //std::cout << "graph_state first item: " << pufferl.graph_state[3][0][0].item<float>() << std::endl;
         //std::cout << "buf_state first item: " << buf_state[0][0][0].item<float>() << std::endl;
-        pufferl_replay_forward(&pufferl);
+        pufferl.rollout_graph.replay();
         buf_state.copy_(pufferl.graph_state_out, false);
         //std::cout << "buf_state first item: " << buf_state[3][0][0].item<float>() << std::endl;
         //std::cout << "graph_logprobs first item: " << pufferl.graph_logprobs[0].item<float>() << std::endl;
@@ -1353,8 +1514,8 @@ pybind11::dict compiled_train(
         vtrace_rho_clip, vtrace_c_clip
     );
 
-    float adv_mean = advantages.mean().item<float>();
-    float adv_std = advantages.std().item<float>();
+    auto adv_mean = advantages.mean().detach();
+    auto adv_std = advantages.std().detach();
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
@@ -1363,7 +1524,6 @@ pybind11::dict compiled_train(
             advantages, gamma, gae_lambda,
             vtrace_rho_clip, vtrace_c_clip
         );
-
 
         // Prioritization
         auto adv = advantages.abs().sum(1);  // [num_envs]
@@ -1391,102 +1551,99 @@ pybind11::dict compiled_train(
             torch::dtype(DTYPE).device(values.device())
         );
 
-        // Forward pass
-        auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
-
-        //torch::Tensor loss = torch::zeros({1}, logits.options());
-        auto loss = fused_ppo_loss(
-            logits,
-            newvalue,
-            mb_actions,
-            mb_logprobs.to(logits.dtype()),
-            mb_advantages.to(logits.dtype()),
-            mb_prio.to(logits.dtype()),
-            mb_values.to(logits.dtype()),
-            mb_returns.to(logits.dtype()),
-            adv_mean,
-            adv_std,
-            clip_coef,
-            vf_clip_coef,
-            vf_coef,
-            ent_coef
-        )[0];
-
         /*
+        std::cout << "mb_obs sizes: " << mb_obs.sizes() << std::endl;
+        std::cout << "mb_state sizes: " << mb_state.sizes() << std::endl;
+        std::cout << "mb_actions sizes: " << mb_actions.sizes() << std::endl;
+        std::cout << "mb_logprobs sizes: " << mb_logprobs.sizes() << std::endl;
+        std::cout << "mb_advantages sizes: " << mb_advantages.sizes() << std::endl;
+        std::cout << "mb_prio sizes: " << mb_prio.sizes() << std::endl;
+        std::cout << "mb_values sizes: " << mb_values.sizes() << std::endl;
+        std::cout << "mb_returns sizes: " << mb_returns.sizes() << std::endl;
 
-        // Flatten for action lookup
-        auto flat_logits = logits.reshape({-1, logits.size(-1)});
-        auto flat_actions = mb_actions.reshape({-1});
-        auto logprobs_new = torch::log_softmax(flat_logits, 1);
-        auto probs_new = logprobs_new.exp();
 
-        // Gather logprobs for taken actions
-        auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-        auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
-        auto entropy = - (probs_new * logprobs_new).sum(1).mean();
-
-        // Compute ratio
-        auto logratio = newlogprob - mb_logprobs;
-        auto ratio_new = logratio.exp();
-
-        // Update global ratio and values in-place (matches Python)
-        // This one can be commented, doesn't matter much on breakout
-        //ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
-
-        // Normalize advantages: (adv - mean) / std, then weight
-        auto adv_normalized = mb_advantages;
-        adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
-
-        // Policy loss
-        auto pg_loss1 = -adv_normalized * ratio_new;
-        auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
-        auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
-
-        // Value loss
-        newvalue = newvalue.view(mb_returns.sizes());
-        auto v_clipped = mb_values + torch::clamp(newvalue - mb_values, -vf_clip_coef, vf_clip_coef);
-        auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
-        auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
-        auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
-
-        // This one matters a lot even on breakout
-        values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
-
-        // Total loss
-        auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
-        {
-            torch::NoGradGuard no_grad;
-
-            // Accumulate stats
-            pg_sum += pg_loss.detach();
-            v_sum += v_loss.detach();
-            ent_sum += entropy.detach();
-            total_sum += loss.detach();
-
-            // KL and clipping diagnostics (matches Python)
-            auto old_kl = (-logratio).mean();
-            auto kl = ((ratio_new - 1) - logratio).mean();
-            auto cf = (ratio_new - 1.0).abs().gt(clip_coef).to(torch::kFloat32).mean();
-            auto imp = ratio_new.mean();
-
-            old_approx_kl_sum += old_kl.detach();
-            approx_kl_sum += kl.detach();
-            clipfrac_sum += cf.detach();
-            importance_sum += imp.detach();
-        }
+        // print dtypes
+        std::cout << "mb_obs dtype: " << mb_obs.dtype() << std::endl;
+        std::cout << "mb_state dtype: " << mb_state.dtype() << std::endl;
+        std::cout << "mb_actions dtype: " << mb_actions.dtype() << std::endl;
+        std::cout << "mb_logprobs dtype: " << mb_logprobs.dtype() << std::endl;
+        std::cout << "mb_advantages dtype: " << mb_advantages.dtype() << std::endl;
+        std::cout << "mb_prio dtype: " << mb_prio.dtype() << std::endl;
+        std::cout << "mb_values dtype: " << mb_values.dtype() << std::endl;
+        std::cout << "mb_returns dtype: " << mb_returns.dtype() << std::endl;
         */
 
-        loss.backward();
+        // Forward pass
+        //auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
+        /*
+        std::cout << "mb_obs sizes: " << mb_obs.sizes() << std::endl;
+        std::cout << "mb_state sizes: " << mb_state.sizes() << std::endl;
+        auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
+        std::cout << "logits sizes: " << logits.sizes() << std::endl;
+        std::cout << "newvalue sizes: " << newvalue.sizes() << std::endl;
+        */
 
+        //std::cout << "call mb_obs sizes: " << pufferl.graph_train_mb_obs.sizes() << std::endl;
+        //std::cout << "call mb_state sizes: " << pufferl.graph_train_mb_state.sizes() << std::endl;
+
+
+        // Check shape and type before copy
+        /*
+        std::cout << "mb obs. sizes: " << pufferl.graph_train_mb_obs.sizes() << mb_obs.sizes() <<  "dtypes: " << mb_obs.dtype() << pufferl.graph_train_mb_obs.dtype() << std::endl;
+        std::cout << "mb state sizes: " << pufferl.graph_train_mb_state.sizes() << mb_state.sizes() <<  "dtypes: " << mb_state.dtype() << pufferl.graph_train_mb_state.dtype() << std::endl;
+        std::cout << "mb actions sizes: " << pufferl.graph_train_mb_actions.sizes() << mb_actions.sizes() <<  "dtypes: " << mb_actions.dtype() << pufferl.graph_train_mb_actions.dtype() << std::endl;
+        std::cout << "mb logprobs sizes: " << pufferl.graph_train_mb_logprobs.sizes() << mb_logprobs.sizes() <<  "dtypes: " << mb_logprobs.dtype() << pufferl.graph_train_mb_logprobs.dtype() << std::endl;
+        std::cout << "mb advantages sizes: " << pufferl.graph_train_mb_advantages.sizes() << mb_advantages.sizes() <<  "dtypes: " << mb_advantages.dtype() << pufferl.graph_train_mb_advantages.dtype() << std::endl;
+        std::cout << "mb prio sizes: " << pufferl.graph_train_mb_prio.sizes() << mb_prio.sizes() <<  "dtypes: " << mb_prio.dtype() << pufferl.graph_train_mb_prio.dtype() << std::endl;
+        std::cout << "mb values sizes: " << pufferl.graph_train_mb_values.sizes() << mb_values.sizes() <<  "dtypes: " << mb_values.dtype() << pufferl.graph_train_mb_values.dtype() << std::endl;
+        std::cout << "mb returns sizes: " << pufferl.graph_train_mb_returns.sizes() << mb_returns.sizes() <<  "dtypes: " << mb_returns.dtype() << pufferl.graph_train_mb_returns.dtype() << std::endl;
+        */
+
+        pufferl.graph_train_mb_obs.copy_(mb_obs, false);
+        pufferl.graph_train_mb_state.copy_(mb_state, false);
+        pufferl.graph_train_mb_actions.copy_(mb_actions, false);
+        pufferl.graph_train_mb_logprobs.copy_(mb_logprobs, false);
+        pufferl.graph_train_mb_advantages.copy_(mb_advantages, false);
+        pufferl.graph_train_mb_prio.copy_(mb_prio, false);
+        pufferl.graph_train_mb_values.copy_(mb_values, false);
+        pufferl.graph_train_mb_returns.copy_(mb_returns, false);
+
+        /*
+        pufferl.graph_train_mb_obs = mb_obs;
+        pufferl.graph_train_mb_state = mb_state;
+        pufferl.graph_train_mb_actions = mb_actions;
+        pufferl.graph_train_mb_logprobs = mb_logprobs;
+        pufferl.graph_train_mb_advantages = mb_advantages;
+        pufferl.graph_train_mb_prio = mb_prio;
+        pufferl.graph_train_mb_values = mb_values;
+        pufferl.graph_train_mb_returns = mb_returns;
+        */
+
+        //auto [logits, newvalue] = train_forward_call(&pufferl);
+        //train_forward_call(&pufferl);
+        pufferl.train_forward_graph.replay();
+
+        // Print out the first weight of the value network
+        //std::cout << "value weight: " << pufferl.policy->value->weight[0][0].item<float>() << std::endl;
+
+
+        //auto logits = pufferl.graph_train_logits;
+        //auto newvalue = pufferl.graph_train_newvalue;
+
+        //torch::Tensor loss = torch::zeros({1}, logits.options());
         // Gradient accumulation and step
         // ~10% overhead in this impl. Can save a ton of launches
+        /*
         if ((mb + 1) % accumulate_minibatches == 0) {
             // We use our version that doesn't sync for no reason
             // 2m+ sps right here on clip + step!
             clip_grad_norm_(policy->parameters(), max_grad_norm);
             muon->step();
             muon->zero_grad();
+            //pufferl.graph_train_logits.detach_();
+            //pufferl.graph_train_newvalue.detach_();
         }
+        */
     }
 
     // Compute explained variance at end of epoch

@@ -783,7 +783,8 @@ void launch_fused_scan_forward(
     int total = B * H;
     int grid = seq_size(total);
 
-    fused_scan_forward_kernel<T><<<grid, SEQ_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    fused_scan_forward_kernel<T><<<grid, SEQ_SIZE, 0, current_stream>>>(
         out,
         a_star,
         s_vals,
@@ -817,7 +818,8 @@ void launch_fused_scan_backward(
     int total = B * H;
     int grid = seq_size(total);
 
-    fused_scan_backward_kernel<T><<<grid, SEQ_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    fused_scan_backward_kernel<T><<<grid, SEQ_SIZE, 0, current_stream>>>(
         grad_log_coeffs,
         grad_log_values,
         grad_out,
@@ -1300,7 +1302,8 @@ inline void launch_ppo_loss_forward(
     int total_elements = N * T_seq;
     int grid = grid_size(total_elements);
 
-    ppo_loss_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    ppo_loss_forward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         loss_output,
         saved_for_backward,
         logits,
@@ -1354,7 +1357,8 @@ void launch_ppo_loss_backward(
     int total_elements = N * T_seq;
     int grid = grid_size(total_elements);
 
-    ppo_loss_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    ppo_loss_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         grad_logits,
         grad_values_pred,
         grad_loss,
