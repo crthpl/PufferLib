@@ -170,7 +170,7 @@ create_environments(int64_t num_envs, int threads) {
     auto terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
 
     // TODO: RESET
-    //vec_reset(vec);
+    vec_reset(vec);
     return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
 
@@ -475,9 +475,11 @@ public:
         torch::Tensor next_prev_hidden;
 
         if (seq_len == 1) {
-            //hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-            //gate = gate.sigmoid();
-            //out = torch::lerp(state, hidden, gate);
+            /*
+            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+            gate = gate.sigmoid();
+            out = torch::lerp(state, hidden, gate);
+            */
             out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
             next_prev_hidden = out;
         } else {
@@ -844,6 +846,7 @@ typedef struct {
     torch::Tensor graph_obs;
     torch::Tensor graph_actions;
     torch::Tensor graph_state;
+    torch::Tensor graph_state_out;
     torch::Tensor graph_value;
     torch::Tensor graph_logprobs;
     //void* cudagraphs;
@@ -882,25 +885,36 @@ void pufferl_init_cudagraph(PuffeRL* pufferl) {
 }
 
 void forward_call(PuffeRL* pufferl) {
-    auto& obs = pufferl->graph_obs;
-    auto& state = pufferl->graph_state;
+    torch::Tensor obs = pufferl->graph_obs;
+    torch::Tensor state = pufferl->graph_state;
     auto* policy = pufferl->policy;
  
     auto [logits, value, state_out] = policy->forward(obs, state);
 
     logits = torch::nan_to_num(logits);
     auto logprobs = torch::log_softmax(logits, 1);
-    auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1).to(torch::kInt32);
+    auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
     auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
 
-    pufferl->graph_actions.copy_(action);
-    pufferl->graph_value.copy_(value.flatten());
-    pufferl->graph_logprobs.copy_(logprob);
+    pufferl->graph_actions.copy_(action.to(torch::kInt32), false);
+    pufferl->graph_value.copy_(value.flatten(), false);
+    pufferl->graph_logprobs.copy_(logprob, false);
+    //pufferl->graph_state.copy_(state_out, false);
+    pufferl->graph_state_out.copy_(state_out, false);
 }
 
 
 // Capture
 void pufferl_capture_forward(PuffeRL* pufferl) {
+    /* Checklist for avoiding diabolical capture bugs:
+     * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
+     * 2. Make sure input/output buffer pointers don't change
+     * 3. Make sure to restore the original stream after tracing
+     * 4. All custom kernels need to use the default torch stream
+     * 5. Make sure you are using the torch stream fns, not the c10 ones.
+     */
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+
     auto* graph = static_cast<at::cuda::CUDAGraph*>(&pufferl->cudagraph);
     torch::NoGradGuard no_grad;
 
@@ -916,6 +930,11 @@ void pufferl_capture_forward(PuffeRL* pufferl) {
     graph->capture_begin();
     forward_call(pufferl);
     graph->capture_end();
+    cap_stream.synchronize();
+
+    cudaDeviceSynchronize();
+
+    at::cuda::setCurrentCUDAStream(current_stream);
 
     /*
     auto obs_contig = torch::zeros({1, 118}, torch::kFloat32).to(torch::kCUDA);
@@ -1037,16 +1056,17 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(int64_t segments, int64_t hor
 
     int batch = 4096;
     pufferl->graph_obs = torch::zeros({batch, input_size}, DTYPE).to(torch::kCUDA);
-    pufferl->graph_actions = torch::zeros(batch, DTYPE).to(torch::kCUDA);
+    pufferl->graph_actions = torch::zeros(batch, torch::kInt32).to(torch::kCUDA);
     pufferl->graph_value = torch::zeros(batch, DTYPE).to(torch::kCUDA);
     pufferl->graph_logprobs = torch::zeros(batch, DTYPE).to(torch::kCUDA);
     pufferl->graph_state = policy->initial_state(batch, torch::kCUDA);
+    pufferl->graph_state_out = policy->initial_state(batch, torch::kCUDA);
 
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
     pufferl_init_cudagraph(pufferl.get());
     pufferl_capture_forward(pufferl.get());
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 0);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1114,7 +1134,7 @@ torch::Tensor compiled_evaluate(
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
 	    int h = i / num_buffers;
-        //vec_recv(vec, buf);
+        vec_recv(vec, buf);
         /*
         obs_buf.copy_(obs.to(DTYPE));
         state_in_buf.copy_(state.to(DTYPE));
@@ -1129,14 +1149,27 @@ torch::Tensor compiled_evaluate(
         auto obs_batch = obs.narrow(0, buf*block_size, block_size);
         auto state_batch = state.narrow(1, buf*block_size, block_size);
         auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
+        logits = torch::nan_to_num(logits);
+        auto logprobs = torch::log_softmax(logits, 1);
+        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
+        auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
+        pufferl.graph_obs.copy_(obs_batch, true);
+        pufferl.graph_actions.copy_(action.to(torch::kInt32), true);
+        pufferl.graph_value.copy_(value.flatten(), true);
+        pufferl.graph_logprobs.copy_(logprob, true);
         state_batch.copy_(state_out);
         */
 
-        pufferl.graph_obs.copy_(pufferl.env_obs.narrow(0, buf*block_size, block_size));
-        pufferl.graph_state.copy_(state.narrow(1, buf*block_size, block_size));
-
-        // Replay graph
+        auto buf_state = state.narrow(1, buf*block_size, block_size);
+        pufferl.graph_obs.copy_(pufferl.env_obs.narrow(0, buf*block_size, block_size).to(torch::kFloat32), true);
+        pufferl.graph_state.copy_(buf_state, false);
+        //std::cout << "graph_state first item: " << pufferl.graph_state[3][0][0].item<float>() << std::endl;
+        //std::cout << "buf_state first item: " << buf_state[0][0][0].item<float>() << std::endl;
         pufferl_replay_forward(&pufferl);
+        buf_state.copy_(pufferl.graph_state_out, false);
+        //std::cout << "buf_state first item: " << buf_state[3][0][0].item<float>() << std::endl;
+        //std::cout << "graph_logprobs first item: " << pufferl.graph_logprobs[0].item<float>() << std::endl;
+        //std::cout << "action first item: " << pufferl.graph_actions[0].item<int>() << std::endl;
 
         /*
         auto obs = env_obs.narrow(0, buf*block_size, block_size);
@@ -1169,7 +1202,7 @@ torch::Tensor compiled_evaluate(
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
-            //vec_send(vec, buf);
+            vec_send(vec, buf);
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];

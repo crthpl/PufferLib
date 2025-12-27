@@ -1,3 +1,8 @@
+/* MAJOR UNDOCUMENTED ISSUE: Kernels must launch on the current torch stream to be traced
+ * by cudagraphs. Ideally this should not have to be handled around launch, since otherwise
+ * these kernels and launch fns do not depend on torch.
+ */
+
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -168,7 +173,8 @@ void launch_rmsnorm_forward(
     int total = B * T_total;
     int grid = grid_size(total);
 
-    rmsnorm_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    rmsnorm_forward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         out,
         inv_norm_buf,
         x,
@@ -203,7 +209,8 @@ void launch_rmsnorm_backward(
     int total = B * T_total * H;
     int grid = grid_size(total);
 
-    rmsnorm_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    rmsnorm_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         grad_x,
         grad_weight,
         grad_out,
@@ -252,7 +259,8 @@ void launch_mingru_gate_inference(
     int N
 ) {
     int grid = grid_size(N);
-    mingru_gate_inference_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    mingru_gate_inference_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         out,
         gate_in,
         hidden_in,
@@ -338,7 +346,8 @@ void launch_log_coeffs_and_values(
     int N
 ) {
     int grid = grid_size(N);
-    log_coeffs_and_values_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    log_coeffs_and_values_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         log_coeffs,
         log_values,
         gate,
@@ -364,7 +373,8 @@ void launch_log_coeffs_and_values_backward(
     int N
 ) {
     int grid = grid_size(N);
-    log_coeffs_and_values_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    log_coeffs_and_values_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
         grad_gate,
         grad_hidden,
         grad_log_coeffs,
