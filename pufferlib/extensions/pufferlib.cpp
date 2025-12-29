@@ -176,51 +176,6 @@ create_environments(int64_t num_envs, int threads) {
     return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
 
-/*
-void step_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
-    int num_envs = indices_tensor.size(0);
-    for (int i = 0; i < num_envs; i++) {
-        c_step(&envs[i]);
-    }
-}
-
-void reset_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
-    int num_envs = indices_tensor.size(0);
-    for (int i = 0; i < num_envs; i++) {
-        c_reset(&envs[i]);
-    }
-}
-
-void render_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
-    c_render(&envs[0]);
-}
-
-Log log_environments(torch::Tensor envs_tensor, torch::Tensor indices_tensor) {
-    Breakout* envs = reinterpret_cast<Breakout*>(envs_tensor.data_ptr<unsigned char>());
-    int num_envs = indices_tensor.size(0);
-    Log log = {0};
-    for (int i=0; i<num_envs; i++) {
-        log.perf += envs[i].log.perf;
-        log.score += envs[i].log.score;
-        log.episode_return += envs[i].log.episode_return;
-        log.episode_length += envs[i].log.episode_length;
-        log.n += envs[i].log.n;
-    }
-    log.perf /= log.n;
-    log.score /= log.n;
-    log.episode_return /= log.n;
-    log.episode_length /= log.n;
-
-    for (int i = 0; i < num_envs; i++) {
-        envs[i].log = {0};
-    }
-    return log;
-}
-*/
-
 namespace py = pybind11;
 
 // Forward declare modules
@@ -319,7 +274,6 @@ void vtrace_check(torch::Tensor values, torch::Tensor rewards,
     }
 }
 
-
 // [num_steps, horizon]
 void puff_advantage(float* values, float* rewards, float* dones, float* importance,
         float* advantages, float gamma, float lambda, float rho_clip, float c_clip,
@@ -331,7 +285,6 @@ void puff_advantage(float* values, float* rewards, float* dones, float* importan
         );
     }
 }
-
 
 void compute_puff_advantage_cpu(torch::Tensor values, torch::Tensor rewards,
         torch::Tensor dones, torch::Tensor importance, torch::Tensor advantages,
@@ -384,15 +337,6 @@ void compute_puff_advantage_cuda(
     double c_clip
 );
 
-/*
-static torch::jit::Module g_policy;
-void set_policy(torch::Tensor serialized_policy) {
-    std::string model_str(reinterpret_cast<const char*>(serialized_policy.data_ptr<uint8_t>()), serialized_policy.numel());
-    std::istringstream model_stream(model_str);
-    g_policy = torch::jit::load(model_stream);
-    g_policy.eval();
-}
-*/
 struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
     ShareableLSTMCell(const torch::nn::LSTMCellOptions& options) : torch::nn::LSTMCellImpl(options) {}
 
@@ -441,11 +385,12 @@ private:
     //torch::Tensor rmsnorm_weight{nullptr};
     //RMSNorm rmsnorm{nullptr};
     std::shared_ptr<RMSNorm> rmsnorm{nullptr};
+    bool kernels;
 
 public:
     int64_t expansion_factor;
-    MinGRULayer(int64_t dim, int64_t expansion_factor = 1.)
-        : dim(dim), expansion_factor(expansion_factor) {
+    MinGRULayer(int64_t dim, int64_t expansion_factor = 1., bool kernels = true)
+        : dim(dim), expansion_factor(expansion_factor), kernels(kernels) {
 
         int dim_inner = int(dim * expansion_factor);
         to_hidden_and_gate = register_module("to_hidden_and_gate",
@@ -477,38 +422,42 @@ public:
         torch::Tensor next_prev_hidden;
 
         if (seq_len == 1) {
-            /*
-            hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-            gate = gate.sigmoid();
-            out = torch::lerp(state, hidden, gate);
-            */
-            out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+            if (kernels) {
+                out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+            } else {
+                hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+                gate = gate.sigmoid();
+                out = torch::lerp(state, hidden, gate);
+            }
             next_prev_hidden = out;
         } else {
-            /*
-            auto log_coeffs = -torch::nn::functional::softplus(gate);
-            auto log_z = -torch::nn::functional::softplus(-gate);
-            auto log_tilde_h = torch::where(hidden >= 0,
-                (torch::nn::functional::relu(hidden) + 0.5).log(),
-                -torch::nn::functional::softplus(-hidden));
-            auto log_values = log_z + log_tilde_h;
-            */
-            torch::autograd::tensor_list outputs = log_coeffs_and_values(gate.contiguous(), hidden.contiguous());
-            auto log_coeffs = outputs[0];
-            auto log_values = outputs[1];
+            torch::Tensor log_coeffs, log_values;
+            if (kernels) {
+                torch::autograd::tensor_list outputs = log_coeffs_and_values(
+                    gate.contiguous(), hidden.contiguous());
+                log_coeffs = outputs[0];
+                log_values = outputs[1];
+            } else {
+                log_coeffs = -torch::nn::functional::softplus(gate);
+                auto log_z = -torch::nn::functional::softplus(-gate);
+                auto log_tilde_h = torch::where(hidden >= 0,
+                    (torch::nn::functional::relu(hidden) + 0.5).log(),
+                    -torch::nn::functional::softplus(-hidden));
+                log_values = log_z + log_tilde_h;
+            }
 
             log_values = torch::cat({state.log(), log_values}, 1);
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
             // Heinsen associative scan
-            /*            
-            auto a_star = log_coeffs.cumsum(1);
-            auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
-            auto log_h = a_star + log_h0_plus_b_star;
-            out = log_h.exp();
-            */
-
-            out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
+            if (kernels) {
+                out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
+            } else {
+                auto a_star = log_coeffs.cumsum(1);
+                auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
+                auto log_h = a_star + log_h0_plus_b_star;
+                out = log_h.exp();
+            }
 
             out = out.narrow(1, out.size(1) - seq_len, seq_len);
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
@@ -518,8 +467,8 @@ public:
             out = to_out->forward(out);
         }
 
-        //out = out + x;
-        //out = rmsnorm->forward(out);
+        out = out + x;
+        out = rmsnorm->forward(out);
         //out = rmsnorm(out, rmsnorm_weight, 1e-5)[0];
 
         return std::make_tuple(out, next_prev_hidden);
@@ -533,6 +482,7 @@ private:
     torch::nn::Linear decoder{nullptr};
     //std::shared_ptr<MinGRULayer> mingru{nullptr};
     torch::nn::ModuleList mingru{nullptr};
+    bool kernels;
 
 public:
     torch::nn::Linear value{nullptr};
@@ -542,8 +492,8 @@ public:
     int64_t num_layers;
     float expansion_factor;
 
-    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t num_layers = 1)
-        : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns), num_layers(num_layers) {
+    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t num_layers = 1, bool kernels = true)
+        : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns), num_layers(num_layers), kernels(kernels) {
         expansion_factor = 1.;
         encoder = register_module("encoder", torch::nn::Sequential(
             torch::nn::Linear(input_size, hidden_size),
@@ -564,7 +514,7 @@ public:
         //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
         mingru = torch::nn::ModuleList();
         for (int64_t i = 0; i < num_layers; ++i) {
-            mingru->push_back(MinGRULayer(hidden_size, 1));
+            mingru->push_back(MinGRULayer(hidden_size, 1, kernels));
         }
         register_module("mingru", mingru);
     }
@@ -859,6 +809,7 @@ typedef struct {
     torch::Tensor graph_train_mb_returns;
     torch::Tensor graph_train_logits;
     torch::Tensor graph_train_newvalue;
+    torch::Tensor temp_train_idx;
     //void* cudagraphs;
     at::cuda::CUDAGraph rollout_graph;
     at::cuda::CUDAGraph train_forward_graph;
@@ -901,6 +852,8 @@ typedef struct {
     int total_minibatches;
     int num_envs;
     int accumulate_minibatches;
+    bool cudagraphs;
+    bool kernels;
     int i_tmp;
     int j_tmp;
 } PuffeRL;
@@ -1006,85 +959,88 @@ void train_forward_call(PuffeRL* pufferl) {
 
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
-    auto loss = fused_ppo_loss(
-        logits,
-        newvalue,
-        mb_actions,
-        mb_logprobs.to(logits.dtype()),
-        mb_advantages.to(logits.dtype()),
-        mb_prio.to(logits.dtype()),
-        mb_values.to(logits.dtype()),
-        mb_returns.to(logits.dtype()),
-        adv_mean,
-        adv_std,
-        clip_coef,
-        vf_clip_coef,
-        vf_coef,
-        ent_coef
-    )[0];
+    torch::Tensor loss;
+    if (pufferl->kernels) {
+        loss = fused_ppo_loss(
+            logits,
+            newvalue,
+            mb_actions,
+            mb_logprobs.to(logits.dtype()),
+            mb_advantages.to(logits.dtype()),
+            mb_prio.to(logits.dtype()),
+            mb_values.to(logits.dtype()),
+            mb_returns.to(logits.dtype()),
+            adv_mean,
+            adv_std,
+            clip_coef,
+            vf_clip_coef,
+            vf_coef,
+            ent_coef
+        )[0];
+    } else {
+        // Flatten for action lookup
+        auto flat_logits = logits.reshape({-1, logits.size(-1)});
+        auto flat_actions = mb_actions.reshape({-1});
+        auto logprobs_new = torch::log_softmax(flat_logits, 1);
+        auto probs_new = logprobs_new.exp();
 
-    /*
-    // Flatten for action lookup
-    auto flat_logits = logits.reshape({-1, logits.size(-1)});
-    auto flat_actions = mb_actions.reshape({-1});
-    auto logprobs_new = torch::log_softmax(flat_logits, 1);
-    auto probs_new = logprobs_new.exp();
+        // Gather logprobs for taken actions
+        auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+        auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
+        auto entropy = - (probs_new * logprobs_new).sum(1).mean();
 
-    // Gather logprobs for taken actions
-    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-    auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
-    auto entropy = - (probs_new * logprobs_new).sum(1).mean();
+        // Compute ratio
+        auto logratio = newlogprob - mb_logprobs;
+        auto ratio_new = logratio.exp();
 
-    // Compute ratio
-    auto logratio = newlogprob - mb_logprobs;
-    auto ratio_new = logratio.exp();
+        // Update global ratio and values in-place (matches Python)
+        // This one can be commented, doesn't matter much on breakout
+        pufferl->ratio.index_copy_(0, pufferl->temp_train_idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
 
-    // Update global ratio and values in-place (matches Python)
-    // This one can be commented, doesn't matter much on breakout
-    //ratio.index_copy_(0, idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+        // Normalize advantages: (adv - mean) / std, then weight
+        auto adv_normalized = mb_advantages;
+        adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
 
-    // Normalize advantages: (adv - mean) / std, then weight
-    auto adv_normalized = mb_advantages;
-    adv_normalized = mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
+        // Policy loss
+        auto pg_loss1 = -adv_normalized * ratio_new;
+        auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+        auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
 
-    // Policy loss
-    auto pg_loss1 = -adv_normalized * ratio_new;
-    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
-    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+        // Value loss
+        newvalue = newvalue.view(mb_returns.sizes());
+        auto v_clipped = mb_values + torch::clamp(newvalue - mb_values, -vf_clip_coef, vf_clip_coef);
+        auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
+        auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
+        auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
-    // Value loss
-    newvalue = newvalue.view(mb_returns.sizes());
-    auto v_clipped = mb_values + torch::clamp(newvalue - mb_values, -vf_clip_coef, vf_clip_coef);
-    auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
-    auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
-    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+        // This one matters a lot even on breakout
+        pufferl->values.index_copy_(0, pufferl->temp_train_idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
-    // This one matters a lot even on breakout
-    //values.index_copy_(0, idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
+        // Total loss
+        loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
+        /*
+        {
+            torch::NoGradGuard no_grad;
 
-    // Total loss
-    auto loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
-    {
-        torch::NoGradGuard no_grad;
+            // Accumulate stats
+            pg_sum += pg_loss.detach();
+            v_sum += v_loss.detach();
+            ent_sum += entropy.detach();
+            total_sum += loss.detach();
 
-        // Accumulate stats
-        pg_sum += pg_loss.detach();
-        v_sum += v_loss.detach();
-        ent_sum += entropy.detach();
-        total_sum += loss.detach();
+            // KL and clipping diagnostics (matches Python)
+            auto old_kl = (-logratio).mean();
+            auto kl = ((ratio_new - 1) - logratio).mean();
+            auto cf = (ratio_new - 1.0).abs().gt(clip_coef).to(torch::kFloat32).mean();
+            auto imp = ratio_new.mean();
 
-        // KL and clipping diagnostics (matches Python)
-        auto old_kl = (-logratio).mean();
-        auto kl = ((ratio_new - 1) - logratio).mean();
-        auto cf = (ratio_new - 1.0).abs().gt(clip_coef).to(torch::kFloat32).mean();
-        auto imp = ratio_new.mean();
-
-        old_approx_kl_sum += old_kl.detach();
-        approx_kl_sum += kl.detach();
-        clipfrac_sum += cf.detach();
-        importance_sum += imp.detach();
+            old_approx_kl_sum += old_kl.detach();
+            approx_kl_sum += kl.detach();
+            clipfrac_sum += cf.detach();
+            importance_sum += imp.detach();
+        }
+        */
     }
-    */
 
     loss.backward();
     clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
@@ -1196,6 +1152,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->total_minibatches = kwargs["total_minibatches"].cast<int>();
     pufferl->num_envs = kwargs["num_envs"].cast<int>();
     pufferl->accumulate_minibatches = kwargs["accumulate_minibatches"].cast<int>();
+    pufferl->cudagraphs = kwargs["cudagraphs"].cast<bool>();
+    pufferl->kernels = kwargs["kernels"].cast<bool>();
 
     // Seeding
     torch::manual_seed(42);
@@ -1220,7 +1178,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     int num_atns = pufferl->num_atns;
     int hidden_size = pufferl->hidden_size;
     int num_layers = pufferl->num_layers;
-    PolicyMinGRU* policy = new PolicyMinGRU(pufferl->input_size, num_atns, hidden_size, num_layers);
+    bool kernels = pufferl->kernels;
+    PolicyMinGRU* policy = new PolicyMinGRU(input_size, num_atns, hidden_size, num_layers, kernels);
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
     pufferl->policy = policy;
@@ -1285,38 +1244,35 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     */
 
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
-    pufferl->rollout_graph = at::cuda::CUDAGraph();
-    pufferl->train_forward_graph = at::cuda::CUDAGraph();
-    pufferl_capture_graph(pufferl.get(), &pufferl->rollout_graph, forward_call);
-    {
-        pybind11::gil_scoped_release no_gil;
-        pufferl_capture_graph(pufferl.get(), &pufferl->train_forward_graph, train_forward_call);
+    if (pufferl->cudagraphs) {
+        pufferl->rollout_graph = at::cuda::CUDAGraph();
+        pufferl->train_forward_graph = at::cuda::CUDAGraph();
+        pufferl_capture_graph(pufferl.get(), &pufferl->rollout_graph, forward_call);
+        {
+            pybind11::gil_scoped_release no_gil;
+            pufferl_capture_graph(pufferl.get(), &pufferl->train_forward_graph, train_forward_call);
+        }
+        std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
     }
-    std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
 
-    //pufferl->graph_train_logits.detach_();
-    //pufferl->graph_train_newvalue.detach_();
-    //muon->zero_grad();
-
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 0);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
     pufferl->env_rewards = rewards;
     pufferl->env_terminals = terminals;
 
-    for (int i = 0; i < 64; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            pufferl->i_tmp = i;
-            pufferl->j_tmp = j;
-            pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
-            pufferl_capture_graph(pufferl.get(), &pufferl->rollout_copy_graphs[i][j], rollout_copy_call);
+    // TODO: stable?
+    if (pufferl->cudagraphs) {
+        for (int i = 0; i < 64; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                pufferl->i_tmp = i;
+                pufferl->j_tmp = j;
+                pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
+                pufferl_capture_graph(pufferl.get(), &pufferl->rollout_copy_graphs[i][j], rollout_copy_call);
+            }
         }
     }
-
-
-    //pufferl->obs_buf = torch::zeros({4096, input_size}, DTYPE).to(torch::kCUDA);
-    //pufferl->state_in_buf = torch::zeros({4096, 2*hidden_size}, DTYPE).to(torch::kCUDA);
 
     return pufferl;
 }
@@ -1356,11 +1312,6 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     auto& policy = pufferl.policy;
     auto& vec = pufferl.vec;
 
-    auto obs = pufferl.env_obs;
-    auto actions = pufferl.env_actions;
-    auto rewards = pufferl.env_rewards;
-    auto terminals = pufferl.env_terminals;
-
     auto env_obs = pufferl.env_obs;
     auto env_actions = pufferl.env_actions;
     auto env_rewards = pufferl.env_rewards;
@@ -1380,31 +1331,7 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
 	    int h = i / num_buffers;
-        //vec_recv(vec, buf);
-        /*
-        obs_buf.copy_(obs.to(DTYPE));
-        state_in_buf.copy_(state.to(DTYPE));
-        pufferl_replay_forward(pufferl.get());
-        state = pufferl->state_out_buf;
-        auto logits = logits_buf;
-        auto value = value_buf;
-        auto state_out = state_out_buf;
-        */
-
-        /*
-        auto obs_batch = obs.narrow(0, buf*block_size, block_size);
-        auto state_batch = state.narrow(1, buf*block_size, block_size);
-        auto [logits, value, state_out] = policy->forward(obs_batch.to(DTYPE), state_batch);
-        logits = torch::nan_to_num(logits);
-        auto logprobs = torch::log_softmax(logits, 1);
-        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
-        auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
-        pufferl.graph_obs.copy_(obs_batch, true);
-        pufferl.graph_actions.copy_(action.to(torch::kInt32), true);
-        pufferl.graph_value.copy_(value.flatten(), true);
-        pufferl.graph_logprobs.copy_(logprob, true);
-        state_batch.copy_(state_out);
-        */
+        vec_recv(vec, buf);
 
         cudaDeviceSynchronize();
         nvtxRangePushA("rollout_copy_inputs");
@@ -1414,66 +1341,43 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
         cudaDeviceSynchronize();
         nvtxRangePop();
 
-        //std::cout << "graph_state first item: " << pufferl.graph_state[3][0][0].item<float>() << std::endl;
-        //std::cout << "buf_state first item: " << buf_state[0][0][0].item<float>() << std::endl;
         //cudaEventRecord(start);
         cudaDeviceSynchronize();
         nvtxRangePushA("rollout_graph");
-        pufferl.rollout_graph.replay();
+        if (pufferl.cudagraphs) {
+            pufferl.rollout_graph.replay();
+        } else {
+            forward_call(&pufferl);
+        }
         cudaDeviceSynchronize();
         nvtxRangePop();
         //cudaEventRecord(stop);
         //cudaEventSynchronize(stop);
-       
         
         cudaDeviceSynchronize();
         nvtxRangePushA("rollout_copy_outputs");
         buf_state.copy_(pufferl.graph_state_out, false);
-        //std::cout << "buf_state first item: " << buf_state[3][0][0].item<float>() << std::endl;
-        //std::cout << "graph_logprobs first item: " << pufferl.graph_logprobs[0].item<float>() << std::endl;
-        //std::cout << "action first item: " << pufferl.graph_actions[0].item<int>() << std::endl;
-
-        /*
-        auto obs = env_obs.narrow(0, buf*block_size, block_size);
-        auto action = env_actions.narrow(0, buf*block_size, block_size);
-        auto logprob = env_logprobs.narrow(0, buf*block_size, block_size);
-        auto value = env_value.narrow(0, buf*block_size, block_size);
-        */
-
+        // Store with non-blocking copies
         pufferl.i_tmp = h;
         pufferl.j_tmp = buf;
-        //rollout_copy_call(&pufferl);
-        pufferl.rollout_copy_graphs[h][buf].replay();
-
-        // Store with non-blocking copies
-        /*
-        obs_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(pufferl.graph_obs, true);
-        act_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(pufferl.graph_actions.to(torch::kInt64), true);
-        logprob_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(pufferl.graph_logprobs.to(torch::kFloat32), true);
-        val_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(pufferl.graph_value.to(torch::kFloat32), true);
-
-        auto rewards_batch = rewards.narrow(0, buf*block_size, block_size);
-        auto rewards_clamped = torch::clamp(rewards_batch, -1.0f, 1.0f);
-        rew_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(rewards_clamped.to(torch::kFloat32), true);
-
-        auto terminals_batch = terminals.narrow(0, buf*block_size, block_size);
-        term_buffer.select(1, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch.to(torch::kFloat32), true);
-
-        actions.narrow(0, buf*block_size, block_size).copy_(pufferl.graph_actions.to(torch::kFloat32), true);
-        */
+        if (pufferl.cudagraphs) {
+            pufferl.rollout_copy_graphs[h][buf].replay();
+        } else {
+            rollout_copy_call(&pufferl);
+        }
         cudaDeviceSynchronize();
         nvtxRangePop();
  
         // TODO: There should be a lighter way to sync. You need to make sure the torch data streams
         // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
-        //cudaDeviceSynchronize();
+        cudaDeviceSynchronize();
         //c10::cuda::getCurrentCUDAStream().synchronize();
 
         {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
-            //vec_send(vec, buf);
+            vec_send(vec, buf);
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];
@@ -1486,70 +1390,6 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     }
 
     return state;
-}
-
-/*
-std::tuple<torch::Tensor, torch::Tensor> evaluate_step(
-    pybind11::object pufferl_obj,
-    torch::Tensor envs_tensor,
-    torch::Tensor indices_tensor,
-    torch::Tensor obs,
-    torch::Tensor actions,
-    torch::Tensor rewards, torch::Tensor terminals,
-    torch::Tensor lstm_h,
-    torch::Tensor lstm_c,
-    torch::Tensor obs_buffer,
-    torch::Tensor act_buffer,
-    torch::Tensor logprob_buffer,
-    torch::Tensor rew_buffer,
-    torch::Tensor term_buffer,
-    torch::Tensor val_buffer,
-    int64_t i
-) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy;
-
-    torch::NoGradGuard no_grad;
-
-    auto [logits, value, lstm_h_out, lstm_c_out] = policy->forward(obs.to(torch::kFloat32), lstm_h, lstm_c);
-    lstm_h = lstm_h_out;
-    lstm_c = lstm_c_out;
-
-    auto logprobs = torch::log_softmax(logits, 1);
-    auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
-    auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
-
-    // Store
-    obs_buffer.select(1, i).copy_(obs.to(torch::kFloat32));
-    act_buffer.select(1, i).copy_(action.to(torch::kInt32));
-    logprob_buffer.select(1, i).copy_(logprob.to(torch::kFloat32));
-    rew_buffer.select(1, i).copy_(rewards.to(torch::kFloat32));
-    term_buffer.select(1, i).copy_(terminals.to(torch::kFloat32));
-    val_buffer.select(1, i).copy_(value.flatten().to(torch::kFloat32));
-
-    actions.copy_(action);
-    return std::make_tuple(lstm_h, lstm_c);
-}
-*/
-
-void batched_forward(
-    pybind11::object pufferl_obj,
-    torch::Tensor observations,  // [num_envs, horizon, ...]
-    int64_t total_minibatches,
-    int64_t minibatch_segments
-) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy;
-    auto device = observations.device();
-    for (int64_t mb = 0; mb < total_minibatches; ++mb) {
-        float rng = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-        torch::Tensor mb_obs = observations.narrow(0, mb*minibatch_segments, minibatch_segments);
-        torch::Tensor mb_state = torch::zeros(
-            {minibatch_segments, 1, policy->hidden_size},
-            DTYPE
-        ).to(device);
-        auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE)+rng, mb_state+rng);
-    }
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {
@@ -1652,6 +1492,9 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         auto idx = at::multinomial(prio_probs, minibatch_segments, true);
         auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
 
+        // TODO: Needed by the cpp impl, not in the kernel yet but perf critical
+        pufferl.temp_train_idx = idx;
+
         // Index into data
         torch::Tensor mb_obs = observations.index_select(0, idx);
         torch::Tensor mb_actions = actions.index_select(0, idx);
@@ -1685,22 +1528,15 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         nvtxRangePop();
 
         //auto [logits, newvalue] = train_forward_call(&pufferl);
-        //train_forward_call(&pufferl);
-        //cudaEventRecord(start);
         cudaDeviceSynchronize();
         nvtxRangePushA("train_forward_graph");
-        pufferl.train_forward_graph.replay();
+        if (pufferl.cudagraphs) {
+            pufferl.train_forward_graph.replay();
+        } else {
+            train_forward_call(&pufferl);
+        }
         cudaDeviceSynchronize();
         nvtxRangePop();
-        //cudaEventRecord(stop);
-        //cudaEventSynchronize(stop);
-
-        // Print out the first weight of the value network
-        //std::cout << "value weight: " << pufferl.policy->value->weight[0][0].item<float>() << std::endl;
-
-
-        //auto logits = pufferl.graph_train_logits;
-        //auto newvalue = pufferl.graph_train_newvalue;
 
         //torch::Tensor loss = torch::zeros({1}, logits.options());
         // Gradient accumulation and step
@@ -1759,7 +1595,6 @@ PYBIND11_MODULE(_C, m) {
 
     //m.def("evaluate_step", &evaluate_step);
     m.def("train", &train);
-    m.def("batched_forward", &batched_forward);
     m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
     m.def("policy_forward", &PolicyMinGRU::forward);
 

@@ -167,6 +167,8 @@ class PuffeRL:
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
         config['num_envs'] = self.num_envs
+        config['cudagraphs'] = False
+        config['kernels'] = False
         self.pufferl_cpp = _C.create_pufferl(config)
 
         # Initializations
