@@ -128,7 +128,7 @@ class PuffeRL:
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
-
+ 
         # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
         max_minibatch_size = config['max_minibatch_size']
@@ -152,34 +152,22 @@ class PuffeRL:
         self.total_epochs = epochs
 
         self.num_layers = 4
-        self.pufferl_cpp = _C.create_pufferl(
-            segments,
-            horizon,
-            118,
-            3,
-            128,
-            self.num_layers,
-            self.minibatch_segments,
-            config['learning_rate'],
-            config['min_lr_ratio'],
-            config['adam_beta1'],
-            config['adam_beta2'],
-            config['adam_eps'],
-            epochs,
-            config['prio_beta0'],
-            config['prio_alpha'],
-            config['clip_coef'],
-            config['vf_clip_coef'],
-            config['gamma'],
-            config['gae_lambda'],
-            config['vtrace_rho_clip'],
-            config['vtrace_c_clip'],
-            config['vf_coef'],
-            config['ent_coef'],
-            config['max_grad_norm'],
-            config['use_rnn'],
-            config['anneal_lr'],
-        )
+        config['input_size'] = 118
+        config['num_atns'] = 3
+        config['hidden_size'] = 128
+        config['num_layers'] = self.num_layers
+        config['minibatch_segments'] = self.minibatch_segments
+        config['segments'] = segments
+        config['horizon'] = horizon
+        config['lr'] = config['learning_rate']
+        config['beta1'] = config['adam_beta1']
+        config['beta2'] = config['adam_beta2']
+        config['eps'] = config['adam_eps']
+        config['max_epochs'] = epochs
+        config['total_minibatches'] = self.total_minibatches
+        config['accumulate_minibatches'] = self.accumulate_minibatches
+        config['num_envs'] = self.num_envs
+        self.pufferl_cpp = _C.create_pufferl(config)
 
         # Initializations
         self.config = config
@@ -223,19 +211,7 @@ class PuffeRL:
         config = self.config
         device = config['device']
 
-        state = _C.initial_state(self.pufferl_cpp, self.agents_per_batch, torch.device(device))
-        state = _C.compiled_evaluate(
-            self.pufferl_cpp,
-            state,
-            self.observations,
-            self.actions,
-            self.logprobs,
-            self.rewards,
-            self.terminals,
-            self.values,
-            self.config['bptt_horizon'],
-            self.num_envs
-        )
+        state = _C.rollouts(self.pufferl_cpp,)
 
         '''
         obs, act, rew, term = _C.env_buffers(self.pufferl_cpp)
@@ -300,37 +276,7 @@ class PuffeRL:
 
         self.ratio[:] = 1
 
-        losses = _C.compiled_train(
-            self.pufferl_cpp,
-            self.observations,
-            self.actions,
-            self.logprobs,
-            self.rewards,
-            self.terminals,
-            self.truncations,
-            self.ratio,
-            self.values,
-            self.total_minibatches,
-            self.minibatch_segments,
-            self.segments,  # Assuming self.segments = self.num_envs
-            self.accumulate_minibatches,
-            self.config['bptt_horizon'],
-            self.config['prio_beta0'],
-            self.config['prio_alpha'],
-            self.config['clip_coef'],
-            self.config['vf_clip_coef'],
-            self.config['gamma'],
-            self.config['gae_lambda'],
-            self.config['vtrace_rho_clip'],
-            self.config['vtrace_c_clip'],
-            self.config['vf_coef'],
-            self.config['ent_coef'],
-            self.config['max_grad_norm'],
-            self.config['use_rnn'],
-            self.config['anneal_lr'],
-            self.total_epochs,
-            self.epoch
-        )
+        losses = _C.train(self.pufferl_cpp)
 
         profile('train_misc', epoch)
         profile.end()
@@ -390,6 +336,7 @@ class PuffeRL:
         return logs
 
     def close(self):
+        os._exit(0)
         self.vecenv.close()
         self.utilization.stop()
         model_path = self.save_checkpoint()
@@ -1296,7 +1243,7 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
             warmup=10,
             active=5,
             repeat=1
-        )
+        ),
     ) as prof:
         for _ in range(35):  # 15 + 5 + 10 + 5 
             with record_function("full_step"):
