@@ -300,6 +300,7 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
     threading->buffer_states = (atomic_int*)calloc(buffers, sizeof(atomic_int));
     threading->num_envs = num_envs;
     threading->num_buffers = buffers;
+    printf("Creation Address of threading->num_envs %p\n", &threading->num_envs);
 
 
     vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
@@ -357,33 +358,34 @@ void vec_reset(VecEnv* vec) {
         Env* env = &vec->envs[i];
         c_reset(env);
     }
-    atomic_int* buffer_states = vec->threading->buffer_states;
-    for (int buf=0; buf < vec->buffers; buf++) {
-        int block_size = vec->size / vec->buffers;
-
-        /*
-        int start = buf * block_size;
+    Threading* threading = vec->threading;
+    if (threading->num_threads == 0) {
         cudaMemcpy(
-            &vec->gpu_observations[start*OBS_SIZE],
-            &vec->observations[start*OBS_SIZE],
-            block_size*OBS_SIZE*sizeof(float),
+            vec->gpu_observations,
+            vec->observations,
+            vec->size*OBS_SIZE*sizeof(float),
             cudaMemcpyHostToDevice
         );
         cudaMemcpy(
-            &vec->gpu_rewards[start],
-            &vec->rewards[start],
-            block_size*sizeof(float),
+            vec->gpu_rewards,
+            vec->rewards,
+            vec->size*sizeof(float),
             cudaMemcpyHostToDevice
         );
         cudaMemcpy(
-            &vec->gpu_terminals[start],
-            &vec->terminals[start],
-            block_size*sizeof(unsigned char),
+            vec->gpu_terminals,
+            vec->terminals,
+            vec->size*sizeof(unsigned char),
             cudaMemcpyHostToDevice
         );
-        */
-        update_buffer_state(vec->threading, buf, OBS_READY_ON_CPU);
-        //buffer_states[buf] = OBS_READY_ON_CPU;
+        cudaDeviceSynchronize();
+    } else {
+        atomic_int* buffer_states = threading->buffer_states;
+        for (int buf=0; buf < vec->buffers; buf++) {
+            int block_size = vec->size / vec->buffers;
+            int start = buf * block_size;
+            update_buffer_state(threading, buf, OBS_READY_ON_CPU);
+        }
     }
 }
 
@@ -401,6 +403,7 @@ void vec_send(VecEnv* vec, int buffer) {
     if (threading->num_threads == 0) {
         //float val = rand()%3;
         //cudaMemcpy(&vec->gpu_actions[start], &val, sizeof(float), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
         cudaMemcpy(
             &vec->actions[start*ACT_SIZE],
             &vec->gpu_actions[start*ACT_SIZE],
@@ -429,6 +432,7 @@ void vec_send(VecEnv* vec, int buffer) {
             block_size*sizeof(unsigned char),
             cudaMemcpyHostToDevice
         );
+        cudaDeviceSynchronize();
     } else {
         if (threading->use_gpu) {
             cudaMemcpyAsync(
@@ -450,9 +454,11 @@ void vec_send(VecEnv* vec, int buffer) {
 }
 
 void vec_recv(VecEnv* vec, int buffer) {
+    cudaDeviceSynchronize();
     Threading* threading = vec->threading;
     // TODO: Single stream architecture requires busy waiting here
     //printf("Recv buf %d\n", buffer);
+
     if (threading->num_threads > 0) {
         atomic_int* buffer_states = threading->buffer_states;
         //printf("vec_recv waiting on CPU obs\n");

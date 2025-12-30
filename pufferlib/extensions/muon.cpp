@@ -78,7 +78,8 @@ void MuonParamState::serialize(torch::serialize::InputArchive& archive) {
 
 //TODO: You actually want this in bfloat16. Still seems slow
 Tensor _zeropower_via_newtonschulz(Tensor G) {
-    auto x = G.to(torch::kBFloat16);
+    //auto x = G.to(torch::kBFloat16);
+    auto x = G.clone();
     if (G.size(-2) > G.size(-1)) {
         x = x.mT();
     }
@@ -90,8 +91,6 @@ Tensor _zeropower_via_newtonschulz(Tensor G) {
         auto a = coeffs[i][0];
         auto b = coeffs[i][1];
         auto c = coeffs[i][2];
-
-        // Changed this to be fewer ops. It's faster. I don't know if it introduces any numerical issues.
         auto A = x.mm(x.mT());
         auto gram_update = at::addmm(A, A, A, b, c);  // beta=b, alpha=c
         x = at::addmm(x, gram_update, x, a, 1.0);
@@ -122,9 +121,11 @@ Tensor Muon::step(LossClosure closure) {
       auto& options = static_cast<MuonOptions&>(group.options());
 
       // Perform stepweight decay
+      /*
       if (options.weight_decay() != 0) {
         p.mul_(1 - options.lr() * options.weight_decay());
       }
+      */
 
       // State initialization
       if (param_state == state_.end()) {

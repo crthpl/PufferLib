@@ -157,7 +157,8 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
+    //VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 1, 256, true, 0, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -369,8 +370,11 @@ public:
     torch::Tensor forward(torch::Tensor x) {
         int ndim = x.dim();
         TORCH_CHECK(x.size(ndim - 1) == dim, "Last dimension must match expected size");
-        return torch::nn::functional::normalize(
-            x, torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(-1).eps(0)) * weight;
+        double eps = 1.19e-07;
+        //return torch::nn::functional::normalize(
+        //    x, torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(-1)) * weight;
+        auto rms = (x.pow(2).mean(-1, true) + eps).rsqrt();
+        return x * rms * weight;
         //auto mean_sq = (x*x).mean(ndim - 1, true);
         //return weight * x/mean_sq.sqrt();
     }
@@ -384,7 +388,7 @@ private:
     torch::nn::Linear to_out{nullptr};
     //torch::Tensor rmsnorm_weight{nullptr};
     //RMSNorm rmsnorm{nullptr};
-    std::shared_ptr<RMSNorm> rmsnorm{nullptr};
+    std::shared_ptr<RMSNorm> norm{nullptr};
     bool kernels;
 
 public:
@@ -402,7 +406,7 @@ public:
         to_out = register_module("to_out",
                 torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
         torch::nn::init::orthogonal_(to_out->weight);
-        rmsnorm = register_module("rmsnorm", std::make_shared<RMSNorm>(dim));
+        norm = register_module("norm", std::make_shared<RMSNorm>(dim));
 
         //rmsnorm_weight = register_parameter("rmsnorm_weight", torch::ones({dim}));
     }
@@ -468,7 +472,7 @@ public:
         }
 
         out = out + x;
-        out = rmsnorm->forward(out);
+        out = norm->forward(out);
         //out = rmsnorm(out, rmsnorm_weight, 1e-5)[0];
 
         return std::make_tuple(out, next_prev_hidden);
@@ -476,10 +480,59 @@ public:
 };
 
 
+class DefaultEncoder : public torch::nn::Module {
+    public:
+        torch::nn::Linear encoder{nullptr};
+        int input_size;
+        int hidden_size;
+
+    DefaultEncoder(int64_t input_size, int64_t hidden_size)
+        : input_size(input_size), hidden_size(hidden_size) {
+        
+        encoder = register_module("encoder", torch::nn::Linear(input_size, hidden_size));
+        torch::nn::init::orthogonal_(encoder->weight, std::sqrt(2.0));
+        torch::nn::init::constant_(encoder->bias, 0.0);
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        torch::Tensor hidden = encoder->forward(x);
+        return torch::nn::functional::gelu(hidden);
+    }
+};
+
+class DefaultDecoder : public torch::nn::Module {
+    public:
+        torch::nn::Linear decoder{nullptr};
+        torch::nn::Linear value_function{nullptr};
+        int hidden_size;
+        int output_size;
+
+    DefaultDecoder(int64_t hidden_size, int64_t output_size)
+        : hidden_size(hidden_size), output_size(output_size) {
+        
+        decoder = register_module("decoder", torch::nn::Linear(hidden_size, output_size)),
+        torch::nn::init::orthogonal_(decoder->weight, 0.01);
+        torch::nn::init::constant_(decoder->bias, 0.0);
+
+        value_function = register_module("value_function", torch::nn::Linear(hidden_size, 1));
+        torch::nn::init::orthogonal_(value_function->weight, 1.0);
+        torch::nn::init::constant_(value_function->bias, 0.0);
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor hidden) {
+        torch::Tensor logits = decoder->forward(hidden);
+        torch::Tensor value = value_function->forward(hidden);
+        return {logits, value};
+    }
+};  
+
+
 class PolicyMinGRU : public torch::nn::Module {
 private:
-    torch::nn::Sequential encoder{nullptr};
-    torch::nn::Linear decoder{nullptr};
+    //torch::nn::Sequential encoder{nullptr};
+    //torch::nn::Linear decoder{nullptr};
+    std::shared_ptr<DefaultEncoder> encoder{nullptr};
+    std::shared_ptr<DefaultDecoder> decoder{nullptr};
     //std::shared_ptr<MinGRULayer> mingru{nullptr};
     torch::nn::ModuleList mingru{nullptr};
     bool kernels;
@@ -495,6 +548,9 @@ public:
     PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t num_layers = 1, bool kernels = true)
         : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns), num_layers(num_layers), kernels(kernels) {
         expansion_factor = 1.;
+        encoder = register_module("encoder", std::make_shared<DefaultEncoder>(input_size, hidden_size));
+        decoder = register_module("decoder", std::make_shared<DefaultDecoder>(hidden_size, num_atns));
+        /*
         encoder = register_module("encoder", torch::nn::Sequential(
             torch::nn::Linear(input_size, hidden_size),
             torch::nn::GELU()
@@ -510,6 +566,7 @@ public:
         value = register_module("value", torch::nn::Linear(hidden_size, 1));
         torch::nn::init::orthogonal_(value->weight, 1.0);
         torch::nn::init::constant_(value->bias, 0.0);
+        */
 
         //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
         mingru = torch::nn::ModuleList();
@@ -559,8 +616,11 @@ public:
         //state = state.squeeze(2);
         state = torch::stack(state_out, 0).squeeze(2);
 
-        auto logits = decoder->forward(hidden);
-        auto values = value->forward(hidden);
+        std::tuple<torch::Tensor, torch::Tensor> out = decoder->forward(hidden);
+        auto logits = std::get<0>(out);
+        auto values = std::get<1>(out);
+        //auto logits = decoder->forward(hidden);
+        //auto values = value->forward(hidden);
 
         return {logits, values, state};
     }
@@ -603,8 +663,13 @@ public:
         }
 
         auto flat_hidden = hidden.reshape({-1, hidden_size});
-        auto logits = decoder->forward(flat_hidden);
-        auto values = value->forward(flat_hidden);
+
+        std::tuple<torch::Tensor, torch::Tensor> out = decoder->forward(flat_hidden);
+        auto logits = std::get<0>(out);
+        auto values = std::get<1>(out);
+ 
+        //auto logits = decoder->forward(flat_hidden);
+        //auto values = value->forward(flat_hidden);
 
         logits = logits.reshape({B, TT, num_atns});
         values = values.reshape({B, TT, 1});
@@ -789,6 +854,7 @@ typedef struct {
     torch::Tensor terminals;
     torch::Tensor ratio;
     torch::Tensor importance;
+    torch::Tensor debug;
     torch::Tensor env_obs;
     torch::Tensor env_actions;
     torch::Tensor env_rewards;
@@ -852,6 +918,7 @@ typedef struct {
     int total_minibatches;
     int num_envs;
     int accumulate_minibatches;
+    int num_buffers;
     bool cudagraphs;
     bool kernels;
     int i_tmp;
@@ -887,7 +954,9 @@ void forward_call(PuffeRL* pufferl) {
  
     auto [logits, value, state_out] = policy->forward(obs, state);
 
-    logits = torch::nan_to_num(logits);
+    pufferl->debug.copy_(state_out[-1]);
+
+    logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
     auto logprobs = torch::log_softmax(logits, 1);
     auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
     auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
@@ -902,8 +971,8 @@ void forward_call(PuffeRL* pufferl) {
 void rollout_copy_call(PuffeRL* pufferl) {
     int h = pufferl->i_tmp;
     int buf = pufferl->j_tmp;
-    int num_buffers = 2;
-    int num_envs = 8192;
+    int num_buffers = pufferl->num_buffers;
+    int num_envs = pufferl->num_envs;
     int block_size = num_envs / num_buffers;
 
     auto obs_buffer = pufferl->observations;
@@ -1152,6 +1221,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->total_minibatches = kwargs["total_minibatches"].cast<int>();
     pufferl->num_envs = kwargs["num_envs"].cast<int>();
     pufferl->accumulate_minibatches = kwargs["accumulate_minibatches"].cast<int>();
+    pufferl->num_buffers = kwargs["num_buffers"].cast<int>();
     pufferl->cudagraphs = kwargs["cudagraphs"].cast<bool>();
     pufferl->kernels = kwargs["kernels"].cast<bool>();
 
@@ -1194,6 +1264,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     // TODO: Match env type, alloc on gpu native
     int segments = pufferl->segments;
     int horizon = pufferl->horizon;
+    int batch = pufferl->num_envs / pufferl->num_buffers;
     pufferl->observations = torch::zeros({segments, horizon, input_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     pufferl->actions = torch::zeros({segments, horizon}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     pufferl->values = torch::zeros({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
@@ -1202,15 +1273,15 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->terminals = torch::zeros({segments, horizon}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     pufferl->ratio = torch::zeros({segments, horizon}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     pufferl->importance = torch::zeros({segments, horizon}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    pufferl->debug = torch::zeros({batch, hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
-    int batch = 4096;
     pufferl->graph_obs = torch::zeros({batch, input_size}, DTYPE).to(torch::kCUDA);
     pufferl->graph_actions = torch::zeros(batch, torch::kInt32).to(torch::kCUDA);
     pufferl->graph_value = torch::zeros(batch, DTYPE).to(torch::kCUDA);
     pufferl->graph_logprobs = torch::zeros(batch, DTYPE).to(torch::kCUDA);
     pufferl->graph_state = policy->initial_state(batch, torch::kCUDA);
     pufferl->graph_state_out = policy->initial_state(batch, torch::kCUDA);
-    pufferl->rollout_state = policy->initial_state(8192, torch::kCUDA);
+    pufferl->rollout_state = policy->initial_state(pufferl->num_envs, torch::kCUDA);
 
     int minibatch_segments = pufferl->minibatch_segments;
     pufferl->graph_train_mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
@@ -1252,10 +1323,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
             pybind11::gil_scoped_release no_gil;
             pufferl_capture_graph(pufferl.get(), &pufferl->train_forward_graph, train_forward_call);
         }
-        std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
     }
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(8192, 8);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(pufferl->num_envs, 0);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1264,8 +1334,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
 
     // TODO: stable?
     if (pufferl->cudagraphs) {
-        for (int i = 0; i < 64; ++i) {
-            for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < pufferl->horizon; ++i) {
+            for (int j = 0; j < pufferl->num_buffers; ++j) {
                 pufferl->i_tmp = i;
                 pufferl->j_tmp = j;
                 pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
@@ -1326,7 +1396,7 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    int num_buffers = 2;
+    int num_buffers = pufferl.num_buffers;
     int block_size = num_envs / num_buffers;
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
@@ -1634,7 +1704,14 @@ PYBIND11_MODULE(_C, m) {
     m.def("create_pufferl", &create_pufferl);
     py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &pufferlib::PuffeRL::policy)
-        .def_readwrite("muon", &pufferlib::PuffeRL::muon);
+        .def_readwrite("muon", &pufferlib::PuffeRL::muon)
+        .def_readwrite("observations", &pufferlib::PuffeRL::observations)
+        .def_readwrite("actions", &pufferlib::PuffeRL::actions)
+        .def_readwrite("rewards", &pufferlib::PuffeRL::rewards)
+        .def_readwrite("terminals", &pufferlib::PuffeRL::terminals)
+        .def_readwrite("logprobs", &pufferlib::PuffeRL::logprobs)
+        .def_readwrite("values", &pufferlib::PuffeRL::values)
+        .def_readwrite("debug", &pufferlib::PuffeRL::debug);
 
     py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
     cls.def(py::init<int64_t, int64_t, int64_t>());
