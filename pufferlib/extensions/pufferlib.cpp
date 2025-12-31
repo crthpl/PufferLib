@@ -380,15 +380,40 @@ public:
     }
 };
 
+class DyT : public torch::nn::Module {
+    private:
+        int64_t dim;
+        torch::Tensor alpha{nullptr};
+        torch::Tensor weight{nullptr};
+        torch::Tensor bias{nullptr};
+
+    public:
+        DyT(int64_t dim)
+            : dim(dim) {
+
+            alpha = register_parameter("alpha", 0.5*torch::ones({dim}));
+            weight = register_parameter("weight", torch::ones({dim}));
+            bias = register_parameter("bias", torch::zeros({dim}));
+        }
+
+        torch::Tensor forward(torch::Tensor x) {
+            x = torch::tanh(alpha*x);
+            x = x*weight + bias;
+            return x;
+        }
+};
+
 
 class MinGRULayer : public torch::nn::Module {
 private:
     int64_t dim;
     torch::nn::Linear to_hidden_and_gate{nullptr};
-    torch::nn::Linear to_out{nullptr};
+    //torch::Tensor to_hidden_and_gate_bf16{nullptr};
+    //torch::nn::Linear to_out{nullptr};
     //torch::Tensor rmsnorm_weight{nullptr};
     //RMSNorm rmsnorm{nullptr};
     std::shared_ptr<RMSNorm> norm{nullptr};
+    //std::shared_ptr<DyT> dyt{nullptr};
     bool kernels;
 
 public:
@@ -401,12 +426,16 @@ public:
                 torch::nn::Linear(torch::nn::LinearOptions(dim, 2*dim_inner).bias(false)));
         torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
 
+        //to_hidden_and_gate_bf16 = register_parameter("to_hidden_and_gate_bf16", torch::zeros({dim, 2*dim_inner}, torch::dtype(torch::kBFloat16).device(torch::kCUDA)));
+        //torch::nn::init::orthogonal_(to_hidden_and_gate_bf16);
+
         // TODO: Is there a way to have this be identity to keep param count correct?
         //if (expansion_factor != 1.) 
-        to_out = register_module("to_out",
-                torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
-        torch::nn::init::orthogonal_(to_out->weight);
+        //to_out = register_module("to_out",
+        //        torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
+        //torch::nn::init::orthogonal_(to_out->weight);
         norm = register_module("norm", std::make_shared<RMSNorm>(dim));
+        //dyt = register_module("dyt", std::make_shared<DyT>(dim));
 
         //rmsnorm_weight = register_parameter("rmsnorm_weight", torch::ones({dim}));
     }
@@ -418,6 +447,7 @@ public:
 
         auto seq_len = x.size(1);
         auto output = to_hidden_and_gate->forward(x);
+        //auto output = torch::matmul(x.to(torch::kBFloat16), to_hidden_and_gate_bf16.to(torch::kBFloat16)).to(torch::kFloat32);
         auto chunks = output.chunk(2, 2);
         auto hidden = chunks[0];
         auto gate = chunks[1];
@@ -467,13 +497,18 @@ public:
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
         }
 
+        /*
         if (expansion_factor != 1) {
             out = to_out->forward(out);
         }
+        */
 
+        // TODO: This norm is slow, but results are inconsistent without it
         out = out + x;
         out = norm->forward(out);
-        //out = rmsnorm(out, rmsnorm_weight, 1e-5)[0];
+        
+        //out = torch::tanh(0.25*out);
+        //out = dyt->forward(out);
 
         return std::make_tuple(out, next_prev_hidden);
     }
@@ -1395,18 +1430,27 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
 	    int h = i / num_buffers;
-        cudaDeviceSynchronize();
-        vec_recv(vec, buf);
 
-        cudaDeviceSynchronize();
-        nvtxRangePushA("rollout_copy_inputs");
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePushA("vec_recv");
+        }
+        vec_recv(vec, buf);
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
+
+            cudaDeviceSynchronize();
+            nvtxRangePushA("rollout_copy_inputs");
+        }
         auto buf_state = state.narrow(1, buf*block_size, block_size);
         pufferl.graph_obs.copy_(pufferl.env_obs.narrow(0, buf*block_size, block_size).to(torch::kFloat32), true);
         pufferl.graph_state.copy_(buf_state, false);
-        cudaDeviceSynchronize();
-        nvtxRangePop();
 
         if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
+
             cudaDeviceSynchronize();
             nvtxRangePushA("rollout_graph");
         }
@@ -1445,7 +1489,15 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
             pybind11::gil_scoped_release no_gil;
             //step_environments_cuda(envs_tensor, indices_tensor);
             // Losing 1m sps here
+            if (pufferl.profile) {
+                cudaDeviceSynchronize();
+                nvtxRangePushA("vec_send");
+            }
             vec_send(vec, buf);
+            if (pufferl.profile) {
+                cudaDeviceSynchronize();
+                nvtxRangePop();
+            }
             //float reward_sum = 0;
             //for (int j = 0; j < vec->size; j++) {
             //    reward_sum += vec->rewards[j];

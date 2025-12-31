@@ -78,8 +78,8 @@ void MuonParamState::serialize(torch::serialize::InputArchive& archive) {
 
 //TODO: You actually want this in bfloat16. Still seems slow
 Tensor _zeropower_via_newtonschulz(Tensor G) {
-    //auto x = G.to(torch::kBFloat16);
-    auto x = G.clone();
+    auto x = G.to(torch::kBFloat16);
+    //auto x = G.clone();
     if (G.size(-2) > G.size(-1)) {
         x = x.mT();
     }
@@ -159,7 +159,9 @@ Tensor Muon::step(LossClosure closure) {
           update.mul_(scale);
       }
 
-      p.mul_(1 - lr * weight_decay);
+      if (options.weight_decay() != 0) {
+        p.mul_(1 - lr * weight_decay);
+      }  
       p.sub_(lr*update.view(p.sizes()));
     }
   }
