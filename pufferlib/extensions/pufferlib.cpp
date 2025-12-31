@@ -1029,7 +1029,8 @@ void train_forward_call(PuffeRL* pufferl) {
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
     torch::Tensor loss;
-    if (pufferl->kernels) {
+    if (false) {
+    //if (pufferl->kernels) {
         loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1321,7 +1322,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
         }
     }
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(pufferl->num_envs, 0);
+    auto [vec, obs, actions, rewards, terminals] = create_environments(pufferl->num_envs, 8);
     pufferl->vec = vec;
     pufferl->env_obs = obs;
     pufferl->env_actions = actions;
@@ -1397,6 +1398,7 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
 	    int h = i / num_buffers;
+        cudaDeviceSynchronize();
         vec_recv(vec, buf);
 
         cudaDeviceSynchronize();

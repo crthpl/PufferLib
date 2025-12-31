@@ -226,13 +226,15 @@ class PuffeRL:
         while self.full_rows < self.segments:
             profile('env', epoch)
 
+            '''
             _C.python_vec_recv(self.pufferl_cpp, 0)
             o, a, r, d = _C.env_buffers(self.pufferl_cpp)
             t = torch.zeros(8192, device=device)
             info = {}
             mask = torch.ones(8192, device=device)
             env_id = [0, 8191]
-            #o, r, d, t, info, env_id, mask = self.vecenv.recv()
+            '''
+            o, r, d, t, info, env_id, mask = self.vecenv.recv()
 
             profile('eval_misc', epoch)
             env_id = slice(env_id[0], env_id[-1] + 1)
@@ -285,7 +287,7 @@ class PuffeRL:
                     self.free_idx += num_full
                     self.full_rows += num_full
 
-                a[:] = action
+                #a[:] = action
                 action = action.cpu().numpy()
                 if isinstance(logits, torch.distributions.Normal):
                     action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
@@ -303,8 +305,8 @@ class PuffeRL:
             profile('env', epoch)
 
 
-            _C.python_vec_send(self.pufferl_cpp, 0)
-            #self.vecenv.send(action)
+            #_C.python_vec_send(self.pufferl_cpp, 0)
+            self.vecenv.send(action)
 
         logs = _C.log_environments(self.pufferl_cpp)
         if logs:

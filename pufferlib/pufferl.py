@@ -169,7 +169,7 @@ class PuffeRL:
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
         config['num_envs'] = self.num_envs
-        config['cudagraphs'] = True
+        config['cudagraphs'] = False
         config['kernels'] = False
         config['num_buffers'] = 1
         self.pufferl_cpp = _C.create_pufferl(config)
@@ -805,6 +805,8 @@ def check(env_name):
 
     # You need to determinize the env before checks
     for i in range(args['train']['bptt_horizon']):
+        python_obs = pufferl_python.observations[:, i].float()
+        cpp_obs = pufferl_cpp.observations[:, i]
         assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.observations[:, i]), f'Observation {i} mismatch'
         assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.actions[:, i].long()), f'Action {i} mismatch'
         assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rewards[:, i]), f'Reward {i} mismatch'
