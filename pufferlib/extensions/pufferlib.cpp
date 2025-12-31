@@ -23,6 +23,7 @@
 #include <vector>
 
 create_environments_fn create_envs;
+create_threads_fn create_threads;
 env_init_fn env_init;
 vec_reset_fn vec_reset;
 vec_step_fn vec_step;
@@ -98,7 +99,7 @@ void clip_grad_norm_(
 }
 
 std::tuple<VecEnv*, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-create_environments(int64_t num_envs, int threads) {
+create_environments(int64_t num_envs) {
     void* handle = dlopen("./breakout.so", RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
@@ -108,6 +109,7 @@ create_environments(int64_t num_envs, int threads) {
 
     // Load the function pointer
     create_envs = (create_environments_fn)dlsym(handle, "create_environments");
+    create_threads = (create_threads_fn)dlsym(handle, "create_threads");
     env_init = (env_init_fn)dlsym(handle, "env_init");
     vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
     vec_step = (vec_step_fn)dlsym(handle, "vec_step");
@@ -157,7 +159,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
+    VecEnv* vec = create_envs(num_envs, 2, true, 0, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -172,7 +174,6 @@ create_environments(int64_t num_envs, int threads) {
     auto terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
 
     // TODO: RESET
-    vec_reset(vec);
     return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
 
@@ -1311,7 +1312,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     std::cout << "value weight: " << pufferl->policy->value->weight[0][0].item<float>() << std::endl;
     */
 
-    // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
+    auto [vec, obs, actions, rewards, terminals] = create_environments(pufferl->num_envs);
+    pufferl->vec = vec;
+    pufferl->env_obs = obs;
+    pufferl->env_actions = actions;
+    pufferl->env_rewards = rewards;
+    pufferl->env_terminals = terminals;
+
     if (pufferl->cudagraphs) {
         pufferl->rollout_graph = at::cuda::CUDAGraph();
         pufferl->train_forward_graph = at::cuda::CUDAGraph();
@@ -1320,18 +1327,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
             pybind11::gil_scoped_release no_gil;
             pufferl_capture_graph(pufferl.get(), &pufferl->train_forward_graph, train_forward_call);
         }
-    }
 
-    auto [vec, obs, actions, rewards, terminals] = create_environments(pufferl->num_envs, 8);
-    pufferl->vec = vec;
-    pufferl->env_obs = obs;
-    pufferl->env_actions = actions;
-    pufferl->env_rewards = rewards;
-    pufferl->env_terminals = terminals;
-
-    // TODO: stable?
-    /*
-    if (pufferl->cudagraphs) {
         for (int i = 0; i < pufferl->horizon; ++i) {
             for (int j = 0; j < pufferl->num_buffers; ++j) {
                 pufferl->i_tmp = i;
@@ -1341,7 +1337,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
             }
         }
     }
-    */
+
+    // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
+    create_threads(vec, 8, 256);
+    vec_reset(vec);
 
     return pufferl;
 }
@@ -1427,14 +1426,11 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
         // Store with non-blocking copies
         pufferl.i_tmp = h;
         pufferl.j_tmp = buf;
-        rollout_copy_call(&pufferl);
-        /*
         if (pufferl.cudagraphs) {
             pufferl.rollout_copy_graphs[h][buf].replay();
         } else {
             rollout_copy_call(&pufferl);
         }
-        */
         if (pufferl.profile) {
             cudaDeviceSynchronize();
             nvtxRangePop();

@@ -220,7 +220,7 @@ static void* c_threadmanager(void* arg) {
 }
  
 __attribute__((visibility("default")))
-VecEnv* create_environments(int num_envs, int threads, int buffers, int block_size, bool use_gpu, int test_idx, Dict* kwargs) {
+VecEnv* create_environments(int num_envs, int buffers, bool use_gpu, int test_idx, Dict* kwargs) {
     Env* envs = (Env*)calloc(num_envs, sizeof(Env));
     VecEnv* vec = (VecEnv*)calloc(1, sizeof(VecEnv));
     vec->envs = envs;
@@ -292,19 +292,21 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         agent += 1;
     }
 
+    return vec;
+}
+
+void create_threads(VecEnv* vec, int threads, int block_size) {
     //printf("Finished creating %d envs\n", num_envs);
     Threading* threading = vec->threading;
     threading->num_threads = threads;
     threading->block_size = block_size;
     threading->completed = (atomic_long*)calloc(threads, sizeof(atomic_long));
-    threading->buffer_states = (atomic_int*)calloc(buffers, sizeof(atomic_int));
-    threading->num_envs = num_envs;
-    threading->num_buffers = buffers;
-    printf("Creation Address of threading->num_envs %p\n", &threading->num_envs);
+    threading->buffer_states = (atomic_int*)calloc(vec->buffers, sizeof(atomic_int));
+    threading->num_envs = vec->size;
+    threading->num_buffers = vec->buffers;
 
-
-    vec->streams = (cudaStream_t*)calloc(buffers, sizeof(cudaStream_t));
-    for (int i = 0; i < buffers; i++) {
+    vec->streams = (cudaStream_t*)calloc(vec->buffers, sizeof(cudaStream_t));
+    for (int i = 0; i < vec->buffers; i++) {
         cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
     }
 
@@ -332,9 +334,6 @@ VecEnv* create_environments(int num_envs, int threads, int buffers, int block_si
         int err = pthread_create(&threading->threads[threads], NULL, c_threadmanager, (void*)(vec));
         assert(err == 0 && "create_vecenv failed to create manager thread\n");
     }
-
-
-    return vec;
 }
 
 Env* env_init(float* observations, float* actions, float* rewards,
