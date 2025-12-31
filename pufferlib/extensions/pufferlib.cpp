@@ -157,8 +157,7 @@ create_environments(int64_t num_envs, int threads) {
     dict_set_int(kwargs, "use_sparse_reward", 0);
     */
 
-    //VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
-    VecEnv* vec = create_envs(num_envs, threads, 1, 256, true, 0, kwargs);
+    VecEnv* vec = create_envs(num_envs, threads, 2, 256, true, 0, kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -921,6 +920,7 @@ typedef struct {
     int num_buffers;
     bool cudagraphs;
     bool kernels;
+    bool profile;
     int i_tmp;
     int j_tmp;
 } PuffeRL;
@@ -982,7 +982,6 @@ void rollout_copy_call(PuffeRL* pufferl) {
     auto term_buffer = pufferl->terminals;
     auto val_buffer = pufferl->values;
 
-    auto obs = pufferl->env_obs;
     auto actions = pufferl->env_actions;
     auto rewards = pufferl->env_rewards;
     auto terminals = pufferl->env_terminals;
@@ -1220,6 +1219,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->num_buffers = kwargs["num_buffers"].cast<int>();
     pufferl->cudagraphs = kwargs["cudagraphs"].cast<bool>();
     pufferl->kernels = kwargs["kernels"].cast<bool>();
+    pufferl->profile = kwargs["profile"].cast<bool>();
 
     // Seeding
     torch::manual_seed(42);
@@ -1330,6 +1330,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->env_terminals = terminals;
 
     // TODO: stable?
+    /*
     if (pufferl->cudagraphs) {
         for (int i = 0; i < pufferl->horizon; ++i) {
             for (int j = 0; j < pufferl->num_buffers; ++j) {
@@ -1340,6 +1341,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
             }
         }
     }
+    */
 
     return pufferl;
 }
@@ -1389,10 +1391,6 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
 
     auto device = torch::kCUDA;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
     int num_buffers = pufferl.num_buffers;
     int block_size = num_envs / num_buffers;
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
@@ -1409,32 +1407,38 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
         cudaDeviceSynchronize();
         nvtxRangePop();
 
-        //cudaEventRecord(start);
-        cudaDeviceSynchronize();
-        nvtxRangePushA("rollout_graph");
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePushA("rollout_graph");
+        }
         if (pufferl.cudagraphs) {
             pufferl.rollout_graph.replay();
         } else {
             forward_call(&pufferl);
         }
-        cudaDeviceSynchronize();
-        nvtxRangePop();
-        //cudaEventRecord(stop);
-        //cudaEventSynchronize(stop);
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
         
-        cudaDeviceSynchronize();
-        nvtxRangePushA("rollout_copy_outputs");
+            cudaDeviceSynchronize();
+            nvtxRangePushA("rollout_copy_outputs");
+        }
         buf_state.copy_(pufferl.graph_state_out, false);
         // Store with non-blocking copies
         pufferl.i_tmp = h;
         pufferl.j_tmp = buf;
+        rollout_copy_call(&pufferl);
+        /*
         if (pufferl.cudagraphs) {
             pufferl.rollout_copy_graphs[h][buf].replay();
         } else {
             rollout_copy_call(&pufferl);
         }
-        cudaDeviceSynchronize();
-        nvtxRangePop();
+        */
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
+        }
 
         // TODO: There should be a lighter way to sync. You need to make sure the torch data streams
         // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
@@ -1542,18 +1546,22 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
 
-        cudaDeviceSynchronize();
-        nvtxRangePushA("compute_puff_advantage");
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePushA("compute_puff_advantage");
+        }
         compute_puff_advantage_cuda(
             values, rewards, terminals, ratio,
             advantages, gamma, gae_lambda,
             vtrace_rho_clip, vtrace_c_clip
         );
-        cudaDeviceSynchronize();
-        nvtxRangePop();
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
 
-        cudaDeviceSynchronize();
-        nvtxRangePushA("train_misc");
+            cudaDeviceSynchronize();
+            nvtxRangePushA("train_misc");
+        }
         // Prioritization
         auto adv = advantages.abs().sum(1);  // [num_envs]
         auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
@@ -1590,19 +1598,23 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         pufferl.graph_train_mb_prio.copy_(mb_prio, false);
         pufferl.graph_train_mb_values.copy_(mb_values, false);
         pufferl.graph_train_mb_returns.copy_(mb_returns, false);
-        cudaDeviceSynchronize();
-        nvtxRangePop();
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
 
-        //auto [logits, newvalue] = train_forward_call(&pufferl);
-        cudaDeviceSynchronize();
-        nvtxRangePushA("train_forward_graph");
+            //auto [logits, newvalue] = train_forward_call(&pufferl);
+            cudaDeviceSynchronize();
+            nvtxRangePushA("train_forward_graph");
+        }
         if (pufferl.cudagraphs) {
             pufferl.train_forward_graph.replay();
         } else {
             train_forward_call(&pufferl);
         }
-        cudaDeviceSynchronize();
-        nvtxRangePop();
+        if (pufferl.profile) {
+            cudaDeviceSynchronize();
+            nvtxRangePop();
+        }
 
         // Update global ratio and values in-place (matches Python)
         // This one can be commented, doesn't matter much on breakout

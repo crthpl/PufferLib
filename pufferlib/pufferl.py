@@ -169,9 +169,10 @@ class PuffeRL:
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
         config['num_envs'] = self.num_envs
-        config['cudagraphs'] = False
-        config['kernels'] = False
-        config['num_buffers'] = 1
+        config['cudagraphs'] = True
+        config['kernels'] = True
+        config['profile'] = False
+        config['num_buffers'] = 2
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.observations
         self.actions = self.pufferl_cpp.actions
