@@ -25,10 +25,10 @@ const double coeffs[5][3] = {
     {2.8366, -3.0525, 1.2012},
 };
 
-MuonOptions::MuonOptions(double lr) : lr_(lr) {}
+MuonOptions::MuonOptions(double initial_lr) : initial_lr_(initial_lr) {}
 
 bool operator==(const MuonOptions& lhs, const MuonOptions& rhs) {
-  return (lhs.lr() == rhs.lr()) &&
+  return (lhs.initial_lr() == rhs.initial_lr()) &&
       (lhs.eps() == rhs.eps()) &&
       (lhs.weight_decay() == rhs.weight_decay()) &&
       (lhs.momentum() == rhs.momentum());
@@ -51,11 +51,11 @@ void MuonOptions::serialize(torch::serialize::InputArchive& archive) {
 */
 
 double MuonOptions::get_lr() const {
-  return lr();
+  return initial_lr();
 }
 
-void MuonOptions::set_lr(const double lr) {
-  this->lr(lr);
+void MuonOptions::set_lr(const double initial_lr) {
+  this->initial_lr(initial_lr);
 }
 
 bool operator==(const MuonParamState& lhs, const MuonParamState& rhs) {
@@ -141,7 +141,6 @@ Tensor Muon::step(LossClosure closure) {
       auto& momentum = options.momentum();
       auto weight_decay = options.weight_decay();
       auto eps = options.eps();
-      auto lr = options.lr();
 
       state.step(state.step() + 1);
 

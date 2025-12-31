@@ -873,9 +873,9 @@ typedef struct {
     torch::Tensor graph_train_mb_prio;
     torch::Tensor graph_train_mb_values;
     torch::Tensor graph_train_mb_returns;
+    torch::Tensor graph_train_ratio;
     torch::Tensor graph_train_logits;
     torch::Tensor graph_train_newvalue;
-    torch::Tensor temp_train_idx;
     //void* cudagraphs;
     at::cuda::CUDAGraph rollout_graph;
     at::cuda::CUDAGraph train_forward_graph;
@@ -1061,10 +1061,8 @@ void train_forward_call(PuffeRL* pufferl) {
         // Compute ratio
         auto logratio = newlogprob - mb_logprobs;
         auto ratio_new = logratio.exp();
-
-        // Update global ratio and values in-place (matches Python)
-        // This one can be commented, doesn't matter much on breakout
-        pufferl->ratio.index_copy_(0, pufferl->temp_train_idx, ratio_new.detach().squeeze(-1).to(torch::kFloat32));
+        pufferl->graph_train_ratio.copy_(ratio_new, false);
+        pufferl->graph_train_newvalue.copy_(newvalue, false);
 
         // Normalize advantages: (adv - mean) / std, then weight
         auto adv_normalized = mb_advantages;
@@ -1081,9 +1079,6 @@ void train_forward_call(PuffeRL* pufferl) {
         auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
         auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
         auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
-
-        // This one matters a lot even on breakout
-        pufferl->values.index_copy_(0, pufferl->temp_train_idx, newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
         // Total loss
         loss = pg_loss + vf_coef*v_loss - ent_coef*entropy;
@@ -1295,7 +1290,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     .device(torch::kCUDA);
 
     //pufferl->graph_train_logits = torch::zeros({minibatch_segments, horizon, num_atns}, options);
-    //pufferl->graph_train_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
+    pufferl->graph_train_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
+    pufferl->graph_train_ratio = torch::zeros({minibatch_segments, horizon}, options);
     pufferl->graph_train_mb_actions = torch::zeros({minibatch_segments, horizon}, options).to(torch::kInt64);
     pufferl->graph_train_mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
     pufferl->graph_train_mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
@@ -1437,7 +1433,7 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
         }
         cudaDeviceSynchronize();
         nvtxRangePop();
- 
+
         // TODO: There should be a lighter way to sync. You need to make sure the torch data streams
         // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
         cudaDeviceSynchronize();
@@ -1517,7 +1513,8 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     if (anneal_lr) {
         double lr_min = pufferl.min_lr_ratio * pufferl.lr;
         double lr = cosine_annealing(pufferl.lr, lr_min,current_epoch, pufferl.max_epochs);
-        muon->param_groups().at(0).options().set_lr(lr);
+        muon->lr.fill_(lr);
+        //muon->param_groups().at(0).options().set_lr(lr);
     }
 
     // Annealed priority exponent
@@ -1562,9 +1559,6 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         auto idx = at::multinomial(prio_probs, minibatch_segments, true);
         auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
 
-        // TODO: Needed by the cpp impl, not in the kernel yet but perf critical
-        pufferl.temp_train_idx = idx;
-
         // Index into data
         torch::Tensor mb_obs = observations.index_select(0, idx);
         torch::Tensor mb_actions = actions.index_select(0, idx);
@@ -1607,6 +1601,14 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         }
         cudaDeviceSynchronize();
         nvtxRangePop();
+
+        // Update global ratio and values in-place (matches Python)
+        // This one can be commented, doesn't matter much on breakout
+        pufferl.ratio.index_copy_(0, idx, pufferl.graph_train_ratio.detach().squeeze(-1).to(torch::kFloat32));
+
+        // This one matters a lot even on breakout
+        pufferl.values.index_copy_(0, idx, pufferl.graph_train_newvalue.detach().squeeze(-1).to(torch::kFloat32));
+
 
         //torch::Tensor loss = torch::zeros({1}, logits.options());
         // Gradient accumulation and step
