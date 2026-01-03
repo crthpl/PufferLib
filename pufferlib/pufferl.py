@@ -157,6 +157,7 @@ class PuffeRL:
         config['input_size'] = 118
         config['num_atns'] = 3
         config['hidden_size'] = 128
+        config['expansion_factor'] = 1
         config['num_layers'] = self.num_layers
         config['minibatch_segments'] = self.minibatch_segments
         config['segments'] = segments

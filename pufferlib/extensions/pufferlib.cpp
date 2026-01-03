@@ -409,7 +409,7 @@ private:
     int64_t dim;
     torch::nn::Linear to_hidden_and_gate{nullptr};
     //torch::Tensor to_hidden_and_gate_bf16{nullptr};
-    //torch::nn::Linear to_out{nullptr};
+    torch::nn::Linear to_out{nullptr};
     //torch::Tensor rmsnorm_weight{nullptr};
     //RMSNorm rmsnorm{nullptr};
     std::shared_ptr<RMSNorm> norm{nullptr};
@@ -423,7 +423,7 @@ public:
 
         int dim_inner = int(dim * expansion_factor);
         to_hidden_and_gate = register_module("to_hidden_and_gate",
-                torch::nn::Linear(torch::nn::LinearOptions(dim, 2*dim_inner).bias(false)));
+                torch::nn::Linear(torch::nn::LinearOptions(dim, 3*dim_inner).bias(false)));
         torch::nn::init::orthogonal_(to_hidden_and_gate->weight);
 
         //to_hidden_and_gate_bf16 = register_parameter("to_hidden_and_gate_bf16", torch::zeros({dim, 2*dim_inner}, torch::dtype(torch::kBFloat16).device(torch::kCUDA)));
@@ -434,6 +434,7 @@ public:
         //to_out = register_module("to_out",
         //        torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
         //torch::nn::init::orthogonal_(to_out->weight);
+
         norm = register_module("norm", std::make_shared<RMSNorm>(dim));
         //dyt = register_module("dyt", std::make_shared<DyT>(dim));
 
@@ -448,9 +449,10 @@ public:
         auto seq_len = x.size(1);
         auto output = to_hidden_and_gate->forward(x);
         //auto output = torch::matmul(x.to(torch::kBFloat16), to_hidden_and_gate_bf16.to(torch::kBFloat16)).to(torch::kFloat32);
-        auto chunks = output.chunk(2, 2);
+        auto chunks = output.chunk(3, 2);
         auto hidden = chunks[0];
         auto gate = chunks[1];
+        auto proj = chunks[2];
 
         torch::Tensor out;
         torch::Tensor next_prev_hidden;
@@ -497,15 +499,16 @@ public:
             next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
         }
 
-        /*
-        if (expansion_factor != 1) {
-            out = to_out->forward(out);
-        }
-        */
+        //if (expansion_factor != 1) {
+        //    out = to_out->forward(out);
+        //}
+
+        proj = torch::sigmoid(proj);
+        out = proj * out;
 
         // TODO: This norm is slow, but results are inconsistent without it
-        out = out + x;
-        out = norm->forward(out);
+        //out = out + x;
+        //out = norm->forward(out);
         
         //out = torch::tanh(0.25*out);
         //out = dyt->forward(out);
@@ -580,9 +583,9 @@ public:
     int64_t num_layers;
     float expansion_factor;
 
-    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t num_layers = 1, bool kernels = true)
-        : input_size(input_size), hidden_size(hidden_size), num_atns(num_atns), num_layers(num_layers), kernels(kernels) {
-        expansion_factor = 1.;
+    PolicyMinGRU(int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t expansion_factor = 1, int64_t num_layers = 1, bool kernels = true)
+        : input_size(input_size), hidden_size(hidden_size), expansion_factor(expansion_factor),
+          num_atns(num_atns), num_layers(num_layers), kernels(kernels) {
         encoder = register_module("encoder", std::make_shared<DefaultEncoder>(input_size, hidden_size));
         decoder = register_module("decoder", std::make_shared<DefaultDecoder>(hidden_size, num_atns));
         /*
@@ -606,14 +609,14 @@ public:
         //mingru = register_module("mingru", std::make_shared<MinGRULayer>(hidden_size, 1));
         mingru = torch::nn::ModuleList();
         for (int64_t i = 0; i < num_layers; ++i) {
-            mingru->push_back(MinGRULayer(hidden_size, 1, kernels));
+            mingru->push_back(MinGRULayer(hidden_size, expansion_factor, kernels));
         }
         register_module("mingru", mingru);
     }
 
     torch::Tensor initial_state(int64_t batch_size, torch::Device device) {
         return torch::zeros(
-            {num_layers, batch_size, hidden_size},
+            {num_layers, batch_size, hidden_size*expansion_factor},
             torch::dtype(torch::kFloat32).device(device)
         );
     }
@@ -676,7 +679,7 @@ public:
         int64_t TT = (x.dim() == 3) ? x_shape[1] : 1;
 
         TORCH_CHECK(state.dim() == 4 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == 1 && state.size(3) == hidden_size*expansion_factor,
-            "state must be [num_layers, B, 1, hidden_size]");
+            "state must be [num_layers, B, 1, hidden_size*expansion_factor]");
 
         // Flatten time steps if needed
         if (x.dim() == 3) {
@@ -928,6 +931,7 @@ typedef struct {
     int input_size;
     int num_atns;
     int hidden_size;
+    int expansion_factor;
     int num_layers;
     int minibatch_segments;
     double lr;
@@ -990,7 +994,7 @@ void forward_call(PuffeRL* pufferl) {
  
     auto [logits, value, state_out] = policy->forward(obs, state);
 
-    pufferl->debug.copy_(state_out[-1]);
+    //pufferl->debug.copy_(state_out[-1]);
 
     logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
     auto logprobs = torch::log_softmax(logits, 1);
@@ -1228,6 +1232,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     pufferl->input_size = kwargs["input_size"].cast<int>();
     pufferl->num_atns = kwargs["num_atns"].cast<int>();
     pufferl->hidden_size = kwargs["hidden_size"].cast<int>();
+    pufferl->expansion_factor = kwargs["expansion_factor"].cast<int>();
     pufferl->num_layers = kwargs["num_layers"].cast<int>();
     pufferl->minibatch_segments = kwargs["minibatch_segments"].cast<int>();
     pufferl->lr = kwargs["lr"].cast<double>();
@@ -1279,9 +1284,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     int input_size = pufferl->input_size;
     int num_atns = pufferl->num_atns;
     int hidden_size = pufferl->hidden_size;
+    int expansion_factor = pufferl->expansion_factor;
     int num_layers = pufferl->num_layers;
     bool kernels = pufferl->kernels;
-    PolicyMinGRU* policy = new PolicyMinGRU(input_size, num_atns, hidden_size, num_layers, kernels);
+    PolicyMinGRU* policy = new PolicyMinGRU(input_size, num_atns, hidden_size, expansion_factor, num_layers, kernels);
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
     pufferl->policy = policy;
@@ -1318,7 +1324,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     int minibatch_segments = pufferl->minibatch_segments;
     pufferl->graph_train_mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
     pufferl->graph_train_mb_state = torch::zeros(
-        {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
+        {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
         torch::dtype(DTYPE).device(torch::kCUDA)
     );
 
@@ -1632,7 +1638,7 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         }
 
         torch::Tensor mb_state = torch::zeros(
-            {policy->num_layers, minibatch_segments, 1, policy->hidden_size},
+            {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
             torch::dtype(DTYPE).device(values.device())
         );
 
