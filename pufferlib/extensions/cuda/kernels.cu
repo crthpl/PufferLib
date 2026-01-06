@@ -1,17 +1,15 @@
-/* MAJOR UNDOCUMENTED ISSUE: Kernels must launch on the current torch stream to be traced
- * by cudagraphs. Ideally this should not have to be handled around launch, since otherwise
- * these kernels and launch fns do not depend on torch.
+/* Kernels must launch on the current torch stream to be traced by cudagraphs.
+ * Launch functions take cudaStream_t as parameter - callers (modules.cu) should
+ * pass at::cuda::getCurrentCUDAStream() when using with torch.
  */
 
-#include <torch/extension.h>
-#include <torch/torch.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include "ops.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#include <iostream>
+#include <cstdio>
+#include <cstdint>
 
 #define SEQ_SIZE 32
 #define BLOCK_SIZE 256
@@ -168,13 +166,13 @@ void launch_rmsnorm_forward(
     double eps,
     int T_total,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     int total = B * T_total;
     int grid = grid_size(total);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    rmsnorm_forward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    rmsnorm_forward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         out,
         inv_norm_buf,
         x,
@@ -202,15 +200,15 @@ void launch_rmsnorm_backward(
     double eps,
     int T_total,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     // The backward is fully parallel
     // since the inv norm is cached
     int total = B * T_total * H;
     int grid = grid_size(total);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    rmsnorm_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    rmsnorm_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         grad_x,
         grad_weight,
         grad_out,
@@ -256,11 +254,11 @@ void launch_mingru_gate_inference(
     const T* gate_in,
     const T* hidden_in,
     const T* state_in,
-    int N
+    int N,
+    cudaStream_t stream
 ) {
     int grid = grid_size(N);
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    mingru_gate_inference_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    mingru_gate_inference_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         out,
         gate_in,
         hidden_in,
@@ -343,11 +341,11 @@ void launch_log_coeffs_and_values(
     T* log_values,
     const T* gate,
     const T* hidden,
-    int N
+    int N,
+    cudaStream_t stream
 ) {
     int grid = grid_size(N);
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    log_coeffs_and_values_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    log_coeffs_and_values_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         log_coeffs,
         log_values,
         gate,
@@ -355,7 +353,6 @@ void launch_log_coeffs_and_values(
         N
     );
 
-    // Optional: Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
@@ -370,11 +367,11 @@ void launch_log_coeffs_and_values_backward(
     const T* grad_log_values,
     const T* gate,
     const T* hidden,
-    int N
+    int N,
+    cudaStream_t stream
 ) {
     int grid = grid_size(N);
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    log_coeffs_and_values_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    log_coeffs_and_values_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         grad_gate,
         grad_hidden,
         grad_log_coeffs,
@@ -384,7 +381,6 @@ void launch_log_coeffs_and_values_backward(
         N
     );
 
-    // Optional: Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
@@ -778,13 +774,13 @@ void launch_fused_scan_forward(
     const T* log_values,
     int T_seq,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     int total = B * H;
     int grid = seq_size(total);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    fused_scan_forward_kernel<T><<<grid, SEQ_SIZE, 0, current_stream>>>(
+    fused_scan_forward_kernel<T><<<grid, SEQ_SIZE, 0, stream>>>(
         out,
         a_star,
         s_vals,
@@ -794,7 +790,7 @@ void launch_fused_scan_forward(
         H,
         B
     );
- 
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA kernel launch error in forward: %s\n", cudaGetErrorString(err));
@@ -813,13 +809,13 @@ void launch_fused_scan_backward(
     const float* s_buf,
     int T_seq,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     int total = B * H;
     int grid = seq_size(total);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    fused_scan_backward_kernel<T><<<grid, SEQ_SIZE, 0, current_stream>>>(
+    fused_scan_backward_kernel<T><<<grid, SEQ_SIZE, 0, stream>>>(
         grad_log_coeffs,
         grad_log_values,
         grad_out,
@@ -974,12 +970,13 @@ void launch_logcumsumexp_forward(
     const T* x,
     int T_total,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     int total = B * H;
     int grid = grid_size(total);
 
-    logcumsumexp_forward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    logcumsumexp_forward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         out, s_buf, x, T_total, H, B
     );
 
@@ -996,12 +993,13 @@ void launch_logcumsumexp_backward(
     const double* s_buf,
     int T_total,
     int H,
-    int B
+    int B,
+    cudaStream_t stream
 ) {
     int total = B * H;
     int grid = grid_size(total);
 
-    logcumsumexp_backward_kernel<T><<<grid, BLOCK_SIZE>>>(
+    logcumsumexp_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         grad_x, grad_out, x, s_buf, T_total, H, B
     );
 
@@ -1297,13 +1295,13 @@ inline void launch_ppo_loss_forward(
     double ent_coef,
     int T_seq,
     int A,
-    int N
+    int N,
+    cudaStream_t stream
 ) {
     int total_elements = N * T_seq;
     int grid = grid_size(total_elements);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    ppo_loss_forward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    ppo_loss_forward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         loss_output,
         saved_for_backward,
         logits,
@@ -1352,13 +1350,13 @@ void launch_ppo_loss_backward(
     double ent_coef,
     int T_seq,
     int A,
-    int N
+    int N,
+    cudaStream_t stream
 ) {
     int total_elements = N * T_seq;
     int grid = grid_size(total_elements);
 
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    ppo_loss_backward_kernel<T><<<grid, BLOCK_SIZE, 0, current_stream>>>(
+    ppo_loss_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         grad_logits,
         grad_values_pred,
         grad_loss,

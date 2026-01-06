@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
 #include "kernels.cu"
@@ -29,6 +30,7 @@ torch::Tensor mingru_gate(
     const int N = state.numel();
 
     auto out = torch::empty(sizes, state.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (dtype == torch::kFloat32) {
         launch_mingru_gate_inference<float>(
@@ -36,7 +38,8 @@ torch::Tensor mingru_gate(
             gate.data_ptr<float>(),
             hidden.data_ptr<float>(),
             state.data_ptr<float>(),
-            N
+            N,
+            stream
         );
     } else if (dtype == torch::kBFloat16) {
         launch_mingru_gate_inference<at::BFloat16>(
@@ -44,7 +47,8 @@ torch::Tensor mingru_gate(
             gate.data_ptr<at::BFloat16>(),
             hidden.data_ptr<at::BFloat16>(),
             state.data_ptr<at::BFloat16>(),
-            N
+            N,
+            stream
         );
     } else {
         TORCH_CHECK(false,
@@ -66,6 +70,7 @@ public:
         auto log_values = torch::empty_like(gate, gate.options().dtype(dtype));
 
         const int N = gate.numel();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_log_coeffs_and_values<float>(
@@ -73,7 +78,8 @@ public:
                 log_values.data_ptr<float>(),
                 gate.data_ptr<float>(),
                 hidden.data_ptr<float>(),
-                N
+                N,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_log_coeffs_and_values<at::BFloat16>(
@@ -81,7 +87,8 @@ public:
                 log_values.data_ptr<at::BFloat16>(),
                 gate.data_ptr<at::BFloat16>(),
                 hidden.data_ptr<at::BFloat16>(),
-                N
+                N,
+                stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype. Supported dtypes are float32 and bfloat16");
@@ -106,6 +113,7 @@ public:
 
         const int N = gate.numel();
         auto dtype = gate.dtype();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_log_coeffs_and_values_backward<float>(
@@ -115,7 +123,8 @@ public:
                 grad_log_values.data_ptr<float>(),
                 gate.data_ptr<float>(),
                 hidden.data_ptr<float>(),
-                N
+                N,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_log_coeffs_and_values_backward<at::BFloat16>(
@@ -125,7 +134,8 @@ public:
                 grad_log_values.data_ptr<at::BFloat16>(),
                 gate.data_ptr<at::BFloat16>(),
                 hidden.data_ptr<at::BFloat16>(),
-                N
+                N,
+                stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype in backward");
@@ -324,6 +334,7 @@ public:
         //auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
         auto a_star = torch::empty({B, T, H}, options_float);
         auto s_vals = torch::empty({B, T, H}, options_float);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // Launch kernel
         if (dtype == torch::kFloat32) {
@@ -335,7 +346,8 @@ public:
                 log_values.data_ptr<float>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
-                static_cast<int>(B)
+                static_cast<int>(B),
+                stream
             );
 
         } else if (dtype == torch::kBFloat16) {
@@ -347,7 +359,8 @@ public:
                 log_values.data_ptr<at::BFloat16>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
-                static_cast<int>(B)
+                static_cast<int>(B),
+                stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
@@ -379,6 +392,7 @@ public:
 
         auto grad_log_coeffs = torch::empty_like(log_coeffs);
         auto grad_log_values = torch::empty_like(log_values);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_fused_scan_backward<float>(
@@ -392,7 +406,8 @@ public:
                 s_vals.data_ptr<float>(),
                 static_cast<int>(T), // Probably not needed
                 static_cast<int>(H),
-                static_cast<int>(B)
+                static_cast<int>(B),
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_fused_scan_backward<at::BFloat16>(
@@ -404,7 +419,8 @@ public:
                 out.data_ptr<at::BFloat16>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                T, H, B
+                T, H, B,
+                stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype");
@@ -437,20 +453,23 @@ public:
         //auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
         auto s_buf = torch::empty({B, T, H}, options_double);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_logcumsumexp_forward<float>(
                 out.data_ptr<float>(),
                 s_buf.data_ptr<double>(),
                 x.data_ptr<float>(),
-                (int)T, (int)H, (int)B
+                (int)T, (int)H, (int)B,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_logcumsumexp_forward<at::BFloat16>(
                 out.data_ptr<at::BFloat16>(),
                 s_buf.data_ptr<double>(),
                 x.data_ptr<at::BFloat16>(),
-                (int)T, (int)H, (int)B
+                (int)T, (int)H, (int)B,
+                stream
             );
         } else {
             TORCH_CHECK(false, "Only float32 and bfloat16 supported");
@@ -472,6 +491,7 @@ public:
         auto B = x.size(0), T = x.size(1), H = x.size(2);
 
         auto grad_x = torch::empty_like(x);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_logcumsumexp_backward<float>(
@@ -479,7 +499,8 @@ public:
                 grad_out.data_ptr<float>(),
                 x.data_ptr<float>(),
                 s_buf.data_ptr<double>(),
-                (int)T, (int)H, (int)B
+                (int)T, (int)H, (int)B,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_logcumsumexp_backward<at::BFloat16>(
@@ -487,7 +508,8 @@ public:
                 grad_out.data_ptr<at::BFloat16>(),
                 x.data_ptr<at::BFloat16>(),
                 s_buf.data_ptr<double>(),
-                (int)T, (int)H, (int)B
+                (int)T, (int)H, (int)B,
+                stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype in backward");
@@ -564,6 +586,7 @@ public:
 
         // Saved for backward: (N, T, 5) → but use (N*T, 5) for flat indexing
         auto saved_for_backward = torch::empty({N * T, 5}, options_double);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_forward<float>(
@@ -583,7 +606,8 @@ public:
                 vf_clip_coef,
                 vf_coef,
                 ent_coef,
-                T, A, N
+                T, A, N,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_ppo_loss_forward<at::BFloat16>(
@@ -603,7 +627,8 @@ public:
                 vf_clip_coef,
                 vf_coef,
                 ent_coef,
-                T, A, N
+                T, A, N,
+                stream
             );
         }
 
@@ -670,6 +695,7 @@ public:
 
         auto grad_logits = torch::empty_like(logits);
         auto grad_values_pred = torch::empty_like(values_pred);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // TODO: Why are we passing grad loss in float?
         if (dtype == torch::kFloat32) {
@@ -689,7 +715,8 @@ public:
                 adv_std.data_ptr<float>(),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
-                T, A, N
+                T, A, N,
+                stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_ppo_loss_backward<at::BFloat16>(
@@ -708,7 +735,8 @@ public:
                 adv_std.data_ptr<float>(),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
-                T, A, N
+                T, A, N,
+                stream
             );
         }
 
