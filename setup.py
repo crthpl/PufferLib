@@ -94,12 +94,12 @@ if DEBUG:
     extra_compile_args += [
         '-O0',
         '-g',
-        '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
-        '-fno-omit-frame-pointer',
+        #'-fsanitize=address,undefined,bounds,pointer-overflow,leak',
+        #'-fno-omit-frame-pointer',
     ]
     extra_link_args += [
         '-g',
-        '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
+        #'-fsanitize=address,undefined,bounds,pointer-overflow,leak',
     ]
     cxx_args += [
         '-O0',
@@ -241,6 +241,10 @@ if not NO_OCEAN:
 
 
 # Check if CUDA compiler is available. You need cuda dev, not just runtime.
+import torch
+cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH') or torch.utils.cpp_extension.CUDA_HOME or '/usr/local/cuda'
+nvtx_lib_dir = os.path.join(cuda_home, 'lib64')  # Common on Linux; fall back to 'lib' if needed
+nvtx_lib = 'nvToolsExt'
 torch_extensions = []
 if not NO_TRAIN:
     torch_sources = [
@@ -268,6 +272,8 @@ if not NO_TRAIN:
             },
             extra_link_args=extra_link_args,
             extra_objects=[RAYLIB_A],
+            libraries=[nvtx_lib],
+            library_dirs=[nvtx_lib_dir],
         ),
     ]
 
