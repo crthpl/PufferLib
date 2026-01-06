@@ -13,6 +13,7 @@
 #ifdef USE_TORCH
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAGraph.h>
 #include "pufferlib/extensions/cuda/modules.cu"
 #else
 #include "pufferlib/extensions/cuda/kernels.cu"
@@ -56,6 +57,50 @@ float profile_kernel(kernel_fn fn, void* args) {
 
     return ms / TIMING_ITERS;
 }
+
+#ifdef USE_TORCH
+float profile_graph(kernel_fn fn, void* args) {
+    cudaDeviceSynchronize();
+
+    at::cuda::CUDAGraph cuda_graph;
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+
+    at::cuda::CUDAStream warmup_stream = at::cuda::getStreamFromPool();
+    at::cuda::setCurrentCUDAStream(warmup_stream);
+    for (int i = 0; i < WARMUP_ITERS; ++i) {
+        fn(args);
+    }
+    warmup_stream.synchronize();
+
+    at::cuda::CUDAStream cap_stream = at::cuda::getStreamFromPool();
+    at::cuda::setCurrentCUDAStream(cap_stream);
+    cuda_graph.capture_begin();
+    fn(args);
+    cuda_graph.capture_end();
+    cap_stream.synchronize();
+
+    cudaDeviceSynchronize();
+    at::cuda::setCurrentCUDAStream(current_stream);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i = 0; i < TIMING_ITERS; ++i) {
+        cuda_graph.replay();
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return ms / TIMING_ITERS;
+}
+#endif
 
 float rand1() {
     return (float)rand() / RAND_MAX * 2.0f - 1.0f;
@@ -159,6 +204,9 @@ void profile_mingrugate(int batch, int seq, int hidden) {
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_mingrugate_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
 
+    float fwd_graph_ms = profile_graph((kernel_fn)run_mingrugate_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch*seq);
+
     delete args_torch;
 #endif
     printf("\n");
@@ -245,10 +293,8 @@ typedef struct {
     torch::Tensor hidden;
     torch::Tensor grad_log_coeffs;
     torch::Tensor grad_log_values;
-    torch::Tensor kernel_log_coeffs;
-    torch::Tensor kernel_log_values;
-    torch::Tensor cpp_log_coeffs;
-    torch::Tensor cpp_log_values;
+    torch::Tensor out_log_coeffs;
+    torch::Tensor out_log_values;
     int N;
 } LogCoeffsAndValuesArgsTorch;
 
@@ -262,14 +308,6 @@ LogCoeffsAndValuesArgsTorch* create_logcoeffsandvaluesargs_torch(LogCoeffsAndVal
     args->grad_log_coeffs = torch::from_blob(raw->grad_log_coeffs, {raw->N}, opts);
     args->grad_log_values = torch::from_blob(raw->grad_log_values, {raw->N}, opts);
 
-    auto kernel_outputs = log_coeffs_and_values(args->gate, args->hidden);
-    args->kernel_log_coeffs = kernel_outputs[0];
-    args->kernel_log_values = kernel_outputs[1];
-
-    auto cpp_outputs = log_coeffs_and_values_cpp(args->gate, args->hidden);
-    args->cpp_log_coeffs = cpp_outputs[0];
-    args->cpp_log_values = cpp_outputs[1];
-
     return args;
 }
 
@@ -282,7 +320,7 @@ void run_logcoeffsandvalues_backward_torch(LogCoeffsAndValuesArgsTorch* args) {
     args->gate.mutable_grad() = torch::Tensor();
     args->hidden.mutable_grad() = torch::Tensor();
     torch::autograd::backward(
-        {args->kernel_log_coeffs, args->kernel_log_values},
+        {args->out_log_coeffs, args->out_log_values},
         {args->grad_log_coeffs, args->grad_log_values},
         /*retain_graph=*/true);
 }
@@ -290,15 +328,6 @@ void run_logcoeffsandvalues_backward_torch(LogCoeffsAndValuesArgsTorch* args) {
 void run_logcoeffsandvalues_forward_cpp(LogCoeffsAndValuesArgsTorch* args) {
     torch::NoGradGuard no_grad;
     log_coeffs_and_values_cpp(args->gate, args->hidden);
-}
-
-void run_logcoeffsandvalues_backward_cpp(LogCoeffsAndValuesArgsTorch* args) {
-    args->gate.mutable_grad() = torch::Tensor();
-    args->hidden.mutable_grad() = torch::Tensor();
-    torch::autograd::backward(
-        {args->cpp_log_coeffs, args->cpp_log_values},
-        {args->grad_log_coeffs, args->grad_log_values},
-        /*retain_graph=*/true);
 }
 
 #endif
@@ -320,14 +349,25 @@ void profile_logcoeffsandvalues(int batch, int seq, int hidden) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_logcoeffsandvalues_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
 
+    auto kernel_outputs = log_coeffs_and_values(args_torch->gate, args_torch->hidden);
+    args_torch->out_log_coeffs = kernel_outputs[0];
+    args_torch->out_log_values = kernel_outputs[1];
+
     float bwd_torch_ms = profile_kernel((kernel_fn)run_logcoeffsandvalues_backward_torch, args_torch);
     print_timing("\tbackward (torch)", bwd_torch_ms, batch*seq);
 
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_logcoeffsandvalues_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
 
-    float bwd_cpp_ms = profile_kernel((kernel_fn)run_logcoeffsandvalues_backward_cpp, args_torch);
+    auto cpp_outputs = log_coeffs_and_values_cpp(args_torch->gate, args_torch->hidden);
+    args_torch->out_log_coeffs = cpp_outputs[0];
+    args_torch->out_log_values = cpp_outputs[1];
+
+    float bwd_cpp_ms = profile_kernel((kernel_fn)run_logcoeffsandvalues_backward_torch, args_torch);
     print_timing("\tbackward (cpp)", bwd_cpp_ms, batch*seq);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_logcoeffsandvalues_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch*seq);
 
     delete args_torch;
 #endif
@@ -400,7 +440,6 @@ void run_logcumsumexp_backward(LogcumsumexpArgs* args) {
 typedef struct {
     torch::Tensor x;
     torch::Tensor out;
-    torch::Tensor cpp_out;
     torch::Tensor grad_out;
     int N;
 } LogcumsumexpArgsTorch;
@@ -412,9 +451,6 @@ LogcumsumexpArgsTorch* create_logcumsumexpargs_torch(LogcumsumexpArgs* raw) {
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     args->x = torch::from_blob(raw->x, {raw->B, raw->T, raw->H}, opts).requires_grad_(true);
     args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts);
-
-    args->out = logcumsumexp_cuda(args->x);
-    args->cpp_out = logcumsumexp_cpp(args->x);
 
     return args;
 }
@@ -432,11 +468,6 @@ void run_logcumsumexp_backward_torch(LogcumsumexpArgsTorch* args) {
 void run_logcumsumexp_forward_cpp(LogcumsumexpArgsTorch* args) {
     torch::NoGradGuard no_grad;
     logcumsumexp_cpp(args->x);
-}
-
-void run_logcumsumexp_backward_cpp(LogcumsumexpArgsTorch* args) {
-    args->x.mutable_grad() = torch::Tensor();
-    args->cpp_out.backward(args->grad_out, /*retain_graph=*/true);
 }
 
 #endif
@@ -458,14 +489,21 @@ void profile_logcumsumexp(int batch, int seq, int hidden) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_logcumsumexp_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
 
+    args_torch->out = logcumsumexp_cuda(args_torch->x);
+
     float bwd_torch_ms = profile_kernel((kernel_fn)run_logcumsumexp_backward_torch, args_torch);
     print_timing("\tbackward (torch)", bwd_torch_ms, batch*seq);
 
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_logcumsumexp_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
 
-    float bwd_cpp_ms = profile_kernel((kernel_fn)run_logcumsumexp_backward_cpp, args_torch);
+    args_torch->out = logcumsumexp_cpp(args_torch->x);
+
+    float bwd_cpp_ms = profile_kernel((kernel_fn)run_logcumsumexp_backward_torch, args_torch);
     print_timing("\tbackward (cpp)", bwd_cpp_ms, batch*seq);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_logcumsumexp_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch*seq);
 
     delete args_torch;
 #endif
@@ -556,7 +594,6 @@ typedef struct {
     torch::Tensor log_coeffs;
     torch::Tensor log_values;
     torch::Tensor out;
-    torch::Tensor cpp_out;
     torch::Tensor grad_out;
     int N;
 } FusedScanArgsTorch;
@@ -569,10 +606,6 @@ FusedScanArgsTorch* create_fusedscanargs_torch(FusedScanArgs* raw) {
     args->log_coeffs = torch::from_blob(raw->log_coeffs, {raw->B, raw->T, raw->H}, opts).requires_grad_(true);
     args->log_values = torch::from_blob(raw->log_values, {raw->B, raw->T, raw->H}, opts).requires_grad_(true);
     args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts);
-
-    auto outputs = fused_scan(args->log_coeffs, args->log_values);
-    args->out = outputs[0];
-    args->cpp_out = fused_scan_cpp(args->log_coeffs, args->log_values);
 
     return args;
 }
@@ -591,12 +624,6 @@ void run_fusedscan_backward_torch(FusedScanArgsTorch* args) {
 void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
     torch::NoGradGuard no_grad;
     fused_scan_cpp(args->log_coeffs, args->log_values);
-}
-
-void run_fusedscan_backward_cpp(FusedScanArgsTorch* args) {
-    args->log_coeffs.mutable_grad() = torch::Tensor();
-    args->log_values.mutable_grad() = torch::Tensor();
-    args->cpp_out.backward(args->grad_out, /*retain_graph=*/true);
 }
 
 #endif
@@ -618,14 +645,21 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
 
+    args_torch->out = fused_scan(args_torch->log_coeffs, args_torch->log_values)[0];
+
     float bwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_backward_torch, args_torch);
     print_timing("\tbackward (torch)", bwd_torch_ms, batch*seq);
 
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_fusedscan_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
 
-    float bwd_cpp_ms = profile_kernel((kernel_fn)run_fusedscan_backward_cpp, args_torch);
+    args_torch->out = fused_scan_cpp(args_torch->log_coeffs, args_torch->log_values);
+
+    float bwd_cpp_ms = profile_kernel((kernel_fn)run_fusedscan_backward_torch, args_torch);
     print_timing("\tbackward (cpp)", bwd_cpp_ms, batch*seq);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_fusedscan_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch*seq);
 
     delete args_torch;
 #endif
@@ -795,7 +829,6 @@ typedef struct {
     torch::Tensor adv_mean;
     torch::Tensor adv_std;
     torch::Tensor loss;
-    torch::Tensor cpp_loss;
     float clip_coef;
     float vf_clip_coef;
     float vf_coef;
@@ -829,19 +862,6 @@ PPOLossArgsTorch* create_ppolossargs_torch(PPOLossArgs* raw) {
     args->adv_mean = torch::from_blob(raw->adv_mean, {1}, opts);
     args->adv_std = torch::from_blob(raw->adv_std, {1}, opts);
 
-    auto outputs = fused_ppo_loss(
-        args->logits, args->values_pred, args->actions,
-        args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
-    args->loss = outputs[0];
-
-    args->cpp_loss = fused_ppo_loss_cpp(
-        args->logits, args->values_pred, args->actions,
-        args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
-
     return args;
 }
 
@@ -869,12 +889,6 @@ void run_ppoloss_forward_cpp(PPOLossArgsTorch* args) {
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
 }
 
-void run_ppoloss_backward_cpp(PPOLossArgsTorch* args) {
-    args->logits.mutable_grad() = torch::Tensor();
-    args->values_pred.mutable_grad() = torch::Tensor();
-    args->cpp_loss.backward({}, /*retain_graph=*/true);
-}
-
 #endif
 
 void profile_ppoloss(int batch, int seq, int actions) {
@@ -895,14 +909,29 @@ void profile_ppoloss(int batch, int seq, int actions) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, NT);
 
+    args_torch->loss = fused_ppo_loss(
+        args_torch->logits, args_torch->values_pred, args_torch->actions,
+        args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef)[0];
+
     float bwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_backward_torch, args_torch);
     print_timing("\tbackward (torch)", bwd_torch_ms, NT);
 
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_ppoloss_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, NT);
 
-    float bwd_cpp_ms = profile_kernel((kernel_fn)run_ppoloss_backward_cpp, args_torch);
+    args_torch->loss = fused_ppo_loss_cpp(
+        args_torch->logits, args_torch->values_pred, args_torch->actions,
+        args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef);
+
+    float bwd_cpp_ms = profile_kernel((kernel_fn)run_ppoloss_backward_torch, args_torch);
     print_timing("\tbackward (cpp)", bwd_cpp_ms, NT);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_ppoloss_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, NT);
 
     delete args_torch;
 #endif
