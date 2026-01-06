@@ -780,3 +780,75 @@ torch::autograd::tensor_list fused_ppo_loss(
         old_logprobs, advantages, prio, values, returns, adv_mean,
         adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
+
+torch::Tensor mingru_gate_cpp(torch::Tensor state, torch::Tensor gate, torch::Tensor hidden) {
+    auto h = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+    auto g = gate.sigmoid();
+    return torch::lerp(state, h, g);
+}
+
+torch::autograd::tensor_list log_coeffs_and_values_cpp(torch::Tensor gate, torch::Tensor hidden) {
+    auto log_coeffs = -torch::nn::functional::softplus(gate);
+    auto log_z = -torch::nn::functional::softplus(-gate);
+    auto log_tilde_h = torch::where(hidden >= 0,
+        (torch::nn::functional::relu(hidden) + 0.5).log(),
+        -torch::nn::functional::softplus(-hidden));
+    auto log_values = log_z + log_tilde_h;
+    return {log_coeffs, log_values};
+}
+
+torch::Tensor logcumsumexp_cpp(torch::Tensor x) {
+    return x.exp().cumsum(1).log();
+}
+
+torch::Tensor fused_scan_cpp(torch::Tensor log_coeffs, torch::Tensor log_values) {
+    auto a_star = log_coeffs.cumsum(1);
+    auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
+    auto log_h = a_star + log_h0_plus_b_star;
+    return log_h.exp();
+}
+
+torch::Tensor fused_ppo_loss_cpp(
+    torch::Tensor logits,
+    torch::Tensor newvalue,
+    torch::Tensor actions,
+    torch::Tensor old_logprobs,
+    torch::Tensor advantages,
+    torch::Tensor prio,
+    torch::Tensor values,
+    torch::Tensor returns,
+    torch::Tensor adv_mean,
+    torch::Tensor adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef
+) {
+    auto segments = logits.size(0);
+    auto horizon = logits.size(1);
+
+    auto flat_logits = logits.reshape({-1, logits.size(-1)});
+    auto flat_actions = actions.reshape({-1});
+    auto logprobs_new = torch::log_softmax(flat_logits, 1);
+
+    auto probs_new = logprobs_new.exp();
+    auto entropy = -(probs_new * logprobs_new).sum(1).mean();
+
+    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+    auto newlogprob = newlogprob_flat.reshape({segments, horizon});
+    auto logratio = newlogprob - old_logprobs;
+    auto ratio_new = logratio.exp();
+
+    auto adv_normalized = prio.unsqueeze(1) * (advantages - adv_mean) / (adv_std + 1e-8);
+    auto pg_loss1 = -adv_normalized * ratio_new;
+    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+
+    auto nv = newvalue.view(returns.sizes());
+    auto v_clipped = values + torch::clamp(nv - values, -vf_clip_coef, vf_clip_coef);
+    auto v_loss_unclipped = (nv - returns).pow(2);
+    auto v_loss_clipped = (v_clipped - returns).pow(2);
+    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+
+    return pg_loss + vf_coef * v_loss - ent_coef * entropy;
+}

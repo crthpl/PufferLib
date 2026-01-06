@@ -239,6 +239,81 @@ TORCH_MODULE(RMSNorm);
 
 auto DTYPE = torch::kFloat32;
 
+// Torch cpp reference implementations for kernel benchmarking
+torch::Tensor mingru_gate_torch(torch::Tensor state, torch::Tensor gate, torch::Tensor hidden) {
+    hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
+    gate = gate.sigmoid();
+    return torch::lerp(state, hidden, gate);
+}
+
+torch::autograd::tensor_list log_coeffs_and_values_torch(torch::Tensor gate, torch::Tensor hidden) {
+    auto log_coeffs = -torch::nn::functional::softplus(gate);
+    auto log_z = -torch::nn::functional::softplus(-gate);
+    auto log_tilde_h = torch::where(hidden >= 0,
+        (torch::nn::functional::relu(hidden) + 0.5).log(),
+        -torch::nn::functional::softplus(-hidden));
+    auto log_values = log_z + log_tilde_h;
+    return {log_coeffs, log_values};
+}
+
+torch::Tensor fused_scan_torch(torch::Tensor log_coeffs, torch::Tensor log_values) {
+    auto a_star = log_coeffs.cumsum(1);
+    auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
+    auto log_h = a_star + log_h0_plus_b_star;
+    return log_h.exp();
+}
+
+torch::Tensor fused_ppo_loss_torch(
+    torch::Tensor logits,
+    torch::Tensor newvalue,
+    torch::Tensor mb_actions,
+    torch::Tensor mb_logprobs,
+    torch::Tensor mb_advantages,
+    torch::Tensor mb_prio,
+    torch::Tensor mb_values,
+    torch::Tensor mb_returns,
+    double clip_coef,
+    double vf_clip_coef,
+    double vf_coef,
+    double ent_coef
+) {
+    auto minibatch_segments = logits.size(0);
+    auto horizon = logits.size(1);
+
+    // Flatten for action lookup
+    auto flat_logits = logits.reshape({-1, logits.size(-1)});
+    auto flat_actions = mb_actions.reshape({-1});
+    auto logprobs_new = torch::log_softmax(flat_logits, 1);
+    auto probs_new = logprobs_new.exp();
+
+    // Gather logprobs for taken actions
+    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+    auto newlogprob = newlogprob_flat.reshape({minibatch_segments, horizon});
+    auto entropy = - (probs_new * logprobs_new).sum(1).mean();
+
+    // Compute ratio
+    auto logratio = newlogprob - mb_logprobs;
+    auto ratio_new = logratio.exp();
+
+    // Normalize advantages: (adv - mean) / std, then weight
+    auto adv_normalized = mb_prio * (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8);
+
+    // Policy loss
+    auto pg_loss1 = -adv_normalized * ratio_new;
+    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+
+    // Value loss
+    newvalue = newvalue.view(mb_returns.sizes());
+    auto v_clipped = mb_values + torch::clamp(newvalue - mb_values, -vf_clip_coef, vf_clip_coef);
+    auto v_loss_unclipped = (newvalue - mb_returns).pow(2);
+    auto v_loss_clipped = (v_clipped - mb_returns).pow(2);
+    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+
+    // Total loss
+    return pg_loss + vf_coef * v_loss - ent_coef * entropy;
+}
+
 namespace pufferlib {
 
 void puff_advantage_row(float* values, float* rewards, float* dones,

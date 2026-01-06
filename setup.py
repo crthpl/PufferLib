@@ -219,11 +219,54 @@ if not NO_OCEAN:
             c_ext.include_dirs.append('/usr/local/include')
             c_ext.extra_link_args.extend(['-L/usr/local/lib', '-llammps'])
 
+# Standalone profiler build command
+class ProfilerBuildExt(build_ext):
+    user_options = build_ext.user_options + [
+        ('no-torch', None, 'Build profiler without torch support'),
+    ]
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.no_torch = False
+
+    def finalize_options(self):
+        super().finalize_options()
+
+    def run(self):
+        import subprocess
+        import sysconfig
+        import torch.utils.cpp_extension as cpp_ext
+
+        src = 'profile_kernels.cu'
+        out = 'profile_kernels'
+
+        nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
+        arch = '-arch=sm_80'
+
+        cmd = [nvcc, '-O3', arch, '-I.', src, '-o', out]
+
+        if not self.no_torch:
+            out = 'profile_kernels_torch'
+            lib_paths = cpp_ext.library_paths()
+            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-I.']
+            cmd += ['-I' + sysconfig.get_path('include')]
+            cmd += ['-I' + p for p in cpp_ext.include_paths()]
+            cmd += ['-L' + p for p in lib_paths]
+            cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
+            cmd += ['-Xlinker', '--no-as-needed']
+            cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda']
+            cmd += [src, '-o', out]
+
+        print(f'Building profiler: {" ".join(cmd)}')
+        subprocess.check_call(cmd)
+        print(f'Built: {out}')
+
 # Define cmdclass outside of setup to add dynamic commands
 cmdclass = {
     "build_ext": BuildExt,
     "build_torch": TorchBuildExt,
     "build_c": CBuildExt,
+    "build_profiler": ProfilerBuildExt,
 }
 
 if not NO_OCEAN:
