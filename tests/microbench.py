@@ -10,9 +10,11 @@ try:
 except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
 
-B = 512
+BR = 4096  # Rollout batch (no T dim)
+BT = 512   # Train batch (with T dim)
 T = 64
 H = 128
+A = 4
 TIMEOUT = 1
 
 def check_close(a, b, rtol=1e-3, atol=1e-4):
@@ -95,17 +97,22 @@ def test_kernel(py_func, cpp_func, *args, benchmark=True):
             print(f'\tBackward sps: {py_sps} (naive) {cpp_sps} (C++)')
 
 def time_sps(func, *args, backward=False):
+    assert isinstance(args[0], torch.Tensor)
+    N = args[0].shape[:-1].numel()
+
     if backward:
         outputs = func(*args)
-        loss = test_loss(outputs)
+        if not isinstance(outputs, (tuple, list)):
+            outputs = [outputs]
+        grad_outputs = [torch.randn_like(o) for o in outputs]
 
     # Warm up
     for i in range(3):
         if backward:
             for arg in args:
-                if isinstance(arg, torch.Tensor) and arg.grad is not None:
+                if isinstance(arg, torch.Tensor) and arg.requires_grad:
                     arg.grad = None
-            loss.backward(retain_graph=True)
+            torch.autograd.backward(outputs, grad_outputs, retain_graph=True)
         else:
             with torch.no_grad():
                 func(*args)
@@ -117,15 +124,15 @@ def time_sps(func, *args, backward=False):
         steps += 1
         if backward:
             for arg in args:
-                if isinstance(arg, torch.Tensor) and arg.grad is not None:
+                if isinstance(arg, torch.Tensor) and arg.requires_grad:
                     arg.grad = None
-            loss.backward(retain_graph=True)
+            torch.autograd.backward(outputs, grad_outputs, retain_graph=True)
         else:
             with torch.no_grad():
                 func(*args)
 
     torch.cuda.synchronize()
-    sps = B*T*steps/(time.time() - start)
+    sps = N*steps/(time.time() - start)
     if sps < 1e3:
         return f'{sps:.2f}'
     if sps < 1e6:
@@ -142,9 +149,9 @@ def mingru_gate(state, gate, hidden):
     return out
 
 def test_mingru_gate():
-    state = torch.randn(B, T, H)
-    gate = torch.randn(B, T, H)
-    hidden = torch.randn(B, T, H)
+    state = torch.randn(BR, H)
+    gate = torch.randn(BR, H)
+    hidden = torch.randn(BR, H)
     print('mingru_gate')
     test_kernel(mingru_gate, _C.mingru_gate, state, gate, hidden)
 
@@ -162,8 +169,8 @@ def log_coeffs_and_values_loss(outputs):
     return torch.sum(log_coeffs) + torch.sum(log_values)
 
 def test_log_coeffs_and_values():
-    gate = torch.randn(B, T, H, requires_grad=True)
-    hidden = torch.randn(B, T, H, requires_grad=True)
+    gate = torch.randn(BT, T, H, requires_grad=True)
+    hidden = torch.randn(BT, T, H, requires_grad=True)
     print('log_coeffs_and_values')
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
 
@@ -180,8 +187,8 @@ def fused_scan_loss(outputs):
 def test_fused_scan():
     # Numerically unstable function. Must be called with the distribution
     # that is used in the full network.
-    log_coeffs = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
-    log_values = -torch.nn.functional.softplus(torch.randn(B, T+1, H, requires_grad=True))
+    log_coeffs = -torch.nn.functional.softplus(torch.randn(BT, T, H)).requires_grad_(True)
+    log_values = -torch.nn.functional.softplus(torch.randn(BT, T, H)).requires_grad_(True)
 
     print('fused_scan')
     test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
@@ -193,7 +200,7 @@ def logcumsumexp_loss(outputs):
     return torch.sum(outputs[0])
 
 def test_logcumsumexp():
-    x = torch.randn(B, T, H, requires_grad=True)
+    x = torch.randn(BT, T, H, requires_grad=True)
     print('logcumsumexp')
     test_kernel(logcumsumexp, _C.logcumsumexp_cuda, x)
 
@@ -231,22 +238,24 @@ def fused_ppo_loss(logits, newvalue, actions, old_logprobs,
     return loss
 
 def test_fused_ppo_loss():
-    A = 4
-    logits = torch.randn(B, T, A, requires_grad=True)
-    values_pred = torch.randn(B, T, requires_grad=True).contiguous()
-    actions = torch.randint(0, A, (B, T))
-    old_logprobs = torch.randn(B, T)
-    advantages = torch.randn(B, T)
-    prio = torch.rand(B)
-    values = torch.randn(B, T)
-    returns = torch.randn(B, T)
+    logits = torch.randn(BT, T, A, requires_grad=True)
+    values_pred = torch.randn(BT, T, requires_grad=True).contiguous()
+    actions = torch.randint(0, A, (BT, T))
+    old_logprobs = torch.randn(BT, T)
+    advantages = torch.randn(BT, T)
+    prio = torch.rand(BT)
+    values = torch.randn(BT, T)
+    returns = torch.randn(BT, T)
 
     adv_mean = advantages.mean()
     adv_std = advantages.std()
-    clip_coef = torch.tensor(0.1)
-    vf_clip_coef = torch.tensor(0.1)
-    vf_coef = torch.tensor(0.1)
-    ent_coef = torch.tensor(0.1)
+
+    # TODO: These should be tensors, but have to adjust the test kernel too.
+    # This makes it much slower... but needed for graphing? More perf checks required.
+    clip_coef = 0.1
+    vf_clip_coef = 0.1
+    vf_coef = 0.1
+    ent_coef = 0.1
 
     args = (fused_ppo_loss, _C.fused_ppo_loss, logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, advantages.mean(), advantages.std(),
@@ -262,7 +271,7 @@ def rmsnorm_loss(outputs):
     return torch.sum(outputs[0])
 
 def test_rmsnorm():
-    x = torch.randn(B, T, H, requires_grad=True)
+    x = torch.randn(BT, T, H, requires_grad=True)
     weight = torch.randn(H, requires_grad=True)
     eps = 1e-5
 

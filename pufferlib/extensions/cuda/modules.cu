@@ -368,7 +368,9 @@ public:
 
         // Save for backward (a_star and s_vals are float32, but that's fine)
         ctx->save_for_backward({log_coeffs, log_values, out, a_star, s_vals});
-            out = torch::nan_to_num(out, 0.0f, 0.0f, 0.0f);
+
+        // TODO: Do we need this? It is very slow. We can probably fuse it if we do need it?
+        //out = torch::nan_to_num(out, 0.0f, 0.0f, 0.0f);
 
         return {out};
     }

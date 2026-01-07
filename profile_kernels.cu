@@ -19,10 +19,11 @@
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
 
-const int WARMUP_ITERS = 10;
+const int WARMUP_ITERS = 1000;
 const int TIMING_ITERS = 10000;
 
-const int B = 512;
+const int BR = 4096;  // Rollout batch (no T dim)
+const int BT = 512;   // Train batch (with T dim)
 const int T = 64;
 const int H = 128;
 const int A = 4;
@@ -31,6 +32,17 @@ typedef void (*kernel_fn)(void*);
 
 void print_timing(const char* name, float ms, int N) {
     printf("  %-18s %6.1f us  %6.2f M elem/s\n", name, ms * 1000, N / ms / 1e3);
+}
+
+void warmup_gpu() {
+    // Warm up GPU clocks with some busy work
+    float* dummy;
+    cudaMalloc(&dummy, 64 * 1024 * 1024);  // 64MB
+    for (int i = 0; i < 100; i++) {
+        cudaMemset(dummy, 0, 64 * 1024 * 1024);
+    }
+    cudaDeviceSynchronize();
+    cudaFree(dummy);
 }
 
 float profile_kernel(kernel_fn fn, void* args) {
@@ -55,6 +67,8 @@ float profile_kernel(kernel_fn fn, void* args) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
     return ms / TIMING_ITERS;
 }
 
@@ -114,9 +128,9 @@ typedef struct {
     int N;
 } MingruGateArgs;
 
-MingruGateArgs* create_mingrugateargs(int batch, int seq, int hidden) {
+MingruGateArgs* create_mingrugateargs(int batch, int hidden) {
     MingruGateArgs* args = (MingruGateArgs*)calloc(1, sizeof(MingruGateArgs));
-    args->N = batch*seq * hidden;
+    args->N = batch * hidden;
 
     cudaMalloc(&args->state, args->N * sizeof(float));
     cudaMalloc(&args->gate, args->N * sizeof(float));
@@ -187,25 +201,25 @@ void run_mingrugate_forward_cpp(MingruGateArgsTorch* args) {
 
 #endif
 
-void profile_mingrugate(int batch, int seq, int hidden) {
-    MingruGateArgs* args = create_mingrugateargs(batch, seq, hidden);
+void profile_mingrugate(int batch, int hidden) {
+    MingruGateArgs* args = create_mingrugateargs(batch, hidden);
 
-    printf("mingru_gate (N=%d, %dx%dx%d)\n", args->N, batch, seq, hidden);
+    printf("mingru_gate (N=%d, %dx%d)\n", args->N, batch, hidden);
 
     float fwd_ms = profile_kernel((kernel_fn)run_mingrugate_forward, args);
-    print_timing("\tforward", fwd_ms, batch*seq);
+    print_timing("\tforward", fwd_ms, batch);
 
 #ifdef USE_TORCH
     MingruGateArgsTorch* args_torch = create_mingrugateargs_torch(args);
 
     float fwd_torch_ms = profile_kernel((kernel_fn)run_mingrugate_forward_torch, args_torch);
-    print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
+    print_timing("\tforward (torch)", fwd_torch_ms, batch);
 
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_mingrugate_forward_cpp, args_torch);
-    print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
+    print_timing("\tforward (cpp)", fwd_cpp_ms, batch);
 
     float fwd_graph_ms = profile_graph((kernel_fn)run_mingrugate_forward_cpp, args_torch);
-    print_timing("\tforward (graph)", fwd_graph_ms, batch*seq);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch);
 
     delete args_torch;
 #endif
@@ -941,10 +955,11 @@ void profile_ppoloss(int batch, int seq, int actions) {
 }
 
 int main(int argc, char** argv) {
-    profile_mingrugate(B, T, H);
-    profile_logcoeffsandvalues(B, T, H);
-    profile_logcumsumexp(B, T, H);
-    profile_fusedscan(B, T, H);
-    profile_ppoloss(B, T, A);
+    warmup_gpu();
+    profile_mingrugate(BR, H);
+    profile_logcoeffsandvalues(BT, T, H);
+    profile_logcumsumexp(BT, T, H);
+    profile_fusedscan(BT, T, H);
+    profile_ppoloss(BT, T, A);
     return 0;
 }
