@@ -312,28 +312,37 @@ public:
     static torch::autograd::tensor_list forward(
         torch::autograd::AutogradContext* ctx,
         torch::Tensor log_coeffs,
-        torch::Tensor log_values
+        torch::Tensor log_values,
+        torch::Tensor state
     ) {
         TORCH_CHECK(log_coeffs.is_cuda(), "log_coeffs must be on CUDA");
         TORCH_CHECK(log_values.is_cuda(), "log_values must be on CUDA");
+        TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
         TORCH_CHECK(log_coeffs.dtype() == log_values.dtype(), "dtypes must match");
+        TORCH_CHECK(log_coeffs.dtype() == state.dtype(), "state dtype must match");
         TORCH_CHECK(log_coeffs.dim() == 3 && log_values.dim() == 3, "must be (B, T, H)");
+        TORCH_CHECK(state.dim() == 3, "state must be (B, 1, H)");
         TORCH_CHECK(log_values.size(1) == log_coeffs.size(1), "T must match");
+        TORCH_CHECK(state.size(0) == log_coeffs.size(0), "B must match");
+        TORCH_CHECK(state.size(1) == 1, "state T dim must be 1");
+        TORCH_CHECK(state.size(2) == log_coeffs.size(2), "H must match");
+        TORCH_CHECK(log_coeffs.is_contiguous() && log_values.is_contiguous() && state.is_contiguous(),
+                    "All tensors must be contiguous");
 
         auto dtype = log_coeffs.dtype();        // e.g., kBFloat16 or kFloat32
         auto device = log_coeffs.device();      // e.g., cuda:0
         auto B = log_coeffs.size(0);
-        auto T = log_coeffs.size(1);            // T = T_total (e.g. T+1)
+        auto T = log_coeffs.size(1);            // T = sequence length (not T+1)
         auto H = log_coeffs.size(2);
+        auto T_out = T + 1;                     // Output has T+1 timesteps
 
-        // Output: same dtype and device as input
-        auto out = torch::empty({B, T, H}, log_coeffs.options());
+        // Output: same dtype and device as input, but T+1 timesteps
+        auto out = torch::empty({B, T_out, H}, log_coeffs.options());
 
         // Intermediates: must be float32, but on same device!
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-        //auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-        auto a_star = torch::empty({B, T, H}, options_float);
-        auto s_vals = torch::empty({B, T, H}, options_float);
+        auto a_star = torch::empty({B, T_out, H}, options_float);
+        auto s_vals = torch::empty({B, T_out, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // Launch kernel
@@ -344,6 +353,7 @@ public:
                 s_vals.data_ptr<float>(),
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
+                state.data_ptr<float>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
                 static_cast<int>(B),
@@ -357,6 +367,7 @@ public:
                 s_vals.data_ptr<float>(),
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
+                state.data_ptr<at::BFloat16>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
                 static_cast<int>(B),
@@ -367,7 +378,7 @@ public:
         }
 
         // Save for backward (a_star and s_vals are float32, but that's fine)
-        ctx->save_for_backward({log_coeffs, log_values, out, a_star, s_vals});
+        ctx->save_for_backward({log_coeffs, log_values, state, out, a_star, s_vals});
 
         // TODO: Do we need this? It is very slow. We can probably fuse it if we do need it?
         //out = torch::nan_to_num(out, 0.0f, 0.0f, 0.0f);
@@ -381,32 +392,36 @@ public:
         auto saved = ctx->get_saved_variables();
         auto log_coeffs = saved[0].contiguous();
         auto log_values = saved[1].contiguous();
-        auto out = saved[2].contiguous();
-        auto a_star_buf = saved[3].contiguous();  // float tensor
-        auto s_vals = saved[4].contiguous();      // float tensor
+        auto state = saved[2].contiguous();
+        auto out = saved[3].contiguous();
+        auto a_star_buf = saved[4].contiguous();  // float tensor
+        auto s_vals = saved[5].contiguous();      // float tensor
 
         auto grad_out = grad_outputs[0].contiguous();
         auto dtype = log_coeffs.dtype();
 
         auto B = log_coeffs.size(0);
-        auto T = log_coeffs.size(1);
+        auto T = log_coeffs.size(1);            // T = sequence length (not T+1)
         auto H = log_coeffs.size(2);
 
         auto grad_log_coeffs = torch::empty_like(log_coeffs);
         auto grad_log_values = torch::empty_like(log_values);
+        auto grad_state = torch::empty_like(state);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_fused_scan_backward<float>(
                 grad_log_coeffs.data_ptr<float>(),
                 grad_log_values.data_ptr<float>(),
+                grad_state.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
+                state.data_ptr<float>(),
                 out.data_ptr<float>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                static_cast<int>(T), // Probably not needed
+                static_cast<int>(T),
                 static_cast<int>(H),
                 static_cast<int>(B),
                 stream
@@ -415,29 +430,34 @@ public:
             launch_fused_scan_backward<at::BFloat16>(
                 grad_log_coeffs.data_ptr<at::BFloat16>(),
                 grad_log_values.data_ptr<at::BFloat16>(),
+                grad_state.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
+                state.data_ptr<at::BFloat16>(),
                 out.data_ptr<at::BFloat16>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                T, H, B,
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(B),
                 stream
             );
         } else {
             TORCH_CHECK(false, "Unsupported dtype");
         }
 
-        return {grad_log_coeffs, grad_log_values};
+        return {grad_log_coeffs, grad_log_values, grad_state};
     }
 };
 
-// Named entrypoint: fused_scan(log_coeffs, log_values) -> out
+// Named entrypoint: fused_scan(log_coeffs, log_values, state) -> out
 torch::autograd::tensor_list fused_scan(
     torch::Tensor log_coeffs,
-    torch::Tensor log_values
+    torch::Tensor log_values,
+    torch::Tensor state
 ) {
-    return FusedScanFunction::apply(log_coeffs, log_values);
+    return FusedScanFunction::apply(log_coeffs, log_values, state);
 }
 
 class LogCumsumExpFunction : public torch::autograd::Function<LogCumsumExpFunction> {

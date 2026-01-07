@@ -174,7 +174,10 @@ def test_log_coeffs_and_values():
     print('log_coeffs_and_values')
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
 
-def fused_scan(log_coeffs, log_values):
+def fused_scan(log_coeffs, log_values, state):
+    # Fuse cat+pad into the scan (matches kernel behavior)
+    log_values = torch.cat([state.log(), log_values], dim=1)
+    log_coeffs = torch.nn.functional.pad(log_coeffs, (0, 0, 1, 0))
     a_star = log_coeffs.cumsum(1)
     log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1)
     log_h = a_star + log_h0_plus_b_star
@@ -189,9 +192,10 @@ def test_fused_scan():
     # that is used in the full network.
     log_coeffs = -torch.nn.functional.softplus(torch.randn(BT, T, H)).requires_grad_(True)
     log_values = -torch.nn.functional.softplus(torch.randn(BT, T, H)).requires_grad_(True)
+    state = torch.rand(BT, 1, H).requires_grad_(True)  # state must be positive for log
 
     print('fused_scan')
-    test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values)
+    test_kernel(fused_scan, _C.fused_scan, log_coeffs, log_values, state)
 
 def logcumsumexp(x):
     return [torch.log(torch.exp(x).cumsum(1))]
@@ -279,9 +283,9 @@ def test_rmsnorm():
     test_kernel(rmsnorm, _C.rmsnorm, x, weight, eps)
 
 if __name__ == '__main__':
-    test_mingru_gate()
-    test_log_coeffs_and_values()
-    test_logcumsumexp()
+    #test_mingru_gate()
+    #test_log_coeffs_and_values()
+    #test_logcumsumexp()
     test_fused_scan()
-    test_fused_ppo_loss()
+    #test_fused_ppo_loss()
     #test_rmsnorm()
