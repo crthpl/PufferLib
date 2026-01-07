@@ -95,20 +95,34 @@ def test_kernel(py_func, cpp_func, *args, benchmark=True):
             print(f'\tBackward sps: {py_sps} (naive) {cpp_sps} (C++)')
 
 def time_sps(func, *args, backward=False):
+    if backward:
+        outputs = func(*args)
+        loss = test_loss(outputs)
+
     # Warm up
     for i in range(3):
-        outputs = func(*args)
         if backward:
-            test_loss(outputs).backward()
+            for arg in args:
+                if isinstance(arg, torch.Tensor) and arg.grad is not None:
+                    arg.grad = None
+            loss.backward(retain_graph=True)
+        else:
+            with torch.no_grad():
+                func(*args)
 
     torch.cuda.synchronize()
     start = time.time()
     steps = 0
     while time.time() - start < TIMEOUT:
         steps += 1
-        outputs = func(*args)
         if backward:
-            test_loss(outputs).backward()
+            for arg in args:
+                if isinstance(arg, torch.Tensor) and arg.grad is not None:
+                    arg.grad = None
+            loss.backward(retain_graph=True)
+        else:
+            with torch.no_grad():
+                func(*args)
 
     torch.cuda.synchronize()
     sps = B*T*steps/(time.time() - start)
