@@ -557,6 +557,7 @@ public:
                 log_values = log_z + log_tilde_h;
             }
 
+            // This can 100% get fused into scan
             log_values = torch::cat({state.log(), log_values}, 1);
             log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
