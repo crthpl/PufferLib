@@ -175,17 +175,21 @@ def test_log_coeffs_and_values():
     test_kernel(log_coeffs_and_values, _C.log_coeffs_and_values, gate, hidden)
 
 def fused_scan(log_coeffs, log_values, state):
-    # Fuse cat+pad into the scan (matches kernel behavior)
+    # Fuse cat+pad+narrow into the scan (matches kernel behavior)
     log_values = torch.cat([state.log(), log_values], dim=1)
     log_coeffs = torch.nn.functional.pad(log_coeffs, (0, 0, 1, 0))
     a_star = log_coeffs.cumsum(1)
     log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1)
     log_h = a_star + log_h0_plus_b_star
-    out = log_h.exp()
-    return [out]
+    full_out = log_h.exp()
+    # Narrow to get last T timesteps (kernel returns this directly)
+    T = log_values.size(1) - 1  # original T before cat
+    out = full_out.narrow(1, 1, T)  # skip first timestep
+    next_state = full_out.narrow(1, T, 1)  # last timestep
+    return [out, next_state]
 
 def fused_scan_loss(outputs):
-    return torch.sum(outputs[0])
+    return torch.sum(outputs[0]) + torch.sum(outputs[1])
 
 def test_fused_scan():
     # Numerically unstable function. Must be called with the distribution

@@ -332,23 +332,26 @@ public:
         auto dtype = log_coeffs.dtype();        // e.g., kBFloat16 or kFloat32
         auto device = log_coeffs.device();      // e.g., cuda:0
         auto B = log_coeffs.size(0);
-        auto T = log_coeffs.size(1);            // T = sequence length (not T+1)
+        auto T = log_coeffs.size(1);            // T = sequence length
         auto H = log_coeffs.size(2);
-        auto T_out = T + 1;                     // Output has T+1 timesteps
+        auto T_buf = T + 1;                     // Buffer has T+1 timesteps for backward
 
-        // Output: same dtype and device as input, but T+1 timesteps
-        auto out = torch::empty({B, T_out, H}, log_coeffs.options());
+        // Output: (B, T, H) for timesteps 1..T
+        auto out = torch::empty({B, T, H}, log_coeffs.options());
+        // Next state: (B, 1, H) for timestep T
+        auto next_state = torch::empty({B, 1, H}, log_coeffs.options());
 
-        // Intermediates: must be float32, but on same device!
+        // Intermediates: must be float32, T+1 timesteps for backward
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-        auto a_star = torch::empty({B, T_out, H}, options_float);
-        auto s_vals = torch::empty({B, T_out, H}, options_float);
+        auto a_star = torch::empty({B, T_buf, H}, options_float);
+        auto s_vals = torch::empty({B, T_buf, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // Launch kernel
         if (dtype == torch::kFloat32) {
             launch_fused_scan_forward<float>(
                 out.data_ptr<float>(),
+                next_state.data_ptr<float>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
                 log_coeffs.data_ptr<float>(),
@@ -363,6 +366,7 @@ public:
         } else if (dtype == torch::kBFloat16) {
             launch_fused_scan_forward<at::BFloat16>(
                 out.data_ptr<at::BFloat16>(),
+                next_state.data_ptr<at::BFloat16>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
                 log_coeffs.data_ptr<at::BFloat16>(),
@@ -377,13 +381,13 @@ public:
             TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
         }
 
-        // Save for backward (a_star and s_vals are float32, but that's fine)
-        ctx->save_for_backward({log_coeffs, log_values, state, out, a_star, s_vals});
+        // Save for backward (no longer need out since we reconstruct from a_star + s)
+        ctx->save_for_backward({log_coeffs, log_values, state, a_star, s_vals});
 
         // TODO: Do we need this? It is very slow. We can probably fuse it if we do need it?
         //out = torch::nan_to_num(out, 0.0f, 0.0f, 0.0f);
 
-        return {out};
+        return {out, next_state};
     }
     static torch::autograd::tensor_list backward(
         torch::autograd::AutogradContext* ctx,
@@ -393,15 +397,15 @@ public:
         auto log_coeffs = saved[0].contiguous();
         auto log_values = saved[1].contiguous();
         auto state = saved[2].contiguous();
-        auto out = saved[3].contiguous();
-        auto a_star_buf = saved[4].contiguous();  // float tensor
-        auto s_vals = saved[5].contiguous();      // float tensor
+        auto a_star_buf = saved[3].contiguous();  // float tensor
+        auto s_vals = saved[4].contiguous();      // float tensor
 
-        auto grad_out = grad_outputs[0].contiguous();
+        auto grad_out = grad_outputs[0].contiguous();          // (B, T, H)
+        auto grad_next_state = grad_outputs[1].contiguous();   // (B, 1, H)
         auto dtype = log_coeffs.dtype();
 
         auto B = log_coeffs.size(0);
-        auto T = log_coeffs.size(1);            // T = sequence length (not T+1)
+        auto T = log_coeffs.size(1);            // T = sequence length
         auto H = log_coeffs.size(2);
 
         auto grad_log_coeffs = torch::empty_like(log_coeffs);
@@ -415,10 +419,10 @@ public:
                 grad_log_values.data_ptr<float>(),
                 grad_state.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
+                grad_next_state.data_ptr<float>(),
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
                 state.data_ptr<float>(),
-                out.data_ptr<float>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
                 static_cast<int>(T),
@@ -432,10 +436,10 @@ public:
                 grad_log_values.data_ptr<at::BFloat16>(),
                 grad_state.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
+                grad_next_state.data_ptr<at::BFloat16>(),
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
                 state.data_ptr<at::BFloat16>(),
-                out.data_ptr<at::BFloat16>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
                 static_cast<int>(T),

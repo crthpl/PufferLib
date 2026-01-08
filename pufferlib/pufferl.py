@@ -297,7 +297,7 @@ class PuffeRL:
         done_training = self.global_step >= config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
-            self.losses = losses
+            #self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()

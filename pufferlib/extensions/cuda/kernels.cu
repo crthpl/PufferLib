@@ -405,13 +405,14 @@ __device__ __forceinline__ double logcumsumexp_backward(double x, double* acc, d
 
 template<typename T>
 __global__ void fused_scan_forward_kernel(
-    T* __restrict__ out,
-    float* __restrict__ a_star_buf,
-    float* __restrict__ s_buf,
+    T* __restrict__ out,                 // (B, T, H) - timesteps 1..T
+    T* __restrict__ next_state,          // (B, 1, H) - timestep T
+    float* __restrict__ a_star_buf,      // (B, T+1, H) - all timesteps for backward
+    float* __restrict__ s_buf,           // (B, T+1, H) - all timesteps for backward
     const T* __restrict__ log_coeffs,    // (B, T, H)
     const T* __restrict__ log_values,    // (B, T, H)
     const T* __restrict__ state,         // (B, 1, H)
-    int T_seq,                           // sequence length (not T+1)
+    int T_seq,                           // sequence length (T)
     int H,
     int B
 ) {
@@ -422,7 +423,8 @@ __global__ void fused_scan_forward_kernel(
     int h = idx % H;
 
     int T_out = T_seq + 1;
-    int out_base = b * T_out * H + h;    // base for output (T+1 timesteps)
+    int buf_base = b * T_out * H + h;    // base for a_star/s buffers (T+1 timesteps)
+    int out_base = b * T_seq * H + h;    // base for output (T timesteps)
     int in_base = b * T_seq * H + h;     // base for input (T timesteps)
     int state_idx = b * H + h;           // state is (B, 1, H) -> flatten to (B, H)
 
@@ -430,7 +432,7 @@ __global__ void fused_scan_forward_kernel(
     float s = -INFINITY;  // this will be logcumsumexp(z[0..t])
 
     for (int t = 0; t < T_out; t++) {
-        int out_curr = out_base + t * H;
+        int buf_curr = buf_base + t * H;
 
         float log_coeff_val, log_value_val;
         if (t == 0) {
@@ -458,26 +460,37 @@ __global__ void fused_scan_forward_kernel(
         }
 
         float log_h = a_star + s;
-        out[out_curr] = T(expf(log_h));
+        float out_val = expf(log_h);
 
-        a_star_buf[out_curr] = a_star;
-        s_buf[out_curr] = s;
+        // Write to out for t=1..T (indices 0..T-1)
+        if (t >= 1) {
+            int out_curr = out_base + (t - 1) * H;
+            out[out_curr] = T(out_val);
+        }
+
+        // Write timestep T to next_state
+        if (t == T_seq) {
+            next_state[state_idx] = T(out_val);
+        }
+
+        a_star_buf[buf_curr] = a_star;
+        s_buf[buf_curr] = s;
     }
 }
 
 template<typename T>
 __global__ void fused_scan_backward_kernel(
-    T* __restrict__ grad_log_coeffs,    // (B, T, H)
-    T* __restrict__ grad_log_values,    // (B, T, H)
-    T* __restrict__ grad_state,         // (B, 1, H)
-    const T* __restrict__ grad_out,     // (B, T+1, H)
-    const T* __restrict__ log_coeffs,   // (B, T, H)
-    const T* __restrict__ log_values,   // (B, T, H)
-    const T* __restrict__ state,        // (B, 1, H)
-    const T* __restrict__ out_buf,      // (B, T+1, H)
+    T* __restrict__ grad_log_coeffs,       // (B, T, H)
+    T* __restrict__ grad_log_values,       // (B, T, H)
+    T* __restrict__ grad_state,            // (B, 1, H)
+    const T* __restrict__ grad_out,        // (B, T, H) - for timesteps 1..T
+    const T* __restrict__ grad_next_state, // (B, 1, H) - for timestep T
+    const T* __restrict__ log_coeffs,      // (B, T, H)
+    const T* __restrict__ log_values,      // (B, T, H)
+    const T* __restrict__ state,           // (B, 1, H)
     const float* __restrict__ a_star_buf,  // (B, T+1, H)
-    const float* __restrict__ s_buf,    // (B, T+1, H)
-    int T_seq,                          // sequence length (not T+1)
+    const float* __restrict__ s_buf,       // (B, T+1, H)
+    int T_seq,                             // sequence length (T)
     int H,
     int B
 ) {
@@ -488,7 +501,8 @@ __global__ void fused_scan_backward_kernel(
     int h = idx % H;
 
     int T_out = T_seq + 1;
-    int out_base = b * T_out * H + h;    // base for output arrays (T+1 timesteps)
+    int buf_base = b * T_out * H + h;    // base for a_star/s buffers (T+1 timesteps)
+    int out_base = b * T_seq * H + h;    // base for grad_out (T timesteps)
     int in_base = b * T_seq * H + h;     // base for input arrays (T timesteps)
     int state_idx = b * H + h;           // state is (B, 1, H) -> flatten to (B, H)
 
@@ -497,10 +511,11 @@ __global__ void fused_scan_backward_kernel(
     float carry_grad_a = 0.0;
 
     for (int t = T_out - 1; t >= 0; --t) {
-        int out_curr = out_base + t * H;
+        int buf_curr = buf_base + t * H;
 
-        float a_star = a_star_buf[out_curr];
-        float s = s_buf[out_curr];
+        float a_star = a_star_buf[buf_curr];
+        float s = s_buf[buf_curr];
+        float out_val = expf(a_star + s);  // reconstruct output value
 
         // Get log_value for this timestep (same logic as forward)
         float log_value_val;
@@ -513,7 +528,20 @@ __global__ void fused_scan_backward_kernel(
 
         float z = log_value_val - a_star;
 
-        float grad_log_h = float(grad_out[out_curr]) * float(out_buf[out_curr]);
+        // Get gradient for this timestep
+        // t=0: no external gradient (was discarded by narrow)
+        // t=1..T-1: grad_out[t-1]
+        // t=T: grad_out[T-1] + grad_next_state
+        float grad_output = 0.0f;
+        if (t >= 1) {
+            int grad_out_idx = out_base + (t - 1) * H;
+            grad_output = float(grad_out[grad_out_idx]);
+        }
+        if (t == T_seq) {
+            grad_output += float(grad_next_state[state_idx]);
+        }
+
+        float grad_log_h = grad_output * out_val;
         float grad_s = grad_log_h;
 
         if (t == T_out - 1) {
@@ -802,6 +830,7 @@ __global__ void fused_scan_backward_kernel(
 template<typename T>
 void launch_fused_scan_forward(
     T* out,
+    T* next_state,
     float* a_star,
     float* s_vals,
     const T* log_coeffs,
@@ -817,6 +846,7 @@ void launch_fused_scan_forward(
 
     fused_scan_forward_kernel<T><<<grid, SEQ_SIZE, 0, stream>>>(
         out,
+        next_state,
         a_star,
         s_vals,
         log_coeffs,
@@ -839,10 +869,10 @@ void launch_fused_scan_backward(
     T* grad_log_values,
     T* grad_state,
     const T* grad_out,
+    const T* grad_next_state,
     const T* log_coeffs,
     const T* log_values,
     const T* state,
-    const T* out,
     const float* a_star_buf,
     const float* s_buf,
     int T_seq,
@@ -858,10 +888,10 @@ void launch_fused_scan_backward(
         grad_log_values,
         grad_state,
         grad_out,
+        grad_next_state,
         log_coeffs,
         log_values,
         state,
-        out,
         a_star_buf,
         s_buf,
         T_seq,

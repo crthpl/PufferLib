@@ -1,3 +1,9 @@
+//TODO:
+//5.6% cat overhead from grad clip. Preallocate?
+//11% seqwise overhead from fused scan
+//30% elemwise form random ops
+//5% on log_coeffs_and_values
+
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch/optim/optimizer.h>
@@ -191,7 +197,8 @@ torch::autograd::tensor_list log_coeffs_and_values(
 );
 torch::autograd::tensor_list fused_scan(
     torch::Tensor log_coeffs,
-    torch::Tensor log_values
+    torch::Tensor log_values,
+    torch::Tensor state
 );
 torch::Tensor logcumsumexp_cuda(torch::Tensor x);
 torch::autograd::tensor_list fused_ppo_loss(
@@ -529,6 +536,8 @@ public:
         auto gate = chunks[1];
         auto proj = chunks[2];
 
+        return std::make_tuple(hidden, gate);
+
         torch::Tensor out;
         torch::Tensor next_prev_hidden;
 
@@ -557,22 +566,22 @@ public:
                 log_values = log_z + log_tilde_h;
             }
 
-            // This can 100% get fused into scan
-            log_values = torch::cat({state.log(), log_values}, 1);
-            log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
-
-            // Heinsen associative scan
+            // Heinsen associative scan (cat+pad+narrow fused into kernel)
             if (kernels) {
-                out = fused_scan(log_coeffs.contiguous(), log_values.contiguous())[0];
+                auto scan_out = fused_scan(log_coeffs.contiguous(), log_values.contiguous(), state.contiguous());
+                out = scan_out[0];                // (B, T, H)
+                next_prev_hidden = scan_out[1];   // (B, 1, H)
             } else {
+                // Non-kernel path still needs cat+pad+narrow
+                log_values = torch::cat({state.log(), log_values}, 1);
+                log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
                 auto a_star = log_coeffs.cumsum(1);
                 auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
                 auto log_h = a_star + log_h0_plus_b_star;
                 out = log_h.exp();
+                out = out.narrow(1, out.size(1) - seq_len, seq_len);
+                next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
             }
-
-            out = out.narrow(1, out.size(1) - seq_len, seq_len);
-            next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
         }
 
         //if (expansion_factor != 1) {
@@ -721,14 +730,14 @@ public:
             auto layer = (*mingru)[i]->as<MinGRULayer>();
             mingru_out = layer->forward(hidden, state_in);
             hidden = std::get<0>(mingru_out);
-            //auto state_out = std::get<1>(mingru_out);
-            //state.select(0, i).copy_(state_out);
-            state_out.push_back(std::get<1>(mingru_out));
+            auto state_out = std::get<1>(mingru_out);
+            state.select(0, i).copy_(state_out);
+            //state_out.push_back(std::get<1>(mingru_out));
         }
 
         hidden = hidden.squeeze(1);
-        //state = state.squeeze(2);
-        state = torch::stack(state_out, 0).squeeze(2);
+        state = state.squeeze(2);
+        //state = torch::stack(state_out, 0).squeeze(2);
 
         std::tuple<torch::Tensor, torch::Tensor> out = decoder->forward(hidden);
         auto logits = std::get<0>(out);
@@ -1144,8 +1153,8 @@ void train_forward_call(PuffeRL* pufferl) {
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
     torch::Tensor loss;
-    if (false) {
-    //if (pufferl->kernels) {
+    //if (false) {
+    if (pufferl->kernels) {
         loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1223,9 +1232,9 @@ void train_forward_call(PuffeRL* pufferl) {
     }
 
     loss.backward();
-    clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
-    pufferl->muon->step();
-    pufferl->muon->zero_grad();
+    //clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
+    //pufferl->muon->step();
+    //pufferl->muon->zero_grad();
 
     //return std::make_tuple(logits, newvalue);
 
@@ -1800,7 +1809,7 @@ pybind11::dict train(pybind11::object pufferl_obj) {
 TORCH_LIBRARY(_C, m) {
     m.def("mingru_gate(Tensor state, Tensor gate, Tensor hidden) -> Tensor");
     m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
-    m.def("fused_scan(Tensor log_coeffs, Tensor log_values) -> Tensor");
+    m.def("fused_scan(Tensor log_coeffs, Tensor log_values, Tensor state) -> Tensor");
     m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
     m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
 }
