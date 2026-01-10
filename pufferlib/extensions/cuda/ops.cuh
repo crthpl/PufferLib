@@ -202,3 +202,65 @@ __device__ __forceinline__ void logcumsumexp_backward(
         grad_x[t] = running;
     }
 }
+
+// ============================================================================
+// log_coeffs_and_values: Single-element ops for fused scan
+// These are ported directly from log_coeffs_and_values_kernel in kernels.cu
+// ============================================================================
+
+// Forward: computes log_coeffs and log_values for mingru scan
+// log_coeffs = -softplus(gate)
+// log_values = -softplus(-gate) + log_tilde_h
+//   where log_tilde_h = log(relu(hidden) + 0.5) if hidden >= 0
+//                     = -softplus(-hidden)      if hidden < 0
+__device__ __forceinline__ void log_coeffs_and_values_fwd(
+    float gate,
+    float hidden,
+    float* log_coeff_out,
+    float* log_value_out
+) {
+    *log_coeff_out = -softplus_fwd(gate);
+
+    float log_z = -softplus_fwd(-gate);
+    float log_tilde_h;
+    if (hidden >= 0.0f) {
+        float relu_h = relu(hidden);
+        log_tilde_h = logf(relu_h + 0.5f);
+    } else {
+        log_tilde_h = -softplus_fwd(-hidden);
+    }
+    *log_value_out = log_z + log_tilde_h;
+}
+
+// Backward: computes gradients for gate and hidden
+// given gradients for log_coeffs and log_values
+__device__ __forceinline__ void log_coeffs_and_values_bwd(
+    float grad_log_coeffs,
+    float grad_log_values,
+    float gate,
+    float hidden,
+    float* grad_gate_out,
+    float* grad_hidden_out
+) {
+    // grad_gate from log_coeffs: d(-softplus(g))/dg = -softplus'(g)
+    float grad_g_from_lc = -softplus_bwd(grad_log_coeffs, gate);
+    // grad_gate from log_values via log_z: d(-softplus(-g))/dg = -(-1)*softplus'(-g) = softplus'(-g)
+    // But we have -softplus_bwd(-grad_lv, -g) which computes -softplus'(-g) * (-grad_lv)
+    float grad_g_from_lz = -softplus_bwd(-grad_log_values, -gate);
+    *grad_gate_out = grad_g_from_lc + grad_g_from_lz;
+
+    // grad_hidden from log_tilde_h
+    float grad_h_from_lt;
+    if (hidden >= 0.0f) {
+        float relu_h = relu(hidden);
+        // log_tilde_h = log(relu_h + 0.5)
+        // d(log_tilde_h)/d(hidden) = (1/(relu_h + 0.5)) * relu'(hidden)
+        float inner_grad = 1.0f / (relu_h + 0.5f);
+        grad_h_from_lt = relu_backward(hidden, inner_grad * grad_log_values);
+    } else {
+        // log_tilde_h = -softplus(-hidden)
+        // d(-softplus(-h))/dh = -(-1)*softplus'(-h) = softplus'(-h)
+        grad_h_from_lt = -softplus_bwd(-grad_log_values, -hidden);
+    }
+    *grad_hidden_out = grad_h_from_lt;
+}

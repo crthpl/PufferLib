@@ -552,33 +552,27 @@ public:
                 out = proj * out;
             }
         } else {
-            // Training path: still needs chunk for log_coeffs_and_values
+            // Training path: chunk for gate/hidden/proj
             auto chunks = output.chunk(3, 2);
             auto hidden = chunks[0];
             auto gate = chunks[1];
             auto proj = chunks[2];
 
-            torch::Tensor log_coeffs, log_values;
+            // Heinsen associative scan (now fuses log_coeffs_and_values + scan)
             if (kernels) {
-                torch::autograd::tensor_list outputs = log_coeffs_and_values(
-                    gate.contiguous(), hidden.contiguous());
-                log_coeffs = outputs[0];
-                log_values = outputs[1];
+                // fused_scan now takes gate/hidden directly and computes log_coeffs/values inline
+                auto scan_out = fused_scan(gate.contiguous(), hidden.contiguous(), state.contiguous());
+                out = scan_out[0];                // (B, T, H)
+                next_prev_hidden = scan_out[1];   // (B, 1, H)
             } else {
-                log_coeffs = -torch::nn::functional::softplus(gate);
+                // Non-kernel path: compute log_coeffs/values manually
+                auto log_coeffs = -torch::nn::functional::softplus(gate);
                 auto log_z = -torch::nn::functional::softplus(-gate);
                 auto log_tilde_h = torch::where(hidden >= 0,
                     (torch::nn::functional::relu(hidden) + 0.5).log(),
                     -torch::nn::functional::softplus(-hidden));
-                log_values = log_z + log_tilde_h;
-            }
+                auto log_values = log_z + log_tilde_h;
 
-            // Heinsen associative scan (cat+pad+narrow fused into kernel)
-            if (kernels) {
-                auto scan_out = fused_scan(log_coeffs.contiguous(), log_values.contiguous(), state.contiguous());
-                out = scan_out[0];                // (B, T, H)
-                next_prev_hidden = scan_out[1];   // (B, 1, H)
-            } else {
                 // Non-kernel path still needs cat+pad+narrow
                 log_values = torch::cat({state.log(), log_values}, 1);
                 log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
