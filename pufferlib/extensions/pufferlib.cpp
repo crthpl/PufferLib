@@ -194,10 +194,11 @@ torch::autograd::tensor_list log_coeffs_and_values(
     torch::Tensor gate,
     torch::Tensor hidden
 );
+// Fully fused scan: takes combined (B, T, 3*H) = [hidden, gate, proj]
+// Returns {out, next_state} where out = sigmoid(proj) * scan_result
 torch::autograd::tensor_list fused_scan(
-    torch::Tensor log_coeffs,
-    torch::Tensor log_values,
-    torch::Tensor state
+    torch::Tensor combined,  // (B, T, 3*H) = [hidden, gate, proj]
+    torch::Tensor state      // (B, 1, H)
 );
 torch::Tensor logcumsumexp_cuda(torch::Tensor x);
 torch::autograd::tensor_list fused_ppo_loss(
@@ -552,20 +553,21 @@ public:
                 out = proj * out;
             }
         } else {
-            // Training path: chunk for gate/hidden/proj
-            auto chunks = output.chunk(3, 2);
-            auto hidden = chunks[0];
-            auto gate = chunks[1];
-            auto proj = chunks[2];
-
-            // Heinsen associative scan (now fuses log_coeffs_and_values + scan)
+            // Training path: fully fused kernel
             if (kernels) {
-                // fused_scan now takes gate/hidden directly and computes log_coeffs/values inline
-                auto scan_out = fused_scan(gate.contiguous(), hidden.contiguous(), state.contiguous());
-                out = scan_out[0];                // (B, T, H)
-                next_prev_hidden = scan_out[1];   // (B, 1, H)
+                // fused_scan takes combined (B, T, 3*H) directly
+                // output already has layout [hidden, gate, proj] from to_hidden_and_gate
+                auto scan_out = fused_scan(output.contiguous(), state.contiguous());
+                out = scan_out[0];                // (B, T, H) = sigmoid(proj) * scan_result
+                next_prev_hidden = scan_out[1];   // (B, 1, H) = raw scan_result at T
             } else {
-                // Non-kernel path: compute log_coeffs/values manually
+                // Non-kernel path: chunk for gate/hidden/proj
+                auto chunks = output.chunk(3, 2);
+                auto hidden = chunks[0];
+                auto gate = chunks[1];
+                auto proj = chunks[2];
+
+                // Compute log_coeffs/values manually
                 auto log_coeffs = -torch::nn::functional::softplus(gate);
                 auto log_z = -torch::nn::functional::softplus(-gate);
                 auto log_tilde_h = torch::where(hidden >= 0,
@@ -582,10 +584,10 @@ public:
                 out = log_h.exp();
                 out = out.narrow(1, out.size(1) - seq_len, seq_len);
                 next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
-            }
 
-            proj = torch::sigmoid(proj);
-            out = proj * out;
+                proj = torch::sigmoid(proj);
+                out = proj * out;
+            }
         }
 
         return std::make_tuple(out, next_prev_hidden);
@@ -1799,7 +1801,7 @@ pybind11::dict train(pybind11::object pufferl_obj) {
 TORCH_LIBRARY(_C, m) {
     m.def("mingru_gate(Tensor state, Tensor combined) -> (Tensor, Tensor)");
     m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
-    m.def("fused_scan(Tensor log_coeffs, Tensor log_values, Tensor state) -> (Tensor, Tensor)");
+    m.def("fused_scan(Tensor combined, Tensor state) -> (Tensor, Tensor)");
     m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
     m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
 }

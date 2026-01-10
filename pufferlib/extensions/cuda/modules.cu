@@ -310,41 +310,37 @@ public:
 };
 */
 
-// Fused scan with log_coeffs_and_values computed inline
-// Takes gate, hidden as inputs instead of log_coeffs, log_values
+// Fully fused scan: chunk + log_coeffs_and_values + scan + sigmoid(proj)*out
+// Takes combined (B, T, 3*H) = [hidden, gate, proj] as input
 class FusedScanFunction : public torch::autograd::Function<FusedScanFunction> {
 public:
     static torch::autograd::tensor_list forward(
         torch::autograd::AutogradContext* ctx,
-        torch::Tensor gate,      // was log_coeffs
-        torch::Tensor hidden,    // was log_values
-        torch::Tensor state
+        torch::Tensor combined,  // (B, T, 3*H) = [hidden, gate, proj]
+        torch::Tensor state      // (B, 1, H)
     ) {
-        TORCH_CHECK(gate.is_cuda(), "gate must be on CUDA");
-        TORCH_CHECK(hidden.is_cuda(), "hidden must be on CUDA");
+        TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
         TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
-        TORCH_CHECK(gate.dtype() == hidden.dtype(), "dtypes must match");
-        TORCH_CHECK(gate.dtype() == state.dtype(), "state dtype must match");
-        TORCH_CHECK(gate.dim() == 3 && hidden.dim() == 3, "must be (B, T, H)");
+        TORCH_CHECK(combined.dtype() == state.dtype(), "dtypes must match");
+        TORCH_CHECK(combined.dim() == 3, "combined must be (B, T, 3*H)");
         TORCH_CHECK(state.dim() == 3, "state must be (B, 1, H)");
-        TORCH_CHECK(hidden.size(1) == gate.size(1), "T must match");
-        TORCH_CHECK(state.size(0) == gate.size(0), "B must match");
+        TORCH_CHECK(state.size(0) == combined.size(0), "B must match");
         TORCH_CHECK(state.size(1) == 1, "state T dim must be 1");
-        TORCH_CHECK(state.size(2) == gate.size(2), "H must match");
-        TORCH_CHECK(gate.is_contiguous() && hidden.is_contiguous() && state.is_contiguous(),
+        TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
+        TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
                     "All tensors must be contiguous");
 
-        auto dtype = gate.dtype();        // e.g., kBFloat16 or kFloat32
-        auto device = gate.device();      // e.g., cuda:0
-        auto B = gate.size(0);
-        auto T = gate.size(1);            // T = sequence length
-        auto H = gate.size(2);
-        auto T_buf = T + 1;               // Buffer has T+1 timesteps for backward
+        auto dtype = combined.dtype();        // e.g., kBFloat16 or kFloat32
+        auto device = combined.device();      // e.g., cuda:0
+        auto B = combined.size(0);
+        auto T = combined.size(1);            // T = sequence length
+        auto H = state.size(2);               // H = hidden size (combined is 3*H)
+        auto T_buf = T + 1;                   // Buffer has T+1 timesteps for backward
 
-        // Output: (B, T, H) for timesteps 1..T
-        auto out = torch::empty({B, T, H}, gate.options());
-        // Next state: (B, 1, H) for timestep T
-        auto next_state = torch::empty({B, 1, H}, gate.options());
+        // Output: (B, T, H) - sigmoid(proj) * scan_result
+        auto out = torch::empty({B, T, H}, state.options());
+        // Next state: (B, 1, H) - raw scan_result at T (for recurrence)
+        auto next_state = torch::empty({B, 1, H}, state.options());
 
         // Intermediates: must be float32, T+1 timesteps for backward
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
@@ -352,15 +348,14 @@ public:
         auto s_vals = torch::empty({B, T_buf, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        // Launch kernel - now takes gate/hidden and computes log_coeffs/values inline
+        // Launch kernel - takes combined (B, T, 3*H) directly
         if (dtype == torch::kFloat32) {
             launch_fused_scan_forward<float>(
                 out.data_ptr<float>(),
                 next_state.data_ptr<float>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                gate.data_ptr<float>(),
-                hidden.data_ptr<float>(),
+                combined.data_ptr<float>(),
                 state.data_ptr<float>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
@@ -374,8 +369,7 @@ public:
                 next_state.data_ptr<at::BFloat16>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
-                gate.data_ptr<at::BFloat16>(),
-                hidden.data_ptr<at::BFloat16>(),
+                combined.data_ptr<at::BFloat16>(),
                 state.data_ptr<at::BFloat16>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
@@ -386,8 +380,8 @@ public:
             TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
         }
 
-        // Save for backward - now saves gate/hidden instead of log_coeffs/log_values
-        ctx->save_for_backward({gate, hidden, state, a_star, s_vals});
+        // Save for backward
+        ctx->save_for_backward({combined, state, a_star, s_vals});
 
         return {out, next_state};
     }
@@ -396,35 +390,31 @@ public:
         torch::autograd::tensor_list grad_outputs
     ) {
         auto saved = ctx->get_saved_variables();
-        auto gate = saved[0].contiguous();
-        auto hidden = saved[1].contiguous();
-        auto state = saved[2].contiguous();
-        auto a_star_buf = saved[3].contiguous();  // float tensor
-        auto s_vals = saved[4].contiguous();      // float tensor
+        auto combined = saved[0].contiguous();
+        auto state = saved[1].contiguous();
+        auto a_star_buf = saved[2].contiguous();  // float tensor
+        auto s_vals = saved[3].contiguous();      // float tensor
 
         auto grad_out = grad_outputs[0].contiguous();          // (B, T, H)
         auto grad_next_state = grad_outputs[1].contiguous();   // (B, 1, H)
-        auto dtype = gate.dtype();
+        auto dtype = combined.dtype();
 
-        auto B = gate.size(0);
-        auto T = gate.size(1);            // T = sequence length
-        auto H = gate.size(2);
+        auto B = combined.size(0);
+        auto T = combined.size(1);            // T = sequence length
+        auto H = state.size(2);               // H = hidden size
 
-        // Now outputs grad_gate, grad_hidden instead of grad_log_coeffs, grad_log_values
-        auto grad_gate = torch::empty_like(gate);
-        auto grad_hidden = torch::empty_like(hidden);
+        // Output grad_combined (B, T, 3*H) = [grad_hidden, grad_gate, grad_proj]
+        auto grad_combined = torch::empty_like(combined);
         auto grad_state = torch::empty_like(state);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_fused_scan_backward<float>(
-                grad_gate.data_ptr<float>(),
-                grad_hidden.data_ptr<float>(),
+                grad_combined.data_ptr<float>(),
                 grad_state.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
                 grad_next_state.data_ptr<float>(),
-                gate.data_ptr<float>(),
-                hidden.data_ptr<float>(),
+                combined.data_ptr<float>(),
                 state.data_ptr<float>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
@@ -435,13 +425,11 @@ public:
             );
         } else if (dtype == torch::kBFloat16) {
             launch_fused_scan_backward<at::BFloat16>(
-                grad_gate.data_ptr<at::BFloat16>(),
-                grad_hidden.data_ptr<at::BFloat16>(),
+                grad_combined.data_ptr<at::BFloat16>(),
                 grad_state.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
                 grad_next_state.data_ptr<at::BFloat16>(),
-                gate.data_ptr<at::BFloat16>(),
-                hidden.data_ptr<at::BFloat16>(),
+                combined.data_ptr<at::BFloat16>(),
                 state.data_ptr<at::BFloat16>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
@@ -454,18 +442,18 @@ public:
             TORCH_CHECK(false, "Unsupported dtype");
         }
 
-        return {grad_gate, grad_hidden, grad_state};
+        return {grad_combined, grad_state};
     }
 };
 
-// Named entrypoint: fused_scan(gate, hidden, state) -> {out, next_state}
-// Takes gate, hidden directly (computes log_coeffs/values inline in kernel)
+// Named entrypoint: fused_scan(combined, state) -> {out, next_state}
+// Takes combined (B, T, 3*H) = [hidden, gate, proj] directly
+// Outputs out = sigmoid(proj) * scan_result, next_state = raw scan_result at T
 torch::autograd::tensor_list fused_scan(
-    torch::Tensor gate,      // was log_coeffs
-    torch::Tensor hidden,    // was log_values
-    torch::Tensor state
+    torch::Tensor combined,  // (B, T, 3*H) = [hidden, gate, proj]
+    torch::Tensor state      // (B, 1, H)
 ) {
-    return FusedScanFunction::apply(gate, hidden, state);
+    return FusedScanFunction::apply(combined, state);
 }
 
 class LogCumsumExpFunction : public torch::autograd::Function<LogCumsumExpFunction> {
