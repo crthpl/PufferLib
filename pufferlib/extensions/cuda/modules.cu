@@ -8,53 +8,56 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-torch::Tensor mingru_gate(
+// Fused: chunk + mingru_gate + sigmoid(proj) * out
+// combined is (B, 1, 3*H) = [hidden, gate, proj]
+// state is (B, 1, H)
+// returns {out, next_state} where:
+//   out (B, 1, H) = sigmoid(proj) * mingru_out
+//   next_state (B, 1, H) = mingru_out (for recurrence)
+std::vector<torch::Tensor> mingru_gate(
     torch::Tensor state,
-    torch::Tensor gate,
-    torch::Tensor hidden
+    torch::Tensor combined
 ) {
-    // Validate
     TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
-    TORCH_CHECK(gate.is_cuda(), "gate must be on CUDA");
-    TORCH_CHECK(hidden.is_cuda(), "hidden must be on CUDA");
-    TORCH_CHECK(state.dtype() == gate.dtype() && gate.dtype() == hidden.dtype(),
-                "All tensors must have the same dtype");
-    TORCH_CHECK(state.sizes() == gate.sizes() && gate.sizes() == hidden.sizes(),
-                "All tensors must have the same shape");
-    TORCH_CHECK(state.is_contiguous() && gate.is_contiguous() && hidden.is_contiguous(),
-                "All tensors must be contiguous");
+    TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
+    TORCH_CHECK(state.dtype() == combined.dtype(), "dtypes must match");
+    TORCH_CHECK(state.dim() == 3 && combined.dim() == 3, "must be 3D tensors");
+    TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
+    TORCH_CHECK(state.size(0) == combined.size(0), "batch size must match");
+    TORCH_CHECK(state.is_contiguous() && combined.is_contiguous(), "must be contiguous");
 
     auto dtype = state.dtype();
-    auto device = state.device();
-    auto sizes = state.sizes();
-    const int N = state.numel();
+    auto B = state.size(0);
+    auto H = state.size(2);
 
-    auto out = torch::empty(sizes, state.options());
+    auto out = torch::empty_like(state);
+    auto next_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (dtype == torch::kFloat32) {
         launch_mingru_gate_inference<float>(
             out.data_ptr<float>(),
-            gate.data_ptr<float>(),
-            hidden.data_ptr<float>(),
+            next_state.data_ptr<float>(),
+            combined.data_ptr<float>(),
             state.data_ptr<float>(),
-            N,
+            static_cast<int>(H),
+            static_cast<int>(B),
             stream
         );
     } else if (dtype == torch::kBFloat16) {
         launch_mingru_gate_inference<at::BFloat16>(
             out.data_ptr<at::BFloat16>(),
-            gate.data_ptr<at::BFloat16>(),
-            hidden.data_ptr<at::BFloat16>(),
+            next_state.data_ptr<at::BFloat16>(),
+            combined.data_ptr<at::BFloat16>(),
             state.data_ptr<at::BFloat16>(),
-            N,
+            static_cast<int>(H),
+            static_cast<int>(B),
             stream
         );
     } else {
-        TORCH_CHECK(false,
-            "Unsupported dtype. Supported dtypes are float32 and bfloat16");
+        TORCH_CHECK(false, "Unsupported dtype. Supported dtypes are float32 and bfloat16");
     }
-    return out;
+    return {out, next_state};
 }
 
 class LogCoeffsAndValuesFunction : public torch::autograd::Function<LogCoeffsAndValuesFunction> {

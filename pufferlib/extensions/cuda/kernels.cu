@@ -228,42 +228,67 @@ void launch_rmsnorm_backward(
 }
 
 
+// Fused kernel: chunk + mingru_gate + sigmoid(proj) * out
+// combined is (B, 1, 3*H) containing [hidden, gate, proj] concatenated on last dim
+// state is (B, 1, H)
+// out is (B, 1, H) = sigmoid(proj) * mingru_out (final output)
+// next_state is (B, 1, H) = mingru_out (recurrent state, without proj)
 template<typename T>
 __global__ void mingru_gate_inference_kernel(
     T* out,
-    const T* gate_in,
-    const T* hidden_in,
-    const T* state_in,
-    int N
+    T* next_state,
+    const T* combined,    // (B, 1, 3*H) = [hidden, gate, proj]
+    const T* state_in,    // (B, 1, H)
+    int H,
+    int B
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * H;
     if (idx >= N) return;
 
-    float gate = float(gate_in[idx]);
-    float hidden = float(hidden_in[idx]);
+    int b = idx / H;
+    int h = idx % H;
+
+    // Read from combined: layout is [hidden(H), gate(H), proj(H)] for each batch
+    int combined_base = b * 3 * H;
+    float hidden = float(combined[combined_base + h]);
+    float gate = float(combined[combined_base + H + h]);
+    float proj = float(combined[combined_base + 2 * H + h]);
+
     float state = float(state_in[idx]);
+
+    // mingru_gate computation
     float gate_sigmoid = fast_sigmoid(gate);
     float hidden_tilde = tilde_relu_fwd(hidden);
-    float out_val = lerp(state, hidden_tilde, gate_sigmoid);
-    out[idx] = T(out_val);
+    float mingru_out = lerp(state, hidden_tilde, gate_sigmoid);
+
+    // next_state is mingru_out (for recurrence)
+    next_state[idx] = T(mingru_out);
+
+    // out is sigmoid(proj) * mingru_out (final output)
+    float proj_sigmoid = fast_sigmoid(proj);
+    out[idx] = T(proj_sigmoid * mingru_out);
 }
 
 template<typename T>
 void launch_mingru_gate_inference(
     T* out,
-    const T* gate_in,
-    const T* hidden_in,
+    T* next_state,
+    const T* combined,
     const T* state_in,
-    int N,
+    int H,
+    int B,
     cudaStream_t stream
 ) {
+    int N = B * H;
     int grid = grid_size(N);
     mingru_gate_inference_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         out,
-        gate_in,
-        hidden_in,
+        next_state,
+        combined,
         state_in,
-        N
+        H,
+        B
     );
 
     cudaError_t err = cudaGetLastError();

@@ -186,10 +186,9 @@ create_environments(int64_t num_envs) {
 namespace py = pybind11;
 
 // Forward declare modules
-torch::Tensor mingru_gate(
+std::vector<torch::Tensor> mingru_gate(
     torch::Tensor state,
-    torch::Tensor gate,
-    torch::Tensor hidden
+    torch::Tensor combined
 );
 torch::autograd::tensor_list log_coeffs_and_values(
     torch::Tensor gate,
@@ -530,27 +529,35 @@ public:
 
         auto seq_len = x.size(1);
         auto output = to_hidden_and_gate->forward(x);
-        //auto output = torch::matmul(x.to(torch::kBFloat16), to_hidden_and_gate_bf16.to(torch::kBFloat16)).to(torch::kFloat32);
-        auto chunks = output.chunk(3, 2);
-        auto hidden = chunks[0];
-        auto gate = chunks[1];
-        auto proj = chunks[2];
-
-        return std::make_tuple(hidden, gate);
 
         torch::Tensor out;
         torch::Tensor next_prev_hidden;
 
         if (seq_len == 1) {
+            // Inference path: fused chunk + mingru + sigmoid(proj) * out
             if (kernels) {
-                out = mingru_gate(state, gate.contiguous(), hidden.contiguous());
+                auto result = mingru_gate(state, output.contiguous());
+                out = result[0];              // sigmoid(proj) * mingru_out
+                next_prev_hidden = result[1]; // mingru_out (for recurrence)
             } else {
+                auto chunks = output.chunk(3, 2);
+                auto hidden = chunks[0];
+                auto gate = chunks[1];
+                auto proj = chunks[2];
                 hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
                 gate = gate.sigmoid();
                 out = torch::lerp(state, hidden, gate);
+                next_prev_hidden = out;
+                proj = torch::sigmoid(proj);
+                out = proj * out;
             }
-            next_prev_hidden = out;
         } else {
+            // Training path: still needs chunk for log_coeffs_and_values
+            auto chunks = output.chunk(3, 2);
+            auto hidden = chunks[0];
+            auto gate = chunks[1];
+            auto proj = chunks[2];
+
             torch::Tensor log_coeffs, log_values;
             if (kernels) {
                 torch::autograd::tensor_list outputs = log_coeffs_and_values(
@@ -582,21 +589,10 @@ public:
                 out = out.narrow(1, out.size(1) - seq_len, seq_len);
                 next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
             }
+
+            proj = torch::sigmoid(proj);
+            out = proj * out;
         }
-
-        //if (expansion_factor != 1) {
-        //    out = to_out->forward(out);
-        //}
-
-        proj = torch::sigmoid(proj);
-        out = proj * out;
-
-        // TODO: This norm is slow, but results are inconsistent without it
-        //out = out + x;
-        //out = norm->forward(out);
-        
-        //out = torch::tanh(0.25*out);
-        //out = dyt->forward(out);
 
         return std::make_tuple(out, next_prev_hidden);
     }
@@ -1153,8 +1149,8 @@ void train_forward_call(PuffeRL* pufferl) {
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
     torch::Tensor loss;
-    //if (false) {
-    if (pufferl->kernels) {
+    if (false) {
+    //if (pufferl->kernels) {
         loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1232,9 +1228,9 @@ void train_forward_call(PuffeRL* pufferl) {
     }
 
     loss.backward();
-    //clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
-    //pufferl->muon->step();
-    //pufferl->muon->zero_grad();
+    clip_grad_norm_(policy->parameters(), pufferl->max_grad_norm);
+    pufferl->muon->step();
+    pufferl->muon->zero_grad();
 
     //return std::make_tuple(logits, newvalue);
 
@@ -1807,9 +1803,9 @@ pybind11::dict train(pybind11::object pufferl_obj) {
 
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 TORCH_LIBRARY(_C, m) {
-    m.def("mingru_gate(Tensor state, Tensor gate, Tensor hidden) -> Tensor");
+    m.def("mingru_gate(Tensor state, Tensor combined) -> (Tensor, Tensor)");
     m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
-    m.def("fused_scan(Tensor log_coeffs, Tensor log_values, Tensor state) -> Tensor");
+    m.def("fused_scan(Tensor log_coeffs, Tensor log_values, Tensor state) -> (Tensor, Tensor)");
     m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
     m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
 }
