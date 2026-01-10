@@ -120,83 +120,98 @@ float rand1() {
     return (float)rand() / RAND_MAX * 2.0f - 1.0f;
 }
 
+// Fused mingru_gate for inference: takes combined (B, 1, 3*H) = [hidden, gate, proj]
+// Outputs: out = sigmoid(proj) * mingru_out, next_state = mingru_out (for recurrence)
 typedef struct {
-    float* state;
-    float* gate;
-    float* hidden;
-    float* out;
-    int N;
+    float* state;       // (B, 1, H) - input state
+    float* combined;    // (B, 1, 3*H) = [hidden, gate, proj]
+    float* out;         // (B, 1, H) - sigmoid(proj) * mingru_out
+    float* next_state;  // (B, 1, H) - raw mingru_out
+    int B;
+    int H;
 } MingruGateArgs;
 
 MingruGateArgs* create_mingrugateargs(int batch, int hidden) {
     MingruGateArgs* args = (MingruGateArgs*)calloc(1, sizeof(MingruGateArgs));
-    args->N = batch * hidden;
+    args->B = batch;
+    args->H = hidden;
 
-    cudaMalloc(&args->state, args->N * sizeof(float));
-    cudaMalloc(&args->gate, args->N * sizeof(float));
-    cudaMalloc(&args->hidden, args->N * sizeof(float));
-    cudaMalloc(&args->out, args->N * sizeof(float));
+    int N_state = batch * hidden;
+    int N_combined = batch * 3 * hidden;
 
-    float* buf = (float*)malloc(args->N * sizeof(float) * 3);
-    float* state_buf = buf;
-    float* gate_buf = buf + args->N;
-    float* hidden_buf = buf + args->N * 2;
-    for (int i = 0; i < args->N; ++i) {
-        state_buf[i] = rand1() * 5.0f;
-        gate_buf[i] = rand1() * 5.0f;
-        hidden_buf[i] = rand1() * 5.0f;
+    cudaMalloc(&args->state, N_state * sizeof(float));
+    cudaMalloc(&args->combined, N_combined * sizeof(float));
+    cudaMalloc(&args->out, N_state * sizeof(float));
+    cudaMalloc(&args->next_state, N_state * sizeof(float));
+
+    float* state_buf = (float*)malloc(N_state * sizeof(float));
+    float* combined_buf = (float*)malloc(N_combined * sizeof(float));
+
+    // Initialize state with positive values
+    for (int i = 0; i < N_state; ++i) {
+        state_buf[i] = fabsf(rand1()) + 0.1f;
+    }
+    // Initialize combined = [hidden, gate, proj]
+    for (int b = 0; b < batch; ++b) {
+        int base = b * 3 * hidden;
+        for (int h = 0; h < hidden; ++h) {
+            combined_buf[base + h] = rand1() * 5.0f;              // hidden
+            combined_buf[base + hidden + h] = rand1() * 5.0f;     // gate
+            combined_buf[base + 2 * hidden + h] = rand1() * 2.0f; // proj
+        }
     }
 
-    cudaMemcpy(args->state, state_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->gate, gate_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->hidden, hidden_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->state, state_buf, N_state * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->combined, combined_buf, N_combined * sizeof(float), cudaMemcpyHostToDevice);
 
-    free(buf);
+    free(state_buf);
+    free(combined_buf);
     return args;
 }
 
 void free_mingrugateargs(MingruGateArgs* args) {
     cudaFree(args->state);
-    cudaFree(args->gate);
-    cudaFree(args->hidden);
+    cudaFree(args->combined);
     cudaFree(args->out);
+    cudaFree(args->next_state);
     free(args);
 }
 
 void run_mingrugate_forward(MingruGateArgs* args) {
     launch_mingru_gate_inference<float>(
-        args->out, args->gate, args->hidden, args->state, args->N, 0);
+        args->out, args->next_state, args->combined, args->state,
+        args->H, args->B, 0);
 }
 
 #ifdef USE_TORCH
 
 typedef struct {
-    torch::Tensor state;
-    torch::Tensor gate;
-    torch::Tensor hidden;
-    int N;
+    torch::Tensor state;     // (B, 1, H)
+    torch::Tensor combined;  // (B, 1, 3*H)
+    int B;
+    int H;
 } MingruGateArgsTorch;
 
 MingruGateArgsTorch* create_mingrugateargs_torch(MingruGateArgs* raw) {
     MingruGateArgsTorch* args = new MingruGateArgsTorch();
-    args->N = raw->N;
+    args->B = raw->B;
+    args->H = raw->H;
 
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    args->state = torch::from_blob(raw->state, {raw->N}, opts);
-    args->gate = torch::from_blob(raw->gate, {raw->N}, opts);
-    args->hidden = torch::from_blob(raw->hidden, {raw->N}, opts);
+    args->state = torch::from_blob(raw->state, {raw->B, 1, raw->H}, opts);
+    args->combined = torch::from_blob(raw->combined, {raw->B, 1, 3 * raw->H}, opts);
 
     return args;
 }
 
 void run_mingrugate_forward_torch(MingruGateArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    mingru_gate(args->state, args->gate, args->hidden);
+    mingru_gate(args->state, args->combined);
 }
 
 void run_mingrugate_forward_cpp(MingruGateArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    mingru_gate_cpp(args->state, args->gate, args->hidden);
+    mingru_gate_cpp(args->state, args->combined);
 }
 
 #endif
@@ -204,7 +219,7 @@ void run_mingrugate_forward_cpp(MingruGateArgsTorch* args) {
 void profile_mingrugate(int batch, int hidden) {
     MingruGateArgs* args = create_mingrugateargs(batch, hidden);
 
-    printf("mingru_gate (N=%d, %dx%d)\n", args->N, batch, hidden);
+    printf("mingru_gate (B=%d, H=%d, combined=%dx%d)\n", batch, hidden, batch, 3*hidden);
 
     float fwd_ms = profile_kernel((kernel_fn)run_mingrugate_forward, args);
     print_timing("\tforward", fwd_ms, batch);
@@ -526,15 +541,20 @@ void profile_logcumsumexp(int batch, int seq, int hidden) {
     free_logcumsumexpargs(args);
 }
 
+// New fused_scan takes combined (B, T, 3*H) = [hidden, gate, proj] and state (B, 1, H)
+// Outputs: out (B, T, H) = sigmoid(proj) * scan_result, next_state (B, 1, H)
 typedef struct {
-    float* log_coeffs;
-    float* log_values;
-    float* out;
-    float* a_star;
-    float* s_vals;
-    float* grad_log_coeffs;
-    float* grad_log_values;
-    float* grad_out;
+    float* combined;       // (B, T, 3*H) = [hidden, gate, proj]
+    float* state;          // (B, 1, H)
+    float* out;            // (B, T, H)
+    float* next_state;     // (B, 1, H)
+    float* a_star;         // (B, T+1, H)
+    float* s_vals;         // (B, T+1, H)
+    float* log_values_buf; // (B, T+1, H)
+    float* grad_combined;  // (B, T, 3*H)
+    float* grad_state;     // (B, 1, H)
+    float* grad_out;       // (B, T, H)
+    float* grad_next_state;// (B, 1, H)
     int B;
     int T;
     int H;
@@ -546,98 +566,143 @@ FusedScanArgs* create_fusedscanargs(int batch, int seq, int hidden) {
     args->B = batch;
     args->T = seq;
     args->H = hidden;
-    args->N = batch*seq * hidden;
+    args->N = batch * seq * hidden;
 
-    cudaMalloc(&args->log_coeffs, args->N * sizeof(float));
-    cudaMalloc(&args->log_values, args->N * sizeof(float));
+    int N_combined = batch * seq * 3 * hidden;
+    int N_state = batch * hidden;
+    int N_buf = batch * (seq + 1) * hidden;
+
+    cudaMalloc(&args->combined, N_combined * sizeof(float));
+    cudaMalloc(&args->state, N_state * sizeof(float));
     cudaMalloc(&args->out, args->N * sizeof(float));
-    cudaMalloc(&args->a_star, args->N * sizeof(float));
-    cudaMalloc(&args->s_vals, args->N * sizeof(float));
-    cudaMalloc(&args->grad_log_coeffs, args->N * sizeof(float));
-    cudaMalloc(&args->grad_log_values, args->N * sizeof(float));
+    cudaMalloc(&args->next_state, N_state * sizeof(float));
+    cudaMalloc(&args->a_star, N_buf * sizeof(float));
+    cudaMalloc(&args->s_vals, N_buf * sizeof(float));
+    cudaMalloc(&args->log_values_buf, N_buf * sizeof(float));
+    cudaMalloc(&args->grad_combined, N_combined * sizeof(float));
+    cudaMalloc(&args->grad_state, N_state * sizeof(float));
     cudaMalloc(&args->grad_out, args->N * sizeof(float));
+    cudaMalloc(&args->grad_next_state, N_state * sizeof(float));
 
-    float* buf = (float*)malloc(args->N * sizeof(float) * 3);
-    float* log_coeffs_buf = buf;
-    float* log_values_buf = buf + args->N;
-    float* grad_out_buf = buf + args->N * 2;
+    // Allocate and initialize host buffers
+    float* combined_buf = (float*)malloc(N_combined * sizeof(float));
+    float* state_buf = (float*)malloc(N_state * sizeof(float));
+    float* grad_out_buf = (float*)malloc(args->N * sizeof(float));
+    float* grad_next_state_buf = (float*)malloc(N_state * sizeof(float));
+
+    // Initialize combined = [hidden, gate, proj] with reasonable values
+    for (int b = 0; b < batch; ++b) {
+        for (int t = 0; t < seq; ++t) {
+            for (int h = 0; h < hidden; ++h) {
+                int base = b * seq * 3 * hidden + t * 3 * hidden;
+                combined_buf[base + h] = rand1() * 5.0f;             // hidden
+                combined_buf[base + hidden + h] = rand1() * 5.0f;    // gate
+                combined_buf[base + 2 * hidden + h] = rand1() * 2.0f; // proj
+            }
+        }
+    }
+    // Initialize state with positive values (will be log'd)
+    for (int i = 0; i < N_state; ++i) {
+        state_buf[i] = fabsf(rand1()) + 0.1f;
+    }
+    // Initialize gradients
     for (int i = 0; i < args->N; ++i) {
-        log_coeffs_buf[i] = -logf(1.0f + expf(rand1() * 5.0f));
-        log_values_buf[i] = -logf(1.0f + expf(rand1() * 5.0f));
         grad_out_buf[i] = rand1();
     }
+    for (int i = 0; i < N_state; ++i) {
+        grad_next_state_buf[i] = rand1();
+    }
 
-    cudaMemcpy(args->log_coeffs, log_coeffs_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->log_values, log_values_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->combined, combined_buf, N_combined * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->state, state_buf, N_state * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(args->grad_out, grad_out_buf, args->N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->grad_next_state, grad_next_state_buf, N_state * sizeof(float), cudaMemcpyHostToDevice);
 
-    free(buf);
+    free(combined_buf);
+    free(state_buf);
+    free(grad_out_buf);
+    free(grad_next_state_buf);
     return args;
 }
 
 void free_fusedscanargs(FusedScanArgs* args) {
-    cudaFree(args->log_coeffs);
-    cudaFree(args->log_values);
+    cudaFree(args->combined);
+    cudaFree(args->state);
     cudaFree(args->out);
+    cudaFree(args->next_state);
     cudaFree(args->a_star);
     cudaFree(args->s_vals);
-    cudaFree(args->grad_log_coeffs);
-    cudaFree(args->grad_log_values);
+    cudaFree(args->log_values_buf);
+    cudaFree(args->grad_combined);
+    cudaFree(args->grad_state);
     cudaFree(args->grad_out);
+    cudaFree(args->grad_next_state);
     free(args);
 }
 
 void run_fusedscan_forward(FusedScanArgs* args) {
     launch_fused_scan_forward<float>(
-        args->out, args->a_star, args->s_vals,
-        args->log_coeffs, args->log_values,
+        args->out, args->next_state,
+        args->a_star, args->s_vals, args->log_values_buf,
+        args->combined, args->state,
         args->T, args->H, args->B, 0);
 }
 
 void run_fusedscan_backward(FusedScanArgs* args) {
     launch_fused_scan_backward<float>(
-        args->grad_log_coeffs, args->grad_log_values, args->grad_out,
-        args->log_coeffs, args->log_values, args->out,
-        args->a_star, args->s_vals,
+        args->grad_combined, args->grad_state,
+        args->grad_out, args->grad_next_state,
+        args->combined, args->state,
+        args->a_star, args->s_vals, args->log_values_buf,
         args->T, args->H, args->B, 0);
 }
 
 #ifdef USE_TORCH
 
 typedef struct {
-    torch::Tensor log_coeffs;
-    torch::Tensor log_values;
-    torch::Tensor out;
-    torch::Tensor grad_out;
-    int N;
+    torch::Tensor combined;    // (B, T, 3*H)
+    torch::Tensor state;       // (B, 1, H)
+    torch::Tensor out;         // (B, T, H)
+    torch::Tensor next_state;  // (B, 1, H)
+    torch::Tensor grad_out;    // (B, T, H)
+    torch::Tensor grad_next_state; // (B, 1, H)
+    int B;
+    int T;
+    int H;
 } FusedScanArgsTorch;
 
 FusedScanArgsTorch* create_fusedscanargs_torch(FusedScanArgs* raw) {
     FusedScanArgsTorch* args = new FusedScanArgsTorch();
-    args->N = raw->N;
+    args->B = raw->B;
+    args->T = raw->T;
+    args->H = raw->H;
 
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    args->log_coeffs = torch::from_blob(raw->log_coeffs, {raw->B, raw->T, raw->H}, opts).requires_grad_(true);
-    args->log_values = torch::from_blob(raw->log_values, {raw->B, raw->T, raw->H}, opts).requires_grad_(true);
+    args->combined = torch::from_blob(raw->combined, {raw->B, raw->T, 3 * raw->H}, opts).requires_grad_(true);
+    args->state = torch::from_blob(raw->state, {raw->B, 1, raw->H}, opts).requires_grad_(true);
     args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts);
+    args->grad_next_state = torch::from_blob(raw->grad_next_state, {raw->B, 1, raw->H}, opts);
 
     return args;
 }
 
 void run_fusedscan_forward_torch(FusedScanArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    fused_scan(args->log_coeffs, args->log_values);
+    fused_scan(args->combined, args->state);
 }
 
 void run_fusedscan_backward_torch(FusedScanArgsTorch* args) {
-    args->log_coeffs.mutable_grad() = torch::Tensor();
-    args->log_values.mutable_grad() = torch::Tensor();
-    args->out.backward(args->grad_out, /*retain_graph=*/true);
+    args->combined.mutable_grad() = torch::Tensor();
+    args->state.mutable_grad() = torch::Tensor();
+    torch::autograd::backward(
+        {args->out, args->next_state},
+        {args->grad_out, args->grad_next_state},
+        /*retain_graph=*/true);
 }
 
 void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    fused_scan_cpp(args->log_coeffs, args->log_values);
+    fused_scan_cpp(args->combined, args->state);
 }
 
 #endif
@@ -645,7 +710,8 @@ void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
 void profile_fusedscan(int batch, int seq, int hidden) {
     FusedScanArgs* args = create_fusedscanargs(batch, seq, hidden);
 
-    printf("fused_scan (N=%d, %dx%dx%d)\n", args->N, batch, seq, hidden);
+    printf("fused_scan (N=%d, %dx%dx%d, combined=%dx%dx%d)\n",
+           args->N, batch, seq, hidden, batch, seq, 3*hidden);
 
     float fwd_ms = profile_kernel((kernel_fn)run_fusedscan_forward, args);
     print_timing("\tforward", fwd_ms, batch*seq);
@@ -659,7 +725,9 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
 
-    args_torch->out = fused_scan(args_torch->log_coeffs, args_torch->log_values)[0];
+    auto scan_out = fused_scan(args_torch->combined, args_torch->state);
+    args_torch->out = scan_out[0];
+    args_torch->next_state = scan_out[1];
 
     float bwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_backward_torch, args_torch);
     print_timing("\tbackward (torch)", bwd_torch_ms, batch*seq);
@@ -667,7 +735,9 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     float fwd_cpp_ms = profile_kernel((kernel_fn)run_fusedscan_forward_cpp, args_torch);
     print_timing("\tforward (cpp)", fwd_cpp_ms, batch*seq);
 
-    args_torch->out = fused_scan_cpp(args_torch->log_coeffs, args_torch->log_values);
+    auto scan_out_cpp = fused_scan_cpp(args_torch->combined, args_torch->state);
+    args_torch->out = scan_out_cpp[0];
+    args_torch->next_state = scan_out_cpp[1];
 
     float bwd_cpp_ms = profile_kernel((kernel_fn)run_fusedscan_backward_torch, args_torch);
     print_timing("\tbackward (cpp)", bwd_cpp_ms, batch*seq);

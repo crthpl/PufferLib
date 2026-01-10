@@ -436,6 +436,7 @@ __global__ void fused_scan_forward_kernel(
     T* __restrict__ next_state,          // (B, 1, H) - raw scan_result at T (for recurrence)
     float* __restrict__ a_star_buf,      // (B, T+1, H) - for backward
     float* __restrict__ s_buf,           // (B, T+1, H) - for backward
+    float* __restrict__ log_values_buf,  // (B, T+1, H) - cached log_values for backward
     const T* __restrict__ combined,      // (B, T, 3*H) = [hidden(H), gate(H), proj(H)]
     const T* __restrict__ state,         // (B, 1, H)
     int T_seq,                           // sequence length (T)
@@ -449,7 +450,7 @@ __global__ void fused_scan_forward_kernel(
     int h = idx % H;
 
     int T_out = T_seq + 1;
-    int buf_base = b * T_out * H + h;    // base for a_star/s buffers (T+1 timesteps)
+    int buf_base = b * T_out * H + h;    // base for a_star/s/log_values buffers (T+1 timesteps)
     int out_base = b * T_seq * H + h;    // base for output (T timesteps)
     int state_idx = b * H + h;           // state is (B, 1, H) -> flatten to (B, H)
 
@@ -475,6 +476,9 @@ __global__ void fused_scan_forward_kernel(
 
             log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value_val);
         }
+
+        // Cache log_value for backward (avoid recomputation)
+        log_values_buf[buf_curr] = log_value_val;
 
         // a_star[t] = sum_{i=0}^t log_coeffs[i]
         a_star += log_coeff_val;
@@ -522,6 +526,7 @@ __global__ void fused_scan_backward_kernel(
     const T* __restrict__ state,           // (B, 1, H)
     const float* __restrict__ a_star_buf,  // (B, T+1, H)
     const float* __restrict__ s_buf,       // (B, T+1, H)
+    const float* __restrict__ log_values_buf, // (B, T+1, H) - cached from forward
     int T_seq,                             // sequence length (T)
     int H,
     int B
@@ -533,7 +538,7 @@ __global__ void fused_scan_backward_kernel(
     int h = idx % H;
 
     int T_out = T_seq + 1;
-    int buf_base = b * T_out * H + h;    // base for a_star/s buffers (T+1 timesteps)
+    int buf_base = b * T_out * H + h;    // base for a_star/s/log_values buffers (T+1 timesteps)
     int out_base = b * T_seq * H + h;    // base for grad_out (T timesteps)
     int state_idx = b * H + h;           // state is (B, 1, H) -> flatten to (B, H)
 
@@ -548,21 +553,18 @@ __global__ void fused_scan_backward_kernel(
         float s = s_buf[buf_curr];
         float scan_result = expf(a_star + s);  // reconstruct scan result
 
-        // Read from combined for t >= 1
-        float log_value_val;
+        // Read cached log_value from forward pass (no recomputation needed)
+        float log_value_val = log_values_buf[buf_curr];
+
+        // Read from combined for t >= 1 (still need gate/hidden for backward, proj for output gate)
         float gate_val = 0.0f, hidden_val = 0.0f, proj_val = 0.0f;
         int combined_base = 0;
 
-        if (t == 0) {
-            log_value_val = logf(float(state[state_idx]));
-        } else {
+        if (t >= 1) {
             combined_base = b * T_seq * 3 * H + (t - 1) * 3 * H;
             hidden_val = float(combined[combined_base + h]);
             gate_val = float(combined[combined_base + H + h]);
             proj_val = float(combined[combined_base + 2 * H + h]);
-            // Recompute log_value from gate/hidden
-            float log_coeff_unused;
-            log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_unused, &log_value_val);
         }
 
         float z = log_value_val - a_star;
@@ -893,6 +895,7 @@ void launch_fused_scan_forward(
     T* next_state,
     float* a_star,
     float* s_vals,
+    float* log_values_buf,  // (B, T+1, H) - cached for backward
     const T* combined,  // (B, T, 3*H) = [hidden, gate, proj]
     const T* state,
     int T_seq,
@@ -908,6 +911,7 @@ void launch_fused_scan_forward(
         next_state,
         a_star,
         s_vals,
+        log_values_buf,
         combined,
         state,
         T_seq,
@@ -932,6 +936,7 @@ void launch_fused_scan_backward(
     const T* state,
     const float* a_star_buf,
     const float* s_buf,
+    const float* log_values_buf,  // (B, T+1, H) - cached from forward
     int T_seq,
     int H,
     int B,
@@ -949,6 +954,7 @@ void launch_fused_scan_backward(
         state,
         a_star_buf,
         s_buf,
+        log_values_buf,
         T_seq,
         H,
         B

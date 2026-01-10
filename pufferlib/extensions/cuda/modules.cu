@@ -346,6 +346,7 @@ public:
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         auto a_star = torch::empty({B, T_buf, H}, options_float);
         auto s_vals = torch::empty({B, T_buf, H}, options_float);
+        auto log_values_buf = torch::empty({B, T_buf, H}, options_float);  // cached for backward
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // Launch kernel - takes combined (B, T, 3*H) directly
@@ -355,6 +356,7 @@ public:
                 next_state.data_ptr<float>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
                 combined.data_ptr<float>(),
                 state.data_ptr<float>(),
                 static_cast<int>(T),
@@ -369,6 +371,7 @@ public:
                 next_state.data_ptr<at::BFloat16>(),
                 a_star.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
                 combined.data_ptr<at::BFloat16>(),
                 state.data_ptr<at::BFloat16>(),
                 static_cast<int>(T),
@@ -381,7 +384,7 @@ public:
         }
 
         // Save for backward
-        ctx->save_for_backward({combined, state, a_star, s_vals});
+        ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
 
         return {out, next_state};
     }
@@ -392,8 +395,9 @@ public:
         auto saved = ctx->get_saved_variables();
         auto combined = saved[0].contiguous();
         auto state = saved[1].contiguous();
-        auto a_star_buf = saved[2].contiguous();  // float tensor
-        auto s_vals = saved[3].contiguous();      // float tensor
+        auto a_star_buf = saved[2].contiguous();      // float tensor
+        auto s_vals = saved[3].contiguous();          // float tensor
+        auto log_values_buf = saved[4].contiguous();  // float tensor - cached from forward
 
         auto grad_out = grad_outputs[0].contiguous();          // (B, T, H)
         auto grad_next_state = grad_outputs[1].contiguous();   // (B, 1, H)
@@ -418,6 +422,7 @@ public:
                 state.data_ptr<float>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
                 static_cast<int>(B),
@@ -433,6 +438,7 @@ public:
                 state.data_ptr<at::BFloat16>(),
                 a_star_buf.data_ptr<float>(),
                 s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
                 static_cast<int>(T),
                 static_cast<int>(H),
                 static_cast<int>(B),
@@ -799,10 +805,22 @@ torch::autograd::tensor_list fused_ppo_loss(
         adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
-torch::Tensor mingru_gate_cpp(torch::Tensor state, torch::Tensor gate, torch::Tensor hidden) {
+// Reference implementation for mingru_gate (inference path)
+// Takes combined (B, 1, 3*H) = [hidden, gate, proj] and state (B, 1, H)
+// Returns {out, next_state} where:
+//   out = sigmoid(proj) * mingru_out
+//   next_state = mingru_out (for recurrence)
+std::vector<torch::Tensor> mingru_gate_cpp(torch::Tensor state, torch::Tensor combined) {
+    auto chunks = combined.chunk(3, 2);
+    auto hidden = chunks[0];
+    auto gate = chunks[1];
+    auto proj = chunks[2];
+
     auto h = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
     auto g = gate.sigmoid();
-    return torch::lerp(state, h, g);
+    auto mingru_out = torch::lerp(state, h, g);
+    auto out = torch::sigmoid(proj) * mingru_out;
+    return {out, mingru_out};
 }
 
 torch::autograd::tensor_list log_coeffs_and_values_cpp(torch::Tensor gate, torch::Tensor hidden) {
@@ -819,11 +837,46 @@ torch::Tensor logcumsumexp_cpp(torch::Tensor x) {
     return x.exp().cumsum(1).log();
 }
 
-torch::Tensor fused_scan_cpp(torch::Tensor log_coeffs, torch::Tensor log_values) {
+// Reference implementation for fused_scan (training path)
+// Takes combined (B, T, 3*H) = [hidden, gate, proj] and state (B, 1, H)
+// Returns {out, next_state} where:
+//   out (B, T, H) = sigmoid(proj) * scan_result
+//   next_state (B, 1, H) = raw scan_result at T (for recurrence)
+std::vector<torch::Tensor> fused_scan_cpp(torch::Tensor combined, torch::Tensor state) {
+    auto seq_len = combined.size(1);
+
+    // Split combined into hidden, gate, proj
+    auto chunks = combined.chunk(3, 2);
+    auto hidden = chunks[0];
+    auto gate = chunks[1];
+    auto proj = chunks[2];
+
+    // Compute log_coeffs and log_values
+    auto log_coeffs = -torch::nn::functional::softplus(gate);
+    auto log_z = -torch::nn::functional::softplus(-gate);
+    auto log_tilde_h = torch::where(hidden >= 0,
+        (torch::nn::functional::relu(hidden) + 0.5).log(),
+        -torch::nn::functional::softplus(-hidden));
+    auto log_values = log_z + log_tilde_h;
+
+    // Cat state and pad for scan
+    log_values = torch::cat({state.log(), log_values}, 1);
+    log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
+
+    // Heinsen associative scan
     auto a_star = log_coeffs.cumsum(1);
     auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
     auto log_h = a_star + log_h0_plus_b_star;
-    return log_h.exp();
+    auto scan_result = log_h.exp();
+
+    // Extract output and next_state
+    scan_result = scan_result.narrow(1, scan_result.size(1) - seq_len, seq_len);
+    auto next_state = scan_result.narrow(1, scan_result.size(1) - 1, 1);
+
+    // Apply sigmoid(proj) * scan_result for output
+    auto out = torch::sigmoid(proj) * scan_result;
+
+    return {out, next_state};
 }
 
 torch::Tensor fused_ppo_loss_cpp(
