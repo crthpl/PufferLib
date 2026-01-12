@@ -1072,8 +1072,8 @@ void train_forward_call(PuffeRL* pufferl) {
     auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
 
     torch::Tensor loss;
-    if (false) {
     //if (pufferl->kernels) {
+    if (false) {
         loss = fused_ppo_loss(
             logits,
             newvalue,
@@ -1578,7 +1578,6 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         double lr_min = pufferl.min_lr_ratio * pufferl.lr;
         double lr = cosine_annealing(pufferl.lr, lr_min,current_epoch, pufferl.max_epochs);
         muon->lr.fill_(lr);
-        //muon->param_groups().at(0).options().set_lr(lr);
     }
 
     // Annealed priority exponent
@@ -1600,6 +1599,11 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+
+    torch::Tensor mb_state = torch::zeros(
+        {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
+        torch::dtype(DTYPE).device(values.device())
+    );
 
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
@@ -1635,16 +1639,16 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         torch::Tensor mb_advantages = advantages.index_select(0, idx);
         torch::Tensor mb_returns = mb_advantages + mb_values;
 
+        pufferl.adv_mean.copy_(mb_advantages.mean().detach());
+        pufferl.adv_std.copy_(mb_advantages.std().detach());
+
         // Reshape obs if not using RNN
         if (!use_rnn) {
             auto flat_shape = std::vector<int64_t>{-1, mb_obs.size(2), mb_obs.size(3)};
             mb_obs = mb_obs.reshape(flat_shape);
         }
 
-        torch::Tensor mb_state = torch::zeros(
-            {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
-            torch::dtype(DTYPE).device(values.device())
-        );
+        mb_state.zero_();
 
         // Forward pass
         //auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
@@ -1681,21 +1685,6 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         // This one matters a lot even on breakout
         pufferl.values.index_copy_(0, idx, pufferl.graph_train_newvalue.detach().squeeze(-1).to(torch::kFloat32));
 
-
-        //torch::Tensor loss = torch::zeros({1}, logits.options());
-        // Gradient accumulation and step
-        // ~10% overhead in this impl. Can save a ton of launches
-        /*
-        if ((mb + 1) % accumulate_minibatches == 0) {
-            // We use our version that doesn't sync for no reason
-            // 2m+ sps right here on clip + step!
-            clip_grad_norm_(policy->parameters(), max_grad_norm);
-            muon->step();
-            muon->zero_grad();
-            //pufferl.graph_train_logits.detach_();
-            //pufferl.graph_train_newvalue.detach_();
-        }
-        */
     }
     pufferl.epoch += 1;
 

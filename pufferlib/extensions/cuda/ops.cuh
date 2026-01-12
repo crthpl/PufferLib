@@ -219,13 +219,24 @@ __device__ __forceinline__ void log_coeffs_and_values_fwd(
     float* log_coeff_out,
     float* log_value_out
 ) {
-    *log_coeff_out = -softplus_fwd(gate);
+    // Save 1 softplus call: softplus(x) = x + softplus(-x) for any x
+    float abs_gate = fabsf(gate);
+    float sp_neg = log1pf(expf(-abs_gate));  // softplus(-|gate|) - single transcendental!
+    float softplus_gate, softplus_neg_gate;
+    if (gate >= 0.0f) {
+        softplus_gate = gate + sp_neg;
+        softplus_neg_gate = sp_neg;
+    } else {
+        softplus_gate = sp_neg;
+        softplus_neg_gate = -gate + sp_neg;
+    }
 
-    float log_z = -softplus_fwd(-gate);
+    *log_coeff_out = -softplus_gate;
+    float log_z = -softplus_neg_gate;
+
     float log_tilde_h;
     if (hidden >= 0.0f) {
-        float relu_h = relu(hidden);
-        log_tilde_h = logf(relu_h + 0.5f);
+        log_tilde_h = logf(hidden + 0.5f);
     } else {
         log_tilde_h = -softplus_fwd(-hidden);
     }
@@ -242,25 +253,21 @@ __device__ __forceinline__ void log_coeffs_and_values_bwd(
     float* grad_gate_out,
     float* grad_hidden_out
 ) {
-    // grad_gate from log_coeffs: d(-softplus(g))/dg = -softplus'(g)
-    float grad_g_from_lc = -softplus_bwd(grad_log_coeffs, gate);
-    // grad_gate from log_values via log_z: d(-softplus(-g))/dg = -(-1)*softplus'(-g) = softplus'(-g)
-    // But we have -softplus_bwd(-grad_lv, -g) which computes -softplus'(-g) * (-grad_lv)
-    float grad_g_from_lz = -softplus_bwd(-grad_log_values, -gate);
-    *grad_gate_out = grad_g_from_lc + grad_g_from_lz;
+    // Optimization: sigmoid(-x) = 1 - sigmoid(x), so compute sigmoid(gate) once
+    // softplus'(x) = sigmoid(x), so:
+    //   d(-softplus(g))/dg = -sigmoid(g)
+    //   d(-softplus(-g))/dg = sigmoid(-g) = 1 - sigmoid(g)
+    float sig_gate = sigmoid(gate);
+    *grad_gate_out = -grad_log_coeffs*sig_gate + grad_log_values*(1.0f - sig_gate);
 
     // grad_hidden from log_tilde_h
-    float grad_h_from_lt;
     if (hidden >= 0.0f) {
-        float relu_h = relu(hidden);
-        // log_tilde_h = log(relu_h + 0.5)
-        // d(log_tilde_h)/d(hidden) = (1/(relu_h + 0.5)) * relu'(hidden)
-        float inner_grad = 1.0f / (relu_h + 0.5f);
-        grad_h_from_lt = relu_backward(hidden, inner_grad * grad_log_values);
+        // log_tilde_h = log(hidden + 0.5)
+        // d(log_tilde_h)/d(hidden) = 1/(hidden + 0.5)
+        *grad_hidden_out = grad_log_values / (hidden + 0.5f);
     } else {
         // log_tilde_h = -softplus(-hidden)
-        // d(-softplus(-h))/dh = -(-1)*softplus'(-h) = softplus'(-h)
-        grad_h_from_lt = -softplus_bwd(-grad_log_values, -hidden);
+        // d(-softplus(-h))/dh = sigmoid(-h)
+        *grad_hidden_out = grad_log_values * sigmoid(-hidden);
     }
-    *grad_hidden_out = grad_h_from_lt;
 }

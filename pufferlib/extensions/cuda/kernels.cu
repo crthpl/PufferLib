@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdint>
 
-#define SEQ_SIZE 32
+#define SEQ_SIZE 256
 #define BLOCK_SIZE 256
 inline int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -258,7 +258,7 @@ __global__ void mingru_gate_inference_kernel(
     float state = float(state_in[idx]);
 
     // mingru_gate computation
-    float gate_sigmoid = fast_sigmoid(gate);
+    float gate_sigmoid = sigmoid(gate);
     float hidden_tilde = tilde_relu_fwd(hidden);
     float mingru_out = lerp(state, hidden_tilde, gate_sigmoid);
 
@@ -266,7 +266,7 @@ __global__ void mingru_gate_inference_kernel(
     next_state[idx] = T(mingru_out);
 
     // out is sigmoid(proj) * mingru_out (final output)
-    float proj_sigmoid = fast_sigmoid(proj);
+    float proj_sigmoid = sigmoid(proj);
     out[idx] = T(proj_sigmoid * mingru_out);
 }
 
@@ -457,25 +457,25 @@ __global__ void fused_scan_forward_kernel(
     float a_star = 0.0f;
     float s = -INFINITY;  // logcumsumexp accumulator
 
-    for (int t = 0; t < T_out; t++) {
+    // Handle t=0 outside the loop: use log(state), coeff = 0
+    float log_value_0 = logf(float(state[state_idx]));
+    log_values_buf[buf_base] = log_value_0;
+    s = log_value_0;  // z = log_value - a_star = log_value - 0 = log_value
+    a_star_buf[buf_base] = a_star;
+    s_buf[buf_base] = s;
+
+    // Loop t=1..T_seq (no branches needed)
+    float scan_result = 0.0f;
+    for (int t = 1; t < T_out; t++) {
         int buf_curr = buf_base + t * H;
+        int combined_base = b * T_seq * 3 * H + (t - 1) * 3 * H;
+
+        float hidden_val = float(combined[combined_base + h]);
+        float gate_val = float(combined[combined_base + H + h]);
+        float proj_val = float(combined[combined_base + 2 * H + h]);
 
         float log_coeff_val, log_value_val;
-        float proj_val = 0.0f;
-
-        if (t == 0) {
-            // First timestep: use log(state), coeff = 0
-            log_coeff_val = 0.0f;
-            log_value_val = logf(float(state[state_idx]));
-        } else {
-            // Read from combined: layout is [hidden(H), gate(H), proj(H)] for each timestep
-            int combined_base = b * T_seq * 3 * H + (t - 1) * 3 * H;
-            float hidden_val = float(combined[combined_base + h]);
-            float gate_val = float(combined[combined_base + H + h]);
-            proj_val = float(combined[combined_base + 2 * H + h]);
-
-            log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value_val);
-        }
+        log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value_val);
 
         // Cache log_value for backward (avoid recomputation)
         log_values_buf[buf_curr] = log_value_val;
@@ -493,25 +493,18 @@ __global__ void fused_scan_forward_kernel(
             s = max_val + log1pf(expf(min_val - max_val));
         }
 
-        float log_h = a_star + s;
-        float scan_result = expf(log_h);
+        scan_result = expf(a_star + s);
 
-        // Write to out for t=1..T (indices 0..T-1)
-        // out = sigmoid(proj) * scan_result
-        if (t >= 1) {
-            int out_curr = out_base + (t - 1) * H;
-            float proj_sigmoid = fast_sigmoid(proj_val);
-            out[out_curr] = T(proj_sigmoid * scan_result);
-        }
-
-        // Write timestep T to next_state (raw scan_result, no proj, for recurrence)
-        if (t == T_seq) {
-            next_state[state_idx] = T(scan_result);
-        }
+        // sigmoid(proj) * out
+        int out_curr = out_base + (t - 1) * H;
+        float proj_sigmoid = sigmoid(proj_val);
+        out[out_curr] = T(proj_sigmoid * scan_result);
 
         a_star_buf[buf_curr] = a_star;
         s_buf[buf_curr] = s;
     }
+    // Write timestep T to next_state (raw scan_result, no proj, for recurrence)
+    next_state[state_idx] = T(scan_result);
 }
 
 // Fully fused backward: chains through sigmoid(proj)*out and log_coeffs_and_values
@@ -547,6 +540,11 @@ __global__ void fused_scan_backward_kernel(
     float carry_grad_a = 0.0;
 
     for (int t = T_out - 1; t >= 0; --t) {
+        int base_adr = b*T_seq*3*H + (t-1)*3*H;
+        int hidden_adr = base_adr + h;
+        int gate_adr = base_adr + H + h;
+        int proj_adr = base_adr + 2*H + h;
+
         int buf_curr = buf_base + t * H;
 
         float a_star = a_star_buf[buf_curr];
@@ -561,10 +559,9 @@ __global__ void fused_scan_backward_kernel(
         int combined_base = 0;
 
         if (t >= 1) {
-            combined_base = b * T_seq * 3 * H + (t - 1) * 3 * H;
-            hidden_val = float(combined[combined_base + h]);
-            gate_val = float(combined[combined_base + H + h]);
-            proj_val = float(combined[combined_base + 2 * H + h]);
+            hidden_val = float(combined[hidden_adr]);
+            gate_val = float(combined[gate_adr]);
+            proj_val = float(combined[proj_adr]);
         }
 
         float z = log_value_val - a_star;
@@ -591,7 +588,7 @@ __global__ void fused_scan_backward_kernel(
         float grad_proj = 0.0f;
 
         if (t >= 1) {
-            float proj_sigmoid = fast_sigmoid(proj_val);
+            float proj_sigmoid = sigmoid(proj_val);
             grad_scan_result += grad_gated_out * proj_sigmoid;
             // sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
             grad_proj = grad_gated_out * scan_result * proj_sigmoid * (1.0f - proj_sigmoid);
@@ -621,9 +618,9 @@ __global__ void fused_scan_backward_kernel(
             log_coeffs_and_values_bwd(grad_a, grad_z, gate_val, hidden_val, &grad_g, &grad_h);
 
             // Write to grad_combined: [grad_hidden, grad_gate, grad_proj]
-            grad_combined[combined_base + h] = T(grad_h);
-            grad_combined[combined_base + H + h] = T(grad_g);
-            grad_combined[combined_base + 2 * H + h] = T(grad_proj);
+            grad_combined[gate_adr] = T(grad_g);
+            grad_combined[hidden_adr] = T(grad_h);
+            grad_combined[proj_adr] = T(grad_proj);
         }
     }
 }
