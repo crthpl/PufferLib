@@ -837,7 +837,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         torch.cuda.set_device(local_rank)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
-    vecenv = vecenv or load_env(env_name, args)
+    #vecenv = vecenv or load_env(env_name, args)
     #policy = policy or load_policy(args, vecenv, env_name)
 
     if 'LOCAL_RANK' in os.environ:

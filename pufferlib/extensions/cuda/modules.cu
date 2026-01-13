@@ -923,3 +923,103 @@ torch::Tensor fused_ppo_loss_cpp(
 
     return pg_loss + vf_coef * v_loss - ent_coef * entropy;
 }
+
+// Fused sample_logits: nan_to_num + log_softmax + multinomial + gather + value copy
+// Writes directly to pre-allocated output tensors to avoid copy overhead
+// logits: (B, A) - raw logits (may be non-contiguous in dim 0)
+// value: (B, 1) or (B,) - value from fused output (may be non-contiguous)
+// actions_out: (B,) float64 - output actions
+// logprobs_out: (B,) same dtype as logits - output log probabilities
+// value_out: (B,) same dtype as logits - output value (flattened copy)
+// seed: RNG seed
+// offset: RNG offset tensor (int64, read at kernel execution time for CUDA graph support)
+//
+// NOTE: Unlike other kernels, this supports non-contiguous logits/value input via stride.
+// This is specifically for fused logit+value decoder output where the decoder outputs
+// (B, V+A) and logits is a view [:, V:] with stride (V+A, 1) instead of (A, 1).
+// Using stride avoids .contiguous() kernel launches.
+//
+// NOTE: offset is a tensor (not scalar) so that CUDA graphs read the current value at
+// replay time. Increment offset with a CUDA tensor op after calling this function.
+void sample_logits(
+    torch::Tensor logits,
+    torch::Tensor value,
+    torch::Tensor actions_out,
+    torch::Tensor logprobs_out,
+    torch::Tensor value_out,
+    uint64_t seed,
+    torch::Tensor offset
+) {
+    TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D (B, A)");
+    TORCH_CHECK(logits.stride(1) == 1, "logits must be contiguous in last dim");
+    TORCH_CHECK(actions_out.is_contiguous(), "actions_out must be contiguous");
+    TORCH_CHECK(logprobs_out.is_contiguous(), "logprobs_out must be contiguous");
+    TORCH_CHECK(value_out.is_contiguous(), "value_out must be contiguous");
+    TORCH_CHECK(actions_out.dtype() == torch::kFloat64, "actions_out must be float64");
+    TORCH_CHECK(offset.dtype() == torch::kInt64, "offset must be int64");
+    TORCH_CHECK(offset.is_cuda(), "offset must be on CUDA");
+
+    auto dtype = logits.dtype();
+    auto B = logits.size(0);
+    auto A = logits.size(1);
+    auto logits_stride = logits.stride(0);  // row stride (may be > A for fused output)
+    // value may be (B, 1) or (B,) - stride(0) works for both (gives stride between elements)
+    auto value_stride = value.stride(0);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (dtype == torch::kFloat32) {
+        launch_sample_logits<float>(
+            actions_out.data_ptr<double>(),
+            logprobs_out.data_ptr<float>(),
+            value_out.data_ptr<float>(),
+            logits.data_ptr<float>(),
+            value.data_ptr<float>(),
+            seed,
+            offset.data_ptr<int64_t>(),
+            static_cast<int>(A),
+            static_cast<int>(B),
+            static_cast<int>(logits_stride),
+            static_cast<int>(value_stride),
+            stream
+        );
+    } else if (dtype == torch::kBFloat16) {
+        launch_sample_logits<at::BFloat16>(
+            actions_out.data_ptr<double>(),
+            logprobs_out.data_ptr<at::BFloat16>(),
+            value_out.data_ptr<at::BFloat16>(),
+            logits.data_ptr<at::BFloat16>(),
+            value.data_ptr<at::BFloat16>(),
+            seed,
+            offset.data_ptr<int64_t>(),
+            static_cast<int>(A),
+            static_cast<int>(B),
+            static_cast<int>(logits_stride),
+            static_cast<int>(value_stride),
+            stream
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
+    }
+}
+
+// Reference implementation for sample_logits (for correctness testing)
+std::vector<torch::Tensor> sample_logits_cpp(
+    torch::Tensor logits
+) {
+    // nan_to_num
+    auto clean_logits = torch::nan_to_num(logits);
+
+    // log_softmax
+    auto log_probs = torch::log_softmax(clean_logits, 1);
+
+    // multinomial sampling
+    auto probs = log_probs.exp();
+    auto actions = torch::multinomial(probs, 1, /*replacement=*/false).squeeze(1);
+
+    // gather logprobs
+    auto sampled_logprobs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1);
+
+    return {actions, sampled_logprobs};
+}
