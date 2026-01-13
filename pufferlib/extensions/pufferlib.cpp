@@ -499,7 +499,9 @@ public:
             if (kernels) {
                 // fused_scan takes combined (B, T, 3*H) directly
                 // output already has layout [hidden, gate, proj] from to_hidden_and_gate
-                auto scan_out = fused_scan(output.contiguous(), state.contiguous());
+                TORCH_CHECK(output.is_contiguous(), "output not contiguous before fused_scan");
+                TORCH_CHECK(state.is_contiguous(), "state not contiguous before fused_scan");
+                auto scan_out = fused_scan(output, state);
                 out = scan_out[0];                // (B, T, H) = sigmoid(proj) * scan_result
                 next_prev_hidden = scan_out[1];   // (B, 1, H) = raw scan_result at T
             } else {
@@ -1026,8 +1028,7 @@ void forward_call(PuffeRL* pufferl) {
         // Fused kernel writes directly to graph_actions, graph_logprobs, and graph_value
         sample_logits(logits, value, pufferl->graph_actions, pufferl->graph_logprobs,
                       pufferl->graph_value, pufferl->rng_seed, pufferl->rng_offset);
-        // Increment offset with CUDA tensor op so it works with graphs
-        pufferl->rng_offset.add_(1);
+        // Offset increment is now fused into sample_logits kernel
     } else {
         // This is most of the vectorized elementwise ops and reduce kernels
         logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
@@ -1636,7 +1637,7 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         muon->lr.fill_(lr);
     }
 
-    // Annealed priority exponent
+    // Annealed priority exponent - TODO: graphed?
     double anneal_beta = prio_beta0 + (1.0 - prio_beta0) * prio_alpha * static_cast<double>(current_epoch) / total_epochs;
 
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
@@ -1661,6 +1662,12 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         torch::dtype(DTYPE).device(values.device())
     );
 
+    // Temporary: random indices and uniform weights
+    /*
+    auto idx = torch::randint(0, segments, {minibatch_segments}, torch::dtype(torch::kInt64).device(device));
+    auto mb_prio = torch::ones({minibatch_segments, 1}, torch::dtype(torch::kFloat32).device(device));
+    */
+
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
 
@@ -1680,14 +1687,25 @@ pybind11::dict train(pybind11::object pufferl_obj) {
             cudaDeviceSynchronize();
             nvtxRangePushA("train_misc");
         }
-        // Prioritization
+        // Prioritization - commented out to isolate other overhead sources
+        // TODO: Replace with fused prioritization kernel
         auto adv = advantages.abs().sum(1);  // [num_envs]
         auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
         auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
         auto idx = at::multinomial(prio_probs, minibatch_segments, true);
         auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
 
-        // Index into data
+        // Temporary: contiguous slice instead of index_select to isolate copy overhead
+        /*
+        auto mb_prio = torch::ones({minibatch_segments, 1}, torch::dtype(torch::kFloat32).device(device));
+        torch::Tensor mb_obs = observations.slice(0, 0, minibatch_segments);
+        torch::Tensor mb_actions = actions.slice(0, 0, minibatch_segments);
+        torch::Tensor mb_logprobs = logprobs.slice(0, 0, minibatch_segments);
+        torch::Tensor mb_values = values.slice(0, 0, minibatch_segments);
+        torch::Tensor mb_advantages = advantages.slice(0, 0, minibatch_segments);
+        */
+        // Original index_select version:
+        //auto idx = torch::randint(0, segments, {minibatch_segments}, torch::dtype(torch::kInt64).device(device));
         torch::Tensor mb_obs = observations.index_select(0, idx);
         torch::Tensor mb_actions = actions.index_select(0, idx);
         torch::Tensor mb_logprobs = logprobs.index_select(0, idx);
@@ -1695,14 +1713,16 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         torch::Tensor mb_advantages = advantages.index_select(0, idx);
         torch::Tensor mb_returns = mb_advantages + mb_values;
 
-        pufferl.adv_mean.copy_(mb_advantages.mean().detach());
-        pufferl.adv_std.copy_(mb_advantages.std().detach());
+        //pufferl.adv_mean.copy_(mb_advantages.mean().detach());
+        //pufferl.adv_std.copy_(mb_advantages.std().detach());
 
         // Reshape obs if not using RNN
+        /*
         if (!use_rnn) {
             auto flat_shape = std::vector<int64_t>{-1, mb_obs.size(2), mb_obs.size(3)};
             mb_obs = mb_obs.reshape(flat_shape);
         }
+        */
 
         mb_state.zero_();
 
@@ -1737,19 +1757,24 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         // Update global ratio and values in-place (matches Python)
         // Buffers are {horizon, segments}, so index_copy_ along dim 1 (segments)
         // Source is {minibatch_segments, horizon}, need to transpose to {horizon, minibatch_segments}
-        // This one can be commented, doesn't matter much on breakout
+        // Temporary: use slice instead of index_copy_ for contiguous test
+        /*
+        pufferl.ratio.slice(1, 0, minibatch_segments).copy_(pufferl.graph_train_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.values.slice(1, 0, minibatch_segments).copy_(pufferl.graph_train_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        */
+        // Original index_copy_ version:
         pufferl.ratio.index_copy_(1, idx, pufferl.graph_train_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-
-        // This one matters a lot even on breakout
         pufferl.values.index_copy_(1, idx, pufferl.graph_train_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
 
     }
     pufferl.epoch += 1;
 
     // Compute explained variance at end of epoch
+    /*
     auto y_true = advantages.flatten() + values.flatten();
     auto y_pred = values.flatten();
     auto var_y = y_true.var();
+    */
     //double explained_var = (var_y.abs() < 1e-8) ? NAN : (1 - (y_true - y_pred).var() / var_y).item<double>();
 
     }

@@ -349,7 +349,7 @@ def test_sample_logits():
     # Wrapper for benchmarking with in-place signature
     def cpp_sample(logits):
         _C.sample_logits(logits, value, actions, logprobs, value_out, seed, offset)
-        offset.add_(1)  # Increment with CUDA op
+        # Offset increment is now fused into kernel
         return [actions, logprobs]
     cpp_sps = time_sps(cpp_sample, logits)
     print(f'\tForward sps: {py_sps} (naive) {cpp_sps} (C++)')

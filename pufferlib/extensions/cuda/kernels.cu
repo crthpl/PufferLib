@@ -1228,8 +1228,8 @@ __global__ void ppo_loss_forward_kernel(
     double v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
     double v_loss = 0.5f * fmax(v_loss_unclipped, v_loss_clipped);
 
-    // === Step 6: total sample loss ===
-    double thread_loss = pg_loss + vf_coef * v_loss - ent_coef * entropy;
+    // === Step 6: total sample loss (pre-divided by N*T for mean) ===
+    double thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * entropy) / double(total_elements);
 
     // === Save for backward ===
     double* saved_row = saved_for_backward + idx * 5;
@@ -1241,7 +1241,7 @@ __global__ void ppo_loss_forward_kernel(
 
     // === Block-local reduction using shared memory ===
     int tid = threadIdx.x;
-    block_loss[tid] = thread_loss;
+    block_loss[tid] = float(thread_loss);
     __syncthreads();
 
     // Reduce within block using tree reduction
@@ -1607,6 +1607,11 @@ __global__ void sample_logits_kernel(
 
     // Copy value (fused to avoid separate elementwise kernel for strided->contiguous copy)
     value_out[idx] = value[idx * value_stride];
+
+    // Increment RNG offset for next call (thread 0 only, fused to avoid separate kernel)
+    if (idx == 0) {
+        atomicAdd((unsigned long long*)offset_ptr, 1ULL);
+    }
 }
 
 template<typename T>
