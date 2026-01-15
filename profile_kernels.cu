@@ -7,14 +7,21 @@
 // Run: ./profile_kernels
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
+#include <nvToolsExt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <dlfcn.h>
+
+#include "pufferlib/extensions/vecenv.h"
 
 #ifdef USE_TORCH
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include "pufferlib/extensions/cuda/modules.cu"
+#include "pufferlib/extensions/policy.h"
 #else
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
@@ -22,6 +29,7 @@
 const int WARMUP_ITERS = 1000;
 const int TIMING_ITERS = 10000;
 
+const int BUF = 2;
 const int BR = 4096;  // Rollout batch (no T dim)
 const int BT = 512;   // Train batch (with T dim)
 const int T = 64;
@@ -45,7 +53,7 @@ void warmup_gpu() {
     cudaFree(dummy);
 }
 
-float profile_kernel(kernel_fn fn, void* args) {
+float profile_kernel(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -55,12 +63,16 @@ float profile_kernel(kernel_fn fn, void* args) {
         cudaDeviceSynchronize();
     }
 
+    cudaProfilerStart();
+    if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
     for (int i = 0; i < TIMING_ITERS; ++i) {
         fn(args);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+    if (name) nvtxRangePop();
+    cudaProfilerStop();
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
@@ -73,7 +85,7 @@ float profile_kernel(kernel_fn fn, void* args) {
 }
 
 #ifdef USE_TORCH
-float profile_graph(kernel_fn fn, void* args) {
+float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaDeviceSynchronize();
 
     at::cuda::CUDAGraph cuda_graph;
@@ -100,12 +112,16 @@ float profile_graph(kernel_fn fn, void* args) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    cudaProfilerStart();
+    if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
     for (int i = 0; i < TIMING_ITERS; ++i) {
         cuda_graph.replay();
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+    if (name) nvtxRangePop();
+    cudaProfilerStop();
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
@@ -214,18 +230,43 @@ void run_mingrugate_forward_cpp(MingruGateArgsTorch* args) {
     mingru_gate_cpp(args->state, args->combined);
 }
 
+void test_mingrugate_correct(MingruGateArgsTorch* args) {
+    // Run CUDA kernel via torch wrapper
+    auto kernel_outputs = mingru_gate(args->state, args->combined);
+    auto kernel_out = kernel_outputs[0];
+    auto kernel_next_state = kernel_outputs[1];
+
+    // Run cpp reference
+    auto cpp_outputs = mingru_gate_cpp(args->state, args->combined);
+    auto cpp_out = cpp_outputs[0];
+    auto cpp_next_state = cpp_outputs[1];
+
+    // Numerical comparison
+    float rtol = 1e-3f, atol = 1e-4f;
+    bool out_match = torch::allclose(kernel_out, cpp_out, rtol, atol);
+    float out_max_diff = (kernel_out - cpp_out).abs().max().item<float>();
+    bool next_state_match = torch::allclose(kernel_next_state, cpp_next_state, rtol, atol);
+    float next_state_max_diff = (kernel_next_state - cpp_next_state).abs().max().item<float>();
+
+    printf("  correctness: out=%s(%.2e) next_state=%s(%.2e)\n",
+           out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff,
+           next_state_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", next_state_max_diff);
+}
+
 #endif
 
 void profile_mingrugate(int batch, int hidden) {
-    MingruGateArgs* args = create_mingrugateargs(batch, hidden);
-
     printf("mingru_gate (B=%d, H=%d, combined=%dx%d)\n", batch, hidden, batch, 3*hidden);
+
+    MingruGateArgs* args = create_mingrugateargs(batch, hidden);
 
     float fwd_ms = profile_kernel((kernel_fn)run_mingrugate_forward, args);
     print_timing("\tforward", fwd_ms, batch);
 
 #ifdef USE_TORCH
     MingruGateArgsTorch* args_torch = create_mingrugateargs_torch(args);
+
+    test_mingrugate_correct(args_torch);
 
     float fwd_torch_ms = profile_kernel((kernel_fn)run_mingrugate_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch);
@@ -1169,13 +1210,616 @@ void profile_samplelogits(int batch, int num_actions) {
     free_samplelogitsargs(args);
 }
 
+// ============================================================================
+// forward_call profiling (inference forward pass)
+// ============================================================================
+
+#ifdef USE_TORCH
+
+typedef struct {
+    std::shared_ptr<PolicyMinGRU> policy;
+    torch::Tensor obs;           // (B, input_size)
+    torch::Tensor state;         // (num_layers, B, hidden_size)
+    torch::Tensor actions;       // (B,) float64
+    torch::Tensor logprobs;      // (B,)
+    torch::Tensor value;         // (B,)
+    torch::Tensor state_out;     // (num_layers, B, hidden_size)
+    torch::Tensor rng_offset;    // (1,) int64
+    uint64_t seed;
+    int B;
+    int input_size;
+    int hidden_size;
+    int num_atns;
+    int num_layers;
+    bool use_kernels;
+} ForwardCallArgs;
+
+ForwardCallArgs* create_forwardcallargs(int batch, int input_size, int hidden_size,
+                                        int num_atns, int num_layers, bool use_kernels) {
+    ForwardCallArgs* args = new ForwardCallArgs();
+    args->B = batch;
+    args->input_size = input_size;
+    args->hidden_size = hidden_size;
+    args->num_atns = num_atns;
+    args->num_layers = num_layers;
+    args->use_kernels = use_kernels;
+    args->seed = 42;
+
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Create policy (use kernels flag controls whether CUDA kernels are used)
+    args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
+    args->policy->to(torch::kCUDA);
+
+    // Create input tensors
+    args->obs = torch::randn({batch, input_size}, opts);
+    args->state = args->policy->initial_state(batch, torch::kCUDA);
+
+    // Create output tensors (pre-allocated for kernel to write to)
+    args->actions = torch::empty({batch}, opts.dtype(torch::kFloat64));
+    args->logprobs = torch::empty({batch}, opts);
+    args->value = torch::empty({batch}, opts);
+    args->state_out = torch::empty_like(args->state);
+    args->rng_offset = torch::zeros({1}, opts.dtype(torch::kInt64));
+
+    return args;
+}
+
+void free_forwardcallargs(ForwardCallArgs* args) {
+    delete args;
+}
+
+void run_forward_call(ForwardCallArgs* args) {
+    torch::NoGradGuard no_grad;
+
+    // Policy forward pass
+    auto [logits, value, state_out] = args->policy->forward(args->obs, args->state);
+
+    // Sample actions using kernel (matches forward_call in pufferlib.cpp)
+    if (args->use_kernels) {
+        sample_logits(logits, value.unsqueeze(1), args->actions, args->logprobs,
+                      args->value, args->seed, args->rng_offset);
+    } else {
+        // Non-kernel path (matches pufferlib.cpp)
+        auto logits_clean = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+        auto log_probs = torch::log_softmax(logits_clean, 1);
+        auto action = at::multinomial(log_probs.exp(), 1, true).squeeze(1);
+        auto logprob = log_probs.gather(1, action.unsqueeze(1)).squeeze(1);
+        args->actions.copy_(action.to(torch::kFloat64), false);
+        args->logprobs.copy_(logprob, false);
+        args->value.copy_(value, false);
+    }
+
+    // Copy state
+    args->state.copy_(state_out, false);
+    args->state_out.copy_(state_out, false);
+}
+
+#endif
+
+void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atns, int num_layers) {
+#ifdef USE_TORCH
+    printf("forward_call (B=%d, in=%d, H=%d, A=%d, layers=%d)\n",
+           batch, input_size, hidden_size, num_atns, num_layers);
+
+    // Profile with kernels
+    ForwardCallArgs* args_kernel = create_forwardcallargs(batch, input_size, hidden_size, num_atns, num_layers, true);
+    float fwd_kernel_ms = profile_kernel((kernel_fn)run_forward_call, args_kernel, "forward_call_kernel");
+    print_timing("\tkernel path", fwd_kernel_ms, batch);
+
+    float fwd_kernel_graph_ms = profile_graph((kernel_fn)run_forward_call, args_kernel, "forward_call_kernel_graph");
+    print_timing("\tkernel (graph)", fwd_kernel_graph_ms, batch);
+
+    free_forwardcallargs(args_kernel);
+
+    // Profile without kernels (torch ops path)
+    ForwardCallArgs* args_torch = create_forwardcallargs(batch, input_size, hidden_size, num_atns, num_layers, false);
+    float fwd_torch_ms = profile_kernel((kernel_fn)run_forward_call, args_torch, "forward_call_torch");
+    print_timing("\ttorch path", fwd_torch_ms, batch);
+
+    float fwd_torch_graph_ms = profile_graph((kernel_fn)run_forward_call, args_torch, "forward_call_torch_graph");
+    print_timing("\ttorch (graph)", fwd_torch_graph_ms, batch);
+
+    free_forwardcallargs(args_torch);
+
+    printf("\n");
+#else
+    printf("forward_call: requires USE_TORCH\n\n");
+#endif
+}
+
+// ============================================================================
+// rollout_copy_call profiling (copy from graph buffers to rollout storage)
+// ============================================================================
+
+#ifdef USE_TORCH
+
+typedef struct {
+    // Storage buffers (horizon, num_envs, ...)
+    torch::Tensor obs_buffer;      // (horizon, num_envs, input_size)
+    torch::Tensor act_buffer;      // (horizon, num_envs)
+    torch::Tensor logprob_buffer;  // (horizon, num_envs)
+    torch::Tensor rew_buffer;      // (horizon, num_envs)
+    torch::Tensor term_buffer;     // (horizon, num_envs)
+    torch::Tensor val_buffer;      // (horizon, num_envs)
+
+    // Graph outputs (block_size, ...)
+    torch::Tensor graph_obs;       // (block_size, input_size)
+    torch::Tensor graph_actions;   // (block_size,)
+    torch::Tensor graph_logprobs;  // (block_size,)
+    torch::Tensor graph_value;     // (block_size,)
+
+    // Env buffers (num_envs, ...)
+    torch::Tensor env_actions;     // (num_envs,)
+    torch::Tensor env_rewards;     // (num_envs,)
+    torch::Tensor env_terminals;   // (num_envs,)
+
+    int horizon;
+    int num_envs;
+    int num_buffers;
+    int input_size;
+    int h;  // current timestep
+    int buf;  // current buffer index
+} RolloutCopyArgs;
+
+RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffers, int input_size) {
+    RolloutCopyArgs* args = new RolloutCopyArgs();
+    args->horizon = horizon;
+    args->num_envs = num_envs;
+    args->num_buffers = num_buffers;
+    args->input_size = input_size;
+    args->h = 0;
+    args->buf = 0;
+
+    int block_size = num_envs / num_buffers;
+
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Storage buffers
+    args->obs_buffer = torch::zeros({horizon, num_envs, input_size}, opts);
+    args->act_buffer = torch::zeros({horizon, num_envs}, opts.dtype(torch::kFloat64));
+    args->logprob_buffer = torch::zeros({horizon, num_envs}, opts);
+    args->rew_buffer = torch::zeros({horizon, num_envs}, opts);
+    args->term_buffer = torch::zeros({horizon, num_envs}, opts);
+    args->val_buffer = torch::zeros({horizon, num_envs}, opts);
+
+    // Graph outputs (simulating forward_call output)
+    args->graph_obs = torch::randn({block_size, input_size}, opts);
+    args->graph_actions = torch::randint(0, 4, {block_size}, opts.dtype(torch::kFloat64));
+    args->graph_logprobs = torch::randn({block_size}, opts);
+    args->graph_value = torch::randn({block_size}, opts);
+
+    // Env buffers
+    args->env_actions = torch::zeros({num_envs}, opts.dtype(torch::kFloat64));
+    args->env_rewards = torch::randn({num_envs}, opts);
+    args->env_terminals = torch::zeros({num_envs}, opts);
+
+    return args;
+}
+
+void free_rolloutcopyargs(RolloutCopyArgs* args) {
+    delete args;
+}
+
+void run_rollout_copy_call(RolloutCopyArgs* args) {
+    int h = args->h;
+    int buf = args->buf;
+    int block_size = args->num_envs / args->num_buffers;
+
+    // Non-blocking copies to storage buffers
+    args->obs_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_obs, true);
+    args->act_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_actions, true);
+    args->logprob_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_logprobs, true);
+    args->val_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_value, true);
+
+    auto rewards_batch = args->env_rewards.narrow(0, buf*block_size, block_size);
+    args->rew_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
+
+    auto terminals_batch = args->env_terminals.narrow(0, buf*block_size, block_size);
+    args->term_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
+
+    args->env_actions.narrow(0, buf*block_size, block_size).copy_(args->graph_actions, true);
+}
+
+#endif
+
+void profile_rolloutcopycall(int horizon, int num_envs, int num_buffers, int input_size) {
+#ifdef USE_TORCH
+    int block_size = num_envs / num_buffers;
+    printf("rollout_copy_call (H=%d, envs=%d, buffers=%d, block=%d)\n",
+           horizon, num_envs, num_buffers, block_size);
+
+    RolloutCopyArgs* args = create_rolloutcopyargs(horizon, num_envs, num_buffers, input_size);
+
+    float copy_ms = profile_kernel((kernel_fn)run_rollout_copy_call, args, "rollout_copy");
+    print_timing("\tcopy ops", copy_ms, block_size);
+
+    float copy_graph_ms = profile_graph((kernel_fn)run_rollout_copy_call, args, "rollout_copy_graph");
+    print_timing("\tcopy (graph)", copy_graph_ms, block_size);
+
+    free_rolloutcopyargs(args);
+
+    printf("\n");
+#else
+    printf("rollout_copy_call: requires USE_TORCH\n\n");
+#endif
+}
+
+// ============================================================================
+// train_forward_call profiling (training forward + backward + optimizer step)
+// ============================================================================
+
+#ifdef USE_TORCH
+
+typedef struct {
+    std::shared_ptr<PolicyMinGRU> policy;
+    std::shared_ptr<torch::optim::Adam> optimizer;
+
+    // Minibatch inputs
+    torch::Tensor mb_obs;         // (segments, horizon, input_size)
+    torch::Tensor mb_state;       // (num_layers, segments, 1, hidden_size)
+    torch::Tensor mb_actions;     // (segments, horizon)
+    torch::Tensor mb_logprobs;    // (segments, horizon)
+    torch::Tensor mb_advantages;  // (segments, horizon)
+    torch::Tensor mb_prio;        // (segments,)
+    torch::Tensor mb_values;      // (segments, horizon)
+    torch::Tensor mb_returns;     // (segments, horizon)
+
+    // PPO params
+    float clip_coef;
+    float vf_clip_coef;
+    float vf_coef;
+    float ent_coef;
+    float max_grad_norm;
+
+    int segments;
+    int horizon;
+    int input_size;
+    int hidden_size;
+    int num_atns;
+    int num_layers;
+    bool use_kernels;
+} TrainForwardArgs;
+
+TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_size,
+                                          int hidden_size, int num_atns, int num_layers,
+                                          bool use_kernels) {
+    TrainForwardArgs* args = new TrainForwardArgs();
+    args->segments = segments;
+    args->horizon = horizon;
+    args->input_size = input_size;
+    args->hidden_size = hidden_size;
+    args->num_atns = num_atns;
+    args->num_layers = num_layers;
+    args->use_kernels = use_kernels;
+    args->clip_coef = 0.1f;
+    args->vf_clip_coef = 0.1f;
+    args->vf_coef = 0.5f;
+    args->ent_coef = 0.01f;
+    args->max_grad_norm = 0.5f;
+
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Create policy
+    args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
+    args->policy->to(torch::kCUDA);
+
+    // Create optimizer (using Adam as simple substitute for Muon)
+    args->optimizer = std::make_shared<torch::optim::Adam>(args->policy->parameters(), 0.0003);
+
+    // Create minibatch tensors
+    args->mb_obs = torch::randn({segments, horizon, input_size}, opts);
+    args->mb_state = torch::zeros({num_layers, segments, 1, hidden_size}, opts);
+    args->mb_actions = torch::randint(0, num_atns, {segments, horizon}, opts.dtype(torch::kInt64));
+    args->mb_logprobs = torch::randn({segments, horizon}, opts);
+    args->mb_advantages = torch::randn({segments, horizon}, opts);
+    args->mb_prio = torch::ones({segments}, opts);
+    args->mb_values = torch::randn({segments, horizon}, opts);
+    args->mb_returns = torch::randn({segments, horizon}, opts);
+
+    return args;
+}
+
+void free_trainforwardargs(TrainForwardArgs* args) {
+    delete args;
+}
+
+void run_train_forward_call(TrainForwardArgs* args) {
+    // Forward pass
+    auto [logits, newvalue] = args->policy->forward_train(args->mb_obs, args->mb_state);
+
+    // Compute PPO loss (torch ops path - matches pufferlib.cpp when kernels=false)
+    auto flat_logits = logits.reshape({-1, logits.size(-1)});
+    auto flat_actions = args->mb_actions.reshape({-1});
+    auto logprobs_new = torch::log_softmax(flat_logits, 1);
+    auto probs_new = logprobs_new.exp();
+
+    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+    auto newlogprob = newlogprob_flat.reshape({args->segments, args->horizon});
+    auto entropy = -(probs_new * logprobs_new).sum(1).mean();
+
+    auto logratio = newlogprob - args->mb_logprobs;
+    auto ratio_new = logratio.exp();
+
+    auto adv_normalized = args->mb_prio.unsqueeze(1) *
+        (args->mb_advantages - args->mb_advantages.mean()) / (args->mb_advantages.std() + 1e-8f);
+
+    auto pg_loss1 = -adv_normalized * ratio_new;
+    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - args->clip_coef, 1.0 + args->clip_coef);
+    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+
+    newvalue = newvalue.view(args->mb_returns.sizes());
+    auto v_clipped = args->mb_values + torch::clamp(newvalue - args->mb_values, -args->vf_clip_coef, args->vf_clip_coef);
+    auto v_loss_unclipped = (newvalue - args->mb_returns).pow(2);
+    auto v_loss_clipped = (v_clipped - args->mb_returns).pow(2);
+    auto v_loss = 0.5f * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+
+    auto loss = pg_loss + args->vf_coef * v_loss - args->ent_coef * entropy;
+
+    // Backward pass
+    loss.backward();
+
+    // Gradient clipping (simplified - full version in pufferlib.cpp)
+    torch::nn::utils::clip_grad_norm_(args->policy->parameters(), args->max_grad_norm);
+
+    // Optimizer step
+    args->optimizer->step();
+    args->optimizer->zero_grad();
+}
+
+#endif
+
+void profile_trainforwardcall(int segments, int horizon, int input_size,
+                              int hidden_size, int num_atns, int num_layers) {
+#ifdef USE_TORCH
+    printf("train_forward_call (seg=%d, H=%d, in=%d, hid=%d, A=%d, layers=%d)\n",
+           segments, horizon, input_size, hidden_size, num_atns, num_layers);
+
+    // Profile with kernels
+    TrainForwardArgs* args_kernel = create_trainforwardargs(segments, horizon, input_size,
+                                                            hidden_size, num_atns, num_layers, true);
+    float train_kernel_ms = profile_kernel((kernel_fn)run_train_forward_call, args_kernel, "train_forward_kernel");
+    print_timing("\tkernel path", train_kernel_ms, segments * horizon);
+
+    //float train_kernel_graph_ms = profile_graph((kernel_fn)run_train_forward_call, args_kernel, "train_forward_kernel_graph");
+    //print_timing("\tkernel (graph)", train_kernel_graph_ms, segments * horizon);
+
+    free_trainforwardargs(args_kernel);
+
+    // Profile without kernels (torch ops path)
+    TrainForwardArgs* args_torch = create_trainforwardargs(segments, horizon, input_size,
+                                                           hidden_size, num_atns, num_layers, false);
+    float train_torch_ms = profile_kernel((kernel_fn)run_train_forward_call, args_torch, "train_forward_torch");
+    print_timing("\ttorch path", train_torch_ms, segments * horizon);
+
+    //float train_torch_graph_ms = profile_graph((kernel_fn)run_train_forward_call, args_torch, "train_forward_torch_graph");
+    //print_timing("\ttorch (graph)", train_torch_graph_ms, segments * horizon);
+
+    free_trainforwardargs(args_torch);
+
+    printf("\n");
+#else
+    printf("train_forward_call: requires USE_TORCH\n\n");
+#endif
+}
+
+// ============================================================================
+// Environment speed test (breakout)
+// ============================================================================
+
+// Global function pointers for env interface
+static create_environments_fn create_envs = nullptr;
+static create_threads_fn create_threads = nullptr;
+static vec_reset_fn vec_reset = nullptr;
+static vec_send_fn vec_send = nullptr;
+static vec_recv_fn vec_recv = nullptr;
+static vec_close_fn vec_close = nullptr;
+
+typedef struct {
+    VecEnv* vec;
+    int num_envs;
+    int num_buffers;
+    int num_threads;
+    int horizon;
+    int obs_n;
+    int act_n;
+} EnvSpeedArgs;
+
+EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads, int horizon) {
+    // Load breakout.so dynamically
+    void* handle = dlopen("./breakout.so", RTLD_NOW);
+    if (!handle) {
+        fprintf(stderr, "dlopen error: %s\n", dlerror());
+        fprintf(stderr, "Make sure to build breakout first: ./scripts/build_ocean.sh breakout fast\n");
+        return nullptr;
+    }
+    dlerror();
+
+    // Load function pointers
+    create_envs = (create_environments_fn)dlsym(handle, "create_environments");
+    create_threads = (create_threads_fn)dlsym(handle, "create_threads");
+    vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
+    vec_send = (vec_send_fn)dlsym(handle, "vec_send");
+    vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
+    vec_close = (vec_close_fn)dlsym(handle, "vec_close");
+    int obs_n = *(int*)dlsym(handle, "OBS_N");
+    int act_n = *(int*)dlsym(handle, "ACT_N");
+
+    const char* dlsym_error = dlerror();
+    if (dlsym_error) {
+        fprintf(stderr, "dlsym error: %s\n", dlsym_error);
+        dlclose(handle);
+        return nullptr;
+    }
+
+    // Create kwargs for breakout
+    Dict* kwargs = create_dict(32);
+    dict_set_int(kwargs, "frameskip", 4);
+    dict_set_int(kwargs, "width", 576);
+    dict_set_int(kwargs, "height", 330);
+    dict_set_int(kwargs, "paddle_width", 62);
+    dict_set_int(kwargs, "paddle_height", 8);
+    dict_set_int(kwargs, "ball_width", 32);
+    dict_set_int(kwargs, "ball_height", 32);
+    dict_set_int(kwargs, "brick_width", 32);
+    dict_set_int(kwargs, "brick_height", 12);
+    dict_set_int(kwargs, "brick_rows", 6);
+    dict_set_int(kwargs, "brick_cols", 18);
+    dict_set_int(kwargs, "initial_ball_speed", 256);
+    dict_set_int(kwargs, "max_ball_speed", 448);
+    dict_set_int(kwargs, "paddle_speed", 620);
+    dict_set_int(kwargs, "continuous", 0);
+
+    // Create environments
+    VecEnv* vec = create_envs(num_envs, num_buffers, true, 0, kwargs);
+    if (!vec) {
+        fprintf(stderr, "Failed to create environments\n");
+        return nullptr;
+    }
+
+    // Create threads
+    int block_size = num_envs / num_threads;
+    create_threads(vec, num_threads, block_size);
+
+    // Reset
+    vec_reset(vec);
+    cudaDeviceSynchronize();
+
+    EnvSpeedArgs* args = (EnvSpeedArgs*)calloc(1, sizeof(EnvSpeedArgs));
+    args->vec = vec;
+    args->num_envs = num_envs;
+    args->num_buffers = num_buffers;
+    args->num_threads = num_threads;
+    args->horizon = horizon;
+    args->obs_n = obs_n;
+    args->act_n = act_n;
+
+    return args;
+}
+
+void free_envspeedargs(EnvSpeedArgs* args) {
+    if (args && args->vec) {
+        vec_close(args->vec);
+    }
+    free(args);
+}
+
+// Run full rollout iteration: iterate through all buffers * horizon
+void run_env_rollout(EnvSpeedArgs* args) {
+    int num_buffers = args->num_buffers;
+    int horizon = args->horizon;
+    VecEnv* vec = args->vec;
+
+    for (int i = 0; i < num_buffers * horizon; ++i) {
+        int buf = i % num_buffers;
+        vec_recv(vec, buf);
+        // In real usage, policy forward would happen here (async on GPU)
+        vec_send(vec, buf);
+    }
+}
+
+float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Warmup
+    for (int i = 0; i < 100; ++i) {
+        run_env_rollout(args);
+        cudaDeviceSynchronize();
+    }
+
+    cudaProfilerStart();
+    if (name) nvtxRangePushA(name);
+    cudaEventRecord(start);
+    for (int i = 0; i < 1000; ++i) {
+        run_env_rollout(args);
+    }
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    if (name) nvtxRangePop();
+    cudaProfilerStop();
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return ms / 1000;  // per rollout
+}
+
+void profile_envspeed(int num_envs, int num_buffers, int num_threads, int horizon) {
+    printf("env_speed (envs=%d, buffers=%d, threads=%d, horizon=%d)\n",
+           num_envs, num_buffers, num_threads, horizon);
+
+    EnvSpeedArgs* args = create_envspeedargs(num_envs, num_buffers, num_threads, horizon);
+    if (!args) {
+        printf("\tFailed to create env - skipping\n\n");
+        return;
+    }
+
+    printf("\tobs_n=%d, act_n=%d\n", args->obs_n, args->act_n);
+
+    // Profile full rollout (num_buffers * horizon steps)
+    float rollout_ms = profile_env_rollout(args, "env_rollout");
+    int total_steps = num_envs * horizon;
+    printf("\trollout time: %.2f ms (%d steps)\n", rollout_ms, total_steps);
+
+    // Compute throughput
+    float sps = total_steps / rollout_ms * 1000.0f;
+    printf("\tthroughput: %.2f M steps/s\n", sps / 1e6);
+
+    free_envspeedargs(args);
+    printf("\n");
+}
+
+void print_usage(const char* prog) {
+    printf("Usage: %s <profile>\n", prog);
+    printf("  kernels        - Individual kernel profiling (no nsys needed)\n");
+    printf("  forwardcall    - Inference forward pass\n");
+    printf("  trainforward   - Training forward + backward + optimizer\n");
+    printf("  rolloutcopy    - Rollout buffer copy operations\n");
+    printf("  envspeed       - Environment step throughput\n");
+    printf("  all            - Run all profiles\n");
+}
+
 int main(int argc, char** argv) {
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const char* profile = argv[1];
     warmup_gpu();
-    //profile_mingrugate(BR, H);
-    //profile_logcoeffsandvalues(BT, T, H);
-    //profile_logcumsumexp(BT, T, H);
-    //profile_fusedscan(BT, T, H);
-    profile_samplelogits(BR, A);
-    //profile_ppoloss(BT, T, A);
+
+    // Using typical breakout settings: input_size=96, hidden_size=128, num_atns=4
+
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "all") == 0) {
+        profile_mingrugate(BR, H);
+        profile_logcoeffsandvalues(BT, T, H);
+        profile_logcumsumexp(BT, T, H);
+        profile_fusedscan(BT, T, H);
+        profile_samplelogits(BR, A);
+        profile_ppoloss(BT, T, A);
+    }
+
+    if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
+        profile_forwardcall(BR, 96, H, A, 1);
+    }
+
+    if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
+        profile_trainforwardcall(BT, T, 96, H, A, 1);
+    }
+
+    if (strcmp(profile, "rolloutcopy") == 0 || strcmp(profile, "all") == 0) {
+        profile_rolloutcopycall(T, BR, 1, 96);
+    }
+
+    if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
+        // num_envs=8192, num_buffers=2, num_threads=8, horizon=64
+        profile_envspeed(BUF*BR, BUF, 8, T);
+    }
+
     return 0;
 }

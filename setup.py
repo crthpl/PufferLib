@@ -248,13 +248,15 @@ class ProfilerBuildExt(build_ext):
         if not self.no_torch:
             out = 'profile_kernels_torch'
             lib_paths = cpp_ext.library_paths()
+            nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
             cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-I.']
             cmd += ['-I' + sysconfig.get_path('include')]
             cmd += ['-I' + p for p in cpp_ext.include_paths()]
             cmd += ['-L' + p for p in lib_paths]
+            cmd += ['-L' + nvtx_lib_dir]
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
-            cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda']
+            cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl']
             cmd += [src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')

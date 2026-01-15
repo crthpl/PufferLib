@@ -10,6 +10,7 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -1459,6 +1460,178 @@ torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
     return {pufferl.env_obs, pufferl.env_actions, pufferl.env_rewards, pufferl.env_terminals};
 }
 
+// ============================================================================
+// Profiled sections - each function wraps an NVTX range
+// ============================================================================
+
+void prof_vec_recv(PuffeRL& pufferl, int buf) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("vec_recv");
+    }
+    vec_recv(pufferl.vec, buf);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("rollout_copy_inputs");
+    }
+    auto& buf_state = pufferl.buffer_states[buf];
+    pufferl.graph_obs.copy_(pufferl.env_obs.narrow(0, buf*block_size, block_size), true);
+    pufferl.graph_state.copy_(buf_state, false);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_rollout_graph(PuffeRL& pufferl) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("rollout_graph");
+    }
+    if (pufferl.cudagraphs) {
+        pufferl.rollout_graph.replay();
+    } else {
+        forward_call(&pufferl);
+    }
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_rollout_copy_outputs(PuffeRL& pufferl, int h, int buf) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("rollout_copy_outputs");
+    }
+    auto& buf_state = pufferl.buffer_states[buf];
+    buf_state.copy_(pufferl.graph_state_out, false);
+    pufferl.i_tmp = h;
+    pufferl.j_tmp = buf;
+    if (pufferl.cudagraphs) {
+        pufferl.rollout_copy_graphs[h][buf].replay();
+    } else {
+        rollout_copy_call(&pufferl);
+    }
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_vec_send(PuffeRL& pufferl, int buf) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("vec_send");
+    }
+    vec_send(pufferl.vec, buf);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_compute_puff_advantage(PuffeRL& pufferl, torch::Tensor& values, torch::Tensor& rewards,
+                                  torch::Tensor& terminals, torch::Tensor& ratio, torch::Tensor& advantages,
+                                  double gamma, double gae_lambda, double vtrace_rho_clip, double vtrace_c_clip) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("compute_puff_advantage");
+    }
+    compute_puff_advantage_cuda(values, rewards, terminals, ratio, advantages,
+                                gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> prof_compute_prio(PuffeRL& pufferl, torch::Tensor& advantages,
+                                                            int64_t minibatch_segments, int64_t segments,
+                                                            double prio_alpha, double anneal_beta) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("compute_prio");
+    }
+    auto adv = advantages.abs().sum(1);
+    auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+    auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
+    auto idx = at::multinomial(prio_probs, minibatch_segments, true);
+    auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+    return {idx, mb_prio};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+prof_train_index_select(PuffeRL& pufferl, torch::Tensor& observations, torch::Tensor& actions,
+                        torch::Tensor& logprobs, torch::Tensor& values, torch::Tensor& advantages,
+                        torch::Tensor& idx) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("train_index_select");
+    }
+    torch::Tensor mb_obs = observations.index_select(0, idx);
+    torch::Tensor mb_actions = actions.index_select(0, idx);
+    torch::Tensor mb_logprobs = logprobs.index_select(0, idx);
+    torch::Tensor mb_values = values.index_select(0, idx);
+    torch::Tensor mb_advantages = advantages.index_select(0, idx);
+    torch::Tensor mb_returns = mb_advantages + mb_values;
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+    return {mb_obs, mb_actions, mb_logprobs, mb_values, mb_advantages, mb_returns};
+}
+
+void prof_train_graph_copy(PuffeRL& pufferl, torch::Tensor& mb_state, torch::Tensor& mb_obs,
+                           torch::Tensor& mb_actions, torch::Tensor& mb_logprobs,
+                           torch::Tensor& mb_advantages, torch::Tensor& mb_prio,
+                           torch::Tensor& mb_values, torch::Tensor& mb_returns) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("train_graph_copy");
+    }
+    mb_state.zero_();
+    pufferl.graph_train_mb_obs.copy_(mb_obs, false);
+    pufferl.graph_train_mb_state.copy_(mb_state, false);
+    pufferl.graph_train_mb_actions.copy_(mb_actions, false);
+    pufferl.graph_train_mb_logprobs.copy_(mb_logprobs, false);
+    pufferl.graph_train_mb_advantages.copy_(mb_advantages, false);
+    pufferl.graph_train_mb_prio.copy_(mb_prio, false);
+    pufferl.graph_train_mb_values.copy_(mb_values, false);
+    pufferl.graph_train_mb_returns.copy_(mb_returns, false);
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
+void prof_train_forward_graph(PuffeRL& pufferl) {
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePushA("train_forward_graph");
+    }
+    if (pufferl.cudagraphs) {
+        pufferl.train_forward_graph.replay();
+    } else {
+        train_forward_call(&pufferl);
+    }
+    if (pufferl.profile) {
+        cudaDeviceSynchronize();
+        nvtxRangePop();
+    }
+}
+
 torch::Tensor rollouts(pybind11::object pufferl_obj) {
     torch::NoGradGuard no_grad;
 
@@ -1490,85 +1663,21 @@ torch::Tensor rollouts(pybind11::object pufferl_obj) {
 
     for (int64_t i = 0; i < num_buffers*horizon; ++i) {
         int buf = i % num_buffers;
-	    int h = i / num_buffers;
+        int h = i / num_buffers;
 
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePushA("vec_recv");
-        }
-        vec_recv(vec, buf);
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-
-            cudaDeviceSynchronize();
-            nvtxRangePushA("rollout_copy_inputs");
-        }
-        // Per-buffer state: {num_layers, block_size, hidden} - already contiguous
-        auto& buf_state = pufferl.buffer_states[buf];
-        pufferl.graph_obs.copy_(pufferl.env_obs.narrow(0, buf*block_size, block_size), true);
-        pufferl.graph_state.copy_(buf_state, false);
-
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-
-            cudaDeviceSynchronize();
-            nvtxRangePushA("rollout_graph");
-        }
-        if (pufferl.cudagraphs) {
-            pufferl.rollout_graph.replay();
-        } else {
-            forward_call(&pufferl);
-        }
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-        
-            cudaDeviceSynchronize();
-            nvtxRangePushA("rollout_copy_outputs");
-        }
-        buf_state.copy_(pufferl.graph_state_out, false);
-        // Store with non-blocking copies
-        pufferl.i_tmp = h;
-        pufferl.j_tmp = buf;
-        if (pufferl.cudagraphs) {
-            pufferl.rollout_copy_graphs[h][buf].replay();
-        } else {
-            rollout_copy_call(&pufferl);
-        }
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-        }
+        prof_vec_recv(pufferl, buf);
+        prof_rollout_copy_inputs(pufferl, buf, block_size);
+        prof_rollout_graph(pufferl);
+        prof_rollout_copy_outputs(pufferl, h, buf);
 
         // TODO: There should be a lighter way to sync. You need to make sure the torch data streams
         // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
         cudaDeviceSynchronize();
-        //c10::cuda::getCurrentCUDAStream().synchronize();
 
         {
             pybind11::gil_scoped_release no_gil;
-            //step_environments_cuda(envs_tensor, indices_tensor);
-            // Losing 1m sps here
-            if (pufferl.profile) {
-                cudaDeviceSynchronize();
-                nvtxRangePushA("vec_send");
-            }
-            vec_send(vec, buf);
-            if (pufferl.profile) {
-                cudaDeviceSynchronize();
-                nvtxRangePop();
-            }
-            //float reward_sum = 0;
-            //for (int j = 0; j < vec->size; j++) {
-            //    reward_sum += vec->rewards[j];
-            //}
-            //render_environments(envs_tensor, indices_tensor);
+            prof_vec_send(pufferl, buf);
         }
-
-	// Bad clamp
-    //    rewards.clamp_(-1.0f, 1.0f);
     }
 
     // TODO: state?
@@ -1671,88 +1780,19 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     for (int64_t mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
 
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePushA("compute_puff_advantage");
-        }
-        compute_puff_advantage_cuda(
-            values, rewards, terminals, ratio,
-            advantages, gamma, gae_lambda,
-            vtrace_rho_clip, vtrace_c_clip
-        );
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
+        prof_compute_puff_advantage(pufferl, values, rewards, terminals, ratio, advantages,
+                                    gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip);
 
-            cudaDeviceSynchronize();
-            nvtxRangePushA("train_misc");
-        }
-        // Prioritization - commented out to isolate other overhead sources
-        // TODO: Replace with fused prioritization kernel
-        auto adv = advantages.abs().sum(1);  // [num_envs]
-        auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-        auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
-        auto idx = at::multinomial(prio_probs, minibatch_segments, true);
-        auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+        auto [idx, mb_prio] = prof_compute_prio(pufferl, advantages, minibatch_segments, segments,
+                                                 prio_alpha, anneal_beta);
 
-        // Temporary: contiguous slice instead of index_select to isolate copy overhead
-        /*
-        auto mb_prio = torch::ones({minibatch_segments, 1}, torch::dtype(torch::kFloat32).device(device));
-        torch::Tensor mb_obs = observations.slice(0, 0, minibatch_segments);
-        torch::Tensor mb_actions = actions.slice(0, 0, minibatch_segments);
-        torch::Tensor mb_logprobs = logprobs.slice(0, 0, minibatch_segments);
-        torch::Tensor mb_values = values.slice(0, 0, minibatch_segments);
-        torch::Tensor mb_advantages = advantages.slice(0, 0, minibatch_segments);
-        */
-        // Original index_select version:
-        //auto idx = torch::randint(0, segments, {minibatch_segments}, torch::dtype(torch::kInt64).device(device));
-        torch::Tensor mb_obs = observations.index_select(0, idx);
-        torch::Tensor mb_actions = actions.index_select(0, idx);
-        torch::Tensor mb_logprobs = logprobs.index_select(0, idx);
-        torch::Tensor mb_values = values.index_select(0, idx);
-        torch::Tensor mb_advantages = advantages.index_select(0, idx);
-        torch::Tensor mb_returns = mb_advantages + mb_values;
+        auto [mb_obs, mb_actions, mb_logprobs, mb_values, mb_advantages, mb_returns] =
+            prof_train_index_select(pufferl, observations, actions, logprobs, values, advantages, idx);
 
-        //pufferl.adv_mean.copy_(mb_advantages.mean().detach());
-        //pufferl.adv_std.copy_(mb_advantages.std().detach());
+        prof_train_graph_copy(pufferl, mb_state, mb_obs, mb_actions, mb_logprobs,
+                              mb_advantages, mb_prio, mb_values, mb_returns);
 
-        // Reshape obs if not using RNN
-        /*
-        if (!use_rnn) {
-            auto flat_shape = std::vector<int64_t>{-1, mb_obs.size(2), mb_obs.size(3)};
-            mb_obs = mb_obs.reshape(flat_shape);
-        }
-        */
-
-        mb_state.zero_();
-
-        // Forward pass
-        //auto [logits, newvalue] = policy->forward_train(mb_obs.to(DTYPE), mb_state);
-        pufferl.graph_train_mb_obs.copy_(mb_obs, false);
-        pufferl.graph_train_mb_state.copy_(mb_state, false);
-        pufferl.graph_train_mb_actions.copy_(mb_actions, false);
-        pufferl.graph_train_mb_logprobs.copy_(mb_logprobs, false);
-        pufferl.graph_train_mb_advantages.copy_(mb_advantages, false);
-        pufferl.graph_train_mb_prio.copy_(mb_prio, false);
-        pufferl.graph_train_mb_values.copy_(mb_values, false);
-        pufferl.graph_train_mb_returns.copy_(mb_returns, false);
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-
-            //auto [logits, newvalue] = train_forward_call(&pufferl);
-            cudaDeviceSynchronize();
-            nvtxRangePushA("train_forward_graph");
-        }
-        if (pufferl.cudagraphs) {
-            pufferl.train_forward_graph.replay();
-        } else {
-            train_forward_call(&pufferl);
-        }
-        if (pufferl.profile) {
-            cudaDeviceSynchronize();
-            nvtxRangePop();
-        }
+        prof_train_forward_graph(pufferl);
 
         // Update global ratio and values in-place (matches Python)
         // Buffers are {horizon, segments}, so index_copy_ along dim 1 (segments)
@@ -1795,6 +1835,18 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     return losses;
 }
 
+// Profiler control for nsys --capture-range=cudaProfilerApi
+void profiler_start() {
+    cudaDeviceSynchronize();
+    printf("cudaProfilerStart()\n");
+    cudaProfilerStart();
+}
+
+void profiler_stop() {
+    cudaDeviceSynchronize();
+    cudaProfilerStop();
+    printf("cudaProfilerStop()\n");
+}
 
 // PYBIND11_MODULE with the extension name (pufferlib._C)
 TORCH_LIBRARY(_C, m) {
@@ -1827,6 +1879,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
     m.def("env_buffers", &env_buffers);
+    m.def("profiler_start", &profiler_start);
+    m.def("profiler_stop", &profiler_stop);
     /*
     py::class_<RMSNorm, torch::nn::ModuleHolder<RMSNormImpl>>(m, "RMSNorm")
         .def(py::init<int64_t, double>(),

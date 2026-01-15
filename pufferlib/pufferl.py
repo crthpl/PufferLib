@@ -172,7 +172,6 @@ class PuffeRL:
         config['num_envs'] = self.num_envs
         config['cudagraphs'] = True
         config['kernels'] = True
-        config['profile'] = False
         config['num_buffers'] = 2
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.observations
@@ -864,6 +863,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 
+    if train_config['profile']:
+        _C.profiler_start()
+
     all_logs = []
     max_cost = args['train'].get('max_cost', -1)
     while pufferl.global_step < train_config['total_timesteps']:
@@ -881,14 +883,18 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
                 all_logs.append(logs)
 
             if should_stop_early is not None and should_stop_early(logs):
+                if train_config['profile']:
+                    _C.profiler_stop()
                 model_path = pufferl.close()
                 pufferl.logger.close(model_path)
                 return all_logs
 
+    if train_config['profile']:
+        _C.profiler_stop()
+
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
-    '''
     uptime = pufferl.uptime
     agent_steps = pufferl.global_step
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
@@ -907,7 +913,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path)
     return all_logs
-    '''
 
 def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
     args = args or load_config(env_name)
@@ -1224,68 +1229,6 @@ def sweep(args=None, env_name=None):
         # Prevent logging final eval steps as training steps
         args['train']['total_timesteps'] = total_timesteps
 
-def profile(args=None, env_name=None, vecenv=None, policy=None):
-    args = load_config(env_name)
-    #vecenv = vecenv or load_env(env_name, args)
-    #policy = policy or load_policy(args, vecenv)
-
-    #train_config = dict(**args['train'], env=args['env_name'], tag=args['tag'])
-    train_config = dict(**args['train'])
-    #pufferl = PuffeRL(train_config, vecenv, policy, neptune=args['neptune'], wandb=args['wandb'])
-    pufferl = PuffeRL(train_config)
-
-    # Warmup
-    for _ in range(5):
-        stats = pufferl.evaluate()
-        pufferl.train()
-
-    torch.cuda.synchronize()
-    torch._C._cuda_clearCublasWorkspaces()      # optional, clears cuBLAS heuristics
-    torch.compiler.cudagraph_mark_step_begin()  # forces any pending CUDA graph/JIT work to finish
-    torch.cuda.synchronize()
-
-    pufferl.evaluate()
-    pufferl.train()
-    torch.cuda.synchronize()
-
-    import torchvision.models as models
-    from torch.profiler import profile, record_function, ProfilerActivity, schedule
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=schedule(
-            skip_first=15,
-            wait=5,
-            warmup=10,
-            active=5,
-            repeat=1
-        ),
-    ) as prof:
-        for _ in range(35):  # 15 + 5 + 10 + 5 
-            with record_function("full_step"):
-                pufferl.evaluate()
-                pufferl.train()
-            prof.step()
-
-    '''
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        with_stack=False,
-    ) as prof:
-        with record_function("full_step"):
-            for _ in range(5):
-                stats = pufferl.evaluate()
-                pufferl.train()
-                prof.step()
-    '''
-
-    print(prof.key_averages(group_by_input_shape=False).table(
-        sort_by="self_cpu_time_total",
-        row_limit=50,
-    ))
-    #prof.export_chrome_trace("trace.json")
-
 def export(args=None, env_name=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
     args['vec'] = dict(backend='Serial', num_envs=1)
@@ -1417,6 +1360,7 @@ def make_parser():
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--sweep-gpus', type=int, default=-1, help='multigpu sweeps')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
+    parser.add_argument('--profile', action='store_true', help='Enable nsys profiling (use with nsys --capture-range=cudaProfilerApi)')
     return parser
 
 def process_config(config, parser=None):
@@ -1465,7 +1409,7 @@ def process_config(config, parser=None):
     return args
 
 def main():
-    err = 'Usage: puffer [train, eval, sweep, autotune, profile, export] [env_name] [optional args]. --help for more info'
+    err = 'Usage: puffer [train, eval, sweep, autotune, export] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
         raise pufferlib.APIUsageError(err)
 
@@ -1483,8 +1427,6 @@ def main():
         paretosweep(env_name=env_name)
     elif mode == 'autotune':
         autotune(env_name=env_name)
-    elif mode == 'profile':
-        profile(env_name=env_name)
     elif mode == 'export':
         export(env_name=env_name)
     elif mode == 'check':
