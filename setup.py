@@ -257,7 +257,7 @@ class ProfilerBuildExt(build_ext):
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
             cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl']
-            cmd += ['pufferlib/extensions/muon.cpp', 'pufferlib/extensions/cuda/pufferlib.cu', src, '-o', out]
+            cmd += ['pufferlib/extensions/muon.cpp', 'pufferlib/extensions/cuda/advantage.cu', src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)
@@ -298,7 +298,7 @@ if not NO_TRAIN:
     ]
     if BUID_CUDA_EXT:
         extension = CUDAExtension
-        torch_sources.append("pufferlib/extensions/cuda/pufferlib.cu")
+        torch_sources.append("pufferlib/extensions/cuda/advantage.cu")
         torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
         torch_sources.append("pufferlib/extensions/cuda/kernels.cu")
         torch_sources.append("pufferlib/extensions/cuda/modules.cu")
