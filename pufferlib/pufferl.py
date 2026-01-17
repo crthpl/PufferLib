@@ -174,12 +174,12 @@ class PuffeRL:
         config['kernels'] = True
         config['num_buffers'] = 2
         self.pufferl_cpp = _C.create_pufferl(config)
-        self.observations = self.pufferl_cpp.observations
-        self.actions = self.pufferl_cpp.actions
-        self.rewards = self.pufferl_cpp.rewards
-        self.terminals = self.pufferl_cpp.terminals
-        self.logprobs = self.pufferl_cpp.logprobs
-        self.values = self.pufferl_cpp.values
+        self.observations = self.pufferl_cpp.rollouts.observations
+        self.actions = self.pufferl_cpp.rollouts.actions
+        self.rewards = self.pufferl_cpp.rollouts.rewards
+        self.terminals = self.pufferl_cpp.rollouts.terminals
+        self.logprobs = self.pufferl_cpp.rollouts.logprobs
+        self.values = self.pufferl_cpp.rollouts.values
         self.debug = self.pufferl_cpp.debug
 
         # Initializations
@@ -807,13 +807,13 @@ def check(env_name):
     # You need to determinize the env before checks
     for i in range(args['train']['bptt_horizon']):
         python_obs = pufferl_python.observations[:, i].float()
-        cpp_obs = pufferl_cpp.observations[:, i]
-        assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.observations[:, i]), f'Observation {i} mismatch'
-        assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.actions[:, i].long()), f'Action {i} mismatch'
-        assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rewards[:, i]), f'Reward {i} mismatch'
-        assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.terminals[:, i]), f'Terminal {i} mismatch'
-        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.logprobs[:, i], atol=1e-5), f'Logprob {i} mismatch'
-        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.values[:, i], atol=1e-4), f'Value {i} mismatch'
+        cpp_obs = pufferl_cpp.rollouts.observations[:, i]
+        assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.rollouts.observations[:, i]), f'Observation {i} mismatch'
+        assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.rollouts.actions[:, i].long()), f'Action {i} mismatch'
+        assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rollouts.rewards[:, i]), f'Reward {i} mismatch'
+        assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.rollouts.terminals[:, i]), f'Terminal {i} mismatch'
+        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.rollouts.logprobs[:, i], atol=1e-5), f'Logprob {i} mismatch'
+        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.rollouts.values[:, i], atol=1e-4), f'Value {i} mismatch'
 
     python_params = dict(policy.named_parameters())
     for k, v in pufferl_cpp.pufferl_cpp.policy.named_parameters():
