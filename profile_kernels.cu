@@ -17,11 +17,9 @@
 #include "pufferlib/extensions/vecenv.h"
 
 #ifdef USE_TORCH
-#include <torch/torch.h>
-#include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAGraph.h>
+#include "pufferlib/extensions/pufferlib.cpp"
 #include "pufferlib/extensions/cuda/modules.cu"
-#include "pufferlib/extensions/policy.h"
+using namespace pufferlib;
 #else
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
@@ -35,6 +33,7 @@ const int BT = 512;   // Train batch (with T dim)
 const int T = 64;
 const int H = 128;
 const int A = 4;
+const int INPUT_SIZE = 96;
 
 typedef void (*kernel_fn)(void*);
 
@@ -1211,56 +1210,33 @@ void profile_samplelogits(int batch, int num_actions) {
 }
 
 // ============================================================================
-// forward_call profiling (inference forward pass)
+// forward_call profiling (inference forward pass) - using GraphBuf
 // ============================================================================
 
 #ifdef USE_TORCH
 
 typedef struct {
     std::shared_ptr<PolicyMinGRU> policy;
-    torch::Tensor obs;           // (B, input_size)
-    torch::Tensor state;         // (num_layers, B, hidden_size)
-    torch::Tensor actions;       // (B,) float64
-    torch::Tensor logprobs;      // (B,)
-    torch::Tensor value;         // (B,)
-    torch::Tensor state_out;     // (num_layers, B, hidden_size)
-    torch::Tensor rng_offset;    // (1,) int64
+    GraphBuf graph;
+    Tensor rng_offset;
     uint64_t seed;
-    int B;
-    int input_size;
-    int hidden_size;
-    int num_atns;
-    int num_layers;
     bool use_kernels;
 } ForwardCallArgs;
 
 ForwardCallArgs* create_forwardcallargs(int batch, int input_size, int hidden_size,
                                         int num_atns, int num_layers, bool use_kernels) {
     ForwardCallArgs* args = new ForwardCallArgs();
-    args->B = batch;
-    args->input_size = input_size;
-    args->hidden_size = hidden_size;
-    args->num_atns = num_atns;
-    args->num_layers = num_layers;
     args->use_kernels = use_kernels;
     args->seed = 42;
 
-    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-
-    // Create policy (use kernels flag controls whether CUDA kernels are used)
+    // Create policy
     args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
 
-    // Create input tensors
-    args->obs = torch::randn({batch, input_size}, opts);
-    args->state = args->policy->initial_state(batch, torch::kCUDA);
-
-    // Create output tensors (pre-allocated for kernel to write to)
-    args->actions = torch::empty({batch}, opts.dtype(torch::kFloat64));
-    args->logprobs = torch::empty({batch}, opts);
-    args->value = torch::empty({batch}, opts);
-    args->state_out = torch::empty_like(args->state);
-    args->rng_offset = torch::zeros({1}, opts.dtype(torch::kInt64));
+    // Use create_graph factory (minibatch_segments=0 since not used for inference)
+    args->graph = create_graph(batch, input_size, 0, 0, num_layers, hidden_size, 1, args->policy.get());
+    args->graph.obs = torch::randn({batch, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->rng_offset = torch::zeros({1}, torch::dtype(torch::kInt64).device(torch::kCUDA));
 
     return args;
 }
@@ -1270,29 +1246,7 @@ void free_forwardcallargs(ForwardCallArgs* args) {
 }
 
 void run_forward_call(ForwardCallArgs* args) {
-    torch::NoGradGuard no_grad;
-
-    // Policy forward pass
-    auto [logits, value, state_out] = args->policy->forward(args->obs, args->state);
-
-    // Sample actions using kernel (matches forward_call in pufferlib.cpp)
-    if (args->use_kernels) {
-        sample_logits(logits, value.unsqueeze(1), args->actions, args->logprobs,
-                      args->value, args->seed, args->rng_offset);
-    } else {
-        // Non-kernel path (matches pufferlib.cpp)
-        auto logits_clean = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
-        auto log_probs = torch::log_softmax(logits_clean, 1);
-        auto action = at::multinomial(log_probs.exp(), 1, true).squeeze(1);
-        auto logprob = log_probs.gather(1, action.unsqueeze(1)).squeeze(1);
-        args->actions.copy_(action.to(torch::kFloat64), false);
-        args->logprobs.copy_(logprob, false);
-        args->value.copy_(value, false);
-    }
-
-    // Copy state
-    args->state.copy_(state_out, false);
-    args->state_out.copy_(state_out, false);
+    forward_call(args->graph, args->policy.get(), args->use_kernels, args->seed, args->rng_offset);
 }
 
 #endif
@@ -1329,37 +1283,20 @@ void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atn
 }
 
 // ============================================================================
-// rollout_copy_call profiling (copy from graph buffers to rollout storage)
+// rollout_copy_call profiling - using RolloutBuf, GraphBuf, EnvBuf
 // ============================================================================
 
 #ifdef USE_TORCH
 
 typedef struct {
-    // Storage buffers (horizon, num_envs, ...)
-    torch::Tensor obs_buffer;      // (horizon, num_envs, input_size)
-    torch::Tensor act_buffer;      // (horizon, num_envs)
-    torch::Tensor logprob_buffer;  // (horizon, num_envs)
-    torch::Tensor rew_buffer;      // (horizon, num_envs)
-    torch::Tensor term_buffer;     // (horizon, num_envs)
-    torch::Tensor val_buffer;      // (horizon, num_envs)
-
-    // Graph outputs (block_size, ...)
-    torch::Tensor graph_obs;       // (block_size, input_size)
-    torch::Tensor graph_actions;   // (block_size,)
-    torch::Tensor graph_logprobs;  // (block_size,)
-    torch::Tensor graph_value;     // (block_size,)
-
-    // Env buffers (num_envs, ...)
-    torch::Tensor env_actions;     // (num_envs,)
-    torch::Tensor env_rewards;     // (num_envs,)
-    torch::Tensor env_terminals;   // (num_envs,)
-
+    RolloutBuf rollouts;
+    GraphBuf graph;
+    EnvBuf env;
     int horizon;
     int num_envs;
     int num_buffers;
-    int input_size;
-    int h;  // current timestep
-    int buf;  // current buffer index
+    int h;   // current timestep
+    int buf; // current buffer index
 } RolloutCopyArgs;
 
 RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffers, int input_size) {
@@ -1367,32 +1304,21 @@ RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffe
     args->horizon = horizon;
     args->num_envs = num_envs;
     args->num_buffers = num_buffers;
-    args->input_size = input_size;
     args->h = 0;
     args->buf = 0;
 
     int block_size = num_envs / num_buffers;
 
-    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    // Use factory functions
+    args->rollouts = create_rollouts(horizon, num_envs, input_size);
+    args->env = create_env(num_envs, input_size);
 
-    // Storage buffers
-    args->obs_buffer = torch::zeros({horizon, num_envs, input_size}, opts);
-    args->act_buffer = torch::zeros({horizon, num_envs}, opts.dtype(torch::kFloat64));
-    args->logprob_buffer = torch::zeros({horizon, num_envs}, opts);
-    args->rew_buffer = torch::zeros({horizon, num_envs}, opts);
-    args->term_buffer = torch::zeros({horizon, num_envs}, opts);
-    args->val_buffer = torch::zeros({horizon, num_envs}, opts);
-
-    // Graph outputs (simulating forward_call output)
-    args->graph_obs = torch::randn({block_size, input_size}, opts);
-    args->graph_actions = torch::randint(0, 4, {block_size}, opts.dtype(torch::kFloat64));
-    args->graph_logprobs = torch::randn({block_size}, opts);
-    args->graph_value = torch::randn({block_size}, opts);
-
-    // Env buffers
-    args->env_actions = torch::zeros({num_envs}, opts.dtype(torch::kFloat64));
-    args->env_rewards = torch::randn({num_envs}, opts);
-    args->env_terminals = torch::zeros({num_envs}, opts);
+    // Create minimal graph for rollout (only rollout tensors needed, use dummy policy for state)
+    auto opts = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
+    args->graph.obs = torch::randn({block_size, input_size}, opts);
+    args->graph.actions = torch::randint(0, 4, {block_size}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    args->graph.logprobs = torch::randn({block_size}, opts);
+    args->graph.value = torch::randn({block_size}, opts);
 
     return args;
 }
@@ -1402,23 +1328,10 @@ void free_rolloutcopyargs(RolloutCopyArgs* args) {
 }
 
 void run_rollout_copy_call(RolloutCopyArgs* args) {
-    int h = args->h;
-    int buf = args->buf;
-    int block_size = args->num_envs / args->num_buffers;
-
-    // Non-blocking copies to storage buffers
-    args->obs_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_obs, true);
-    args->act_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_actions, true);
-    args->logprob_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_logprobs, true);
-    args->val_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(args->graph_value, true);
-
-    auto rewards_batch = args->env_rewards.narrow(0, buf*block_size, block_size);
-    args->rew_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
-
-    auto terminals_batch = args->env_terminals.narrow(0, buf*block_size, block_size);
-    args->term_buffer.select(0, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
-
-    args->env_actions.narrow(0, buf*block_size, block_size).copy_(args->graph_actions, true);
+    HypersT hypers;
+    hypers.num_envs = args->num_envs;
+    hypers.num_buffers = args->num_buffers;
+    rollout_copy_call(args->rollouts, args->env, args->graph, hypers, args->h, args->buf);
 }
 
 #endif
@@ -1446,38 +1359,18 @@ void profile_rolloutcopycall(int horizon, int num_envs, int num_buffers, int inp
 }
 
 // ============================================================================
-// train_forward_call profiling (training forward + backward + optimizer step)
+// train_forward_call profiling - using GraphBuf
 // ============================================================================
 
 #ifdef USE_TORCH
 
 typedef struct {
     std::shared_ptr<PolicyMinGRU> policy;
-    std::shared_ptr<torch::optim::Adam> optimizer;
-
-    // Minibatch inputs
-    torch::Tensor mb_obs;         // (segments, horizon, input_size)
-    torch::Tensor mb_state;       // (num_layers, segments, 1, hidden_size)
-    torch::Tensor mb_actions;     // (segments, horizon)
-    torch::Tensor mb_logprobs;    // (segments, horizon)
-    torch::Tensor mb_advantages;  // (segments, horizon)
-    torch::Tensor mb_prio;        // (segments,)
-    torch::Tensor mb_values;      // (segments, horizon)
-    torch::Tensor mb_returns;     // (segments, horizon)
-
-    // PPO params
-    float clip_coef;
-    float vf_clip_coef;
-    float vf_coef;
-    float ent_coef;
-    float max_grad_norm;
-
-    int segments;
-    int horizon;
-    int input_size;
-    int hidden_size;
-    int num_atns;
-    int num_layers;
+    torch::optim::Muon* muon;
+    GraphBuf graph;
+    HypersT hypers;
+    Tensor adv_mean;
+    Tensor adv_std;
     bool use_kernels;
 } TrainForwardArgs;
 
@@ -1485,86 +1378,42 @@ TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_s
                                           int hidden_size, int num_atns, int num_layers,
                                           bool use_kernels) {
     TrainForwardArgs* args = new TrainForwardArgs();
-    args->segments = segments;
-    args->horizon = horizon;
-    args->input_size = input_size;
-    args->hidden_size = hidden_size;
-    args->num_atns = num_atns;
-    args->num_layers = num_layers;
     args->use_kernels = use_kernels;
-    args->clip_coef = 0.1f;
-    args->vf_clip_coef = 0.1f;
-    args->vf_coef = 0.5f;
-    args->ent_coef = 0.01f;
-    args->max_grad_norm = 0.5f;
 
-    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    // Setup hypers
+    args->hypers.minibatch_segments = segments;
+    args->hypers.horizon = horizon;
+    args->hypers.clip_coef = 0.1f;
+    args->hypers.vf_clip_coef = 0.1f;
+    args->hypers.vf_coef = 0.5f;
+    args->hypers.ent_coef = 0.01f;
+    args->hypers.max_grad_norm = 0.5f;
 
     // Create policy
     args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
 
-    // Create optimizer (using Adam as simple substitute for Muon)
-    args->optimizer = std::make_shared<torch::optim::Adam>(args->policy->parameters(), 0.0003);
+    // Create Muon optimizer
+    args->muon = new torch::optim::Muon(args->policy->parameters(),
+        torch::optim::MuonOptions(0.0003).momentum(0.95).eps(1e-8));
 
-    // Create minibatch tensors
-    args->mb_obs = torch::randn({segments, horizon, input_size}, opts);
-    args->mb_state = torch::zeros({num_layers, segments, 1, hidden_size}, opts);
-    args->mb_actions = torch::randint(0, num_atns, {segments, horizon}, opts.dtype(torch::kInt64));
-    args->mb_logprobs = torch::randn({segments, horizon}, opts);
-    args->mb_advantages = torch::randn({segments, horizon}, opts);
-    args->mb_prio = torch::ones({segments}, opts);
-    args->mb_values = torch::randn({segments, horizon}, opts);
-    args->mb_returns = torch::randn({segments, horizon}, opts);
+    // Use create_graph factory (batch=0 since not used for training)
+    args->graph = create_graph(0, input_size, segments, horizon, num_layers, hidden_size, 1, args->policy.get());
+
+    // Adv normalization tensors
+    args->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
 
     return args;
 }
 
 void free_trainforwardargs(TrainForwardArgs* args) {
+    delete args->muon;
     delete args;
 }
 
 void run_train_forward_call(TrainForwardArgs* args) {
-    // Forward pass
-    auto [logits, newvalue] = args->policy->forward_train(args->mb_obs, args->mb_state);
-
-    // Compute PPO loss (torch ops path - matches pufferlib.cpp when kernels=false)
-    auto flat_logits = logits.reshape({-1, logits.size(-1)});
-    auto flat_actions = args->mb_actions.reshape({-1});
-    auto logprobs_new = torch::log_softmax(flat_logits, 1);
-    auto probs_new = logprobs_new.exp();
-
-    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-    auto newlogprob = newlogprob_flat.reshape({args->segments, args->horizon});
-    auto entropy = -(probs_new * logprobs_new).sum(1).mean();
-
-    auto logratio = newlogprob - args->mb_logprobs;
-    auto ratio_new = logratio.exp();
-
-    auto adv_normalized = args->mb_prio.unsqueeze(1) *
-        (args->mb_advantages - args->mb_advantages.mean()) / (args->mb_advantages.std() + 1e-8f);
-
-    auto pg_loss1 = -adv_normalized * ratio_new;
-    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - args->clip_coef, 1.0 + args->clip_coef);
-    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
-
-    newvalue = newvalue.view(args->mb_returns.sizes());
-    auto v_clipped = args->mb_values + torch::clamp(newvalue - args->mb_values, -args->vf_clip_coef, args->vf_clip_coef);
-    auto v_loss_unclipped = (newvalue - args->mb_returns).pow(2);
-    auto v_loss_clipped = (v_clipped - args->mb_returns).pow(2);
-    auto v_loss = 0.5f * torch::max(v_loss_unclipped, v_loss_clipped).mean();
-
-    auto loss = pg_loss + args->vf_coef * v_loss - args->ent_coef * entropy;
-
-    // Backward pass
-    loss.backward();
-
-    // Gradient clipping (simplified - full version in pufferlib.cpp)
-    torch::nn::utils::clip_grad_norm_(args->policy->parameters(), args->max_grad_norm);
-
-    // Optimizer step
-    args->optimizer->step();
-    args->optimizer->zero_grad();
+    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std);
 }
 
 #endif
@@ -1607,13 +1456,13 @@ void profile_trainforwardcall(int segments, int horizon, int input_size,
 // Environment speed test (breakout)
 // ============================================================================
 
-// Global function pointers for env interface
-static create_environments_fn create_envs = nullptr;
-static create_threads_fn create_threads = nullptr;
-static vec_reset_fn vec_reset = nullptr;
-static vec_send_fn vec_send = nullptr;
-static vec_recv_fn vec_recv = nullptr;
-static vec_close_fn vec_close = nullptr;
+// Function pointers for env interface (loaded dynamically)
+static create_environments_fn profile_create_envs = nullptr;
+static create_threads_fn profile_create_threads = nullptr;
+static vec_reset_fn profile_vec_reset = nullptr;
+static vec_send_fn profile_vec_send = nullptr;
+static vec_recv_fn profile_vec_recv = nullptr;
+static vec_close_fn profile_vec_close = nullptr;
 
 typedef struct {
     VecEnv* vec;
@@ -1636,12 +1485,12 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
     dlerror();
 
     // Load function pointers
-    create_envs = (create_environments_fn)dlsym(handle, "create_environments");
-    create_threads = (create_threads_fn)dlsym(handle, "create_threads");
-    vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
-    vec_send = (vec_send_fn)dlsym(handle, "vec_send");
-    vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
-    vec_close = (vec_close_fn)dlsym(handle, "vec_close");
+    profile_create_envs = (create_environments_fn)dlsym(handle, "create_environments");
+    profile_create_threads = (create_threads_fn)dlsym(handle, "create_threads");
+    profile_vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
+    profile_vec_send = (vec_send_fn)dlsym(handle, "vec_send");
+    profile_vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
+    profile_vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     int obs_n = *(int*)dlsym(handle, "OBS_N");
     int act_n = *(int*)dlsym(handle, "ACT_N");
 
@@ -1671,7 +1520,7 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
     dict_set_int(kwargs, "continuous", 0);
 
     // Create environments
-    VecEnv* vec = create_envs(num_envs, num_buffers, true, 0, kwargs);
+    VecEnv* vec = profile_create_envs(num_envs, num_buffers, true, 0, kwargs);
     if (!vec) {
         fprintf(stderr, "Failed to create environments\n");
         return nullptr;
@@ -1679,10 +1528,10 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
 
     // Create threads
     int block_size = num_envs / num_threads;
-    create_threads(vec, num_threads, block_size);
+    profile_create_threads(vec, num_threads, block_size);
 
     // Reset
-    vec_reset(vec);
+    profile_vec_reset(vec);
     cudaDeviceSynchronize();
 
     EnvSpeedArgs* args = (EnvSpeedArgs*)calloc(1, sizeof(EnvSpeedArgs));
@@ -1699,7 +1548,7 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
 
 void free_envspeedargs(EnvSpeedArgs* args) {
     if (args && args->vec) {
-        vec_close(args->vec);
+        profile_vec_close(args->vec);
     }
     free(args);
 }
@@ -1712,9 +1561,9 @@ void run_env_rollout(EnvSpeedArgs* args) {
 
     for (int i = 0; i < num_buffers * horizon; ++i) {
         int buf = i % num_buffers;
-        vec_recv(vec, buf);
+        profile_vec_recv(vec, buf);
         // In real usage, policy forward would happen here (async on GPU)
-        vec_send(vec, buf);
+        profile_vec_send(vec, buf);
     }
 }
 
@@ -1793,7 +1642,7 @@ int main(int argc, char** argv) {
     const char* profile = argv[1];
     warmup_gpu();
 
-    // Using typical breakout settings: input_size=96, hidden_size=128, num_atns=4
+    // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
 
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "all") == 0) {
         profile_mingrugate(BR, H);
@@ -1805,15 +1654,15 @@ int main(int argc, char** argv) {
     }
 
     if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
-        profile_forwardcall(BR, 96, H, A, 1);
+        profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
     }
 
     if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
-        profile_trainforwardcall(BT, T, 96, H, A, 1);
+        profile_trainforwardcall(BT, T, INPUT_SIZE, H, A, 1);
     }
 
     if (strcmp(profile, "rolloutcopy") == 0 || strcmp(profile, "all") == 0) {
-        profile_rolloutcopycall(T, BR, 1, 96);
+        profile_rolloutcopycall(T, BR, 1, INPUT_SIZE);
     }
 
     if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {

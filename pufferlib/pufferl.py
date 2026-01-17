@@ -180,7 +180,6 @@ class PuffeRL:
         self.terminals = self.pufferl_cpp.rollouts.terminals
         self.logprobs = self.pufferl_cpp.rollouts.logprobs
         self.values = self.pufferl_cpp.rollouts.values
-        self.debug = self.pufferl_cpp.debug
 
         # Initializations
         self.config = config

@@ -1,3 +1,6 @@
+#ifndef PUFFERLIB_VECENV_H
+#define PUFFERLIB_VECENV_H
+
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,3 +138,5 @@ typedef void (*c_reset_fn)(Env* env);
 typedef void (*c_step_fn)(Env* env);
 typedef void (*c_close_fn)(Env* env);
 typedef void (*c_render_fn)(Env* env);
+
+#endif // PUFFERLIB_VECENV_H

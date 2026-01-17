@@ -12,9 +12,6 @@
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-
 #include <atomic>
 #include "vecenv.h"
 #include <dlfcn.h>
@@ -102,8 +99,8 @@ void clip_grad_norm_(
         (norms.size() == 1) ? norms[0] : torch::stack(norms).norm(norm_type);
   }
 
-  auto clip_coef = max_norm / (total_norm_tensor + 1e-6);
-  auto clip_coef_clamped =
+  Tensor clip_coef = max_norm / (total_norm_tensor + 1e-6);
+  Tensor clip_coef_clamped =
       torch::clamp(clip_coef, std::nullopt /* min */, 1.0 /* max */);
   for (auto& param : params_with_grad) {
     param.grad().data().mul_(clip_coef_clamped);
@@ -180,16 +177,14 @@ create_environments(int64_t num_envs) {
     auto obs_dtype = to_torch_dtype(obs_t);
     auto atn_dtype = to_torch_dtype(act_t);
 
-    auto obs = torch::from_blob(vec->gpu_observations, {num_envs, obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
-    auto actions = torch::from_blob(vec->gpu_actions, {num_envs}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
-    auto rewards = torch::from_blob(vec->gpu_rewards, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    auto terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    Tensor obs = torch::from_blob(vec->gpu_observations, {num_envs, obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
+    Tensor actions = torch::from_blob(vec->gpu_actions, {num_envs}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    Tensor rewards = torch::from_blob(vec->gpu_rewards, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    Tensor terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
     // TODO: RESET
     return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
-
-namespace py = pybind11;
 
 // Forward declare modules
 std::vector<Tensor> mingru_gate(
@@ -307,13 +302,6 @@ void compute_puff_advantage_cpu(Tensor values, Tensor rewards,
     );
 }
 
-TORCH_LIBRARY(pufferlib, m) {
-   m.def("compute_puff_advantage(Tensor(a!) values, Tensor(b!) rewards, Tensor(c!) dones, Tensor(d!) importance, Tensor(e!) advantages, float gamma, float lambda, float rho_clip, float c_clip) -> ()");
- }
-
-TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {
-  m.impl("compute_puff_advantage", &compute_puff_advantage_cpu);
-}
 
 /*
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
@@ -381,7 +369,7 @@ public:
         double eps = 1.19e-07;
         //return torch::nn::functional::normalize(
         //    x, torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(-1)) * weight;
-        auto rms = (x.pow(2).mean(-1, true) + eps).rsqrt();
+        Tensor rms = (x.pow(2).mean(-1, true) + eps).rsqrt();
         return x * rms * weight;
         //auto mean_sq = (x*x).mean(ndim - 1, true);
         //return weight * x/mean_sq.sqrt();
@@ -454,8 +442,8 @@ public:
         TORCH_CHECK(state.dim() == 3, "state must be [B, seq, hidden_size]");
         TORCH_CHECK(x.size(0) == state.size(0), "x and state must have the same batch size");
 
-        auto seq_len = x.size(1);
-        auto output = to_hidden_and_gate->forward(x);
+        int seq_len = x.size(1);
+        Tensor output = to_hidden_and_gate->forward(x);
 
         Tensor out;
         Tensor next_prev_hidden;
@@ -467,10 +455,10 @@ public:
                 out = result[0];              // sigmoid(proj) * mingru_out
                 next_prev_hidden = result[1]; // mingru_out (for recurrence)
             } else {
-                auto chunks = output.chunk(3, 2);
-                auto hidden = chunks[0];
-                auto gate = chunks[1];
-                auto proj = chunks[2];
+                std::vector<Tensor> chunks = output.chunk(3, 2);
+                Tensor hidden = chunks[0];
+                Tensor gate = chunks[1];
+                Tensor proj = chunks[2];
                 hidden = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
                 gate = gate.sigmoid();
                 out = torch::lerp(state, hidden, gate);
@@ -490,25 +478,25 @@ public:
                 next_prev_hidden = scan_out[1];   // (B, 1, H) = raw scan_result at T
             } else {
                 // Non-kernel path: chunk for gate/hidden/proj
-                auto chunks = output.chunk(3, 2);
-                auto hidden = chunks[0];
-                auto gate = chunks[1];
-                auto proj = chunks[2];
+                std::vector<Tensor> chunks = output.chunk(3, 2);
+                Tensor hidden = chunks[0];
+                Tensor gate = chunks[1];
+                Tensor proj = chunks[2];
 
                 // Compute log_coeffs/values manually
-                auto log_coeffs = -torch::nn::functional::softplus(gate);
-                auto log_z = -torch::nn::functional::softplus(-gate);
-                auto log_tilde_h = torch::where(hidden >= 0,
+                Tensor log_coeffs = -torch::nn::functional::softplus(gate);
+                Tensor log_z = -torch::nn::functional::softplus(-gate);
+                Tensor log_tilde_h = torch::where(hidden >= 0,
                     (torch::nn::functional::relu(hidden) + 0.5).log(),
                     -torch::nn::functional::softplus(-hidden));
-                auto log_values = log_z + log_tilde_h;
+                Tensor log_values = log_z + log_tilde_h;
 
                 // Non-kernel path still needs cat+pad+narrow
                 log_values = torch::cat({state.log(), log_values}, 1);
                 log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
-                auto a_star = log_coeffs.cumsum(1);
-                auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
-                auto log_h = a_star + log_h0_plus_b_star;
+                Tensor a_star = log_coeffs.cumsum(1);
+                Tensor log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
+                Tensor log_h = a_star + log_h0_plus_b_star;
                 out = log_h.exp();
                 out = out.narrow(1, out.size(1) - seq_len, seq_len);
                 next_prev_hidden = out.narrow(1, out.size(1) - 1, 1);
@@ -629,7 +617,7 @@ public:
     Tensor initial_state(int64_t batch_size, torch::Device device) {
         // Layout: {num_layers, batch_size, hidden} - select(0, i) gives contiguous slice
         return torch::zeros(
-            {num_layers, batch_size, hidden_size*expansion_factor},
+            {num_layers, batch_size, (int64_t)(hidden_size*expansion_factor)},
             torch::dtype(torch::kFloat32).device(device)
         );
     }
@@ -642,10 +630,10 @@ public:
         TORCH_CHECK(observations.dim() == 2 && observations.size(1) == input_size,
             "Observations must be [B, input_size]");
 
-        TORCH_CHECK(state.dim() == 3 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == hidden_size*expansion_factor,
+        TORCH_CHECK(state.dim() == 3 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == (int64_t)(hidden_size*expansion_factor),
             "state must be [num_layers, B, hidden_size]");
 
-        auto hidden = encoder->forward(observations);
+        Tensor hidden = encoder->forward(observations);
 
         hidden = hidden.unsqueeze(1);
         state = state.unsqueeze(2);
@@ -653,11 +641,11 @@ public:
         std::tuple<Tensor, Tensor> mingru_out;
 
         for (int64_t i = 0; i < num_layers; ++i) {
-            auto state_in = state.select(0, i);
+            Tensor state_in = state.select(0, i);
             auto layer = (*mingru)[i]->as<MinGRULayer>();
             mingru_out = layer->forward(hidden, state_in);
             hidden = std::get<0>(mingru_out);
-            auto state_out = std::get<1>(mingru_out);
+            Tensor state_out = std::get<1>(mingru_out);
             state.select(0, i).copy_(state_out);
         }
 
@@ -665,8 +653,8 @@ public:
         state = state.squeeze(2);
 
         std::tuple<Tensor, Tensor> out = decoder->forward(hidden);
-        auto logits = std::get<0>(out);
-        auto values = std::get<1>(out);
+        Tensor logits = std::get<0>(out);
+        Tensor values = std::get<1>(out);
         //auto logits = decoder->forward(hidden);
         //auto values = value->forward(hidden);
 
@@ -676,7 +664,7 @@ public:
     std::tuple<Tensor, Tensor> forward_train(
         Tensor observations, Tensor state) {
 
-        auto x = observations;
+        Tensor x = observations;
         auto x_shape = x.sizes();
 
         // Expecting [B, TT, input_size] or [B, input_size]
@@ -688,7 +676,7 @@ public:
         int64_t B = x_shape[0];
         int64_t TT = (x.dim() == 3) ? x_shape[1] : 1;
 
-        TORCH_CHECK(state.dim() == 4 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == 1 && state.size(3) == hidden_size*expansion_factor,
+        TORCH_CHECK(state.dim() == 4 && state.size(0) == num_layers && state.size(1) == B && state.size(2) == 1 && state.size(3) == (int64_t)(hidden_size*expansion_factor),
             "state must be [num_layers, B, 1, hidden_size*expansion_factor]");
 
         // Flatten time steps if needed
@@ -698,23 +686,23 @@ public:
             TT = 1;
         }
 
-        auto hidden = encoder->forward(x);
+        Tensor hidden = encoder->forward(x);
 
         hidden = hidden.reshape({B, TT, hidden_size});
 
         std::tuple<Tensor, Tensor> mingru_out;
         for (int64_t i = 0; i < num_layers; ++i) {
-            auto state_in = state.select(0, i);
+            Tensor state_in = state.select(0, i);
             auto layer = (*mingru)[i]->as<MinGRULayer>();
             mingru_out = layer->forward(hidden, state_in);
             hidden = std::get<0>(mingru_out);
         }
 
-        auto flat_hidden = hidden.reshape({-1, hidden_size});
+        Tensor flat_hidden = hidden.reshape({-1, hidden_size});
 
         std::tuple<Tensor, Tensor> out = decoder->forward(flat_hidden);
-        auto logits = std::get<0>(out);
-        auto values = std::get<1>(out);
+        Tensor logits = std::get<0>(out);
+        Tensor values = std::get<1>(out);
  
         //auto logits = decoder->forward(flat_hidden);
         //auto values = value->forward(flat_hidden);
@@ -798,7 +786,7 @@ public:
                         "c must be [B, hidden_size]");
         }
 
-        auto hidden = encoder->forward(observations);
+        Tensor hidden = encoder->forward(observations);
 
         std::tuple<Tensor, Tensor> cell_out;
         if (h.defined() && h.numel() > 0) {
@@ -807,15 +795,15 @@ public:
             cell_out = cell->forward(hidden);
         }
 
-        auto hidden_out = std::get<0>(cell_out);
-        auto c_out = std::get<1>(cell_out);
+        Tensor hidden_out = std::get<0>(cell_out);
+        Tensor c_out = std::get<1>(cell_out);
 
         //std::std::cout << std::fixed << std::setprecision(10);
         //std::std::cout << "Hidden 0 cpp: " << hidden_out[0][0].item<float>() << std::std::endl;
 
 
-        auto logits = decoder->forward(hidden_out);
-        auto values = value->forward(hidden_out);
+        Tensor logits = decoder->forward(hidden_out);
+        Tensor values = value->forward(hidden_out);
 
         return {logits, values, hidden_out, c_out};
     }
@@ -823,7 +811,7 @@ public:
     // Forward for training (uses LSTM)
     std::tuple<Tensor, Tensor> forward_train(
         Tensor observations, Tensor lstm_h, Tensor lstm_c) {
-        auto x = observations;
+        Tensor x = observations;
         auto x_shape = x.sizes();
 
         // Expecting [B, TT, input_size] or [B, input_size]
@@ -849,7 +837,7 @@ public:
             TT = 1;
         }
 
-        auto hidden = encoder->forward(x);
+        Tensor hidden = encoder->forward(x);
 
         hidden = hidden.reshape({B, TT, hidden_size_});
         hidden = hidden.transpose(0, 1);  // [TT, B, hidden_size]
@@ -864,9 +852,9 @@ public:
         hidden = std::get<0>(lstm_out);
         hidden = hidden.transpose(0, 1);  // [B, TT, hidden_size]
 
-        auto flat_hidden = hidden.reshape({-1, hidden_size_});
-        auto logits = decoder->forward(flat_hidden);
-        auto values = value->forward(flat_hidden);
+        Tensor flat_hidden = hidden.reshape({-1, hidden_size_});
+        Tensor logits = decoder->forward(flat_hidden);
+        Tensor values = value->forward(flat_hidden);
 
         logits = logits.reshape({B, TT, num_atns_});
         values = values.reshape({B, TT, 1});
@@ -895,18 +883,17 @@ typedef struct {
     Tensor actions;
     Tensor rewards;
     Tensor terminals;
-} EnvT;
+} EnvBuf;
 
 typedef struct {
+    // Rollout tensors
     Tensor obs;
     Tensor actions;
     Tensor state;
     Tensor state_out;
     Tensor value;
     Tensor logprobs;
-} GraphT;
-
-typedef struct {
+    // Train tensors
     Tensor mb_obs;
     Tensor mb_state;
     Tensor mb_actions;
@@ -915,10 +902,9 @@ typedef struct {
     Tensor mb_prio;
     Tensor mb_values;
     Tensor mb_returns;
-    Tensor ratio;
-    Tensor logits;
-    Tensor newvalue;
-} GraphTrainT;
+    Tensor mb_ratio;
+    Tensor mb_newvalue;
+} GraphBuf;
 
 typedef struct {
     Tensor observations;
@@ -929,16 +915,7 @@ typedef struct {
     Tensor terminals;
     Tensor ratio;
     Tensor importance;
-} RolloutsT;
-
-typedef struct {
-    Tensor obs;
-    Tensor actions;
-    Tensor logprobs;
-    Tensor values;
-    Tensor advantages;
-    Tensor returns;
-} MinibatchT;
+} RolloutBuf;
 
 typedef struct {
     // Layout
@@ -993,19 +970,12 @@ typedef struct {
     torch::optim::Muon* muon;
     HypersT hypers;
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
-    RolloutsT rollouts;
-    Tensor debug;
-    EnvT env;
-    GraphT graph;
-    GraphTrainT graph_train;
+    RolloutBuf rollouts;
+    EnvBuf env;
+    GraphBuf graph;
     at::cuda::CUDAGraph rollout_graph;
     at::cuda::CUDAGraph train_forward_graph;
     at::cuda::CUDAGraph rollout_copy_graphs[64][2];
-    Tensor obs_input;
-    Tensor state_input;
-    Tensor logits_output;
-    Tensor value_output;
-    Tensor state_output;
     bool captured;
     Tensor adv_mean;
     Tensor adv_std;
@@ -1014,27 +984,67 @@ typedef struct {
     Tensor rng_offset;  // CUDA tensor so increment is graphable
 } PuffeRL;
 
-pybind11::dict log_environments(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& vec = pufferl.vec;
+RolloutBuf create_rollouts(int horizon, int segments, int input_size) {
+    RolloutBuf r;
+    r.observations = torch::zeros({horizon, segments, input_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.actions = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    r.values = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
+    r.logprobs = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.rewards = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.terminals = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.ratio = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.importance = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    return r;
+}
 
+EnvBuf create_env(int num_envs, int input_size) {
+    EnvBuf e;
+    auto opts = torch::dtype(torch::kFloat32).device(torch::kCUDA);
+    e.obs = torch::zeros({num_envs, input_size}, opts);
+    e.actions = torch::zeros({num_envs}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    e.rewards = torch::zeros({num_envs}, opts);
+    e.terminals = torch::zeros({num_envs}, opts);
+    return e;
+}
+
+GraphBuf create_graph(int batch, int input_size, int minibatch_segments, int horizon,
+        int num_layers, int hidden_size, int expansion_factor, PolicyMinGRU* policy) {
+    GraphBuf g;
+    auto options = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
+
+    // Rollout tensors
+    g.obs = torch::zeros({batch, input_size}, options);
+    g.actions = torch::zeros(batch, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    g.value = torch::zeros(batch, options);
+    g.logprobs = torch::zeros(batch, options);
+    g.state = policy->initial_state(batch, torch::kCUDA);
+    g.state_out = policy->initial_state(batch, torch::kCUDA);
+
+    // Train tensors
+    g.mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, options);
+    g.mb_state = torch::zeros({num_layers, minibatch_segments, 1, hidden_size * expansion_factor}, options);
+    g.mb_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
+    g.mb_ratio = torch::zeros({minibatch_segments, horizon}, options);
+    g.mb_actions = torch::zeros({minibatch_segments, horizon}, options).to(torch::kInt64);
+    g.mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
+    g.mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
+    g.mb_prio = torch::zeros({minibatch_segments, 1}, options);
+    g.mb_values = torch::zeros({minibatch_segments, horizon}, options);
+    g.mb_returns = torch::zeros({minibatch_segments, horizon}, options);
+    return g;
+}
+
+Dict* log_environments_impl(PuffeRL& pufferl) {
     Dict* out = create_dict(32);
-    vec_log(vec, out);
-
-    pybind11::dict py_out;
-    for (int i = 0; i < out->size; i++) {
-        py_out[out->items[i].key] = out->items[i].float_value;
-    }
-    return py_out;
+    vec_log(pufferl.vec, out);
+    return out;
 }
 
-Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::Device device) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& policy = pufferl.policy;
-    return policy->initial_state(batch_size, device);
+Tensor initial_state_impl(PuffeRL& pufferl, int64_t batch_size, torch::Device device) {
+    return pufferl.policy->initial_state(batch_size, device);
 }
 
-void forward_call(GraphT& graph, PolicyMinGRU* policy, bool kernels,
+void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
         uint64_t rng_seed, Tensor& rng_offset) {
     torch::NoGradGuard no_grad;
 
@@ -1045,9 +1055,9 @@ void forward_call(GraphT& graph, PolicyMinGRU* policy, bool kernels,
             graph.value, rng_seed, rng_offset);
     } else {
         logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
-        auto logprobs = torch::log_softmax(logits, 1);
-        auto action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
-        auto logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
+        Tensor logprobs = torch::log_softmax(logits, 1);
+        Tensor action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
+        Tensor logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
         graph.actions.copy_(action, false);
         graph.logprobs.copy_(logprob, false);
         graph.value.copy_(value.flatten(), false);
@@ -1056,7 +1066,7 @@ void forward_call(GraphT& graph, PolicyMinGRU* policy, bool kernels,
     graph.state_out.copy_(state_out, false);
 }
 
-void rollout_copy_call(RolloutsT& rollouts, EnvT& env, GraphT& graph,
+void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
         HypersT& hypers, int h, int buf) {
     int block_size = hypers.num_envs / hypers.num_buffers;
 
@@ -1067,18 +1077,18 @@ void rollout_copy_call(RolloutsT& rollouts, EnvT& env, GraphT& graph,
     rollouts.logprobs.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.logprobs, true);
     rollouts.values.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.value, true);
 
-    auto rewards_batch = env.rewards.narrow(0, buf*block_size, block_size);
+    Tensor rewards_batch = env.rewards.narrow(0, buf*block_size, block_size);
     rollouts.rewards.select(0, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
 
-    auto terminals_batch = env.terminals.narrow(0, buf*block_size, block_size);
+    Tensor terminals_batch = env.terminals.narrow(0, buf*block_size, block_size);
     rollouts.terminals.select(0, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
 
     env.actions.narrow(0, buf*block_size, block_size).copy_(graph.actions, true);
 }
 
-void train_forward_call(GraphTrainT& graph_train, PolicyMinGRU* policy,
+void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
         torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std) {
-    auto [logits, newvalue] = policy->forward_train(graph_train.mb_obs.to(DTYPE), graph_train.mb_state);
+    auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
     //if (kernels) {
@@ -1086,12 +1096,12 @@ void train_forward_call(GraphTrainT& graph_train, PolicyMinGRU* policy,
         loss = fused_ppo_loss(
             logits,
             newvalue,
-            graph_train.mb_actions,
-            graph_train.mb_logprobs.to(logits.dtype()),
-            graph_train.mb_advantages.to(logits.dtype()),
-            graph_train.mb_prio.to(logits.dtype()),
-            graph_train.mb_values.to(logits.dtype()),
-            graph_train.mb_returns.to(logits.dtype()),
+            graph.mb_actions,
+            graph.mb_logprobs.to(logits.dtype()),
+            graph.mb_advantages.to(logits.dtype()),
+            graph.mb_prio.to(logits.dtype()),
+            graph.mb_values.to(logits.dtype()),
+            graph.mb_returns.to(logits.dtype()),
             adv_mean,
             adv_std,
             hypers.clip_coef,
@@ -1101,38 +1111,38 @@ void train_forward_call(GraphTrainT& graph_train, PolicyMinGRU* policy,
         )[0];
     } else {
         // Flatten for action lookup
-        auto flat_logits = logits.reshape({-1, logits.size(-1)});
-        auto flat_actions = graph_train.mb_actions.reshape({-1});
-        auto logprobs_new = torch::log_softmax(flat_logits, 1);
-        auto probs_new = logprobs_new.exp();
+        Tensor flat_logits = logits.reshape({-1, logits.size(-1)});
+        Tensor flat_actions = graph.mb_actions.reshape({-1});
+        Tensor logprobs_new = torch::log_softmax(flat_logits, 1);
+        Tensor probs_new = logprobs_new.exp();
 
         // Gather logprobs for taken actions
-        auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-        auto newlogprob = newlogprob_flat.reshape({hypers.minibatch_segments, hypers.horizon});
-        auto entropy = - (probs_new * logprobs_new).sum(1).mean();
+        Tensor newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+        Tensor newlogprob = newlogprob_flat.reshape({hypers.minibatch_segments, hypers.horizon});
+        Tensor entropy = - (probs_new * logprobs_new).sum(1).mean();
 
         // Compute ratio
-        auto logratio = newlogprob - graph_train.mb_logprobs;
-        auto ratio_new = logratio.exp();
-        graph_train.ratio.copy_(ratio_new, false);
-        graph_train.newvalue.copy_(newvalue, false);
+        Tensor logratio = newlogprob - graph.mb_logprobs;
+        Tensor ratio_new = logratio.exp();
+        graph.mb_ratio.copy_(ratio_new, false);
+        graph.mb_newvalue.copy_(newvalue, false);
 
         // Normalize advantages: (adv - mean) / std, then weight
-        auto adv_normalized = graph_train.mb_advantages;
-        adv_normalized = graph_train.mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
+        Tensor adv_normalized = graph.mb_advantages;
+        adv_normalized = graph.mb_prio * (adv_normalized - adv_normalized.mean()) / (adv_normalized.std() + 1e-8);
 
         // Policy loss
-        auto pg_loss1 = -adv_normalized * ratio_new;
-        auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - hypers.clip_coef, 1.0 + hypers.clip_coef);
-        auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
+        Tensor pg_loss1 = -adv_normalized * ratio_new;
+        Tensor pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - hypers.clip_coef, 1.0 + hypers.clip_coef);
+        Tensor pg_loss = torch::max(pg_loss1, pg_loss2).mean();
 
         // Value loss
-        newvalue = newvalue.view(graph_train.mb_returns.sizes());
-        auto v_clipped = graph_train.mb_values + torch::clamp(newvalue - graph_train.mb_values,
+        newvalue = newvalue.view(graph.mb_returns.sizes());
+        Tensor v_clipped = graph.mb_values + torch::clamp(newvalue - graph.mb_values,
             -hypers.vf_clip_coef, hypers.vf_clip_coef);
-        auto v_loss_unclipped = (newvalue - graph_train.mb_returns).pow(2);
-        auto v_loss_clipped = (v_clipped - graph_train.mb_returns).pow(2);
-        auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+        Tensor v_loss_unclipped = (newvalue - graph.mb_returns).pow(2);
+        Tensor v_loss_clipped = (v_clipped - graph.mb_returns).pow(2);
+        Tensor v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
 
         // Total loss
         loss = pg_loss + hypers.vf_coef*v_loss - hypers.ent_coef*entropy;
@@ -1197,87 +1207,9 @@ void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func) {
     at::cuda::setCurrentCUDAStream(current_stream);
 }
 
-/*
-// Destroy
-void pufferl_destroy_cudagraph(PuffeRL* pufferl) {
-    auto* graph = static_cast<at::cuda::CUDAGraph*>(pufferl->cudagraph);
-    delete graph;
-    pufferl->cudagraph = nullptr;
-}
-
-
-void capture_forward(std::unique_ptr<pufferlib::PuffeRL>& pufferl) {
-    auto& policy = pufferl->policy;
-    pufferl->forward_graph.reset();
-    pufferl->forward_graph.capture_begin(
-        c10::cuda::MempoolId_t{0, 0},
-        cudaStreamCaptureModeGlobal
-    );
-
-    try {
-        auto output_tuple = policy->forward(pufferl->obs_buf, pufferl->state_in_buf);
-        pufferl->logits_buf  = std::get<0>(output_tuple);
-        pufferl->value_buf   = std::get<1>(output_tuple);
-        pufferl->state_out_buf = std::get<2>(output_tuple);
-
-        pufferl->forward_graph.capture_end();
-    } catch (...) {
-        pufferl->forward_graph.reset();
-        throw;
-    }
-
-    pufferl->forward_graph.instantiate();
-}
-*/
-
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
+std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers) {
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
-    auto& hypers = pufferl->hypers;
-
-    // Layout
-    hypers.segments = kwargs["segments"].cast<int>();
-    hypers.horizon = kwargs["horizon"].cast<int>();
-    hypers.num_envs = kwargs["num_envs"].cast<int>();
-    hypers.num_buffers = kwargs["num_buffers"].cast<int>();
-    hypers.minibatch_segments = kwargs["minibatch_segments"].cast<int>();
-    hypers.total_minibatches = kwargs["total_minibatches"].cast<int>();
-    hypers.accumulate_minibatches = kwargs["accumulate_minibatches"].cast<int>();
-    // Model architecture
-    hypers.input_size = kwargs["input_size"].cast<int>();
-    hypers.num_atns = kwargs["num_atns"].cast<int>();
-    hypers.hidden_size = kwargs["hidden_size"].cast<int>();
-    hypers.expansion_factor = kwargs["expansion_factor"].cast<int>();
-    hypers.num_layers = kwargs["num_layers"].cast<int>();
-    // Learning rate
-    hypers.lr = kwargs["lr"].cast<float>();
-    hypers.min_lr_ratio = kwargs["min_lr_ratio"].cast<float>();
-    hypers.anneal_lr = kwargs["anneal_lr"].cast<bool>();
-    // Optimizer
-    hypers.beta1 = kwargs["beta1"].cast<float>();
-    hypers.beta2 = kwargs["beta2"].cast<float>();
-    hypers.eps = kwargs["eps"].cast<float>();
-    // Training
-    hypers.max_epochs = kwargs["max_epochs"].cast<int>();
-    hypers.max_grad_norm = kwargs["max_grad_norm"].cast<float>();
-    // PPO
-    hypers.clip_coef = kwargs["clip_coef"].cast<float>();
-    hypers.vf_clip_coef = kwargs["vf_clip_coef"].cast<float>();
-    hypers.vf_coef = kwargs["vf_coef"].cast<float>();
-    hypers.ent_coef = kwargs["ent_coef"].cast<float>();
-    // GAE
-    hypers.gamma = kwargs["gamma"].cast<float>();
-    hypers.gae_lambda = kwargs["gae_lambda"].cast<float>();
-    // VTrace
-    hypers.vtrace_rho_clip = kwargs["vtrace_rho_clip"].cast<float>();
-    hypers.vtrace_c_clip = kwargs["vtrace_c_clip"].cast<float>();
-    // Priority
-    hypers.prio_alpha = kwargs["prio_alpha"].cast<float>();
-    hypers.prio_beta0 = kwargs["prio_beta0"].cast<float>();
-    // Flags
-    hypers.use_rnn = kwargs["use_rnn"].cast<bool>();
-    hypers.cudagraphs = kwargs["cudagraphs"].cast<bool>();
-    hypers.kernels = kwargs["kernels"].cast<bool>();
-    hypers.profile = kwargs["profile"].cast<bool>();
+    pufferl->hypers = hypers;
 
     // Seeding
     torch::manual_seed(42);
@@ -1318,56 +1250,24 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
         torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
 
     // Allocate buffers
-    // TODO: Match env type, alloc on gpu native
-    // Layout: {horizon, segments, ...} for contiguous writes in rollout_copy_call
     int segments = hypers.segments;
     int horizon = hypers.horizon;
     int batch = hypers.num_envs / hypers.num_buffers;
-    pufferl->rollouts.observations = torch::zeros({horizon, segments, input_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->rollouts.actions = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
-    pufferl->rollouts.values = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
-    pufferl->rollouts.logprobs = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->rollouts.rewards = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->rollouts.terminals = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->rollouts.ratio = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->rollouts.importance = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    pufferl->debug = torch::zeros({batch, hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-
-    pufferl->graph.obs = torch::zeros({batch, input_size}, DTYPE).to(torch::kCUDA);
-    pufferl->graph.actions = torch::zeros(batch, torch::kFloat64).to(torch::kCUDA);
-    pufferl->graph.value = torch::zeros(batch, DTYPE).to(torch::kCUDA);
-    pufferl->graph.logprobs = torch::zeros(batch, DTYPE).to(torch::kCUDA);
-    pufferl->graph.state = policy->initial_state(batch, torch::kCUDA);
-    pufferl->graph.state_out = policy->initial_state(batch, torch::kCUDA);
-    // Per-buffer states: each is {num_layers, block_size, hidden} for contiguous access
     int num_buffers = hypers.num_buffers;
+    int minibatch_segments = hypers.minibatch_segments;
+
+    pufferl->rollouts = create_rollouts(horizon, segments, input_size);
+    pufferl->graph = create_graph(batch, input_size, minibatch_segments, horizon,
+        policy->num_layers, policy->hidden_size, policy->expansion_factor, policy);
+
+    pufferl->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
+    pufferl->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
+
+    // Per-buffer states: each is {num_layers, block_size, hidden} for contiguous access
     pufferl->buffer_states.resize(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_states[i] = policy->initial_state(batch, torch::kCUDA);
     }
-
-    int minibatch_segments = hypers.minibatch_segments;
-    pufferl->graph_train.mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, DTYPE).to(torch::kCUDA);
-    pufferl->graph_train.mb_state = torch::zeros(
-        {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
-        torch::dtype(DTYPE).device(torch::kCUDA)
-    );
-
-    auto options = torch::TensorOptions()
-    .dtype(DTYPE)
-    .device(torch::kCUDA);
-
-    //pufferl->graph_train.logits = torch::zeros({minibatch_segments, horizon, num_atns}, options);
-    pufferl->graph_train.newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
-    pufferl->graph_train.ratio = torch::zeros({minibatch_segments, horizon}, options);
-    pufferl->graph_train.mb_actions = torch::zeros({minibatch_segments, horizon}, options).to(torch::kInt64);
-    pufferl->graph_train.mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
-    pufferl->graph_train.mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
-    pufferl->graph_train.mb_prio = torch::zeros({minibatch_segments, 1}, options);
-    pufferl->graph_train.mb_values = torch::zeros({minibatch_segments, horizon}, options);
-    pufferl->graph_train.mb_returns = torch::zeros({minibatch_segments, horizon}, options);
-    pufferl->adv_mean = torch::zeros({1}, options);
-    pufferl->adv_std = torch::ones({1}, options);
 
     auto [vec, obs, actions, rewards, terminals] = create_environments(hypers.num_envs);
     pufferl->vec = vec;
@@ -1384,13 +1284,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
         capture_graph(&pufferl->rollout_graph, [p]() {
             forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset);
         });
-        {
-            pybind11::gil_scoped_release no_gil;
-            capture_graph(&pufferl->train_forward_graph, [p]() {
-                train_forward_call(p->graph_train, p->policy, p->muon,
-                    p->hypers, p->adv_mean, p->adv_std);
-            });
-        }
+        capture_graph(&pufferl->train_forward_graph, [p]() {
+            train_forward_call(p->graph, p->policy, p->muon,
+                p->hypers, p->adv_mean, p->adv_std);
+        });
 
         for (int i = 0; i < hypers.horizon; ++i) {
             for (int j = 0; j < hypers.num_buffers; ++j) {
@@ -1409,21 +1306,15 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     return pufferl;
 }
 
-void python_vec_recv(pybind11::object pufferl_obj, int buf) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& vec = pufferl.vec;
-    vec_recv(vec, buf);
+void python_vec_recv_impl(PuffeRL& pufferl, int buf) {
+    vec_recv(pufferl.vec, buf);
 }
 
-void python_vec_send(pybind11::object pufferl_obj, int buf) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& vec = pufferl.vec;
-    vec_send(vec, buf);
+void python_vec_send_impl(PuffeRL& pufferl, int buf) {
+    vec_send(pufferl.vec, buf);
 }
 
-torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& vec = pufferl.vec;
+torch::autograd::tensor_list env_buffers_impl(PuffeRL& pufferl) {
     return {pufferl.env.obs, pufferl.env.actions, pufferl.env.rewards, pufferl.env.terminals};
 }
 
@@ -1453,7 +1344,7 @@ void env_send(PuffeRL& pufferl, int buf) {
     vec_send(pufferl.vec, buf);
 }
 
-void compute_advantage(RolloutsT& rollouts, Tensor& advantages, HypersT& hypers) {
+void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
     compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
         rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
         hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
@@ -1462,42 +1353,38 @@ void compute_advantage(RolloutsT& rollouts, Tensor& advantages, HypersT& hypers)
 std::tuple<Tensor, Tensor> compute_prio(Tensor& advantages,
         int minibatch_segments, int segments,
         float prio_alpha, float anneal_beta) {
-    auto adv = advantages.abs().sum(1);
-    auto prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-    auto prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
-    auto idx = at::multinomial(prio_probs, minibatch_segments, true);
-    auto mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+    Tensor adv = advantages.abs().sum(1);
+    Tensor prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+    Tensor prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
+    Tensor idx = at::multinomial(prio_probs, minibatch_segments, true);
+    Tensor mb_prio = torch::pow(segments*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
     return {idx, mb_prio};
 }
 
-MinibatchT train_index_select(RolloutsT& rollouts, Tensor& advantages, Tensor& idx) {
-    MinibatchT mb;
-    mb.obs = rollouts.observations.index_select(0, idx);
-    mb.actions = rollouts.actions.index_select(0, idx);
-    mb.logprobs = rollouts.logprobs.index_select(0, idx);
-    mb.values = rollouts.values.index_select(0, idx);
-    mb.advantages = advantages.index_select(0, idx);
-    mb.returns = mb.advantages + mb.values;
-    return mb;
-}
+void train_select_and_copy(GraphBuf& graph, RolloutBuf& rollouts,
+        Tensor& advantages, Tensor& idx, Tensor& mb_state, Tensor& mb_prio) {
+    Tensor mb_obs = rollouts.observations.index_select(0, idx);
+    Tensor mb_actions = rollouts.actions.index_select(0, idx);
+    Tensor mb_logprobs = rollouts.logprobs.index_select(0, idx);
+    Tensor mb_values = rollouts.values.index_select(0, idx);
+    Tensor mb_advantages = advantages.index_select(0, idx);
+    Tensor mb_returns = mb_advantages + mb_values;
 
-void train_graph_copy(PuffeRL& pufferl, Tensor& mb_state, MinibatchT& mb, Tensor& mb_prio) {
     mb_state.zero_();
-    pufferl.graph_train.mb_obs.copy_(mb.obs, false);
-    pufferl.graph_train.mb_state.copy_(mb_state, false);
-    pufferl.graph_train.mb_actions.copy_(mb.actions, false);
-    pufferl.graph_train.mb_logprobs.copy_(mb.logprobs, false);
-    pufferl.graph_train.mb_advantages.copy_(mb.advantages, false);
-    pufferl.graph_train.mb_prio.copy_(mb_prio, false);
-    pufferl.graph_train.mb_values.copy_(mb.values, false);
-    pufferl.graph_train.mb_returns.copy_(mb.returns, false);
+    graph.mb_obs.copy_(mb_obs, false);
+    graph.mb_state.copy_(mb_state, false);
+    graph.mb_actions.copy_(mb_actions, false);
+    graph.mb_logprobs.copy_(mb_logprobs, false);
+    graph.mb_advantages.copy_(mb_advantages, false);
+    graph.mb_prio.copy_(mb_prio, false);
+    graph.mb_values.copy_(mb_values, false);
+    graph.mb_returns.copy_(mb_returns, false);
 }
 
-void rollouts(pybind11::object pufferl_obj) {
+void rollouts_impl(PuffeRL& pufferl) {
     torch::NoGradGuard no_grad;
+    HypersT& hypers = pufferl.hypers;
 
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& hypers = pufferl.hypers;
     int horizon = hypers.horizon;
     int num_envs = hypers.num_envs;
     int num_buffers = hypers.num_buffers;
@@ -1539,23 +1426,19 @@ void rollouts(pybind11::object pufferl_obj) {
         // are ready because puffer vec uses different streams. Setting to non-blocking is not enough.
         cudaDeviceSynchronize();
 
-        {
-            pybind11::gil_scoped_release no_gil;
-            profile_begin("env_send", hypers.profile);
-            env_send(pufferl, buf);
-            profile_end(hypers.profile);
-        }
+        profile_begin("env_send", hypers.profile);
+        env_send(pufferl, buf);
+        profile_end(hypers.profile);
     }
 }
 
-pybind11::dict train(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& hypers = pufferl.hypers;
+void train_impl(PuffeRL& pufferl) {
+    HypersT& hypers = pufferl.hypers;
 
     // Buffers are stored as {horizon, segments, ...} for contiguous rollout writes
     // Transpose to {segments, horizon, ...} for train logic
     // Need .contiguous() because compute_puff_advantage_cuda uses raw data pointers
-    RolloutsT rollouts;
+    RolloutBuf rollouts;
     rollouts.observations = pufferl.rollouts.observations.permute({1, 0, 2}).contiguous();
     rollouts.actions = pufferl.rollouts.actions.transpose(0, 1).contiguous();
     rollouts.logprobs = pufferl.rollouts.logprobs.transpose(0, 1).contiguous();
@@ -1587,8 +1470,8 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     int current_epoch = pufferl.epoch;
 
     // Accumulators
-    auto device = rollouts.values.device();
-    auto scalar_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    torch::Device device = rollouts.values.device();
+    torch::TensorOptions scalar_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     Tensor pg_sum = torch::zeros({}, scalar_opts);
     Tensor v_sum = torch::zeros({}, scalar_opts);
     Tensor ent_sum = torch::zeros({}, scalar_opts);
@@ -1598,12 +1481,8 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     Tensor clipfrac_sum = torch::zeros({}, scalar_opts);
     Tensor importance_sum = torch::zeros({}, scalar_opts);
 
-    {
-    pybind11::gil_scoped_release no_gil;
-    auto& policy = pufferl.policy;
-    auto& muon = pufferl.muon;
-
-    auto device = rollouts.values.device();
+    PolicyMinGRU* policy = pufferl.policy;
+    torch::optim::Muon* muon = pufferl.muon;
 
     if (anneal_lr) {
         float lr_min = hypers.min_lr_ratio * hypers.lr;
@@ -1612,12 +1491,12 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     }
 
     // Annealed priority exponent - TODO: graphed?
-    float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * static_cast<float>(current_epoch) / total_epochs;
+    float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
 
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
     rollouts.ratio.fill_(1.0);
 
-    auto advantages = torch::zeros_like(rollouts.values);
+    Tensor advantages = torch::zeros_like(rollouts.values);
     compute_advantage(rollouts, advantages, hypers);
 
     pufferl.adv_mean.copy_(advantages.mean().detach());
@@ -1628,7 +1507,7 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     cudaEventCreate(&stop);
 
     Tensor mb_state = torch::zeros(
-        {policy->num_layers, minibatch_segments, 1, policy->hidden_size*policy->expansion_factor},
+        {policy->num_layers, minibatch_segments, 1, (int64_t)(policy->hidden_size*policy->expansion_factor)},
         torch::dtype(DTYPE).device(rollouts.values.device())
     );
 
@@ -1650,19 +1529,15 @@ pybind11::dict train(pybind11::object pufferl_obj) {
             prio_alpha, anneal_beta);
         profile_end(hypers.profile);
 
-        profile_begin("train_index_select", hypers.profile);
-        MinibatchT minibatch = train_index_select(rollouts, advantages, idx);
-        profile_end(hypers.profile);
-
-        profile_begin("train_graph_copy", hypers.profile);
-        train_graph_copy(pufferl, mb_state, minibatch, mb_prio);
+        profile_begin("train_select_and_copy", hypers.profile);
+        train_select_and_copy(pufferl.graph, rollouts, advantages, idx, mb_state, mb_prio);
         profile_end(hypers.profile);
 
         profile_begin("train_forward_graph", hypers.profile);
         if (hypers.cudagraphs) {
             pufferl.train_forward_graph.replay();
         } else {
-            train_forward_call(pufferl.graph_train, pufferl.policy, pufferl.muon,
+            train_forward_call(pufferl.graph, pufferl.policy, pufferl.muon,
                 hypers, pufferl.adv_mean, pufferl.adv_std);
         }
         profile_end(hypers.profile);
@@ -1672,12 +1547,12 @@ pybind11::dict train(pybind11::object pufferl_obj) {
         // Source is {minibatch_segments, horizon}, need to transpose to {horizon, minibatch_segments}
         // Temporary: use slice instead of index_copy_ for contiguous test
         /*
-        pufferl.rollouts.ratio.slice(1, 0, minibatch_segments).copy_(pufferl.graph_train.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.slice(1, 0, minibatch_segments).copy_(pufferl.graph_train.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.ratio.slice(1, 0, minibatch_segments).copy_(pufferl.graph.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.values.slice(1, 0, minibatch_segments).copy_(pufferl.graph.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
         */
         // Original index_copy_ version:
-        pufferl.rollouts.ratio.index_copy_(1, idx, pufferl.graph_train.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.index_copy_(1, idx, pufferl.graph_train.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.ratio.index_copy_(1, idx, pufferl.graph.mb_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.values.index_copy_(1, idx, pufferl.graph.mb_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
 
     }
     pufferl.epoch += 1;
@@ -1689,23 +1564,6 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     auto var_y = y_true.var();
     */
     //double explained_var = (var_y.abs() < 1e-8) ? NAN : (1 - (y_true - y_pred).var() / var_y).item<double>();
-
-    }
-    // Return losses (averaged)
-    pybind11::dict losses;
-    /*
-    losses["pg_loss"] = pg_sum.item<float>() / total_minibatches;
-    losses["value_loss"] = v_sum.item<float>() / total_minibatches;
-    losses["entropy"] = ent_sum.item<float>() / total_minibatches;
-    losses["total_loss"] = total_sum.item<float>() / total_minibatches;
-    losses["old_approx_kl"] = old_approx_kl_sum.item<float>() / total_minibatches;
-    losses["approx_kl"] = approx_kl_sum.item<float>() / total_minibatches;
-    losses["clipfrac"] = clipfrac_sum.item<float>() / total_minibatches;
-    losses["importance"] = importance_sum.item<float>() / total_minibatches;
-    */
-    //losses["explained_variance"] = explained_var;
-
-    return losses;
 }
 
 // Profiler control for nsys --capture-range=cudaProfilerApi
@@ -1721,132 +1579,4 @@ void profiler_stop() {
     printf("cudaProfilerStop()\n");
 }
 
-// PYBIND11_MODULE with the extension name (pufferlib._C)
-TORCH_LIBRARY(_C, m) {
-    m.def("mingru_gate(Tensor state, Tensor combined) -> (Tensor, Tensor)");
-    m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
-    m.def("fused_scan(Tensor combined, Tensor state) -> (Tensor, Tensor)");
-    m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
-    m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
-}
-
-PYBIND11_MODULE(_C, m) {
-    m.def("log_environments", &log_environments);
-    m.def("rollouts", &rollouts);
-
-    //m.def("evaluate_step", &evaluate_step);
-    m.def("train", &train);
-    m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
-    m.def("policy_forward", &PolicyMinGRU::forward);
-
-    m.def("initial_state", &initial_state);
-
-    // TODO: Why tf are these needed?
-    m.def("mingru_gate", &mingru_gate);
-    m.def("log_coeffs_and_values", &log_coeffs_and_values);
-    m.def("fused_scan", &fused_scan);
-    m.def("fused_ppo_loss", &fused_ppo_loss);
-    m.def("sample_logits", &sample_logits);  // void(logits, value, actions_out, logprobs_out, value_out, seed, offset)
-    //m.def("rmsnorm", &rmsnorm);
-
-    m.def("python_vec_recv", &python_vec_recv);
-    m.def("python_vec_send", &python_vec_send);
-    m.def("env_buffers", &env_buffers);
-    m.def("profiler_start", &profiler_start);
-    m.def("profiler_stop", &profiler_stop);
-    /*
-    py::class_<RMSNorm, torch::nn::ModuleHolder<RMSNormImpl>>(m, "RMSNorm")
-        .def(py::init<int64_t, double>(),
-             py::arg("hidden_size"),
-             py::arg("eps") = 1e-5)
-        .def("forward", &RMSNorm::forward)
-        .def("__call__", &RMSNorm::operator())
-        .def_readwrite("weight", &RMSNormImpl::weight)
-        .def_readonly("eps", &RMSNormImpl::eps);
-    */
-
-
-    py::class_<torch::optim::MuonOptions>(m, "MuonOptions")
-        .def(py::init<double>());
-
-    py::class_<torch::optim::MuonParamState>(m, "MuonParamState")
-        .def(py::init<>());
-
-    py::class_<torch::optim::Muon>(m, "Muon")
-        .def(py::init<std::vector<torch::optim::OptimizerParamGroup>, torch::optim::MuonOptions>());
-
-    py::class_<pufferlib::HypersT>(m, "HypersT")
-        // Layout
-        .def_readwrite("segments", &pufferlib::HypersT::segments)
-        .def_readwrite("horizon", &pufferlib::HypersT::horizon)
-        .def_readwrite("num_envs", &pufferlib::HypersT::num_envs)
-        .def_readwrite("num_buffers", &pufferlib::HypersT::num_buffers)
-        .def_readwrite("minibatch_segments", &pufferlib::HypersT::minibatch_segments)
-        .def_readwrite("total_minibatches", &pufferlib::HypersT::total_minibatches)
-        .def_readwrite("accumulate_minibatches", &pufferlib::HypersT::accumulate_minibatches)
-        // Model architecture
-        .def_readwrite("input_size", &pufferlib::HypersT::input_size)
-        .def_readwrite("num_atns", &pufferlib::HypersT::num_atns)
-        .def_readwrite("hidden_size", &pufferlib::HypersT::hidden_size)
-        .def_readwrite("expansion_factor", &pufferlib::HypersT::expansion_factor)
-        .def_readwrite("num_layers", &pufferlib::HypersT::num_layers)
-        // Learning rate
-        .def_readwrite("lr", &pufferlib::HypersT::lr)
-        .def_readwrite("min_lr_ratio", &pufferlib::HypersT::min_lr_ratio)
-        .def_readwrite("anneal_lr", &pufferlib::HypersT::anneal_lr)
-        // Optimizer
-        .def_readwrite("beta1", &pufferlib::HypersT::beta1)
-        .def_readwrite("beta2", &pufferlib::HypersT::beta2)
-        .def_readwrite("eps", &pufferlib::HypersT::eps)
-        // Training
-        .def_readwrite("max_epochs", &pufferlib::HypersT::max_epochs)
-        .def_readwrite("max_grad_norm", &pufferlib::HypersT::max_grad_norm)
-        // PPO
-        .def_readwrite("clip_coef", &pufferlib::HypersT::clip_coef)
-        .def_readwrite("vf_clip_coef", &pufferlib::HypersT::vf_clip_coef)
-        .def_readwrite("vf_coef", &pufferlib::HypersT::vf_coef)
-        .def_readwrite("ent_coef", &pufferlib::HypersT::ent_coef)
-        // GAE
-        .def_readwrite("gamma", &pufferlib::HypersT::gamma)
-        .def_readwrite("gae_lambda", &pufferlib::HypersT::gae_lambda)
-        // VTrace
-        .def_readwrite("vtrace_rho_clip", &pufferlib::HypersT::vtrace_rho_clip)
-        .def_readwrite("vtrace_c_clip", &pufferlib::HypersT::vtrace_c_clip)
-        // Priority
-        .def_readwrite("prio_alpha", &pufferlib::HypersT::prio_alpha)
-        .def_readwrite("prio_beta0", &pufferlib::HypersT::prio_beta0)
-        // Flags
-        .def_readwrite("use_rnn", &pufferlib::HypersT::use_rnn)
-        .def_readwrite("cudagraphs", &pufferlib::HypersT::cudagraphs)
-        .def_readwrite("kernels", &pufferlib::HypersT::kernels)
-        .def_readwrite("profile", &pufferlib::HypersT::profile);
-
-    py::class_<pufferlib::RolloutsT>(m, "RolloutsT")
-        .def_readwrite("observations", &pufferlib::RolloutsT::observations)
-        .def_readwrite("actions", &pufferlib::RolloutsT::actions)
-        .def_readwrite("values", &pufferlib::RolloutsT::values)
-        .def_readwrite("logprobs", &pufferlib::RolloutsT::logprobs)
-        .def_readwrite("rewards", &pufferlib::RolloutsT::rewards)
-        .def_readwrite("terminals", &pufferlib::RolloutsT::terminals)
-        .def_readwrite("ratio", &pufferlib::RolloutsT::ratio)
-        .def_readwrite("importance", &pufferlib::RolloutsT::importance);
-
-    m.def("create_pufferl", &create_pufferl);
-    py::class_<pufferlib::PuffeRL, std::unique_ptr<pufferlib::PuffeRL>>(m, "PuffeRL")
-        .def_readwrite("policy", &pufferlib::PuffeRL::policy)
-        .def_readwrite("muon", &pufferlib::PuffeRL::muon)
-        .def_readwrite("hypers", &pufferlib::PuffeRL::hypers)
-        .def_readwrite("rollouts", &pufferlib::PuffeRL::rollouts)
-        .def_readwrite("debug", &pufferlib::PuffeRL::debug);
-
-    py::class_<pufferlib::PolicyLSTM, std::shared_ptr<pufferlib::PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
-    cls.def(py::init<int64_t, int64_t, int64_t>());
-    cls.def("forward", &pufferlib::PolicyLSTM::forward);
-    cls.def("forward_train", &pufferlib::PolicyLSTM::forward_train);
-
-    py::class_<pufferlib::PolicyMinGRU, std::shared_ptr<pufferlib::PolicyMinGRU>, torch::nn::Module> cls2(m, "PolicyMinGRU");
-    cls2.def(py::init<int64_t, int64_t, int64_t>());
-    cls2.def("forward", &pufferlib::PolicyMinGRU::forward);
-    cls2.def("forward_train", &pufferlib::PolicyMinGRU::forward_train);
-}
-}
+} // namespace pufferlib

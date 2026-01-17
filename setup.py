@@ -257,7 +257,7 @@ class ProfilerBuildExt(build_ext):
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
             cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl']
-            cmd += [src, '-o', out]
+            cmd += ['pufferlib/extensions/muon.cpp', 'pufferlib/extensions/cuda/pufferlib.cu', src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)
@@ -293,7 +293,7 @@ nvtx_lib = 'nvToolsExt'
 torch_extensions = []
 if not NO_TRAIN:
     torch_sources = [
-        "pufferlib/extensions/pufferlib.cpp",
+        "pufferlib/extensions/bindings.cpp",
         "pufferlib/extensions/muon.cpp",
     ]
     if BUID_CUDA_EXT:
