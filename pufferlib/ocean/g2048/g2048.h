@@ -57,9 +57,10 @@ typedef struct Log {
 typedef struct Game {
     Log log;                        // Required
     unsigned char* observations;    // Cheaper in memory if encoded in uint_8
-    int* actions;                   // Required
+    double* actions;                // Required
     float* rewards;                 // Required
-    unsigned char* terminals;       // Required
+    float* terminals;               // Required
+    int num_agents;                 // Required for env_binding
 
     bool can_go_over_65536;         // Set false for training, true for eval
     float reward_scaler;            // Pufferlib clips rew from -1 to 1, adjust the resulting rew accordingly

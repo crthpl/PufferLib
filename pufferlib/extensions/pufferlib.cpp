@@ -50,6 +50,8 @@ torch::Dtype to_torch_dtype(int dtype) {
         return torch::kUInt8;
     } else if (dtype == DOUBLE) {
         return torch::kFloat64;
+    } else if (dtype == CHAR) {
+        return torch::kInt8;
     } else {
         assert(false && "to_torch_dtype failed to convert dtype");
     }
@@ -114,7 +116,7 @@ float cosine_annealing(float lr_base, float lr_min, int t, int T) {
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
-std::tuple<VecEnv*, Tensor, Tensor, Tensor, Tensor>
+std::tuple<VecEnv*, Tensor, Tensor, Tensor, Tensor, Tensor>
 create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwargs) {
     std::string name = env_name;
     if (name.rfind("puffer_", 0) == 0) {
@@ -141,7 +143,8 @@ create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwa
     vec_log = (vec_log_fn)dlsym(handle, "vec_log");
     vec_render = (vec_render_fn)dlsym(handle, "vec_render");
     int obs_n = *(int*)dlsym(handle, "OBS_N");
-    int act_n = *(int*)dlsym(handle, "ACT_N");
+    int num_atns = *(int*)dlsym(handle, "NUM_ATNS_EXPORT");
+    int* act_sizes = (int*)dlsym(handle, "ACT_SIZES_EXPORT");
     int obs_t = *(int*)dlsym(handle, "OBS_T");
     int act_t = *(int*)dlsym(handle, "ACT_T");
 
@@ -153,21 +156,22 @@ create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwa
     }
 
     VecEnv* vec = create_envs(num_envs, 2, true, 0, env_kwargs);
-    printf("Created VecEnv with %d environments\n", vec->size);
+    int total_agents = vec->num_agents;
+    printf("DEBUG create_environments: num_envs=%d, vec->size=%d, vec->num_agents=%d\n",
+        (int)num_envs, vec->size, vec->num_agents);
 
-    // Close the library
-    //dlclose(handle);
- 
     auto obs_dtype = to_torch_dtype(obs_t);
     auto atn_dtype = to_torch_dtype(act_t);
 
-    Tensor obs = torch::from_blob(vec->gpu_observations, {num_envs, obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
-    Tensor actions = torch::from_blob(vec->gpu_actions, {num_envs}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
-    Tensor rewards = torch::from_blob(vec->gpu_rewards, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    Tensor terminals = torch::from_blob(vec->gpu_terminals, {num_envs}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    Tensor obs = torch::from_blob(vec->gpu_observations, {total_agents, obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
+    Tensor actions = torch::from_blob(vec->gpu_actions, {total_agents, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    Tensor rewards = torch::from_blob(vec->gpu_rewards, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    Tensor terminals = torch::from_blob(vec->gpu_terminals, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
-    // TODO: RESET
-    return std::make_tuple(vec, obs, actions, rewards, terminals);
+    // Create act_sizes tensor on CUDA (needed for sample_logits kernel)
+    Tensor act_sizes_tensor = torch::from_blob(act_sizes, {num_atns}, torch::dtype(torch::kInt32)).to(torch::kCUDA);
+
+    return std::make_tuple(vec, obs, actions, rewards, terminals, act_sizes_tensor);
 }
 
 // CUDA kernel wrappers
@@ -227,6 +231,7 @@ typedef struct {
     int segments;
     int horizon;
     int num_envs;
+    int num_agents;
     int num_buffers;
     int minibatch_segments;
     int total_minibatches;
@@ -283,15 +288,16 @@ typedef struct {
     bool captured;
     Tensor adv_mean;
     Tensor adv_std;
+    Tensor act_sizes;  // CUDA int32 tensor of action head sizes for MultiDiscrete
     int epoch;
     uint64_t rng_seed;
     Tensor rng_offset;  // CUDA tensor so increment is graphable
 } PuffeRL;
 
-RolloutBuf create_rollouts(int horizon, int segments, int input_size) {
+RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_atns) {
     RolloutBuf r;
     r.observations = torch::zeros({horizon, segments, input_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    r.actions = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    r.actions = torch::zeros({horizon, segments, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     r.values = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
     r.logprobs = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     r.rewards = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
@@ -312,13 +318,13 @@ EnvBuf create_env(int num_envs, int input_size) {
 }
 
 GraphBuf create_graph(int batch, int input_size, int minibatch_segments, int horizon,
-        int num_layers, int hidden_size, int expansion_factor, PolicyMinGRU* policy) {
+        int num_layers, int hidden_size, int expansion_factor, int num_atns, PolicyMinGRU* policy) {
     GraphBuf g;
     auto options = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
 
     // Rollout tensors
     g.obs = torch::zeros({batch, input_size}, options);
-    g.actions = torch::zeros(batch, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    g.actions = torch::zeros({batch, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     g.value = torch::zeros(batch, options);
     g.logprobs = torch::zeros(batch, options);
     g.state = policy->initial_state(batch, torch::kCUDA);
@@ -329,7 +335,7 @@ GraphBuf create_graph(int batch, int input_size, int minibatch_segments, int hor
     g.mb_state = torch::zeros({num_layers, minibatch_segments, 1, hidden_size * expansion_factor}, options);
     g.mb_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
     g.mb_ratio = torch::zeros({minibatch_segments, horizon}, options);
-    g.mb_actions = torch::zeros({minibatch_segments, horizon}, options).to(torch::kInt64);
+    g.mb_actions = torch::zeros({minibatch_segments, horizon, num_atns}, options).to(torch::kInt64);
     g.mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_prio = torch::zeros({minibatch_segments, 1}, options);
@@ -349,21 +355,45 @@ Tensor initial_state_impl(PuffeRL& pufferl, int64_t batch_size, torch::Device de
 }
 
 void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
-        uint64_t rng_seed, Tensor& rng_offset) {
+        uint64_t rng_seed, Tensor& rng_offset, Tensor& act_sizes) {
     torch::NoGradGuard no_grad;
 
     auto [logits, value, state_out] = policy->forward(graph.obs, graph.state);
 
     if (kernels) {
         sample_logits(logits, value, graph.actions, graph.logprobs,
-            graph.value, rng_seed, rng_offset);
+            graph.value, act_sizes, rng_seed, rng_offset);
     } else {
+        int num_action_heads = graph.actions.size(1);
         logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
-        Tensor logprobs = torch::log_softmax(logits, 1);
-        Tensor action = at::multinomial(logprobs.exp(), 1, true).squeeze(1);
-        Tensor logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1);
-        graph.actions.copy_(action, false);
-        graph.logprobs.copy_(logprob, false);
+
+        if (num_action_heads == 1) {
+            // Discrete
+            Tensor log_probs = torch::log_softmax(logits, 1);
+            Tensor action = at::multinomial(log_probs.exp(), 1, true).squeeze(1);
+            Tensor logprob = log_probs.gather(1, action.unsqueeze(1)).squeeze(1);
+            graph.actions.select(1, 0).copy_(action.to(torch::kFloat64), false);
+            graph.logprobs.copy_(logprob, false);
+        } else {
+            // MultiDiscrete
+            auto sizes_vec = act_sizes.cpu().to(torch::kInt64).contiguous();
+            auto split_logits = torch::split(logits, c10::IntArrayRef(sizes_vec.data_ptr<int64_t>(), num_action_heads), 1);
+            std::vector<Tensor> transposed;
+            for (const auto& t : split_logits) transposed.push_back(t.t());
+            logits = torch::nn::utils::rnn::pad_sequence(transposed, false, -INFINITY).permute({1, 2, 0});
+
+            Tensor normalized_logits = logits - logits.logsumexp(-1, true);
+            Tensor probs = torch::softmax(logits, -1);
+            probs = torch::nan_to_num(probs, 1e-8, 1e-8, 1e-8);
+
+            auto shape = probs.sizes().vec();
+            shape.pop_back();
+            Tensor action = at::multinomial(probs.reshape({-1, probs.size(-1)}), 1, true).reshape(shape);
+            Tensor logprob = normalized_logits.gather(-1, action.unsqueeze(-1)).squeeze(-1);
+
+            graph.actions.copy_(action.t().to(torch::kFloat64), false);
+            graph.logprobs.copy_(logprob.sum(0), false);
+        }
         graph.value.copy_(value.flatten(), false);
     }
     graph.state.copy_(state_out, false);
@@ -372,7 +402,8 @@ void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
 
 void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
         HypersT& hypers, int h, int buf) {
-    int block_size = hypers.num_envs / hypers.num_buffers;
+    int total_agents = hypers.num_envs * hypers.num_agents;
+    int block_size = total_agents / hypers.num_buffers;
 
     // Store with non-blocking copies
     // Layout is {horizon, segments, ...}, so select(0, h) gives contiguous {segments, ...}
@@ -391,7 +422,7 @@ void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
 }
 
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
-        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std) {
+        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes) {
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
@@ -414,16 +445,39 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
             hypers.ent_coef
         )[0];
     } else {
-        // Flatten for action lookup
-        Tensor flat_logits = logits.reshape({-1, logits.size(-1)});
-        Tensor flat_actions = graph.mb_actions.reshape({-1});
-        Tensor logprobs_new = torch::log_softmax(flat_logits, 1);
-        Tensor probs_new = logprobs_new.exp();
+        int num_action_heads = graph.mb_actions.size(-1);
+        Tensor newlogprob;
+        Tensor entropy;
 
-        // Gather logprobs for taken actions
-        Tensor newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-        Tensor newlogprob = newlogprob_flat.reshape({hypers.minibatch_segments, hypers.horizon});
-        Tensor entropy = - (probs_new * logprobs_new).sum(1).mean();
+        if (num_action_heads == 1) {
+            // Discrete
+            Tensor flat_logits = logits.reshape({-1, logits.size(-1)});
+            Tensor flat_actions = graph.mb_actions.reshape({-1});
+            Tensor logprobs_new = torch::log_softmax(flat_logits, 1);
+            Tensor probs_new = logprobs_new.exp();
+            Tensor newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
+            newlogprob = newlogprob_flat.reshape({hypers.minibatch_segments, hypers.horizon});
+            entropy = - (probs_new * logprobs_new).sum(1).mean();
+        } else {
+            // MultiDiscrete: action!=None path
+            int batch = hypers.minibatch_segments * hypers.horizon;
+            Tensor flat_logits = logits.reshape({batch, -1});
+            flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
+
+            auto sizes_vec = act_sizes.cpu().to(torch::kInt64).contiguous();
+            auto split_logits = torch::split(flat_logits, c10::IntArrayRef(sizes_vec.data_ptr<int64_t>(), num_action_heads), 1);
+            std::vector<Tensor> transposed;
+            for (const auto& t : split_logits) transposed.push_back(t.t());
+            Tensor padded_logits = torch::nn::utils::rnn::pad_sequence(transposed, false, -INFINITY).permute({1, 2, 0});
+
+            Tensor normalized_logits = padded_logits - padded_logits.logsumexp(-1, true);
+            Tensor probs = torch::softmax(padded_logits, -1);
+
+            Tensor action = graph.mb_actions.reshape({batch, -1}).t().to(torch::kInt64);
+            Tensor logprob = normalized_logits.gather(-1, action.unsqueeze(-1)).squeeze(-1);
+            newlogprob = logprob.sum(0).reshape({hypers.minibatch_segments, hypers.horizon});
+            entropy = - (probs * normalized_logits).sum(-1).sum(0).mean();
+        }
 
         // Compute ratio
         Tensor logratio = newlogprob - graph.mb_logprobs;
@@ -536,21 +590,48 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // BF16 reduction (if using bfloat16)
     torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
-    // Load environment first to get input_size from obs tensor
-    auto [vec, obs, actions, rewards, terminals] = create_environments(hypers.num_envs, env_name, env_kwargs);
+    // Load environment first to get input_size and action info from env
+    // act_sizes: 1D tensor of action space sizes per head
+    // num_action_heads: number of action heads (for MultiDiscrete)
+    // act_n: sum of action space sizes (decoder output dim)
+    auto [vec, obs, actions, rewards, terminals, act_sizes] = create_environments(hypers.num_envs, env_name, env_kwargs);
+    int num_action_heads = actions.size(1);
+    int act_n = act_sizes.sum().item<int>();
     pufferl->vec = vec;
     pufferl->env.obs = obs;
     pufferl->env.actions = actions;
     pufferl->env.rewards = rewards;
     pufferl->env.terminals = terminals;
+    pufferl->act_sizes = act_sizes;
 
     int input_size = obs.size(1);
-    int num_atns = hypers.num_atns;
     int hidden_size = hypers.hidden_size;
     int expansion_factor = hypers.expansion_factor;
     int num_layers = hypers.num_layers;
     bool kernels = hypers.kernels;
-    PolicyMinGRU* policy = new PolicyMinGRU(input_size, num_atns, hidden_size, expansion_factor, num_layers, kernels);
+
+    // Create encoder/decoder based on env_name
+    // Decoder output size is act_n (sum of all action space sizes)
+    std::shared_ptr<Encoder> enc;
+    std::shared_ptr<Decoder> dec;
+    if (env_name == "puffer_snake") {
+        enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
+        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+    } else if (env_name == "puffer_g2048") {
+        enc = std::make_shared<G2048Encoder>(input_size, hidden_size);
+        dec = std::make_shared<G2048Decoder>(hidden_size, act_n);
+    } else if (env_name == "puffer_nmmo3") {
+        enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
+        dec = std::make_shared<NMMO3Decoder>(hidden_size, act_n);
+    } else if (env_name == "puffer_drive") {
+        enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
+        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+    } else {
+        enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
+        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+    }
+
+    PolicyMinGRU* policy = new PolicyMinGRU(enc, dec, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
     policy->to(torch::kCUDA);
     policy->to(DTYPE);
     pufferl->policy = policy;
@@ -564,13 +645,17 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // Allocate buffers
     int segments = hypers.segments;
     int horizon = hypers.horizon;
-    int batch = hypers.num_envs / hypers.num_buffers;
+    int total_agents = hypers.num_envs * hypers.num_agents;
+    int batch = total_agents / hypers.num_buffers;
     int num_buffers = hypers.num_buffers;
     int minibatch_segments = hypers.minibatch_segments;
 
-    pufferl->rollouts = create_rollouts(horizon, segments, input_size);
+    printf("DEBUG: num_envs=%d, num_agents=%d, total_agents=%d, segments=%d, batch=%d, num_buffers=%d\n",
+        hypers.num_envs, hypers.num_agents, total_agents, segments, batch, num_buffers);
+
+    pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
     pufferl->graph = create_graph(batch, input_size, minibatch_segments, horizon,
-        policy->num_layers, policy->hidden_size, policy->expansion_factor, policy);
+        policy->num_layers, policy->hidden_size, policy->expansion_factor, num_action_heads, policy);
 
     pufferl->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
     pufferl->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
@@ -587,11 +672,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
         auto* p = pufferl.get();
         capture_graph(&pufferl->rollout_graph, [p]() {
-            forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset);
+            forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes);
         });
         capture_graph(&pufferl->train_forward_graph, [p]() {
             train_forward_call(p->graph, p->policy, p->muon,
-                p->hypers, p->adv_mean, p->adv_std);
+                p->hypers, p->adv_mean, p->adv_std, p->act_sizes);
         });
 
         for (int i = 0; i < hypers.horizon; ++i) {
@@ -605,7 +690,16 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     }
 
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
-    create_threads(vec, 8, 256);
+    // Try num_threads=0 to disable threading for debugging
+    int num_threads = 8;
+    int block_size = hypers.num_envs / 16;
+    if (hypers.num_envs < num_threads) {
+        num_threads = hypers.num_envs;
+    }
+    if (block_size < 1) {
+        block_size = 1;
+    }
+    create_threads(vec, num_threads, block_size);
     vec_reset(vec);
 
     return pufferl;
@@ -691,9 +785,9 @@ void rollouts_impl(PuffeRL& pufferl) {
     HypersT& hypers = pufferl.hypers;
 
     int horizon = hypers.horizon;
-    int num_envs = hypers.num_envs;
+    int total_agents = hypers.num_envs * hypers.num_agents;
     int num_buffers = hypers.num_buffers;
-    int block_size = num_envs / num_buffers;
+    int block_size = total_agents / num_buffers;
     // TODO: You removed state zeros and reward clamping
 
     for (int i = 0; i < num_buffers*horizon; ++i) {
@@ -713,7 +807,7 @@ void rollouts_impl(PuffeRL& pufferl) {
             pufferl.rollout_graph.replay();
         } else {
             forward_call(pufferl.graph, pufferl.policy, hypers.kernels,
-                pufferl.rng_seed, pufferl.rng_offset);
+                pufferl.rng_seed, pufferl.rng_offset, pufferl.act_sizes);
         }
         profile_end(hypers.profile);
 
@@ -843,7 +937,7 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_forward_graph.replay();
         } else {
             train_forward_call(pufferl.graph, pufferl.policy, pufferl.muon,
-                hypers, pufferl.adv_mean, pufferl.adv_std);
+                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes);
         }
         profile_end(hypers.profile);
 

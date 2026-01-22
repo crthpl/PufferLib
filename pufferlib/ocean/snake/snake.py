@@ -9,21 +9,21 @@ from pufferlib.ocean.snake import binding
 
 class Snake(pufferlib.PufferEnv):
     def __init__(self, num_envs=16, width=640, height=360,
-            num_snakes=256, num_food=4096,
+            num_agents=256, num_food=4096,
             vision=5, leave_corpse_on_death=True,
             reward_food=0.1, reward_corpse=0.1, reward_death=-1.0,
             report_interval=128, max_snake_length=1024,
-            render_mode='human', buf=None, seed=0):
+            render_mode='human', buf=None, seed=0, **kwargs):
         
         if num_envs is not None:
-            num_snakes = num_envs * [num_snakes]
+            num_agents = num_envs * [num_agents]
             width = num_envs * [width]
             height = num_envs * [height]
             num_food = num_envs * [num_food]
             leave_corpse_on_death = num_envs * [leave_corpse_on_death]
 
-        if not (len(num_snakes) == len(width) == len(height) == len(num_food)):
-            raise APIUsageError('num_snakes, width, height, num_food must be lists of equal length')
+        if not (len(num_agents) == len(width) == len(height) == len(num_food)):
+            raise APIUsageError('num_agents, width, height, num_food must be lists of equal length')
 
         for w, h in zip(width, height):
             if w < 2*vision+2 or h < 2*vision+2:
@@ -36,7 +36,7 @@ class Snake(pufferlib.PufferEnv):
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=2, shape=(2*vision+1, 2*vision+1), dtype=np.int8)
         self.single_action_space = gymnasium.spaces.Discrete(4)
-        self.num_agents = sum(num_snakes)
+        self.num_agents = sum(num_agents)
         self.render_mode = render_mode
         self.tick = 0
 
@@ -46,7 +46,7 @@ class Snake(pufferlib.PufferEnv):
         c_envs = []
         offset = 0
         for i in range(num_envs):
-            ns = num_snakes[i]
+            ns = num_agents[i]
             obs_slice = self.observations[offset:offset+ns]
             act_slice = self.actions[offset:offset+ns]
             rew_slice = self.rewards[offset:offset+ns]
@@ -63,7 +63,7 @@ class Snake(pufferlib.PufferEnv):
                 env_seed,
                 width=width[i], 
                 height=height[i],
-                num_snakes=ns, 
+                num_agents=ns, 
                 num_food=num_food[i],
                 vision=vision, 
                 leave_corpse_on_death=leave_corpse_on_death[i],

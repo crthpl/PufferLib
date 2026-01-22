@@ -176,6 +176,7 @@ class PuffeRL:
         self.print_dashboard(clear=True)
 
 
+        '''
         self.num_layers = 4
         config['input_size'] = 118
         config['num_atns'] = 3
@@ -196,6 +197,7 @@ class PuffeRL:
         config['kernels'] = False
         config['num_buffers'] = 1
         self.pufferl_cpp = _C.create_pufferl(config)
+        '''
 
 
     @property
@@ -308,13 +310,15 @@ class PuffeRL:
             #_C.python_vec_send(self.pufferl_cpp, 0)
             self.vecenv.send(action)
 
-        logs = _C.log_environments(self.pufferl_cpp)
+        #logs = _C.log_environments(self.pufferl_cpp)
+        '''
         if logs:
             self.stats['perf'] = [logs['perf']]
             self.stats['score'] = [logs['score']]
             self.stats['episode_return'] = [logs['episode_return']]
             self.stats['episode_length'] = [logs['episode_length']]
             self.stats['n'] = [logs['n']]
+        '''
 
 
         profile('eval_misc', epoch)

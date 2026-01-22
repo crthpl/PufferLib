@@ -82,12 +82,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.segments = get_config(kwargs, "segments");
     hypers.horizon = get_config(kwargs, "horizon");
     hypers.num_envs = get_config(kwargs, "num_envs");
+    hypers.num_agents = get_config(kwargs, "num_agents");
     hypers.num_buffers = get_config(kwargs, "num_buffers");
     hypers.minibatch_segments = get_config(kwargs, "minibatch_segments");
     hypers.total_minibatches = get_config(kwargs, "total_minibatches");
     hypers.accumulate_minibatches = get_config(kwargs, "accumulate_minibatches");
-    // Model architecture
-    hypers.num_atns = get_config(kwargs, "num_atns");
+    // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(kwargs, "hidden_size");
     hypers.expansion_factor = get_config(kwargs, "expansion_factor");
     hypers.num_layers = get_config(kwargs, "num_layers");
@@ -229,8 +229,27 @@ PYBIND11_MODULE(_C, m) {
     cls.def("forward", &PolicyLSTM::forward);
     cls.def("forward_train", &PolicyLSTM::forward_train);
 
+    py::class_<Encoder, std::shared_ptr<Encoder>, torch::nn::Module>(m, "Encoder");
+    py::class_<Decoder, std::shared_ptr<Decoder>, torch::nn::Module>(m, "Decoder");
+    py::class_<DefaultEncoder, std::shared_ptr<DefaultEncoder>, Encoder>(m, "DefaultEncoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<SnakeEncoder, std::shared_ptr<SnakeEncoder>, Encoder>(m, "SnakeEncoder")
+        .def(py::init<int64_t, int64_t, int64_t>());
+    py::class_<G2048Encoder, std::shared_ptr<G2048Encoder>, Encoder>(m, "G2048Encoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<DefaultDecoder, std::shared_ptr<DefaultDecoder>, Decoder>(m, "DefaultDecoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<G2048Decoder, std::shared_ptr<G2048Decoder>, Decoder>(m, "G2048Decoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<NMMO3Encoder, std::shared_ptr<NMMO3Encoder>, Encoder>(m, "NMMO3Encoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<NMMO3Decoder, std::shared_ptr<NMMO3Decoder>, Decoder>(m, "NMMO3Decoder")
+        .def(py::init<int64_t, int64_t>());
+    py::class_<DriveEncoder, std::shared_ptr<DriveEncoder>, Encoder>(m, "DriveEncoder")
+        .def(py::init<int64_t, int64_t>());
+
     py::class_<PolicyMinGRU, std::shared_ptr<PolicyMinGRU>, torch::nn::Module> cls2(m, "PolicyMinGRU");
-    cls2.def(py::init<int64_t, int64_t, int64_t>());
+    cls2.def(py::init<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>, int64_t, int64_t, int64_t, int64_t, int64_t, bool>());
     cls2.def("forward", &PolicyMinGRU::forward);
     cls2.def("forward_train", &PolicyMinGRU::forward_train);
 }

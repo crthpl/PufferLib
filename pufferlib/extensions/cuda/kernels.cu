@@ -1531,20 +1531,22 @@ void launch_ppo_loss_backward(
 // ============================================================================
 
 // Single kernel that handles: nan_to_num, log_softmax, multinomial sampling, logprob gather, value copy
-// Input: logits (B, A) with row stride logits_stride, value (B, 1) with row stride value_stride, seed for RNG
-// Output: actions (B,) as float64, logprobs (B,), value_out (B,)
+// Input: logits (B, sum(act_sizes)) with row stride logits_stride, value (B, 1) with row stride value_stride, seed for RNG
+// Output: actions (B, num_atns) as float64, logprobs (B,), value_out (B,)
 // NOTE: offset is read from a pointer (not passed by value) so it works correctly with CUDA graphs.
 // The offset tensor is incremented with a CUDA op after this kernel, so each graph replay gets a new offset.
+// Supports MultiDiscrete via act_sizes array - loops over action heads and sums logprobs.
 template<typename T>
 __global__ void sample_logits_kernel(
-    double* __restrict__ actions,         // (B,) output - sampled action indices as float64
-    T* __restrict__ logprobs,             // (B,) output - log prob of sampled action
+    double* __restrict__ actions,         // (B, num_atns) output - sampled action indices as float64
+    T* __restrict__ logprobs,             // (B,) output - sum of log probs across action heads
     T* __restrict__ value_out,            // (B,) output - copied value (flattened)
-    const T* __restrict__ logits,         // (B, A) input - raw logits (may be non-contiguous)
+    const T* __restrict__ logits,         // (B, sum(act_sizes)) input - raw logits (may be non-contiguous)
     const T* __restrict__ value,          // (B, 1) input - value from fused output (may be non-contiguous)
+    const int* __restrict__ act_sizes,    // (num_atns,) input - size of each action head
     uint64_t seed,                        // RNG seed
     const int64_t* __restrict__ offset_ptr, // RNG offset pointer (read at execution time for CUDA graph support)
-    int A,                                // number of actions
+    int num_atns,                         // number of action heads
     int B,                                // batch size
     int logits_stride,                    // stride between rows (for non-contiguous logits from fused output)
     int value_stride                      // stride between rows (for non-contiguous value from fused output)
@@ -1555,59 +1557,74 @@ __global__ void sample_logits_kernel(
     // Read offset at execution time (important for CUDA graph replay)
     uint64_t offset = static_cast<uint64_t>(*offset_ptr);
 
-    int logits_base = idx * logits_stride;
-
-    // Step 1: Find max for numerical stability (with nan_to_num)
-    float max_val = -INFINITY;
-    for (int a = 0; a < A; ++a) {
-        float l = float(logits[logits_base + a]);
-        // nan_to_num: replace nan with 0
-        if (isnan(l)) l = 0.0f;
-        // clamp inf/-inf (pytorch defaults: neginf=-3.4028e+38, posinf=3.4028e+38)
-        if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-        max_val = fmaxf(max_val, l);
-    }
-
-    // Step 2: Compute logsumexp for log_softmax denominator
-    float sum_exp = 0.0f;
-    for (int a = 0; a < A; ++a) {
-        float l = float(logits[logits_base + a]);
-        if (isnan(l)) l = 0.0f;
-        if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-        sum_exp += expf(l - max_val);
-    }
-    float logsumexp = max_val + logf(sum_exp);
-
-    // Step 3: Generate random value using Philox RNG (fast, high quality)
+    // Initialize RNG state once per thread
     curandStatePhilox4_32_10_t state;
     curand_init(seed, idx, offset, &state);
-    float rand_val = curand_uniform(&state);
 
-    // Step 4: Multinomial sampling using inverse CDF
-    float cumsum = 0.0f;
-    int sampled_action = A - 1;  // default to last action
+    int logits_base = idx * logits_stride;
+    int logits_offset = 0;  // offset within row for current action head
+    float total_log_prob = 0.0f;
 
-    for (int a = 0; a < A; ++a) {
-        float l = float(logits[logits_base + a]);
-        if (isnan(l)) l = 0.0f;
-        if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-        float prob = expf(l - logsumexp);
-        cumsum += prob;
-        if (rand_val < cumsum) {
-            sampled_action = a;
-            break;
+    // Loop over action heads
+    for (int h = 0; h < num_atns; ++h) {
+        int A = act_sizes[h];  // size of this action head
+
+        // Step 1: Find max for numerical stability (with nan_to_num)
+        float max_val = -INFINITY;
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + logits_offset + a]);
+            // nan_to_num: replace nan with 0
+            if (isnan(l)) l = 0.0f;
+            // clamp inf/-inf (pytorch defaults: neginf=-3.4028e+38, posinf=3.4028e+38)
+            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+            max_val = fmaxf(max_val, l);
         }
+
+        // Step 2: Compute logsumexp for log_softmax denominator
+        float sum_exp = 0.0f;
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + logits_offset + a]);
+            if (isnan(l)) l = 0.0f;
+            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+            sum_exp += expf(l - max_val);
+        }
+        float logsumexp = max_val + logf(sum_exp);
+
+        // Step 3: Generate random value for this action head
+        float rand_val = curand_uniform(&state);
+
+        // Step 4: Multinomial sampling using inverse CDF
+        float cumsum = 0.0f;
+        int sampled_action = A - 1;  // default to last action
+
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + logits_offset + a]);
+            if (isnan(l)) l = 0.0f;
+            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+            float prob = expf(l - logsumexp);
+            cumsum += prob;
+            if (rand_val < cumsum) {
+                sampled_action = a;
+                break;
+            }
+        }
+
+        // Step 5: Gather log probability of sampled action
+        float sampled_logit = float(logits[logits_base + logits_offset + sampled_action]);
+        if (isnan(sampled_logit)) sampled_logit = 0.0f;
+        if (isinf(sampled_logit)) sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
+        float log_prob = sampled_logit - logsumexp;
+
+        // Write action for this head
+        actions[idx * num_atns + h] = double(sampled_action);
+        total_log_prob += log_prob;
+
+        // Advance to next action head
+        logits_offset += A;
     }
 
-    // Step 5: Gather log probability of sampled action
-    float sampled_logit = float(logits[logits_base + sampled_action]);
-    if (isnan(sampled_logit)) sampled_logit = 0.0f;
-    if (isinf(sampled_logit)) sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
-    float log_prob = sampled_logit - logsumexp;
-
-    // Write outputs (action as float64 for compatibility with continuous/discrete)
-    actions[idx] = double(sampled_action);
-    logprobs[idx] = T(log_prob);
+    // Write summed log probability (log of joint probability)
+    logprobs[idx] = T(total_log_prob);
 
     // Copy value (fused to avoid separate elementwise kernel for strided->contiguous copy)
     value_out[idx] = value[idx * value_stride];
@@ -1625,9 +1642,10 @@ void launch_sample_logits(
     T* value_out,
     const T* logits,
     const T* value,
+    const int* act_sizes,
     uint64_t seed,
     const int64_t* offset_ptr,  // pointer to offset tensor (read at execution time for CUDA graphs)
-    int A,
+    int num_atns,
     int B,
     int logits_stride,  // stride between rows (for non-contiguous logits from fused output)
     int value_stride,   // stride between rows (for non-contiguous value from fused output)
@@ -1640,9 +1658,10 @@ void launch_sample_logits(
         value_out,
         logits,
         value,
+        act_sizes,
         seed,
         offset_ptr,
-        A,
+        num_atns,
         B,
         logits_stride,
         value_stride
@@ -1688,8 +1707,8 @@ void launch_ppo_loss_forward_float(float* loss_output, double* saved_for_backwar
 void launch_ppo_loss_backward_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward<float>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
-void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* value, uint64_t seed, const int64_t* offset_ptr, int A, int B, int logits_stride, int value_stride, cudaStream_t stream) {
-    launch_sample_logits<float>(actions, logprobs, value_out, logits, value, seed, offset_ptr, A, B, logits_stride, value_stride, stream);
+void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
+    launch_sample_logits<float>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
 }
 
 // Non-templated wrappers for BFloat16
@@ -1726,8 +1745,8 @@ void launch_ppo_loss_forward_bf16(float* loss_output, double* saved_for_backward
 void launch_ppo_loss_backward_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
-void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, uint64_t seed, const int64_t* offset_ptr, int A, int B, int logits_stride, int value_stride, cudaStream_t stream) {
-    launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, seed, offset_ptr, A, B, logits_stride, value_stride, stream);
+void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
+    launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
 }
 
 #endif // PUFFERLIB_KERNELS_CU

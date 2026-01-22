@@ -64,14 +64,10 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 class PuffeRL:
     def __init__(self, config, logger=None, verbose=True):
-        # Backend perf optimization
-        num_envs = 8192
+        env_kwargs = config['env_kwargs']
+        num_envs = int(env_kwargs['num_envs'])
+        num_agents = int(env_kwargs['num_agents'])
         self.num_envs = num_envs
-        #grid_size = 11
-        dummy = torch.zeros(5).cuda()
-
-        #vecenv = CPPEnv(num_envs)
-        #vecenv.reset()
 
         # Reproducibility
         seed = config['seed']
@@ -79,12 +75,7 @@ class PuffeRL:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Vecenv info
-        #vecenv.async_reset(seed)
-        #obs_space = vecenv.single_observation_space
-        #atn_space = vecenv.single_action_space
-        #total_agents = vecenv.num_agents
-        total_agents = num_envs
+        total_agents = num_envs * num_agents
         self.total_agents = total_agents
         self.agents_per_batch = total_agents
 
@@ -147,10 +138,10 @@ class PuffeRL:
         
         self.total_epochs = epochs
 
-        self.num_layers = 4
-        config['num_atns'] = 3
-        config['hidden_size'] = 128
-        config['expansion_factor'] = 1
+        policy_kwargs = config.get('policy_kwargs', {})
+        self.num_layers = int(policy_kwargs.get('num_layers', 4))
+        config['hidden_size'] = int(policy_kwargs.get('hidden_size', 128))
+        config['expansion_factor'] = int(policy_kwargs.get('expansion_factor', 1))
         config['num_layers'] = self.num_layers
         config['minibatch_segments'] = self.minibatch_segments
         config['segments'] = segments
@@ -163,6 +154,7 @@ class PuffeRL:
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
         config['num_envs'] = self.num_envs
+        config['num_agents'] = int(env_kwargs['num_agents'])
         config['cudagraphs'] = True
         config['kernels'] = True
         config['num_buffers'] = 2
@@ -406,7 +398,7 @@ class PuffeRL:
         table.add_column(justify="right", width=13)
 
         table.add_row(
-            f'{b1}PufferLib {b2}3.0 {idx[0]*" "}:blowfish:',
+            f'{b1}PufferLib {b2}4.0 {idx[0]*" "}:blowfish:',
             f'{c1}CPU: {b2}{np.mean(self.utilization.cpu_util):.1f}{c2}%',
             f'{c1}GPU: {b2}{np.mean(self.utilization.gpu_util):.1f}{c2}%',
             f'{c1}DRAM: {b2}{np.mean(self.utilization.cpu_mem):.1f}{c2}%',
@@ -853,6 +845,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
     train_config['env_kwargs'] = args['env']
+    train_config['policy_kwargs'] = args['policy']
     pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 

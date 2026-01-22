@@ -45,9 +45,9 @@ typedef struct {
     Agent* agents;
     Goal* goals;
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
-    int* actions; // Required. int* for discrete/multidiscrete, float* for box
+    double* actions; // Required. double* for discrete/multidiscrete, float* for box
     float* rewards; // Required
-    unsigned char* terminals; // Required. We don't yet have truncations as standard yet
+    float* terminals; // Required. We don't yet have truncations as standard yet
     int width;
     int height;
     int num_agents;

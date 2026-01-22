@@ -1,6 +1,7 @@
 #include "../ocean/breakout/breakout.h"
 #define OBS_SIZE 118
-#define ACT_SIZE 1
+#define NUM_ATNS 1
+#define ACT_SIZES {3}
 #define OBS_TYPE FLOAT
 #define ACT_TYPE DOUBLE
 
@@ -8,6 +9,7 @@
 #include "env_binding.h"
 
 void my_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
     env->frameskip = dict_get(kwargs, "frameskip")->value;
     env->width = dict_get(kwargs, "width")->value;
     env->height = dict_get(kwargs, "height")->value;

@@ -6,7 +6,7 @@
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {   
     env->width = unpack(kwargs, "width");
     env->height = unpack(kwargs, "height");
-    env->num_snakes = unpack(kwargs, "num_snakes");
+    env->num_agents = unpack(kwargs, "num_agents");
     env->vision = unpack(kwargs, "vision");
     env->leave_corpse_on_death = unpack(kwargs, "leave_corpse_on_death");
     env->food = unpack(kwargs, "num_food");

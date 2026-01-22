@@ -1,7 +1,8 @@
 #include "../ocean/g2048/g2048.h"
 
 #define OBS_SIZE 289
-#define ACT_SIZE 1
+#define NUM_ATNS 1
+#define ACT_SIZES {4}
 #define OBS_TYPE UNSIGNED_CHAR
 #define ACT_TYPE INT
 
@@ -10,6 +11,7 @@
 #include "env_binding.h"
 
 void my_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
     env->can_go_over_65536 = dict_get(kwargs, "can_go_over_65536")->value;
     env->reward_scaler = dict_get(kwargs, "reward_scaler")->value;
     env->endgame_env_prob = dict_get(kwargs, "endgame_env_prob")->value;

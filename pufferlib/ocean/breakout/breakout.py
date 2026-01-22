@@ -5,7 +5,7 @@ import pufferlib
 from pufferlib.ocean.breakout import binding
 
 class Breakout(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, render_mode=None,
+    def __init__(self, num_envs=1, num_agents=1, render_mode=None,
             frameskip=4, width=576, height=330,
             paddle_width=62, paddle_height=8,
             ball_width=32, ball_height=32,

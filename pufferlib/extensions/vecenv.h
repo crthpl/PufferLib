@@ -12,6 +12,7 @@
 #define INT 2
 #define UNSIGNED_CHAR 3
 #define DOUBLE 4
+#define CHAR 5
 
 typedef struct {
     const char* key;
@@ -25,17 +26,18 @@ typedef struct {
     int capacity;
 } Dict;
 
-typedef struct Env Env;
+typedef struct Env;
 typedef struct Threading Threading;
 
 typedef struct {
     Env* envs;
     int size;
-    float* observations;
+    int num_agents;
+    void* observations;
     double* actions;
     float* rewards;
     float* terminals;
-    float* gpu_observations;
+    void* gpu_observations;
     double* gpu_actions;
     float* gpu_rewards;
     float* gpu_terminals;
@@ -62,7 +64,8 @@ DictItem* dict_get_unsafe(Dict* dict, const char* key) {
 
 DictItem* dict_get(Dict* dict, const char* key) {
     DictItem* item = dict_get_unsafe(dict, key);
-    assert(item != NULL && "dict_get failed to find key");
+    if (item == NULL) printf("dict_get failed to find key: %s\n", key);
+    assert(item != NULL);
     return item;
 }
 
@@ -99,7 +102,7 @@ void my_shared_close(Env* env);
 void* my_get(Env* env, Dict* out);
 int my_put(Env* env, Dict* kwargs);
 
-typedef struct Log Log;
+typedef struct Log;
 void my_log(Log* log, Dict* out);
 
 // Sharp bit (puffers have spikes)

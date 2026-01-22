@@ -4,7 +4,7 @@
 
 int demo() {
     CSnake env = {
-        .num_snakes = 256,
+        .num_agents = 256,
         .width = 640,
         .height = 360,
         .max_snake_length = 200,
@@ -20,7 +20,7 @@ int demo() {
 
     Weights* weights = load_weights("resources/snake/snake_weights.bin", 256773);
     int logit_sizes[] = {4};
-    LinearLSTM* net = make_linearlstm(weights, env.num_snakes, 968, logit_sizes, 1);
+    LinearLSTM* net = make_linearlstm(weights, env.num_agents, 968, logit_sizes, 1);
     env.client = make_client(2, env.width, env.height);
 
     while (!WindowShouldClose()) {
@@ -31,12 +31,17 @@ int demo() {
             if (IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A)) env.actions[0] = 2;
             if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) env.actions[0] = 3;
         } else {
-            memset(net->obs, 0, env.num_snakes*968*sizeof(float));
-            for (int i = 0; i < env.num_snakes*121; i++) {
+            memset(net->obs, 0, env.num_agents*968*sizeof(float));
+            for (int i = 0; i < env.num_agents*121; i++) {
                 int obs = env.observations[i];
                 net->obs[i*8 + obs] = 1.0f;
             }
-            forward_linearlstm(net, net->obs, env.actions);
+            int* actions = (int*)calloc(env.num_agents, sizeof(int));
+            forward_linearlstm(net, net->obs, actions);
+            for (int i = 0; i < env.num_agents; i++) {
+                env.actions[i] = actions[i];
+            }
+            free(actions);
         }
         c_step(&env);
         c_render(&env);
@@ -50,7 +55,7 @@ int demo() {
 
 void test_performance(float test_time) {
     CSnake env = {
-        .num_snakes = 1024,
+        .num_agents = 1024,
         .width = 1280,
         .height = 720,
         .max_snake_length = 200,
@@ -67,7 +72,7 @@ void test_performance(float test_time) {
     int start = time(NULL);
     int i = 0;
     while (time(NULL) - start < test_time) {
-        for (int j = 0; j < env.num_snakes; j++) {
+        for (int j = 0; j < env.num_agents; j++) {
             env.actions[j] = rand()%4;
         }
         c_step(&env);
@@ -75,7 +80,7 @@ void test_performance(float test_time) {
     }
     int end = time(NULL);
     free_csnake(&env);
-    printf("SPS: %f\n", (float)env.num_snakes*i / (end - start));
+    printf("SPS: %f\n", (float)env.num_agents*i / (end - start));
 }
 
 int main() {

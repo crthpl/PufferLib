@@ -22,9 +22,9 @@ typedef struct Client Client;
 typedef struct CSnake CSnake;
 struct CSnake {
     char* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     Log log;
     Log* snake_logs;
     char* grid;
@@ -33,7 +33,7 @@ struct CSnake {
     int* snake_ptr;
     int* snake_lifetimes;
     int* snake_colors;
-    int num_snakes;
+    int num_agents;
     int width;
     int height;
     int max_snake_length;
@@ -65,16 +65,16 @@ void add_log(CSnake* env, int snake_id) {
 
 void init_csnake(CSnake* env) {
     env->grid = (char*)calloc(env->width*env->height, sizeof(char));
-    env->snake = (int*)calloc(env->num_snakes*2*env->max_snake_length, sizeof(int));
-    env->snake_lengths = (int*)calloc(env->num_snakes, sizeof(int));
-    env->snake_ptr = (int*)calloc(env->num_snakes, sizeof(int));
-    env->snake_lifetimes = (int*)calloc(env->num_snakes, sizeof(int));
-    env->snake_colors = (int*)calloc(env->num_snakes, sizeof(int));
-    env->snake_logs = (Log*)calloc(env->num_snakes, sizeof(Log));
+    env->snake = (int*)calloc(env->num_agents*2*env->max_snake_length, sizeof(int));
+    env->snake_lengths = (int*)calloc(env->num_agents, sizeof(int));
+    env->snake_ptr = (int*)calloc(env->num_agents, sizeof(int));
+    env->snake_lifetimes = (int*)calloc(env->num_agents, sizeof(int));
+    env->snake_colors = (int*)calloc(env->num_agents, sizeof(int));
+    env->snake_logs = (Log*)calloc(env->num_agents, sizeof(Log));
     env->tick = 0;
     env->client = NULL;
     env->snake_colors[0] = 7;
-    for (int i = 1; i<env->num_snakes; i++)
+    for (int i = 1; i<env->num_agents; i++)
         env->snake_colors[i] = i%4 + 4; // Randomize snake colors
 }
 
@@ -89,9 +89,10 @@ void c_close(CSnake* env) {
 }
 void allocate_csnake(CSnake* env) {
     int obs_size = (2*env->vision + 1) * (2*env->vision + 1);
-    env->observations = (char*)calloc(env->num_snakes*obs_size, sizeof(char));
-    env->actions = (int*)calloc(env->num_snakes, sizeof(int));
-    env->rewards = (float*)calloc(env->num_snakes, sizeof(float));    
+    env->observations = (char*)calloc(env->num_agents*obs_size, sizeof(char));
+    env->actions = (double*)calloc(env->num_agents, sizeof(double));
+    env->rewards = (float*)calloc(env->num_agents, sizeof(float));
+    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
     init_csnake(env);
 }
 
@@ -103,7 +104,7 @@ void free_csnake(CSnake* env) {
 }
 
 void compute_observations(CSnake* env) {
-    for (int i = 0; i < env->num_snakes; i++) {
+    for (int i = 0; i < env->num_agents; i++) {
         int head_ptr = i*2*env->max_snake_length + 2*env->snake_ptr[i];
         int r_offset = env->snake[head_ptr] - env->vision;
         int c_offset = env->snake[head_ptr+1] - env->vision;
@@ -173,7 +174,7 @@ void c_reset(CSnake* env) {
     env->tick = 0;
     env->log = (Log){0};
     
-    for (int i = 0; i < env->num_snakes; i++)
+    for (int i = 0; i < env->num_agents; i++)
         env->snake_logs[i] = (Log){0};
 
     for (int r = 0; r < env->vision; r++) {
@@ -190,7 +191,7 @@ void c_reset(CSnake* env) {
         for (int c = env->width - env->vision; c < env->width; c++)
             env->grid[r*env->width + c] = WALL;
     }
-    for (int i = 0; i < env->num_snakes; i++)
+    for (int i = 0; i < env->num_agents; i++)
         spawn_snake(env, i);
     for (int i = 0; i < env->food; i++)
         spawn_food(env);
@@ -199,6 +200,7 @@ void c_reset(CSnake* env) {
 }
 
 void step_snake(CSnake* env, int i) {
+    env->terminals[i] = 0;
     env->snake_logs[i].episode_length += 1;
     int atn = env->actions[i];
     int dr = 0;
@@ -230,6 +232,7 @@ void step_snake(CSnake* env, int i) {
     int tile = env->grid[next_r*env->width + next_c];
     if (tile >= WALL) {
         env->rewards[i] = env->reward_death;
+        //env->terminals[i] = 1;
         env->snake_logs[i].episode_return += env->reward_death;
         env->snake_logs[i].score = env->snake_lengths[i];
         env->snake_logs[i].perf = fminf(env->snake_logs[i].score/120.0f, 1.0f);
@@ -281,7 +284,7 @@ void step_snake(CSnake* env, int i) {
 
 void c_step(CSnake* env){
     env->tick++;
-    for (int i = 0; i < env->num_snakes; i++)
+    for (int i = 0; i < env->num_agents; i++)
         step_snake(env, i);
 
     compute_observations(env);

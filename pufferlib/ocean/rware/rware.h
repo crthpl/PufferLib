@@ -151,9 +151,9 @@ struct MovementGraph {
 struct CRware {
     Client* client;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     Log* agent_logs;
     Log log;
     float* scores;
@@ -296,9 +296,9 @@ void init(CRware* env) {
 void allocate(CRware* env) {
     init(env);
     env->observations = (float*)calloc(env->num_agents*(SELF_OBS+VISION_OBS), sizeof(float));
-    env->actions = (int*)calloc(env->num_agents, sizeof(int));
+    env->actions = (double*)calloc(env->num_agents, sizeof(double));
     env->rewards = (float*)calloc(env->num_agents, sizeof(float));
-    env->terminals = (unsigned char*)calloc(env->num_agents, sizeof(unsigned char));
+    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 }
 
 void c_close(CRware* env) {
@@ -652,7 +652,7 @@ void process_cycle_movements(CRware* env, MovementGraph* graph) {
         if (!can_move_cycle) continue;
         for (int i = 0; i < env->num_agents; i++) {
             if (graph->cycle_ids[i] != cycle) continue;
-            if (env->actions[i] != FORWARD) continue;            
+            if ((int)env->actions[i] != FORWARD) continue;
             move_agent(env, i);
         }
     }
@@ -669,7 +669,7 @@ void process_tree_movements(CRware* env, MovementGraph* graph) {
     for (int weight = max_weight; weight > 0; weight--) {
         for (int i = 0; i < env->num_agents; i++) {
             if (graph->cycle_ids[i] != -1 || graph->weights[i] != weight) continue;
-            if (env->actions[i] != FORWARD) continue;
+            if ((int)env->actions[i] != FORWARD) continue;
 
             int new_pos = get_new_position(env, i);
             if (new_pos == -1) continue;
@@ -687,7 +687,7 @@ void c_step(CRware* env) {
     for (int i = 0; i < env->num_agents; i++) {
         env->old_agent_locations[i] = env->agent_locations[i];
         env->agent_logs[i].episode_length += 1;
-        int action = env->actions[i];
+        int action = (int)env->actions[i];
         
 	    // Handle direction changes and non-movement actions
         if (action != NOOP && action != TOGGLE_LOAD) {
@@ -702,7 +702,7 @@ void c_step(CRware* env) {
     }
     int is_movement=0;
     for(int i=0; i<env->num_agents; i++) {
-        if (env->actions[i] == FORWARD) is_movement++;
+        if ((int)env->actions[i] == FORWARD) is_movement++;
     }
     if (is_movement>=1) {
         // Process movements in cycles first

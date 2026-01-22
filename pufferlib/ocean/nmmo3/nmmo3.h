@@ -680,7 +680,7 @@ struct MMO {
     Client* client;
     int width;
     int height;
-    int num_players;
+    int num_agents;
     int num_enemies;
     int num_resources;
     int num_weapons;
@@ -697,7 +697,7 @@ struct MMO {
     float* terminals;
     Reward* reward_struct;
     Reward* returns;
-    int* actions;
+    double* actions;
     int tick;
     int tiers;
     int levels;
@@ -722,10 +722,10 @@ struct MMO {
 };
 
 Entity* get_entity(MMO* env, int pid) {
-    if (pid < env->num_players) {
+    if (pid < env->num_agents) {
         return &env->players[pid];
     } else {
-        return &env->enemies[pid - env->num_players];
+        return &env->enemies[pid - env->num_agents];
     }
 }
 
@@ -778,9 +778,9 @@ void init(MMO* env) {
         env->num_enemies, env->enemy_respawn_ticks);
     env->drop_respawn_buffer = make_respawn_buffer(2*env->num_enemies, 20);
 
-    env->returns = calloc(env->num_players, sizeof(Reward));
-    env->reward_struct = calloc(env->num_players, sizeof(Reward));
-    env->players = calloc(env->num_players, sizeof(Entity));
+    env->returns = calloc(env->num_agents, sizeof(Reward));
+    env->reward_struct = calloc(env->num_agents, sizeof(Reward));
+    env->players = calloc(env->num_agents, sizeof(Entity));
     env->enemies = calloc(env->num_enemies, sizeof(Entity));
 
     // TODO: Figure out how to cast to array. Size is static
@@ -790,10 +790,10 @@ void init(MMO* env) {
 
 void allocate_mmo(MMO* env) {
     // TODO: Not hardcode
-    env->observations = calloc(env->num_players*(11*15*10+47+10), sizeof(unsigned char));
-    env->rewards = calloc(env->num_players, sizeof(float));
-    env->terminals = calloc(env->num_players, sizeof(float));
-    env->actions = calloc(env->num_players, sizeof(int));
+    env->observations = calloc(env->num_agents*(11*15*10+47+10), sizeof(unsigned char));
+    env->rewards = calloc(env->num_agents, sizeof(float));
+    env->terminals = calloc(env->num_agents, sizeof(float));
+    env->actions = calloc(env->num_agents, sizeof(double));
     init(env);
 }
 
@@ -920,7 +920,7 @@ float sell_price(int idx) {
 }
 
 void compute_all_obs(MMO* env) {
-    for (int pid = 0; pid < env->num_players; pid++) {
+    for (int pid = 0; pid < env->num_agents; pid++) {
         Entity* player = get_entity(env, pid);
         int r = player->r;
         int c = player->c;
@@ -1574,7 +1574,7 @@ void enemy_ai(MMO* env, int pid) {
         for (int cc = c-NPC_AGGRO_RANGE; cc <= c+NPC_AGGRO_RANGE; cc++) {
             int adr = map_offset(env, rr, cc);
             int target_id = env->pids[adr];
-            if (target_id == -1 || target_id >= env->num_players) {
+            if (target_id == -1 || target_id >= env->num_agents) {
                 continue;
             }
 
@@ -1750,7 +1750,7 @@ void c_reset(MMO* env) {
         }
 
         if (
-            player_count == env->num_players && 
+            player_count == env->num_agents && 
             enemy_count == env->num_enemies && 
             ore_count == env->num_resources && 
             herb_count == env->num_resources && 
@@ -1776,7 +1776,7 @@ void c_reset(MMO* env) {
     free(spawn_cands);
 
     //int distance = abs(r - env->height/2);
-    for (int player_count = 0; player_count < env->num_players; player_count++) {
+    for (int player_count = 0; player_count < env->num_agents; player_count++) {
         int pid = player_count;
         Entity* player = &env->players[pid];
         player->type = ENTITY_PLAYER;
@@ -1828,7 +1828,7 @@ void c_reset(MMO* env) {
         enemy->element = element;
         enemy->ranged = ranged;
 
-        env->pids[adr] = env->num_players + enemy_count;
+        env->pids[adr] = env->num_agents + enemy_count;
         enemy->comb_lvl = level;
     }
 
@@ -1875,7 +1875,7 @@ void c_step(MMO* env) {
         }
     }
 
-    for (int pid = 0; pid < env->num_players + env->num_enemies; pid++) {
+    for (int pid = 0; pid < env->num_agents + env->num_enemies; pid++) {
         Entity* entity = get_entity(env, pid);
         entity->time_alive += 1;
         int entity_type = entity->type;
@@ -2117,7 +2117,7 @@ void c_step(MMO* env) {
         }
     }
     compute_all_obs(env);
-    for (int pid = 0; pid < env->num_players; pid++) {
+    for (int pid = 0; pid < env->num_agents; pid++) {
         Reward* reward = &env->reward_struct[pid];
         env->rewards[pid] = (
             reward->death + reward->comb_lvl
@@ -2883,7 +2883,7 @@ void render_centered(Client* client, MMO* env, int pid, int action, float delta)
         start_r, end_c-start_c, end_r-start_r,
         env->width, env->height, 1, delta);
 
-    for (int pid = 0; pid < env->num_players+env->num_enemies; pid++) {
+    for (int pid = 0; pid < env->num_agents+env->num_enemies; pid++) {
         draw_entity(client, env, pid, delta);
     }
 
@@ -3045,7 +3045,7 @@ void render_fixed(Client* client, MMO* env, float delta) {
     draw_min(client, env, start_c, start_r,
         end_c-start_c, end_r-start_r, env->width, env->height, 1, delta);
 
-    for (int pid = 0; pid < env->num_players+env->num_enemies; pid++) {
+    for (int pid = 0; pid < env->num_agents+env->num_enemies; pid++) {
         draw_entity(client, env, pid, delta);
     }
 
@@ -3095,7 +3095,7 @@ void process_command_input(Client* client, MMO* env) {
             char* pid = command + 7;
             pid = pid;
             int pid = atoi(pid);
-            if (pid < 0 || pid > env->num_players) {
+            if (pid < 0 || pid > env->num_agents) {
                 client->command = "Invalid player id";
             }
             client->my_player = pid;

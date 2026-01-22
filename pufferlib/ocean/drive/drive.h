@@ -166,9 +166,9 @@ float relative_distance_2d(float x1, float y1, float x2, float y2){
 struct Drive {
     Client* client;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     Log log;
     Log* logs;
     int num_agents;
@@ -559,7 +559,7 @@ void set_means(Drive* env) {
     
 }
 
-void move_expert(Drive* env, int* actions, int agent_idx){
+void move_expert(Drive* env, double* actions, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
     agent->x = agent->traj_x[env->timestep];
     agent->y = agent->traj_y[env->timestep];
@@ -932,9 +932,9 @@ void allocate(Drive* env){
     // printf("active agent count: %d\n", env->active_agent_count);
     // printf("num objects: %d\n", env->num_objects);
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
-    env->actions = (int*)calloc(env->active_agent_count*2, sizeof(int));
+    env->actions = (double*)calloc(env->active_agent_count*2, sizeof(double));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
-    env->terminals= (unsigned char*)calloc(env->active_agent_count, sizeof(unsigned char));
+    env->terminals = (float*)calloc(env->active_agent_count, sizeof(float));
     // printf("allocated\n");
 }
 
@@ -964,7 +964,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         // clip acceleration & steering
         Entity* agent = &env->entities[agent_idx];
         // Extract action components directly from the multi-discrete action array
-        int (*action_array)[2] = (int(*)[2])env->actions;
+        double (*action_array)[2] = (double(*)[2])env->actions;
         int acceleration_index = action_array[action_idx][0];
         int steering_index = action_array[action_idx][1];
         float acceleration = ACCELERATION_VALUES[acceleration_index];

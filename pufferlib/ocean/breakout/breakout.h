@@ -43,6 +43,7 @@ typedef struct Breakout {
     double* actions;
     float* rewards;
     float* terminals;
+    int num_agents;
     int score;
     float paddle_x;
     float paddle_y;

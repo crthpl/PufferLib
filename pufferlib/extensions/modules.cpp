@@ -960,11 +960,12 @@ void sample_logits(
     torch::Tensor actions_out,
     torch::Tensor logprobs_out,
     torch::Tensor value_out,
+    torch::Tensor act_sizes,
     uint64_t seed,
     torch::Tensor offset
 ) {
     TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
-    TORCH_CHECK(logits.dim() == 2, "logits must be 2D (B, A)");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D (B, sum(act_sizes))");
     TORCH_CHECK(logits.stride(1) == 1, "logits must be contiguous in last dim");
     TORCH_CHECK(actions_out.is_contiguous(), "actions_out must be contiguous");
     TORCH_CHECK(logprobs_out.is_contiguous(), "logprobs_out must be contiguous");
@@ -972,11 +973,13 @@ void sample_logits(
     TORCH_CHECK(actions_out.dtype() == torch::kFloat64, "actions_out must be float64");
     TORCH_CHECK(offset.dtype() == torch::kInt64, "offset must be int64");
     TORCH_CHECK(offset.is_cuda(), "offset must be on CUDA");
+    TORCH_CHECK(act_sizes.dtype() == torch::kInt32, "act_sizes must be int32");
+    TORCH_CHECK(act_sizes.is_cuda(), "act_sizes must be on CUDA");
 
     auto dtype = logits.dtype();
     auto B = logits.size(0);
-    auto A = logits.size(1);
-    auto logits_stride = logits.stride(0);  // row stride (may be > A for fused output)
+    auto num_atns = act_sizes.size(0);
+    auto logits_stride = logits.stride(0);  // row stride (may be > sum(act_sizes) for fused output)
     // value may be (B, 1) or (B,) - stride(0) works for both (gives stride between elements)
     auto value_stride = value.stride(0);
 
@@ -989,9 +992,10 @@ void sample_logits(
             value_out.data_ptr<float>(),
             logits.data_ptr<float>(),
             value.data_ptr<float>(),
+            act_sizes.data_ptr<int>(),
             seed,
             offset.data_ptr<int64_t>(),
-            static_cast<int>(A),
+            static_cast<int>(num_atns),
             static_cast<int>(B),
             static_cast<int>(logits_stride),
             static_cast<int>(value_stride),
@@ -1004,9 +1008,10 @@ void sample_logits(
             value_out.data_ptr<at::BFloat16>(),
             logits.data_ptr<at::BFloat16>(),
             value.data_ptr<at::BFloat16>(),
+            act_sizes.data_ptr<int>(),
             seed,
             offset.data_ptr<int64_t>(),
-            static_cast<int>(A),
+            static_cast<int>(num_atns),
             static_cast<int>(B),
             static_cast<int>(logits_stride),
             static_cast<int>(value_stride),

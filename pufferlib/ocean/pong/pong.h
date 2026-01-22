@@ -21,6 +21,7 @@ struct Pong {
     double* actions;
     float* rewards;
     float* terminals;
+    int num_agents;
     float paddle_yl;
     float paddle_yr;
     float ball_x;

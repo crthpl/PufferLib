@@ -7,7 +7,7 @@ import pufferlib
 from pufferlib.ocean.g2048 import binding
 
 class G2048(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, reward_scaler=1.0,
+    def __init__(self, num_envs=1, num_agents=1, reward_scaler=1.0,
                  can_go_over_65536=False, endgame_env_prob=0.0, scaffolding_ratio=0.0,
                  use_heuristic_rewards=False, snake_reward_weight=0.0, use_sparse_reward=False,
                  render_mode=None, log_interval=128, buf=None, seed=0):
