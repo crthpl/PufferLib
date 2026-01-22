@@ -18,9 +18,9 @@ struct Pong {
     Client* client;
     Log log;
     float* observations;
-    float* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     float paddle_yl;
     float paddle_yr;
     float ball_x;
@@ -67,9 +67,9 @@ void init(Pong* env) {
 void allocate(Pong* env) {
     init(env);
     env->observations = (float*)calloc(8, sizeof(float));
-    env->actions = (float*)calloc(1, sizeof(float));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
 }
 
 void free_allocated(Pong* env) {

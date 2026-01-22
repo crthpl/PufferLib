@@ -79,12 +79,6 @@ class PuffeRL:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        from gymnasium.spaces import Box, Discrete
-        obs_space = Box(low=0, high=2, shape=(118,), dtype=np.float32)
-        atn_space = Discrete(3)
-        self.single_observation_space = obs_space
-        self.single_action_space = atn_space
-
         # Vecenv info
         #vecenv.async_reset(seed)
         #obs_space = vecenv.single_observation_space
@@ -154,7 +148,6 @@ class PuffeRL:
         self.total_epochs = epochs
 
         self.num_layers = 4
-        config['input_size'] = 118
         config['num_atns'] = 3
         config['hidden_size'] = 128
         config['expansion_factor'] = 1
@@ -857,8 +850,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = dict(**args['train'])#, env=env_name)
-    #pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
+    train_config = dict(**args['train'])
+    train_config['env_name'] = args['env_name']
+    train_config['env_kwargs'] = args['env']
     pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 

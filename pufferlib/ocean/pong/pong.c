@@ -44,9 +44,9 @@ void demo() {
             }
         } else if (frame % 8 == 0) {
             // Apply frameskip outside the env for smoother rendering
-            int* actions = (int*)env.actions;
-            forward_linearlstm(net, env.observations, actions);
-            env.actions[0] = actions[0];
+            int action;
+            forward_linearlstm(net, env.observations, &action);
+            env.actions[0] = action;
         }
 
         frame = (frame + 1) % 8;

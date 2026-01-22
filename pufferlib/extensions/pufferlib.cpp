@@ -115,8 +115,13 @@ float cosine_annealing(float lr_base, float lr_min, int t, int T) {
 }
 
 std::tuple<VecEnv*, Tensor, Tensor, Tensor, Tensor>
-create_environments(int64_t num_envs) {
-    void* handle = dlopen("./breakout.so", RTLD_NOW);
+create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwargs) {
+    std::string name = env_name;
+    if (name.rfind("puffer_", 0) == 0) {
+        name = name.substr(7);
+    }
+    std::string so_path = "./" + name + ".so";
+    void* handle = dlopen(so_path.c_str(), RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
         exit(1);
@@ -139,7 +144,7 @@ create_environments(int64_t num_envs) {
     int act_n = *(int*)dlsym(handle, "ACT_N");
     int obs_t = *(int*)dlsym(handle, "OBS_T");
     int act_t = *(int*)dlsym(handle, "ACT_T");
-    
+
     const char* dlsym_error = dlerror();
     if (dlsym_error) {
         fprintf(stderr, "dlsym error: %s\n", dlsym_error);
@@ -147,35 +152,7 @@ create_environments(int64_t num_envs) {
         exit(1);
     }
 
-    Dict* kwargs = create_dict(32);
-    dict_set_int(kwargs, "frameskip", 4);
-    dict_set_int(kwargs, "width", 576);
-    dict_set_int(kwargs, "height", 330);
-    dict_set_int(kwargs, "paddle_width", 62);
-    dict_set_int(kwargs, "paddle_height", 8);
-    dict_set_int(kwargs, "ball_width", 32);
-    dict_set_int(kwargs, "ball_height", 32);
-    dict_set_int(kwargs, "brick_width", 32);
-    dict_set_int(kwargs, "brick_height", 12);
-    dict_set_int(kwargs, "brick_rows", 6);
-    dict_set_int(kwargs, "brick_cols", 18);
-    dict_set_int(kwargs, "initial_ball_speed", 256);
-    dict_set_int(kwargs, "max_ball_speed", 448);
-    dict_set_int(kwargs, "paddle_speed", 620);
-    dict_set_int(kwargs, "continuous", 0);
-
-    /*
-    Dict* kwargs = create_dict(32);
-    dict_set_int(kwargs, "can_go_over_65536", 0);
-    dict_set_float(kwargs, "reward_scaler", 0.67);
-    dict_set_float(kwargs, "endgame_env_prob", 0.05);
-    dict_set_float(kwargs, "scaffolding_ratio", 0.67);
-    dict_set_int(kwargs, "use_heuristic_rewards", 1);
-    dict_set_float(kwargs, "snake_reward_weight", 0.0005);
-    dict_set_int(kwargs, "use_sparse_reward", 0);
-    */
-
-    VecEnv* vec = create_envs(num_envs, 2, true, 0, kwargs);
+    VecEnv* vec = create_envs(num_envs, 2, true, 0, env_kwargs);
     printf("Created VecEnv with %d environments\n", vec->size);
 
     // Close the library
@@ -193,59 +170,8 @@ create_environments(int64_t num_envs) {
     return std::make_tuple(vec, obs, actions, rewards, terminals);
 }
 
-// Forward declare modules
-std::vector<Tensor> mingru_gate(
-    Tensor state,
-    Tensor combined
-);
-torch::autograd::tensor_list log_coeffs_and_values(
-    Tensor gate,
-    Tensor hidden
-);
-// Fully fused scan: takes combined (B, T, 3*H) = [hidden, gate, proj]
-// Returns {out, next_state} where out = sigmoid(proj) * scan_result
-torch::autograd::tensor_list fused_scan(
-    Tensor combined,  // (B, T, 3*H) = [hidden, gate, proj]
-    Tensor state      // (B, 1, H)
-);
-Tensor logcumsumexp_cuda(Tensor x);
-torch::autograd::tensor_list fused_ppo_loss(
-    Tensor logits,
-    Tensor values_pred,
-    Tensor actions,
-    Tensor old_logprobs,
-    Tensor advantages,
-    Tensor prio,
-    Tensor values,
-    Tensor returns,
-    Tensor adv_mean,
-    Tensor adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef
-    /*
-    Tensor adv_mean,
-    Tensor adv_std,
-    Tensor clip_coef,
-    Tensor vf_clip_coef,
-    Tensor vf_coef,
-    Tensor ent_coef
-    */
-);
-
-// Fused sample_logits: nan_to_num + log_softmax + multinomial + gather + value copy
-// Writes directly to output tensors to avoid copy overhead
-// NOTE: offset is a tensor so CUDA graphs read current value at replay time
-void sample_logits(
-    Tensor logits,       // (B, A) - raw logits (may be non-contiguous)
-    Tensor value,        // (B, 1) or (B,) - value (may be non-contiguous)
-    Tensor actions_out,  // (B,) float64 - output
-    Tensor logprobs_out, // (B,) - output
-    Tensor value_out,    // (B,) - output (flattened value)
-    uint64_t seed,              // RNG seed
-    Tensor offset        // RNG offset tensor (int64 CUDA tensor)
-);
+// CUDA kernel wrappers
+#include "modules.cpp"
 
 auto DTYPE = torch::kFloat32;
 
@@ -306,7 +232,6 @@ typedef struct {
     int total_minibatches;
     int accumulate_minibatches;
     // Model architecture
-    int input_size;
     int num_atns;
     int hidden_size;
     int expansion_factor;
@@ -586,7 +511,7 @@ void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func) {
     at::cuda::setCurrentCUDAStream(current_stream);
 }
 
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers) {
+std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const std::string& env_name, Dict* env_kwargs) {
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->hypers = hypers;
 
@@ -611,7 +536,15 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers) {
     // BF16 reduction (if using bfloat16)
     torch::globalContext().setAllowBF16ReductionCuBLAS(true);
 
-    int input_size = hypers.input_size;
+    // Load environment first to get input_size from obs tensor
+    auto [vec, obs, actions, rewards, terminals] = create_environments(hypers.num_envs, env_name, env_kwargs);
+    pufferl->vec = vec;
+    pufferl->env.obs = obs;
+    pufferl->env.actions = actions;
+    pufferl->env.rewards = rewards;
+    pufferl->env.terminals = terminals;
+
+    int input_size = obs.size(1);
     int num_atns = hypers.num_atns;
     int hidden_size = hypers.hidden_size;
     int expansion_factor = hypers.expansion_factor;
@@ -647,13 +580,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers) {
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_states[i] = policy->initial_state(batch, torch::kCUDA);
     }
-
-    auto [vec, obs, actions, rewards, terminals] = create_environments(hypers.num_envs);
-    pufferl->vec = vec;
-    pufferl->env.obs = obs;
-    pufferl->env.actions = actions;
-    pufferl->env.rewards = rewards;
-    pufferl->env.terminals = terminals;
 
     if (hypers.cudagraphs) {
         pufferl->rollout_graph = at::cuda::CUDAGraph();

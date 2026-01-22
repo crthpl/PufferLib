@@ -301,7 +301,6 @@ if not NO_TRAIN:
         torch_sources.append("pufferlib/extensions/cuda/advantage.cu")
         torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
         torch_sources.append("pufferlib/extensions/cuda/kernels.cu")
-        torch_sources.append("pufferlib/extensions/cuda/modules.cu")
     else:
         extension = CppExtension
 

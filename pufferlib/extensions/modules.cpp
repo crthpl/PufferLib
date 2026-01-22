@@ -1,9 +1,12 @@
+#ifndef PUFFERLIB_MODULES_CPP
+#define PUFFERLIB_MODULES_CPP
+
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
-#include "kernels.cu"
+#include "cuda/kernels.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +38,7 @@ std::vector<torch::Tensor> mingru_gate(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (dtype == torch::kFloat32) {
-        launch_mingru_gate_inference<float>(
+        launch_mingru_gate_inference_float(
             out.data_ptr<float>(),
             next_state.data_ptr<float>(),
             combined.data_ptr<float>(),
@@ -45,7 +48,7 @@ std::vector<torch::Tensor> mingru_gate(
             stream
         );
     } else if (dtype == torch::kBFloat16) {
-        launch_mingru_gate_inference<at::BFloat16>(
+        launch_mingru_gate_inference_bf16(
             out.data_ptr<at::BFloat16>(),
             next_state.data_ptr<at::BFloat16>(),
             combined.data_ptr<at::BFloat16>(),
@@ -76,7 +79,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_log_coeffs_and_values<float>(
+            launch_log_coeffs_and_values_float(
                 log_coeffs.data_ptr<float>(),
                 log_values.data_ptr<float>(),
                 gate.data_ptr<float>(),
@@ -85,7 +88,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_log_coeffs_and_values<at::BFloat16>(
+            launch_log_coeffs_and_values_bf16(
                 log_coeffs.data_ptr<at::BFloat16>(),
                 log_values.data_ptr<at::BFloat16>(),
                 gate.data_ptr<at::BFloat16>(),
@@ -119,7 +122,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_log_coeffs_and_values_backward<float>(
+            launch_log_coeffs_and_values_backward_float(
                 grad_gate.data_ptr<float>(),
                 grad_hidden.data_ptr<float>(),
                 grad_log_coeffs.data_ptr<float>(),
@@ -130,7 +133,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_log_coeffs_and_values_backward<at::BFloat16>(
+            launch_log_coeffs_and_values_backward_bf16(
                 grad_gate.data_ptr<at::BFloat16>(),
                 grad_hidden.data_ptr<at::BFloat16>(),
                 grad_log_coeffs.data_ptr<at::BFloat16>(),
@@ -183,7 +186,7 @@ public:
         auto inv_norm = torch::empty({B, T}, options_float);
 
         if (dtype == torch::kFloat32) {
-            launch_rmsnorm_forward<float>(
+            launch_rmsnorm_forward_float(
                 out.data_ptr<float>(),
                 inv_norm.data_ptr<float>(),
                 x.data_ptr<float>(),
@@ -194,7 +197,7 @@ public:
                 static_cast<int>(B)
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_rmsnorm_forward<at::BFloat16>(
+            launch_rmsnorm_forward_bf16(
                 out.data_ptr<at::BFloat16>(),
                 inv_norm.data_ptr<float>(),
                 x.data_ptr<at::BFloat16>(),
@@ -240,7 +243,7 @@ public:
         auto grad_eps = torch::Tensor();
 
         if (dtype == torch::kFloat32) {
-            launch_rmsnorm_backward<float>(
+            launch_rmsnorm_backward_float(
                 grad_x.data_ptr<float>(),
                 grad_weight.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
@@ -253,7 +256,7 @@ public:
                 static_cast<int>(B)
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_rmsnorm_backward<at::BFloat16>(
+            launch_rmsnorm_backward_bf16(
                 grad_x.data_ptr<at::BFloat16>(),
                 grad_weight.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
@@ -351,7 +354,7 @@ public:
 
         // Launch kernel - takes combined (B, T, 3*H) directly
         if (dtype == torch::kFloat32) {
-            launch_fused_scan_forward<float>(
+            launch_fused_scan_forward_float(
                 out.data_ptr<float>(),
                 next_state.data_ptr<float>(),
                 a_star.data_ptr<float>(),
@@ -366,7 +369,7 @@ public:
             );
 
         } else if (dtype == torch::kBFloat16) {
-            launch_fused_scan_forward<at::BFloat16>(
+            launch_fused_scan_forward_bf16(
                 out.data_ptr<at::BFloat16>(),
                 next_state.data_ptr<at::BFloat16>(),
                 a_star.data_ptr<float>(),
@@ -424,7 +427,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_fused_scan_backward<float>(
+            launch_fused_scan_backward_float(
                 grad_combined.data_ptr<float>(),
                 grad_state.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
@@ -440,7 +443,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_fused_scan_backward<at::BFloat16>(
+            launch_fused_scan_backward_bf16(
                 grad_combined.data_ptr<at::BFloat16>(),
                 grad_state.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
@@ -491,7 +494,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_logcumsumexp_forward<float>(
+            launch_logcumsumexp_forward_float(
                 out.data_ptr<float>(),
                 s_buf.data_ptr<double>(),
                 x.data_ptr<float>(),
@@ -499,7 +502,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_logcumsumexp_forward<at::BFloat16>(
+            launch_logcumsumexp_forward_bf16(
                 out.data_ptr<at::BFloat16>(),
                 s_buf.data_ptr<double>(),
                 x.data_ptr<at::BFloat16>(),
@@ -529,7 +532,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_logcumsumexp_backward<float>(
+            launch_logcumsumexp_backward_float(
                 grad_x.data_ptr<float>(),
                 grad_out.data_ptr<float>(),
                 x.data_ptr<float>(),
@@ -538,7 +541,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_logcumsumexp_backward<at::BFloat16>(
+            launch_logcumsumexp_backward_bf16(
                 grad_x.data_ptr<at::BFloat16>(),
                 grad_out.data_ptr<at::BFloat16>(),
                 x.data_ptr<at::BFloat16>(),
@@ -624,7 +627,7 @@ public:
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
-            launch_ppo_loss_forward<float>(
+            launch_ppo_loss_forward_float(
                 loss_output.data_ptr<float>(),
                 saved_for_backward.data_ptr<double>(),
                 logits.data_ptr<float>(),
@@ -645,7 +648,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_ppo_loss_forward<at::BFloat16>(
+            launch_ppo_loss_forward_bf16(
                 loss_output.data_ptr<float>(),
                 saved_for_backward.data_ptr<double>(),
                 logits.data_ptr<at::BFloat16>(),
@@ -733,7 +736,7 @@ public:
 
         // TODO: Why are we passing grad loss in float?
         if (dtype == torch::kFloat32) {
-            launch_ppo_loss_backward<float>(
+            launch_ppo_loss_backward_float(
                 grad_logits.data_ptr<float>(),
                 grad_values_pred.data_ptr<float>(),
                 grad_loss.data_ptr<float>(),
@@ -753,7 +756,7 @@ public:
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
-            launch_ppo_loss_backward<at::BFloat16>(
+            launch_ppo_loss_backward_bf16(
                 grad_logits.data_ptr<at::BFloat16>(),
                 grad_values_pred.data_ptr<at::BFloat16>(),
                 grad_loss.data_ptr<float>(),
@@ -980,7 +983,7 @@ void sample_logits(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (dtype == torch::kFloat32) {
-        launch_sample_logits<float>(
+        launch_sample_logits_float(
             actions_out.data_ptr<double>(),
             logprobs_out.data_ptr<float>(),
             value_out.data_ptr<float>(),
@@ -995,7 +998,7 @@ void sample_logits(
             stream
         );
     } else if (dtype == torch::kBFloat16) {
-        launch_sample_logits<at::BFloat16>(
+        launch_sample_logits_bf16(
             actions_out.data_ptr<double>(),
             logprobs_out.data_ptr<at::BFloat16>(),
             value_out.data_ptr<at::BFloat16>(),
@@ -1033,3 +1036,5 @@ std::vector<torch::Tensor> sample_logits_cpp(
 
     return {actions, sampled_logprobs};
 }
+
+#endif // PUFFERLIB_MODULES_CPP

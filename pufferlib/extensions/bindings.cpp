@@ -15,7 +15,7 @@ pybind11::dict log_environments(pybind11::object pufferl_obj) {
     Dict* out = log_environments_impl(pufferl);
     pybind11::dict py_out;
     for (int i = 0; i < out->size; i++) {
-        py_out[out->items[i].key] = out->items[i].float_value;
+        py_out[out->items[i].key] = out->items[i].value;
     }
     return py_out;
 }
@@ -56,55 +56,77 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     return losses;
 }
 
+double get_config(py::dict& kwargs, const char* key) {
+    if (!kwargs.contains(key)) {
+        throw std::runtime_error(std::string("Missing config key: ") + key);
+    }
+    try {
+        return kwargs[key].cast<double>();
+    } catch (const py::cast_error& e) {
+        throw std::runtime_error(std::string("Failed to cast config key '") + key + "': " + e.what());
+    }
+}
+
+Dict* py_dict_to_c_dict(py::dict py_dict) {
+    Dict* c_dict = create_dict(py_dict.size());
+    for (auto item : py_dict) {
+        const char* key = PyUnicode_AsUTF8(item.first.ptr());
+        dict_set(c_dict, key, item.second.cast<double>());
+    }
+    return c_dict;
+}
+
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     HypersT hypers;
     // Layout
-    hypers.segments = kwargs["segments"].cast<int>();
-    hypers.horizon = kwargs["horizon"].cast<int>();
-    hypers.num_envs = kwargs["num_envs"].cast<int>();
-    hypers.num_buffers = kwargs["num_buffers"].cast<int>();
-    hypers.minibatch_segments = kwargs["minibatch_segments"].cast<int>();
-    hypers.total_minibatches = kwargs["total_minibatches"].cast<int>();
-    hypers.accumulate_minibatches = kwargs["accumulate_minibatches"].cast<int>();
+    hypers.segments = get_config(kwargs, "segments");
+    hypers.horizon = get_config(kwargs, "horizon");
+    hypers.num_envs = get_config(kwargs, "num_envs");
+    hypers.num_buffers = get_config(kwargs, "num_buffers");
+    hypers.minibatch_segments = get_config(kwargs, "minibatch_segments");
+    hypers.total_minibatches = get_config(kwargs, "total_minibatches");
+    hypers.accumulate_minibatches = get_config(kwargs, "accumulate_minibatches");
     // Model architecture
-    hypers.input_size = kwargs["input_size"].cast<int>();
-    hypers.num_atns = kwargs["num_atns"].cast<int>();
-    hypers.hidden_size = kwargs["hidden_size"].cast<int>();
-    hypers.expansion_factor = kwargs["expansion_factor"].cast<int>();
-    hypers.num_layers = kwargs["num_layers"].cast<int>();
+    hypers.num_atns = get_config(kwargs, "num_atns");
+    hypers.hidden_size = get_config(kwargs, "hidden_size");
+    hypers.expansion_factor = get_config(kwargs, "expansion_factor");
+    hypers.num_layers = get_config(kwargs, "num_layers");
     // Learning rate
-    hypers.lr = kwargs["lr"].cast<float>();
-    hypers.min_lr_ratio = kwargs["min_lr_ratio"].cast<float>();
-    hypers.anneal_lr = kwargs["anneal_lr"].cast<bool>();
+    hypers.lr = get_config(kwargs, "lr");
+    hypers.min_lr_ratio = get_config(kwargs, "min_lr_ratio");
+    hypers.anneal_lr = get_config(kwargs, "anneal_lr");
     // Optimizer
-    hypers.beta1 = kwargs["beta1"].cast<float>();
-    hypers.beta2 = kwargs["beta2"].cast<float>();
-    hypers.eps = kwargs["eps"].cast<float>();
+    hypers.beta1 = get_config(kwargs, "beta1");
+    hypers.beta2 = get_config(kwargs, "beta2");
+    hypers.eps = get_config(kwargs, "eps");
     // Training
-    hypers.max_epochs = kwargs["max_epochs"].cast<int>();
-    hypers.max_grad_norm = kwargs["max_grad_norm"].cast<float>();
+    hypers.max_epochs = get_config(kwargs, "max_epochs");
+    hypers.max_grad_norm = get_config(kwargs, "max_grad_norm");
     // PPO
-    hypers.clip_coef = kwargs["clip_coef"].cast<float>();
-    hypers.vf_clip_coef = kwargs["vf_clip_coef"].cast<float>();
-    hypers.vf_coef = kwargs["vf_coef"].cast<float>();
-    hypers.ent_coef = kwargs["ent_coef"].cast<float>();
+    hypers.clip_coef = get_config(kwargs, "clip_coef");
+    hypers.vf_clip_coef = get_config(kwargs, "vf_clip_coef");
+    hypers.vf_coef = get_config(kwargs, "vf_coef");
+    hypers.ent_coef = get_config(kwargs, "ent_coef");
     // GAE
-    hypers.gamma = kwargs["gamma"].cast<float>();
-    hypers.gae_lambda = kwargs["gae_lambda"].cast<float>();
+    hypers.gamma = get_config(kwargs, "gamma");
+    hypers.gae_lambda = get_config(kwargs, "gae_lambda");
     // VTrace
-    hypers.vtrace_rho_clip = kwargs["vtrace_rho_clip"].cast<float>();
-    hypers.vtrace_c_clip = kwargs["vtrace_c_clip"].cast<float>();
+    hypers.vtrace_rho_clip = get_config(kwargs, "vtrace_rho_clip");
+    hypers.vtrace_c_clip = get_config(kwargs, "vtrace_c_clip");
     // Priority
-    hypers.prio_alpha = kwargs["prio_alpha"].cast<float>();
-    hypers.prio_beta0 = kwargs["prio_beta0"].cast<float>();
+    hypers.prio_alpha = get_config(kwargs, "prio_alpha");
+    hypers.prio_beta0 = get_config(kwargs, "prio_beta0");
     // Flags
-    hypers.use_rnn = kwargs["use_rnn"].cast<bool>();
-    hypers.cudagraphs = kwargs["cudagraphs"].cast<bool>();
-    hypers.kernels = kwargs["kernels"].cast<bool>();
-    hypers.profile = kwargs["profile"].cast<bool>();
+    hypers.use_rnn = get_config(kwargs, "use_rnn");
+    hypers.cudagraphs = get_config(kwargs, "cudagraphs");
+    hypers.kernels = get_config(kwargs, "kernels");
+    hypers.profile = get_config(kwargs, "profile");
+
+    std::string env_name = kwargs["env_name"].cast<std::string>();
+    Dict* env_kwargs = py_dict_to_c_dict(kwargs["env_kwargs"].cast<py::dict>());
 
     pybind11::gil_scoped_release no_gil;
-    return create_pufferl_impl(hypers);
+    return create_pufferl_impl(hypers, env_name, env_kwargs);
 }
 
 TORCH_LIBRARY(pufferlib, m) {
@@ -158,7 +180,6 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("minibatch_segments", &HypersT::minibatch_segments)
         .def_readwrite("total_minibatches", &HypersT::total_minibatches)
         .def_readwrite("accumulate_minibatches", &HypersT::accumulate_minibatches)
-        .def_readwrite("input_size", &HypersT::input_size)
         .def_readwrite("num_atns", &HypersT::num_atns)
         .def_readwrite("hidden_size", &HypersT::hidden_size)
         .def_readwrite("expansion_factor", &HypersT::expansion_factor)

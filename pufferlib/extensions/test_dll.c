@@ -58,21 +58,21 @@ int main() {
     }
 
     Dict* kwargs = create_dict(32);
-    dict_set_int(kwargs, "frameskip", 4);
-    dict_set_int(kwargs, "width", 576);
-    dict_set_int(kwargs, "height", 330);
-    dict_set_int(kwargs, "paddle_width", 62);
-    dict_set_int(kwargs, "paddle_height", 8);
-    dict_set_int(kwargs, "ball_width", 32);
-    dict_set_int(kwargs, "ball_height", 32);
-    dict_set_int(kwargs, "brick_width", 32);
-    dict_set_int(kwargs, "brick_height", 12);
-    dict_set_int(kwargs, "brick_rows", 6);
-    dict_set_int(kwargs, "brick_cols", 18);
-    dict_set_int(kwargs, "initial_ball_speed", 256);
-    dict_set_int(kwargs, "max_ball_speed", 448);
-    dict_set_int(kwargs, "paddle_speed", 620);
-    dict_set_int(kwargs, "continuous", 0);
+    dict_set(kwargs, "frameskip", 4);
+    dict_set(kwargs, "width", 576);
+    dict_set(kwargs, "height", 330);
+    dict_set(kwargs, "paddle_width", 62);
+    dict_set(kwargs, "paddle_height", 8);
+    dict_set(kwargs, "ball_width", 32);
+    dict_set(kwargs, "ball_height", 32);
+    dict_set(kwargs, "brick_width", 32);
+    dict_set(kwargs, "brick_height", 12);
+    dict_set(kwargs, "brick_rows", 6);
+    dict_set(kwargs, "brick_cols", 18);
+    dict_set(kwargs, "initial_ball_speed", 256);
+    dict_set(kwargs, "max_ball_speed", 448);
+    dict_set(kwargs, "paddle_speed", 620);
+    dict_set(kwargs, "continuous", 0);
 
     int num_envs = 8192;
     int threads = 8;

@@ -521,6 +521,6 @@ void vec_log(VecEnv* vec, Dict* out) {
     }
 
     // User populates dict
-    dict_set_float(out, "n", n);
+    dict_set(out, "n", n);
     my_log(&aggregate, out);
 }

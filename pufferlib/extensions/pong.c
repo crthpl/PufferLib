@@ -1,27 +1,26 @@
-#include "../ocean/breakout/breakout.h"
-#define OBS_SIZE 118
+#include "../ocean/pong/pong.h"
+#define OBS_SIZE 8
 #define ACT_SIZE 1
 #define OBS_TYPE FLOAT
 #define ACT_TYPE DOUBLE
 
-#define Env Breakout
+#define Env Pong
 #include "env_binding.h"
 
 void my_init(Env* env, Dict* kwargs) {
-    env->frameskip = dict_get(kwargs, "frameskip")->value;
     env->width = dict_get(kwargs, "width")->value;
     env->height = dict_get(kwargs, "height")->value;
-    env->initial_paddle_width = dict_get(kwargs, "paddle_width")->value;
+    env->paddle_width = dict_get(kwargs, "paddle_width")->value;
     env->paddle_height = dict_get(kwargs, "paddle_height")->value;
     env->ball_width = dict_get(kwargs, "ball_width")->value;
     env->ball_height = dict_get(kwargs, "ball_height")->value;
-    env->brick_width = dict_get(kwargs, "brick_width")->value;
-    env->brick_height = dict_get(kwargs, "brick_height")->value;
-    env->brick_rows = dict_get(kwargs, "brick_rows")->value;
-    env->brick_cols = dict_get(kwargs, "brick_cols")->value;
-    env->initial_ball_speed = dict_get(kwargs, "initial_ball_speed")->value;
-    env->max_ball_speed = dict_get(kwargs, "max_ball_speed")->value;
     env->paddle_speed = dict_get(kwargs, "paddle_speed")->value;
+    env->ball_initial_speed_x = dict_get(kwargs, "ball_initial_speed_x")->value;
+    env->ball_initial_speed_y = dict_get(kwargs, "ball_initial_speed_y")->value;
+    env->ball_max_speed_y = dict_get(kwargs, "ball_max_speed_y")->value;
+    env->ball_speed_y_increment = dict_get(kwargs, "ball_speed_y_increment")->value;
+    env->max_score = dict_get(kwargs, "max_score")->value;
+    env->frameskip = dict_get(kwargs, "frameskip")->value;
     env->continuous = dict_get(kwargs, "continuous")->value;
     init(env);
 }

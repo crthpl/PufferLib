@@ -1,3 +1,6 @@
+#ifndef PUFFERLIB_KERNELS_CU
+#define PUFFERLIB_KERNELS_CU
+
 /* Kernels must launch on the current torch stream to be traced by cudagraphs.
  * Launch functions take cudaStream_t as parameter - callers (modules.cu) should
  * pass at::cuda::getCurrentCUDAStream() when using with torch.
@@ -8,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <curand_kernel.h>
+#include <c10/util/BFloat16.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -1649,3 +1653,81 @@ void launch_sample_logits(
         fprintf(stderr, "sample_logits kernel error: %s\n", cudaGetErrorString(err));
     }
 }
+
+// Non-templated wrappers for float
+void launch_mingru_gate_inference_float(float* out, float* next_state, const float* combined, const float* state_in, int H, int B, cudaStream_t stream) {
+    launch_mingru_gate_inference<float>(out, next_state, combined, state_in, H, B, stream);
+}
+void launch_log_coeffs_and_values_float(float* log_coeffs, float* log_values, const float* gate, const float* hidden, int N, cudaStream_t stream) {
+    launch_log_coeffs_and_values<float>(log_coeffs, log_values, gate, hidden, N, stream);
+}
+void launch_log_coeffs_and_values_backward_float(float* grad_gate, float* grad_hidden, const float* grad_log_coeffs, const float* grad_log_values, const float* gate, const float* hidden, int N, cudaStream_t stream) {
+    launch_log_coeffs_and_values_backward<float>(grad_gate, grad_hidden, grad_log_coeffs, grad_log_values, gate, hidden, N, stream);
+}
+void launch_rmsnorm_forward_float(float* out, float* inv_norm_buf, const float* x, const float* weight, double eps, int T_total, int H, int B, cudaStream_t stream) {
+    launch_rmsnorm_forward<float>(out, inv_norm_buf, x, weight, eps, T_total, H, B, stream);
+}
+void launch_rmsnorm_backward_float(float* grad_x, float* grad_weight, const float* grad_out, const float* inv_norm_buf, const float* x_buf, const float* weight, double eps, int T_total, int H, int B, cudaStream_t stream) {
+    launch_rmsnorm_backward<float>(grad_x, grad_weight, grad_out, inv_norm_buf, x_buf, weight, eps, T_total, H, B, stream);
+}
+void launch_fused_scan_forward_float(float* out, float* next_state, float* a_star, float* s_vals, float* log_values_buf, const float* combined, const float* state, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_forward<float>(out, next_state, a_star, s_vals, log_values_buf, combined, state, T_seq, H, B, stream);
+}
+void launch_fused_scan_backward_float(float* grad_combined, float* grad_state, const float* grad_out, const float* grad_next_state, const float* combined, const float* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_backward<float>(grad_combined, grad_state, grad_out, grad_next_state, combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B, stream);
+}
+void launch_logcumsumexp_forward_float(float* out, double* s_buf, const float* x, int T_total, int H, int B, cudaStream_t stream) {
+    launch_logcumsumexp_forward<float>(out, s_buf, x, T_total, H, B, stream);
+}
+void launch_logcumsumexp_backward_float(float* grad_x, const float* grad_out, const float* x, const double* s_buf, int T_total, int H, int B, cudaStream_t stream) {
+    launch_logcumsumexp_backward<float>(grad_x, grad_out, x, s_buf, T_total, H, B, stream);
+}
+void launch_ppo_loss_forward_float(float* loss_output, double* saved_for_backward, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward<float>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_ppo_loss_backward_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_backward<float>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* value, uint64_t seed, const int64_t* offset_ptr, int A, int B, int logits_stride, int value_stride, cudaStream_t stream) {
+    launch_sample_logits<float>(actions, logprobs, value_out, logits, value, seed, offset_ptr, A, B, logits_stride, value_stride, stream);
+}
+
+// Non-templated wrappers for BFloat16
+void launch_mingru_gate_inference_bf16(at::BFloat16* out, at::BFloat16* next_state, const at::BFloat16* combined, const at::BFloat16* state_in, int H, int B, cudaStream_t stream) {
+    launch_mingru_gate_inference<at::BFloat16>(out, next_state, combined, state_in, H, B, stream);
+}
+void launch_log_coeffs_and_values_bf16(at::BFloat16* log_coeffs, at::BFloat16* log_values, const at::BFloat16* gate, const at::BFloat16* hidden, int N, cudaStream_t stream) {
+    launch_log_coeffs_and_values<at::BFloat16>(log_coeffs, log_values, gate, hidden, N, stream);
+}
+void launch_log_coeffs_and_values_backward_bf16(at::BFloat16* grad_gate, at::BFloat16* grad_hidden, const at::BFloat16* grad_log_coeffs, const at::BFloat16* grad_log_values, const at::BFloat16* gate, const at::BFloat16* hidden, int N, cudaStream_t stream) {
+    launch_log_coeffs_and_values_backward<at::BFloat16>(grad_gate, grad_hidden, grad_log_coeffs, grad_log_values, gate, hidden, N, stream);
+}
+void launch_rmsnorm_forward_bf16(at::BFloat16* out, float* inv_norm_buf, const at::BFloat16* x, const at::BFloat16* weight, double eps, int T_total, int H, int B, cudaStream_t stream) {
+    launch_rmsnorm_forward<at::BFloat16>(out, inv_norm_buf, x, weight, eps, T_total, H, B, stream);
+}
+void launch_rmsnorm_backward_bf16(at::BFloat16* grad_x, at::BFloat16* grad_weight, const at::BFloat16* grad_out, const float* inv_norm_buf, const at::BFloat16* x_buf, const at::BFloat16* weight, double eps, int T_total, int H, int B, cudaStream_t stream) {
+    launch_rmsnorm_backward<at::BFloat16>(grad_x, grad_weight, grad_out, inv_norm_buf, x_buf, weight, eps, T_total, H, B, stream);
+}
+void launch_fused_scan_forward_bf16(at::BFloat16* out, at::BFloat16* next_state, float* a_star, float* s_vals, float* log_values_buf, const at::BFloat16* combined, const at::BFloat16* state, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_forward<at::BFloat16>(out, next_state, a_star, s_vals, log_values_buf, combined, state, T_seq, H, B, stream);
+}
+void launch_fused_scan_backward_bf16(at::BFloat16* grad_combined, at::BFloat16* grad_state, const at::BFloat16* grad_out, const at::BFloat16* grad_next_state, const at::BFloat16* combined, const at::BFloat16* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_backward<at::BFloat16>(grad_combined, grad_state, grad_out, grad_next_state, combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B, stream);
+}
+void launch_logcumsumexp_forward_bf16(at::BFloat16* out, double* s_buf, const at::BFloat16* x, int T_total, int H, int B, cudaStream_t stream) {
+    launch_logcumsumexp_forward<at::BFloat16>(out, s_buf, x, T_total, H, B, stream);
+}
+void launch_logcumsumexp_backward_bf16(at::BFloat16* grad_x, const at::BFloat16* grad_out, const at::BFloat16* x, const double* s_buf, int T_total, int H, int B, cudaStream_t stream) {
+    launch_logcumsumexp_backward<at::BFloat16>(grad_x, grad_out, x, s_buf, T_total, H, B, stream);
+}
+void launch_ppo_loss_forward_bf16(float* loss_output, double* saved_for_backward, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward<at::BFloat16>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_ppo_loss_backward_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_backward<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, uint64_t seed, const int64_t* offset_ptr, int A, int B, int logits_stride, int value_stride, cudaStream_t stream) {
+    launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, seed, offset_ptr, A, B, logits_stride, value_stride, stream);
+}
+
+#endif // PUFFERLIB_KERNELS_CU

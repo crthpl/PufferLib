@@ -1,6 +1,8 @@
 #!/bin/bash
 
-# Usage: ./build_env.sh pong [local|fast|web]
+# Usage: ./build_vec.sh <env_name>
+
+ENV_NAME=${1:?Usage: ./build_vec.sh <env_name>}
 
 RAYLIB_NAME='raylib-5.5_linux_amd64'
 LINK_ARCHIVES="./$RAYLIB_NAME/lib/libraylib.a"
@@ -10,7 +12,7 @@ FLAGS=(
     -Wall
     -I./$RAYLIB_NAME/include
     -I/usr/local/cuda/include
-    "pufferlib/extensions/breakout.c" -o "breakout.so"
+    "pufferlib/extensions/${ENV_NAME}.c" -o "${ENV_NAME}.so"
     $LINK_ARCHIVES
     -lGL
     -lm

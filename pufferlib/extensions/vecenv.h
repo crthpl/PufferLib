@@ -15,9 +15,8 @@
 
 typedef struct {
     const char* key;
-    void* void_value;
-    int int_value;
-    float float_value;
+    double value;
+    void* ptr;
 } DictItem;
 
 typedef struct {
@@ -67,45 +66,31 @@ DictItem* dict_get(Dict* dict, const char* key) {
     return item;
 }
 
-void dict_set_int(Dict* dict, const char* key, int value) {
+void dict_set(Dict* dict, const char* key, double value) {
     assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
 
     if (item != NULL) {
-        item->int_value = value;
+        item->value = value;
         return;
     }
 
     dict->items[dict->size].key = key;
-    dict->items[dict->size].int_value = value;
+    dict->items[dict->size].value = value;
     dict->size++;
 }
 
-void dict_set_float(Dict* dict, const char* key, float value) {
+void dict_set_ptr(Dict* dict, const char* key, void* ptr) {
     assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
 
     if (item != NULL) {
-        item->float_value = value;
+        item->ptr = ptr;
         return;
     }
 
     dict->items[dict->size].key = key;
-    dict->items[dict->size].float_value = value;
-    dict->size++;
-}
-
-void dict_set_void(Dict* dict, const char* key, void* value) {
-    assert(dict->size < dict->capacity);
-    DictItem* item = dict_get_unsafe(dict, key);
-
-    if (item != NULL) {
-        item->void_value = value;
-        return;
-    }
-
-    dict->items[dict->size].key = key;
-    dict->items[dict->size].void_value = value;
+    dict->items[dict->size].ptr = ptr;
     dict->size++;
 }
 
