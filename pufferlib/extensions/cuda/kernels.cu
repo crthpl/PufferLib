@@ -519,14 +519,14 @@ __global__ void fused_scan_forward_kernel(
 // Uses fast math intrinsics for better performance
 template<typename T>
 __global__ void fused_scan_forward_kernel_checkpointed(
-    T* __restrict__ out,                 // (B, T, H) - sigmoid(proj) * scan_result
-    T* __restrict__ next_state,          // (B, 1, H) - raw scan_result at T (for recurrence)
-    float* __restrict__ a_star_buf,      // (B, T+1, H) - sparse checkpoints for backward
-    float* __restrict__ s_buf,           // (B, T+1, H) - sparse checkpoints for backward
-    float* __restrict__ log_values_buf,  // (B, T+1, H) - sparse checkpoints for backward
-    const T* __restrict__ combined,      // (B, T, 3*H) = [hidden(H), gate(H), proj(H)]
+    T* __restrict__ out,                 // (B, T, H)
+    T* __restrict__ next_state,          // (B, 1, H)
+    float* __restrict__ a_star_buf,      // (B, T+1, H)
+    float* __restrict__ s_buf,           // (B, T+1, H)
+    float* __restrict__ log_values_buf,  // (B, T+1, H)
+    const T* __restrict__ combined,      // (B, T, 3*H)
     const T* __restrict__ state,         // (B, 1, H)
-    int T_seq,                           // sequence length (T)
+    int T_seq,
     int H,
     int B
 ) {
@@ -724,16 +724,16 @@ __global__ void fused_scan_backward_kernel(
 // Uses fast math intrinsics for better performance
 template<typename T>
 __global__ void fused_scan_backward_kernel_checkpointed(
-    T* __restrict__ grad_combined,         // (B, T, 3*H) = [grad_hidden, grad_gate, grad_proj]
+    T* __restrict__ grad_combined,         // (B, T, 3*H)
     T* __restrict__ grad_state,            // (B, 1, H)
-    const T* __restrict__ grad_out,        // (B, T, H) - gradient of sigmoid(proj)*scan_result
-    const T* __restrict__ grad_next_state, // (B, 1, H) - gradient of raw scan_result at T
-    const T* __restrict__ combined,        // (B, T, 3*H) = [hidden, gate, proj]
+    const T* __restrict__ grad_out,        // (B, T, H)
+    const T* __restrict__ grad_next_state, // (B, 1, H)
+    const T* __restrict__ combined,        // (B, T, 3*H)
     const T* __restrict__ state,           // (B, 1, H)
-    const float* __restrict__ a_star_buf,  // (B, T+1, H) sparse checkpoints from forward
-    const float* __restrict__ s_buf,       // (B, T+1, H) sparse checkpoints from forward
-    const float* __restrict__ log_values_buf, // (B, T+1, H) sparse checkpoints from forward
-    int T_seq,                             // sequence length (T)
+    const float* __restrict__ a_star_buf,  // (B, T+1, H)
+    const float* __restrict__ s_buf,       // (B, T+1, H)
+    const float* __restrict__ log_values_buf, // (B, T+1, H)
+    int T_seq,                             // (T)
     int H,
     int B
 ) {
@@ -1172,8 +1172,8 @@ void launch_fused_scan_forward_checkpointed(
     T* next_state,
     float* a_star,
     float* s_vals,
-    float* log_values_buf,  // (B, T+1, H) - sparse checkpoints for backward
-    const T* combined,  // (B, T, 3*H) = [hidden, gate, proj]
+    float* log_values_buf,  // (B, T+1, H)
+    const T* combined,  // (B, T, 3*H)
     const T* state,
     int T_seq,
     int H,
@@ -1247,15 +1247,15 @@ void launch_fused_scan_backward(
 // Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
 template<typename T>
 void launch_fused_scan_backward_checkpointed(
-    T* grad_combined,   // (B, T, 3*H) = [grad_hidden, grad_gate, grad_proj]
+    T* grad_combined,   // (B, T, 3*H)
     T* grad_state,
     const T* grad_out,
     const T* grad_next_state,
-    const T* combined,  // (B, T, 3*H) = [hidden, gate, proj]
+    const T* combined,  // (B, T, 3*H)
     const T* state,
-    const float* a_star_buf,  // (B, T+1, H) - sparse checkpoints from forward
-    const float* s_buf,       // (B, T+1, H) - sparse checkpoints from forward
-    const float* log_values_buf,  // (B, T+1, H) - sparse checkpoints from forward
+    const float* a_star_buf,  // (B, T+1, H)
+    const float* s_buf,       // (B, T+1, H)
+    const float* log_values_buf,  // (B, T+1, H)
     int T_seq,
     int H,
     int B,
