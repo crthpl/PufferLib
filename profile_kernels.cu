@@ -14,13 +14,17 @@
 #include <string.h>
 #include <dlfcn.h>
 
-#include "pufferlib/extensions/vecenv.h"
 
 #ifdef USE_TORCH
 #include "pufferlib/extensions/pufferlib.cpp"
-#include "pufferlib/extensions/cuda/modules.cu"
+#include "pufferlib/extensions/cuda/kernels.cu"
+// #include "pufferlib/extensions/modules.cpp"
 using namespace pufferlib;
-#else
+#endif
+
+#include "pufferlib/extensions/vecenv.h"
+
+#ifndef USE_TORCH
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
 
@@ -697,6 +701,23 @@ void run_fusedscan_backward(FusedScanArgs* args) {
         args->T, args->H, args->B, 0);
 }
 
+void run_fusedscan_forward_checkpointed(FusedScanArgs* args) {
+    launch_fused_scan_forward_checkpointed<float>(
+        args->out, args->next_state,
+        args->a_star, args->s_vals, args->log_values_buf,
+        args->combined, args->state,
+        args->T, args->H, args->B, 0);
+}
+
+void run_fusedscan_backward_checkpointed(FusedScanArgs* args) {
+    launch_fused_scan_backward_checkpointed<float>(
+        args->grad_combined, args->grad_state,
+        args->grad_out, args->grad_next_state,
+        args->combined, args->state,
+        args->a_star, args->s_vals, args->log_values_buf,
+        args->T, args->H, args->B, 0);
+}
+
 #ifdef USE_TORCH
 
 typedef struct {
@@ -745,6 +766,82 @@ void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
     fused_scan_cpp(args->combined, args->state);
 }
 
+void test_fusedscan_checkpointed_correct(FusedScanArgsTorch* args) {
+    // Run reference (non-checkpointed) kernel forward
+    auto combined_ref = args->combined.clone().requires_grad_(true);
+    auto state_ref = args->state.clone().requires_grad_(true);
+    combined_ref.retain_grad();
+    state_ref.retain_grad();
+    auto ref_outputs = fused_scan(combined_ref, state_ref);
+    auto ref_out = ref_outputs[0];
+    auto ref_next_state = ref_outputs[1];
+
+    // Run checkpointed forward kernel via raw launch
+    auto opts = torch::TensorOptions().dtype(args->combined.dtype()).device(torch::kCUDA);
+    auto opts_float = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    
+    auto out_ckpt = torch::empty({args->B, args->T, args->H}, opts);
+    auto next_state_ckpt = torch::empty({args->B, 1, args->H}, opts);
+    auto a_star = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    auto s_vals = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    auto log_values_buf = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    
+    launch_fused_scan_forward_checkpointed<float>(
+        out_ckpt.data_ptr<float>(),
+        next_state_ckpt.data_ptr<float>(),
+        a_star.data_ptr<float>(),
+        s_vals.data_ptr<float>(),
+        log_values_buf.data_ptr<float>(),
+        args->combined.data_ptr<float>(),
+        args->state.data_ptr<float>(),
+        args->T, args->H, args->B,
+        at::cuda::getCurrentCUDAStream());
+    cudaDeviceSynchronize();
+
+    // Numerical comparison - use same tolerances as other tests
+    float rtol = 1e-3f, atol = 1e-4f;
+    bool out_match = torch::allclose(out_ckpt, ref_out, rtol, atol);
+    float out_max_diff = (out_ckpt - ref_out).abs().max().item<float>();
+    bool next_state_match = torch::allclose(next_state_ckpt, ref_next_state, rtol, atol);
+    float next_state_max_diff = (next_state_ckpt - ref_next_state).abs().max().item<float>();
+
+    printf("  checkpointed forward correctness: out=%s(%.2e) next_state=%s(%.2e)\n",
+           out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff,
+           next_state_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", next_state_max_diff);
+
+    // Test backward pass - run reference backward
+    torch::autograd::backward({ref_out, ref_next_state}, {args->grad_out, args->grad_next_state});
+    auto grad_combined_ref = combined_ref.grad().clone();
+    auto grad_state_ref = state_ref.grad().clone();
+
+    // Run checkpointed backward
+    auto grad_combined_ckpt = torch::empty_like(args->combined);
+    auto grad_state_ckpt = torch::empty_like(args->state);
+
+    launch_fused_scan_backward_checkpointed<float>(
+        grad_combined_ckpt.data_ptr<float>(),
+        grad_state_ckpt.data_ptr<float>(),
+        args->grad_out.data_ptr<float>(),
+        args->grad_next_state.data_ptr<float>(),
+        args->combined.data_ptr<float>(),
+        args->state.data_ptr<float>(),
+        a_star.data_ptr<float>(),
+        s_vals.data_ptr<float>(),
+        log_values_buf.data_ptr<float>(),
+        args->T, args->H, args->B,
+        at::cuda::getCurrentCUDAStream());
+    cudaDeviceSynchronize();
+
+    bool grad_combined_match = torch::allclose(grad_combined_ckpt, grad_combined_ref, rtol, atol);
+    float grad_combined_max_diff = (grad_combined_ckpt - grad_combined_ref).abs().max().item<float>();
+    bool grad_state_match = torch::allclose(grad_state_ckpt, grad_state_ref, rtol, atol);
+    float grad_state_max_diff = (grad_state_ckpt - grad_state_ref).abs().max().item<float>();
+
+    printf("  checkpointed backward correctness: grad_combined=%s(%.2e) grad_state=%s(%.2e)\n",
+           grad_combined_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_combined_max_diff,
+           grad_state_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_state_max_diff);
+}
+
 #endif
 
 void profile_fusedscan(int batch, int seq, int hidden) {
@@ -759,8 +856,16 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     float bwd_ms = profile_kernel((kernel_fn)run_fusedscan_backward, args);
     print_timing("\tbackward", bwd_ms, batch*seq);
 
+    float fwd_ckpt_ms = profile_kernel((kernel_fn)run_fusedscan_forward_checkpointed, args);
+    print_timing("\tforward (checkpointed)", fwd_ckpt_ms, batch*seq);
+
+    float bwd_ckpt_ms = profile_kernel((kernel_fn)run_fusedscan_backward_checkpointed, args);
+    print_timing("\tbackward (checkpointed)", bwd_ckpt_ms, batch*seq);
+
 #ifdef USE_TORCH
     FusedScanArgsTorch* args_torch = create_fusedscanargs_torch(args);
+
+    test_fusedscan_checkpointed_correct(args_torch);
 
     float fwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);

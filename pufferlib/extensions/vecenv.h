@@ -5,7 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 #include <cuda_runtime.h>
 
 #define FLOAT 1
@@ -92,6 +94,10 @@ void dict_set_ptr(Dict* dict, const char* key, void* ptr) {
     dict->items[dict->size].key = key;
     dict->items[dict->size].ptr = ptr;
     dict->size++;
+}
+
+void dict_set_int(Dict* dict, const char* key, int value) {
+    dict_set(dict, key, (double)value);
 }
 
 void* my_shared(Env* env, Dict* kwargs);
