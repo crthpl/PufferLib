@@ -18,16 +18,12 @@
 
 #define SEQ_SIZE 256
 #define BLOCK_SIZE 256
-#define CHECKPOINT_INTERVAL 16  // Sparse checkpoint interval for optimized kernels
-#define OPT_BLOCK_SIZE 256     // Block size for optimized checkpointed kernels
+#define CHECKPOINT_INTERVAL 4  // Sparse checkpoint interval for optimized kernels
 inline int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
 inline int seq_size(int N) {
     return (N + SEQ_SIZE - 1) / SEQ_SIZE;
-}
-inline int opt_grid_size(int N) {
-    return (N + OPT_BLOCK_SIZE - 1) / OPT_BLOCK_SIZE;
 }
 
 // If you can get this to work, go ahead. I tried.
@@ -1185,9 +1181,9 @@ void launch_fused_scan_forward_checkpointed(
     cudaStream_t stream
 ) {
     int total = B * H;
-    int grid = opt_grid_size(total);
+    int grid = grid_size(total);
 
-    fused_scan_forward_kernel_checkpointed<T><<<grid, OPT_BLOCK_SIZE, 0, stream>>>(
+    fused_scan_forward_kernel_checkpointed<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         out,
         next_state,
         a_star,
@@ -1266,9 +1262,9 @@ void launch_fused_scan_backward_checkpointed(
     cudaStream_t stream
 ) {
     int total = B * H;
-    int grid = opt_grid_size(total);
+    int grid = grid_size(total);
 
-    fused_scan_backward_kernel_checkpointed<T><<<grid, OPT_BLOCK_SIZE, 0, stream>>>(
+    fused_scan_backward_kernel_checkpointed<T><<<grid, BLOCK_SIZE, 0, stream>>>(
         grad_combined,
         grad_state,
         grad_out,
