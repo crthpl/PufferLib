@@ -17,10 +17,17 @@ static inline int max(int a, int b) { return a > b ? a : b; }
 #define RIGHT 4
 #define BASE_MAX_TICKS 1000
 
-// These work well
-#define MERGE_REWARD_WEIGHT 0.0625f
+// Reward constants
+#define MERGE_BASE_REWARD 0.05f
+#define MERGE_REWARD_SCALE 0.03f
 #define INVALID_MOVE_PENALTY -0.05f
 #define GAME_OVER_PENALTY -1.0f
+
+// Pow 1.5 lookup table for tiles 128+ (index = row[i] - 6)
+// Index: 1=128, 2=256, 3=512, 4=1024, 5=2048, 6=4096, 7=8192, 8=16384, 9=32768, 10=65536
+static const float pow15_table[11] = {
+    0.0f, 1.0f, 2.83f, 5.20f, 8.0f, 11.18f, 14.70f, 18.52f, 22.63f, 27.0f, 31.62f,
+};
 
 static inline float calculate_perf(unsigned char max_tile) {
     // Reaching 65k -> 1.0, 32k -> 0.8, 16k -> 0.4, 8k -> 0.2, 4k -> 0.1, 2k -> 0.05
@@ -252,7 +259,13 @@ static inline bool slide_and_merge(Game* game, unsigned char* row, float* reward
     for (int i = 0; i < SIZE - 1; i++) {
         if (row[i] != EMPTY && row[i] == row[i + 1]) {
             row[i]++;
-            *reward += ((float)row[i]) * MERGE_REWARD_WEIGHT;
+            // Tiles 2-64 (row[i] 1-6): base reward only
+            // Tiles 128+ (row[i] 7+): base + pow1.5 scaled bonus
+            if (row[i] <= 6) {
+                *reward += MERGE_BASE_REWARD;
+            } else {
+                *reward += MERGE_BASE_REWARD + pow15_table[row[i] - 6] * MERGE_REWARD_SCALE;
+            }
             *score_increase += (float)(1 << (int)row[i]);
             // Shift remaining elements left
             for (int j = i + 1; j < SIZE - 1; j++) {
@@ -400,7 +413,7 @@ void c_step(Game* game) {
 
     // Game over penalty overrides other rewards
     if (game_over) {
-        reward = GAME_OVER_PENALTY;
+        reward += GAME_OVER_PENALTY;
     }
 
     game->rewards[0] = reward;
