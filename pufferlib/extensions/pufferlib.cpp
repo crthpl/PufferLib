@@ -415,13 +415,12 @@ void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
 }
 
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
-        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu) {
+        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu, bool kernels) {
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
-    //if (kernels) {
-    if (false) {
-        loss = fused_ppo_loss(
+    if (kernels) {
+        loss = fused_ppo_loss_optimized(
             logits,
             newvalue,
             graph.mb_actions,
@@ -662,7 +661,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         });
         capture_graph(&pufferl->train_forward_graph, [p]() {
             train_forward_call(p->graph, p->policy, p->muon,
-                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu);
+                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
         });
 
         int total_agents = vec->total_agents;
@@ -926,7 +925,7 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_forward_graph.replay();
         } else {
             train_forward_call(pufferl.graph, pufferl.policy, pufferl.muon,
-                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu);
+                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, hypers.kernels);
         }
         profile_end(hypers.profile);
 

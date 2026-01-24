@@ -970,6 +970,201 @@ torch::autograd::tensor_list fused_ppo_loss(
         adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
+class PPOFusedLossOptimizedFunction : public torch::autograd::Function<PPOFusedLossOptimizedFunction> {
+public:
+    static torch::autograd::tensor_list forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor logits,           // (N, T, A)
+        torch::Tensor values_pred,      // (N, T, 1) or (N, T)
+        torch::Tensor actions,          // (N, T)
+        torch::Tensor old_logprobs,     // (N, T)
+        torch::Tensor advantages,       // (N, T)
+        torch::Tensor prio,             // (N, 1) — importance weights
+        torch::Tensor values,           // (N, T)
+        torch::Tensor returns,          // (N, T)
+        torch::Tensor adv_mean,         // (1)
+        torch::Tensor adv_std,          // (1)
+        double clip_coef,
+        double vf_clip_coef,
+        double vf_coef,
+        double ent_coef
+    ) {
+        TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
+        auto dtype = logits.dtype();
+        TORCH_CHECK(dtype == torch::kFloat32 || dtype == torch::kBFloat16,
+                    "Only float32 and bfloat16 supported");
+
+        auto device = logits.device();
+        auto N = logits.size(0);
+        auto T = logits.size(1);
+        auto A = logits.size(2);
+
+        auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+        auto loss_output = torch::zeros({1}, options_float);
+
+        // saved_for_backward not used by optimized backward, but kernel still writes to it
+        auto saved_for_backward = torch::empty({N * T, 5}, options_double);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_ppo_loss_forward_optimized_float(
+                loss_output.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
+                logits.data_ptr<float>(),
+                values_pred.data_ptr<float>(),
+                actions.data_ptr<int64_t>(),
+                old_logprobs.data_ptr<float>(),
+                advantages.data_ptr<float>(),
+                prio.data_ptr<float>(),
+                values.data_ptr<float>(),
+                returns.data_ptr<float>(),
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                static_cast<float>(clip_coef),
+                static_cast<float>(vf_clip_coef),
+                static_cast<float>(vf_coef),
+                static_cast<float>(ent_coef),
+                T, A, N,
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_ppo_loss_forward_optimized_bf16(
+                loss_output.data_ptr<float>(),
+                saved_for_backward.data_ptr<double>(),
+                logits.data_ptr<at::BFloat16>(),
+                values_pred.data_ptr<at::BFloat16>(),
+                actions.data_ptr<int64_t>(),
+                old_logprobs.data_ptr<at::BFloat16>(),
+                advantages.data_ptr<at::BFloat16>(),
+                prio.data_ptr<at::BFloat16>(),
+                values.data_ptr<at::BFloat16>(),
+                returns.data_ptr<at::BFloat16>(),
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                static_cast<float>(clip_coef),
+                static_cast<float>(vf_clip_coef),
+                static_cast<float>(vf_coef),
+                static_cast<float>(ent_coef),
+                T, A, N,
+                stream
+            );
+        }
+
+        ctx->saved_data["clip_coef"] = clip_coef;
+        ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
+        ctx->saved_data["vf_coef"] = vf_coef;
+        ctx->saved_data["ent_coef"] = ent_coef;
+
+        ctx->save_for_backward({logits, values_pred, actions, old_logprobs, advantages,
+                                prio, values, returns, adv_mean, adv_std});
+
+        return {loss_output};
+    }
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto logits = saved[0].contiguous();
+        auto values_pred = saved[1].contiguous();
+        auto actions = saved[2].contiguous();
+        auto old_logprobs = saved[3].contiguous();
+        auto advantages = saved[4].contiguous();
+        auto prio = saved[5].contiguous();
+        auto values = saved[6].contiguous();
+        auto returns = saved[7].contiguous();
+        auto adv_mean = saved[8].contiguous();
+        auto adv_std = saved[9].contiguous();
+
+        auto dtype = logits.dtype();
+        auto N = logits.size(0);
+        auto T = logits.size(1);
+        auto A = logits.size(2);
+
+        float clip_coef = ctx->saved_data["clip_coef"].to<double>();
+        float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
+        float vf_coef = ctx->saved_data["vf_coef"].to<double>();
+        float ent_coef = ctx->saved_data["ent_coef"].to<double>();
+
+        auto grad_loss = grad_outputs[0].to(torch::kFloat32).contiguous();
+
+        auto grad_logits = torch::empty_like(logits);
+        auto grad_values_pred = torch::empty_like(values_pred);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_ppo_loss_backward_optimized_float(
+                grad_logits.data_ptr<float>(),
+                grad_values_pred.data_ptr<float>(),
+                grad_loss.data_ptr<float>(),
+                logits.data_ptr<float>(),
+                values_pred.data_ptr<float>(),
+                actions.data_ptr<int64_t>(),
+                old_logprobs.data_ptr<float>(),
+                advantages.data_ptr<float>(),
+                prio.data_ptr<float>(),
+                values.data_ptr<float>(),
+                returns.data_ptr<float>(),
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                clip_coef, vf_clip_coef,
+                vf_coef, ent_coef,
+                T, A, N,
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_ppo_loss_backward_optimized_bf16(
+                grad_logits.data_ptr<at::BFloat16>(),
+                grad_values_pred.data_ptr<at::BFloat16>(),
+                grad_loss.data_ptr<float>(),
+                logits.data_ptr<at::BFloat16>(),
+                values_pred.data_ptr<at::BFloat16>(),
+                actions.data_ptr<int64_t>(),
+                old_logprobs.data_ptr<at::BFloat16>(),
+                advantages.data_ptr<at::BFloat16>(),
+                prio.data_ptr<at::BFloat16>(),
+                values.data_ptr<at::BFloat16>(),
+                returns.data_ptr<at::BFloat16>(),
+                adv_mean.data_ptr<float>(),
+                adv_std.data_ptr<float>(),
+                clip_coef, vf_clip_coef,
+                vf_coef, ent_coef,
+                T, A, N,
+                stream
+            );
+        }
+
+        return {
+            grad_logits,
+            grad_values_pred,
+            {}, {}, {}, {}, {}, {},  // actions, old_logprobs, advantages, prio, values, returns
+            {}, {}, {}, {}, {}, {}   // adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef
+        };
+    }
+};
+
+torch::autograd::tensor_list fused_ppo_loss_optimized(
+    torch::Tensor logits,
+    torch::Tensor values_pred,
+    torch::Tensor actions,
+    torch::Tensor old_logprobs,
+    torch::Tensor advantages,
+    torch::Tensor prio,
+    torch::Tensor values,
+    torch::Tensor returns,
+    torch::Tensor adv_mean,
+    torch::Tensor adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef
+) {
+    return PPOFusedLossOptimizedFunction::apply(logits, values_pred, actions,
+        old_logprobs, advantages, prio, values, returns, adv_mean,
+        adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
+}
+
 // Reference implementation for mingru_gate (inference path)
 // Takes combined (B, 1, 3*H) = [hidden, gate, proj] and state (B, 1, H)
 // Returns {out, next_state} where:

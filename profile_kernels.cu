@@ -1712,10 +1712,7 @@ void free_rolloutcopyargs(RolloutCopyArgs* args) {
 }
 
 void run_rollout_copy_call(RolloutCopyArgs* args) {
-    HypersT hypers;
-    hypers.num_envs = args->num_envs;
-    hypers.num_buffers = args->num_buffers;
-    rollout_copy_call(args->rollouts, args->env, args->graph, hypers, args->h, args->buf);
+    rollout_copy_call(args->rollouts, args->env, args->graph, args->num_envs, args->num_buffers, args->h, args->buf);
 }
 
 #endif
@@ -1817,7 +1814,7 @@ void free_trainforwardargs(TrainForwardArgs* args) {
 }
 
 void run_train_forward_call(TrainForwardArgs* args) {
-    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std, args->act_sizes_cpu);
+    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std, args->act_sizes_cpu, args->use_kernels);
 }
 
 #endif
