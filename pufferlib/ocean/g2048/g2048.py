@@ -7,7 +7,7 @@ import pufferlib
 from pufferlib.ocean.g2048 import binding
 
 class G2048(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, can_go_over_65536=False, scaffolding_ratio=0.0,
+    def __init__(self, num_envs=1, scaffolding_ratio=0.0,
                  render_mode=None, log_interval=128, buf=None, seed=0):
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=18, shape=(16,), dtype=np.uint8
@@ -17,14 +17,12 @@ class G2048(pufferlib.PufferEnv):
         self.num_agents = num_envs
         self.log_interval = log_interval
 
-        self.can_go_over_65536 = can_go_over_65536
         self.scaffolding_ratio = scaffolding_ratio
 
         super().__init__(buf)
         self.c_envs = binding.vec_init(
             self.observations, self.actions, self.rewards,
             self.terminals, self.truncations, num_envs, seed,
-            can_go_over_65536 = self.can_go_over_65536,
             scaffolding_ratio = self.scaffolding_ratio,
         )
 

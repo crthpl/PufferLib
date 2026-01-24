@@ -24,14 +24,14 @@ static inline int max(int a, int b) { return a > b ? a : b; }
 #define GAME_OVER_PENALTY -1.0f
 
 // Pow 1.5 lookup table for tiles 128+ (index = row[i] - 6)
-// Index: 1=128, 2=256, 3=512, 4=1024, 5=2048, 6=4096, 7=8192, 8=16384, 9=32768, 10=65536
-static const float pow15_table[11] = {
-    0.0f, 1.0f, 2.83f, 5.20f, 8.0f, 11.18f, 14.70f, 18.52f, 22.63f, 27.0f, 31.62f,
+// Index: 1=128, 2=256, 3=512, 4=1024, 5=2048, 6=4096, 7=8192, 8=16384, 9=32768, 10=65536, 11=131k
+static const float pow15_table[12] = {
+    0.0f, 1.0f, 2.83f, 5.20f, 8.0f, 11.18f, 14.70f, 18.52f, 22.63f, 27.0f, 31.62f, 36.48f,
 };
 
 static inline float calculate_perf(unsigned char max_tile) {
-    // Reaching 65k -> 1.0, 32k -> 0.8, 16k -> 0.4, 8k -> 0.2, 4k -> 0.1, 2k -> 0.05
-    float perf = 0.8f * (float)(1 << max_tile) / 32768.0f;
+    // Reaching 131k -> 1.0, 65k -> 0.8, 32k -> 0.4, 16k -> 0.2, 8k -> 0.1
+    float perf = 0.8f * (float)(1 << max_tile) / 65536.0f;
     if (perf > 1.0f) perf = 1.0f;
     return perf;
 }
@@ -45,6 +45,7 @@ typedef struct {
     float lifetime_max_tile;
     float reached_32768;
     float reached_65536;
+    float reached_131072;
     float n;
 } Log;
 
@@ -55,7 +56,6 @@ typedef struct {
     float* rewards;                 // Required
     unsigned char* terminals;       // Required
 
-    bool can_go_over_65536;         // Set false for training, true for eval
     float scaffolding_ratio;        // The ratio for "scaffolding" runs, in which higher blocks are spawned
     bool is_scaffolding_episode;
 
@@ -67,7 +67,6 @@ typedef struct {
     float episode_reward;           // Accumulate episode reward
     int moves_made;
     int max_episode_ticks;          // Dynamic max_ticks based on score
-    bool stop_at_65536;
 
     // Cached values to avoid recomputation
     int empty_count;
@@ -136,6 +135,7 @@ void add_log(Game* game) {
     game->log.lifetime_max_tile += (float)(1 << game->lifetime_max_tile);
     game->log.reached_32768 += (game->max_tile >= 15);
     game->log.reached_65536 += (game->max_tile >= 16);
+    game->log.reached_131072 += (game->max_tile >= 17);
     game->log.n += 1;
 }
 
@@ -164,47 +164,44 @@ static inline void place_tile_at_random_cell(Game* game, unsigned char tile) {
 }
 
 void set_scaffolding_curriculum(Game* game) {
-    game->stop_at_65536 = true;
-
     if (game->lifetime_max_tile < 14) {
         int curriculum = rand() % 5;
 
-        // Spawn one high tiles from 8192, 16384, 32768, 65536
+        // Spawn one high tile from 8192, 16384, 32768, 65536
         unsigned char high_tile = max(12 + curriculum, game->lifetime_max_tile);
         place_tile_at_random_cell(game, high_tile);
-        if (high_tile >= 16) game->stop_at_65536 = false;
 
     } else {
+        // base=14 until 65536 reached, then base=15 to practice for 131072
+        unsigned char base = (game->lifetime_max_tile >= 16) ? 15 : 14;
         int curriculum = rand() % 8;
 
         if (curriculum < 2) { // curriculum 0, 1
-            place_tile_at_random_cell(game, 14 + curriculum); // Spawn one of 16384 or 32768
+            place_tile_at_random_cell(game, base + curriculum);
 
         } else if (curriculum == 2) {
             // Place the tiles in the second row, so that they can be moved up in the first move
-            unsigned char tiles[] = {14, 13};
+            unsigned char tiles[] = {base, base - 1};
             memcpy(game->grid[1], tiles, 2);
             game->empty_count -= 2;
         } else if (curriculum == 3) {  // harder
-            game->grid[1][0] = 14; game->empty_count--;
-            place_tile_at_random_cell(game, 13);
-
+            game->grid[1][0] = base; game->empty_count--;
+            place_tile_at_random_cell(game, base - 1);
         } else if (curriculum == 4) {
-            unsigned char tiles[] = {15, 14};
+            unsigned char tiles[] = {base + 1, base};
             memcpy(game->grid[1], tiles, 2);
             game->empty_count -= 2;
         } else if (curriculum == 5) {  // harder
-            game->grid[1][0] = 15; game->empty_count--;
-            place_tile_at_random_cell(game, 14);
-
+            game->grid[1][0] = base + 1; game->empty_count--;
+            place_tile_at_random_cell(game, base);
         } else if (curriculum == 6) {
-            unsigned char tiles[] = {15, 14, 13};
+            unsigned char tiles[] = {base + 1, base, base - 1};
             memcpy(game->grid[1], tiles, 3);
             game->empty_count -= 3;
         } else if (curriculum == 7) {  // harder
-            game->grid[1][0] = 15; game->empty_count--;
-            place_tile_at_random_cell(game, 14);
-            place_tile_at_random_cell(game, 13);
+            game->grid[1][0] = base + 1; game->empty_count--;
+            place_tile_at_random_cell(game, base);
+            place_tile_at_random_cell(game, base - 1);
         }
     }
 }
@@ -220,7 +217,6 @@ void c_reset(Game* game) {
     game->moves_made = 0;
     game->max_episode_ticks = BASE_MAX_TICKS;
     game->max_tile = 0;
-    game->stop_at_65536 = game->can_go_over_65536;
 
     // Higher tiles are spawned in scaffolding episodes
     // Having high tiles saves moves to get there, allowing agents to experience it faster
@@ -419,8 +415,7 @@ void c_step(Game* game) {
     game->rewards[0] = reward;
     game->episode_reward += reward;
 
-    bool max_level_reached = game->stop_at_65536 && game->max_tile >= 16;
-    if (game->terminals[0] || max_level_reached) {
+    if (game->terminals[0]) {
         add_log(game);
         c_reset(game);
     }
