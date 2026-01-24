@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <cmath>
 
 
 #ifdef USE_TORCH
@@ -1044,6 +1045,26 @@ void run_ppoloss_backward(PPOLossArgs* args) {
         args->T, args->A, args->N, 0);
 }
 
+void run_ppoloss_forward_opt(PPOLossArgs* args) {
+    launch_ppo_loss_forward_optimized<float>(
+        args->loss, args->saved_for_backward,
+        args->logits, args->values_pred, args->actions,
+        args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+}
+
+void run_ppoloss_backward_opt(PPOLossArgs* args) {
+    launch_ppo_loss_backward_optimized<float>(
+        args->grad_logits, args->grad_values_pred, args->grad_loss,
+        args->logits, args->values_pred, args->actions,
+        args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+}
+
 #ifdef USE_TORCH
 
 typedef struct {
@@ -1124,13 +1145,20 @@ void profile_ppoloss(int batch, int seq, int actions) {
     PPOLossArgs* args = create_ppolossargs(batch, seq, actions);
 
     int NT = batch*seq;
+    int NTA = batch*seq*actions;
     printf("ppo_loss (NT=%d, %dx%d, A=%d)\n", NT, batch, seq, actions);
 
     float fwd_ms = profile_kernel((kernel_fn)run_ppoloss_forward, args);
-    print_timing("\tforward", fwd_ms, NT);
+    print_timing("\tforward (original)", fwd_ms, NT);
 
     float bwd_ms = profile_kernel((kernel_fn)run_ppoloss_backward, args);
-    print_timing("\tbackward", bwd_ms, NT);
+    print_timing("\tbackward (original)", bwd_ms, NT);
+
+    float fwd_opt_ms = profile_kernel((kernel_fn)run_ppoloss_forward_opt, args);
+    print_timing("\tforward (optimized)", fwd_opt_ms, NT);
+
+    float bwd_opt_ms = profile_kernel((kernel_fn)run_ppoloss_backward_opt, args);
+    print_timing("\tbackward (optimized)", bwd_opt_ms, NT);
 
 #ifdef USE_TORCH
     PPOLossArgsTorch* args_torch = create_ppolossargs_torch(args);
@@ -1161,6 +1189,240 @@ void profile_ppoloss(int batch, int seq, int actions) {
 
     float fwd_graph_ms = profile_graph((kernel_fn)run_ppoloss_forward_cpp, args_torch);
     print_timing("\tforward (graph)", fwd_graph_ms, NT);
+
+    // ========================================================================
+    // Numerical Stability Comparison: Torch vs Original vs Optimized
+    // ========================================================================
+    printf("\n\tNumerical Stability Comparison:\n");
+
+    // Allocate separate output buffers for each implementation
+    float* loss_orig = nullptr;
+    float* loss_opt = nullptr;
+    double* saved_orig = nullptr;
+    double* saved_opt = nullptr;
+    float* grad_logits_orig = nullptr;
+    float* grad_logits_opt = nullptr;
+    float* grad_values_orig = nullptr;
+    float* grad_values_opt = nullptr;
+
+    cudaMalloc(&loss_orig, sizeof(float));
+    cudaMalloc(&loss_opt, sizeof(float));
+    cudaMalloc(&saved_orig, NT * 5 * sizeof(double));
+    cudaMalloc(&saved_opt, NT * 5 * sizeof(double));
+    cudaMalloc(&grad_logits_orig, NTA * sizeof(float));
+    cudaMalloc(&grad_logits_opt, NTA * sizeof(float));
+    cudaMalloc(&grad_values_orig, NT * sizeof(float));
+    cudaMalloc(&grad_values_opt, NT * sizeof(float));
+
+    // Zero loss buffers before kernel calls (they use atomicAdd)
+    cudaMemset(loss_orig, 0, sizeof(float));
+    cudaMemset(loss_opt, 0, sizeof(float));
+
+    // Run original forward
+    launch_ppo_loss_forward<float>(
+        loss_orig, saved_orig,
+        args->logits, args->values_pred, args->actions,
+        args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+
+    // Run optimized forward
+    launch_ppo_loss_forward_optimized<float>(
+        loss_opt, saved_opt,
+        args->logits, args->values_pred, args->actions,
+        args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+
+    // Run pure PyTorch reference (ground truth) - fused_ppo_loss_cpp is the correct implementation
+    torch::Tensor torch_loss = fused_ppo_loss_cpp(
+        args_torch->logits, args_torch->values_pred, args_torch->actions,
+        args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef);
+
+    cudaDeviceSynchronize();
+
+    // Copy results to host
+    float h_loss_orig, h_loss_opt;
+    cudaMemcpy(&h_loss_orig, loss_orig, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_loss_opt, loss_opt, sizeof(float), cudaMemcpyDeviceToHost);
+    float h_loss_torch = torch_loss.item<float>();
+
+    // Check for NaN/Inf
+    bool orig_nan = std::isnan(h_loss_orig) || std::isinf(h_loss_orig);
+    bool opt_nan = std::isnan(h_loss_opt) || std::isinf(h_loss_opt);
+    bool torch_nan = std::isnan(h_loss_torch) || std::isinf(h_loss_torch);
+
+    printf("\t  Forward Loss Values:\n");
+    printf("\t    PyTorch:   %.8f %s\n", h_loss_torch, torch_nan ? "(NaN/Inf!)" : "");
+    printf("\t    Original:  %.8f %s\n", h_loss_orig, orig_nan ? "(NaN/Inf!)" : "");
+    printf("\t    Optimized: %.8f %s\n", h_loss_opt, opt_nan ? "(NaN/Inf!)" : "");
+
+    // Compute relative differences
+    float diff_orig_torch = fabsf(h_loss_orig - h_loss_torch) / (fabsf(h_loss_torch) + 1e-8f);
+    float diff_opt_torch = fabsf(h_loss_opt - h_loss_torch) / (fabsf(h_loss_torch) + 1e-8f);
+    float diff_orig_opt = fabsf(h_loss_orig - h_loss_opt) / (fabsf(h_loss_orig) + 1e-8f);
+
+    printf("\t  Relative Differences:\n");
+    printf("\t    Original vs PyTorch:   %.2e %s\n", diff_orig_torch, diff_orig_torch > 0.01f ? "(>1%% MISMATCH)" : "(OK)");
+    printf("\t    Optimized vs PyTorch:  %.2e %s\n", diff_opt_torch, diff_opt_torch > 0.01f ? "(>1%% MISMATCH)" : "(OK)");
+    printf("\t    Original vs Optimized: %.2e %s\n", diff_orig_opt, diff_orig_opt > 1e-5f ? "(DIFF)" : "(OK)");
+    fflush(stdout);
+
+    // Run backward passes
+    float grad_loss_val = 1.0f;
+    cudaMemcpy(args->grad_loss, &grad_loss_val, sizeof(float), cudaMemcpyHostToDevice);
+
+    launch_ppo_loss_backward<float>(
+        grad_logits_orig, grad_values_orig, args->grad_loss,
+        args->logits, args->actions, args->old_logprobs,
+        args->advantages, args->prio, args->values, args->returns,
+        saved_orig, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+
+    launch_ppo_loss_backward_optimized<float>(
+        grad_logits_opt, grad_values_opt, args->grad_loss,
+        args->logits, args->values_pred, args->actions,
+        args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        args->T, args->A, args->N, 0);
+
+    // Run torch backward using fused_ppo_loss_cpp (pure PyTorch, has proper autograd)
+    bool torch_backward_ok = false;
+    try {
+        args_torch->logits.mutable_grad() = torch::Tensor();
+        args_torch->values_pred.mutable_grad() = torch::Tensor();
+        torch_loss.backward();
+        torch_backward_ok = args_torch->logits.grad().defined() && args_torch->values_pred.grad().defined();
+    } catch (...) {
+        torch_backward_ok = false;
+    }
+
+    cudaDeviceSynchronize();
+
+    // Copy gradients to host for comparison
+    float* h_grad_logits_orig = (float*)malloc(NTA * sizeof(float));
+    float* h_grad_logits_opt = (float*)malloc(NTA * sizeof(float));
+    float* h_grad_values_orig = (float*)malloc(NT * sizeof(float));
+    float* h_grad_values_opt = (float*)malloc(NT * sizeof(float));
+
+    cudaMemcpy(h_grad_logits_orig, grad_logits_orig, NTA * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_grad_logits_opt, grad_logits_opt, NTA * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_grad_values_orig, grad_values_orig, NT * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_grad_values_opt, grad_values_opt, NT * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Get torch gradients - check if backward succeeded
+    float* h_grad_logits_torch = nullptr;
+    float* h_grad_values_torch = nullptr;
+    bool has_torch_grads = torch_backward_ok;
+    
+    torch::Tensor torch_grad_logits, torch_grad_values;
+    if (has_torch_grads) {
+        torch_grad_logits = args_torch->logits.grad().contiguous().cpu();
+        torch_grad_values = args_torch->values_pred.grad().contiguous().cpu();
+        h_grad_logits_torch = torch_grad_logits.data_ptr<float>();
+        h_grad_values_torch = torch_grad_values.data_ptr<float>();
+    }
+    
+    // Debug: check torch gradient sizes
+    if (has_torch_grads) {
+        // Safety check - if sizes don't match, skip torch comparison
+        if (torch_grad_logits.numel() != NTA || torch_grad_values.numel() != NT) {
+            has_torch_grads = false;
+        }
+    }
+
+    // Compute gradient statistics
+    double grad_logits_orig_torch_diff = 0.0, grad_logits_opt_torch_diff = 0.0, grad_logits_orig_opt_diff = 0.0;
+    double grad_logits_orig_torch_max = 0.0, grad_logits_opt_torch_max = 0.0, grad_logits_orig_opt_max = 0.0;
+    int grad_logits_nan_orig = 0, grad_logits_nan_opt = 0, grad_logits_nan_torch = 0;
+
+    for (int i = 0; i < NTA; ++i) {
+        if (std::isnan(h_grad_logits_orig[i]) || std::isinf(h_grad_logits_orig[i])) grad_logits_nan_orig++;
+        if (std::isnan(h_grad_logits_opt[i]) || std::isinf(h_grad_logits_opt[i])) grad_logits_nan_opt++;
+
+        double d3 = fabs((double)h_grad_logits_orig[i] - (double)h_grad_logits_opt[i]);
+        grad_logits_orig_opt_diff += d3;
+        grad_logits_orig_opt_max = fmax(grad_logits_orig_opt_max, d3);
+
+        if (has_torch_grads) {
+            if (std::isnan(h_grad_logits_torch[i]) || std::isinf(h_grad_logits_torch[i])) grad_logits_nan_torch++;
+            double d1 = fabs((double)h_grad_logits_orig[i] - (double)h_grad_logits_torch[i]);
+            double d2 = fabs((double)h_grad_logits_opt[i] - (double)h_grad_logits_torch[i]);
+            grad_logits_orig_torch_diff += d1;
+            grad_logits_opt_torch_diff += d2;
+            grad_logits_orig_torch_max = fmax(grad_logits_orig_torch_max, d1);
+            grad_logits_opt_torch_max = fmax(grad_logits_opt_torch_max, d2);
+        }
+    }
+
+    double grad_values_orig_torch_diff = 0.0, grad_values_opt_torch_diff = 0.0, grad_values_orig_opt_diff = 0.0;
+    double grad_values_orig_torch_max = 0.0, grad_values_opt_torch_max = 0.0, grad_values_orig_opt_max = 0.0;
+    int grad_values_nan_orig = 0, grad_values_nan_opt = 0, grad_values_nan_torch = 0;
+
+    for (int i = 0; i < NT; ++i) {
+        if (std::isnan(h_grad_values_orig[i]) || std::isinf(h_grad_values_orig[i])) grad_values_nan_orig++;
+        if (std::isnan(h_grad_values_opt[i]) || std::isinf(h_grad_values_opt[i])) grad_values_nan_opt++;
+
+        double d3 = fabs((double)h_grad_values_orig[i] - (double)h_grad_values_opt[i]);
+        grad_values_orig_opt_diff += d3;
+        grad_values_orig_opt_max = fmax(grad_values_orig_opt_max, d3);
+
+        if (has_torch_grads) {
+            if (std::isnan(h_grad_values_torch[i]) || std::isinf(h_grad_values_torch[i])) grad_values_nan_torch++;
+            double d1 = fabs((double)h_grad_values_orig[i] - (double)h_grad_values_torch[i]);
+            double d2 = fabs((double)h_grad_values_opt[i] - (double)h_grad_values_torch[i]);
+            grad_values_orig_torch_diff += d1;
+            grad_values_opt_torch_diff += d2;
+            grad_values_orig_torch_max = fmax(grad_values_orig_torch_max, d1);
+            grad_values_opt_torch_max = fmax(grad_values_opt_torch_max, d2);
+        }
+    }
+
+    printf("\t  Backward grad_logits (NTA=%d):\n", NTA);
+    if (has_torch_grads) {
+        printf("\t    NaN/Inf counts: torch=%d, orig=%d, opt=%d\n", grad_logits_nan_torch, grad_logits_nan_orig, grad_logits_nan_opt);
+        printf("\t    Mean abs diff: orig-torch=%.2e, opt-torch=%.2e, orig-opt=%.2e\n",
+               grad_logits_orig_torch_diff/NTA, grad_logits_opt_torch_diff/NTA, grad_logits_orig_opt_diff/NTA);
+        printf("\t    Max abs diff:  orig-torch=%.2e, opt-torch=%.2e, orig-opt=%.2e\n",
+               grad_logits_orig_torch_max, grad_logits_opt_torch_max, grad_logits_orig_opt_max);
+    } else {
+        printf("\t    NaN/Inf counts: orig=%d, opt=%d (torch grads unavailable)\n", grad_logits_nan_orig, grad_logits_nan_opt);
+        printf("\t    Mean abs diff: orig-opt=%.2e\n", grad_logits_orig_opt_diff/NTA);
+        printf("\t    Max abs diff:  orig-opt=%.2e\n", grad_logits_orig_opt_max);
+    }
+
+    printf("\t  Backward grad_values (NT=%d):\n", NT);
+    if (has_torch_grads) {
+        printf("\t    NaN/Inf counts: torch=%d, orig=%d, opt=%d\n", grad_values_nan_torch, grad_values_nan_orig, grad_values_nan_opt);
+        printf("\t    Mean abs diff: orig-torch=%.2e, opt-torch=%.2e, orig-opt=%.2e\n",
+               grad_values_orig_torch_diff/NT, grad_values_opt_torch_diff/NT, grad_values_orig_opt_diff/NT);
+        printf("\t    Max abs diff:  orig-torch=%.2e, opt-torch=%.2e, orig-opt=%.2e\n",
+               grad_values_orig_torch_max, grad_values_opt_torch_max, grad_values_orig_opt_max);
+    } else {
+        printf("\t    NaN/Inf counts: orig=%d, opt=%d (torch grads unavailable)\n", grad_values_nan_orig, grad_values_nan_opt);
+        printf("\t    Mean abs diff: orig-opt=%.2e\n", grad_values_orig_opt_diff/NT);
+        printf("\t    Max abs diff:  orig-opt=%.2e\n", grad_values_orig_opt_max);
+    }
+
+    // Cleanup
+    free(h_grad_logits_orig);
+    free(h_grad_logits_opt);
+    free(h_grad_values_orig);
+    free(h_grad_values_opt);
+    cudaFree(loss_orig);
+    cudaFree(loss_opt);
+    cudaFree(saved_orig);
+    cudaFree(saved_opt);
+    cudaFree(grad_logits_orig);
+    cudaFree(grad_logits_opt);
+    cudaFree(grad_values_orig);
+    cudaFree(grad_values_opt);
 
     delete args_torch;
 #endif
