@@ -1469,6 +1469,8 @@ template<typename T>
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
     double* __restrict__ saved_for_backward,
+    T* __restrict__ ratio_out,
+    T* __restrict__ newvalue_out,
     const T* __restrict__ logits,
     const T* __restrict__ values_pred,
     const int64_t* __restrict__ actions,
@@ -1555,6 +1557,10 @@ __global__ void ppo_loss_forward_kernel_optimized(
     float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
 
     float thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * entropy) / float(total_elements);
+
+    // Write ratio and newvalue outputs
+    //ratio_out[nt] = T(ratio);
+    //newvalue_out[nt] = T(val_pred);
 
     int tid = threadIdx.x;
     block_loss[tid] = thread_loss;
@@ -1697,6 +1703,8 @@ template<typename T>
 inline void launch_ppo_loss_forward_optimized(
     float* loss_output,
     double* saved_for_backward,
+    T* ratio_out,
+    T* newvalue_out,
     const T* logits,
     const T* values_pred,
     const int64_t* actions,
@@ -1718,9 +1726,12 @@ inline void launch_ppo_loss_forward_optimized(
 ) {
     int total = N * T_seq;
     int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+    cudaMemsetAsync(loss_output, 0, sizeof(T), stream);
     ppo_loss_forward_kernel_optimized<T><<<grid, PPO_THREADS, 0, stream>>>(
         loss_output,
         saved_for_backward,
+        ratio_out,
+        newvalue_out,
         logits,
         values_pred,
         actions,
@@ -2424,15 +2435,15 @@ void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFlo
     launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
 }
 
-void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
 void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
 
-void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
 void launch_ppo_loss_backward_optimized_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);

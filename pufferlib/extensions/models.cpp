@@ -255,20 +255,30 @@ class DefaultDecoder : public Decoder {
     }
 };
 
-// G2048 encoder: 3 linear layers with GELU, scales first 16 obs by /100
+// G2048 encoder: embeddings + 3 linear layers with GELU
+// Matches Python: value_embed(obs) + pos_embed -> flatten -> encoder MLP
 class G2048Encoder : public Encoder {
     public:
+        torch::nn::Embedding value_embed{nullptr};
+        torch::nn::Embedding pos_embed{nullptr};
         torch::nn::Linear linear1{nullptr};
         torch::nn::Linear linear2{nullptr};
         torch::nn::Linear linear3{nullptr};
         int input_size;
         int hidden_size;
+        static constexpr int embed_dim = 3;  // ceil(33^0.25) = 3
+        static constexpr int num_grid_cells = 16;
+        static constexpr int num_obs = num_grid_cells * embed_dim;  // 48
 
     G2048Encoder(int64_t input_size, int64_t hidden_size)
         : input_size(input_size), hidden_size(hidden_size) {
-        // hidden_size > 256 path: input -> 2*hidden -> hidden -> hidden
+        // Embeddings for tile values and positions
+        value_embed = register_module("value_embed", torch::nn::Embedding(18, embed_dim));
+        pos_embed = register_module("pos_embed", torch::nn::Embedding(num_grid_cells, embed_dim));
+
+        // Encoder MLP: num_obs -> 2*hidden -> hidden -> hidden
         linear1 = register_module("linear1", torch::nn::Linear(
-            torch::nn::LinearOptions(input_size, 2*hidden_size).bias(false)));
+            torch::nn::LinearOptions(num_obs, 2*hidden_size).bias(false)));
         torch::nn::init::orthogonal_(linear1->weight, std::sqrt(2.0));
 
         linear2 = register_module("linear2", torch::nn::Linear(
@@ -281,15 +291,23 @@ class G2048Encoder : public Encoder {
     }
 
     Tensor forward(Tensor x) override {
-        // Scale first 16 elements (tile values) by /100
-        x = x.to(torch::kFloat32);
-        x.index_put_({torch::indexing::Slice(), torch::indexing::Slice(0, 16)},
-            x.index({torch::indexing::Slice(), torch::indexing::Slice(0, 16)}) / 100.0f);
+        // x is (B, 16) uint8 tile values
+        auto B = x.size(0);
 
-        x = torch::gelu(linear1->forward(x));
-        x = torch::gelu(linear2->forward(x));
-        x = torch::gelu(linear3->forward(x));
-        return x;
+        // value_embed(obs) -> (B, 16, embed_dim)
+        auto value_obs = value_embed->forward(x.to(torch::kLong));
+
+        // pos_embed.weight expanded to (B, 16, embed_dim)
+        auto pos_obs = pos_embed->weight.unsqueeze(0).expand({B, num_grid_cells, embed_dim});
+
+        // grid_obs = (value_obs + pos_obs).flatten(1) -> (B, 48)
+        auto grid_obs = (value_obs + pos_obs).flatten(1);
+
+        // Encoder MLP
+        auto h = torch::gelu(linear1->forward(grid_obs));
+        h = torch::gelu(linear2->forward(h));
+        h = torch::gelu(linear3->forward(h));
+        return h;
     }
 };
 
@@ -513,30 +531,51 @@ class DriveEncoder : public Encoder {
     }
 };
 
-// G2048 decoder: hidden -> GELU -> fused logits+value
+// G2048 decoder: separate policy and value heads, cat + narrow for contiguous output
 class G2048Decoder : public Decoder {
     public:
-        torch::nn::Linear linear1{nullptr};
-        torch::nn::Linear linear2{nullptr};
+        torch::nn::Linear dec_linear1{nullptr};
+        torch::nn::Linear dec_linear2{nullptr};
+        torch::nn::Linear val_linear1{nullptr};
+        torch::nn::Linear val_linear2{nullptr};
         int hidden_size;
         int output_size;
 
     G2048Decoder(int64_t hidden_size, int64_t output_size)
         : hidden_size(hidden_size), output_size(output_size) {
-        linear1 = register_module("linear1", torch::nn::Linear(
+        // Decoder head: hidden -> hidden -> num_atns
+        dec_linear1 = register_module("dec_linear1", torch::nn::Linear(
             torch::nn::LinearOptions(hidden_size, hidden_size).bias(false)));
-        torch::nn::init::orthogonal_(linear1->weight, std::sqrt(2.0));
+        torch::nn::init::orthogonal_(dec_linear1->weight, std::sqrt(2.0));
 
-        linear2 = register_module("linear2", torch::nn::Linear(
-            torch::nn::LinearOptions(hidden_size, output_size + 1).bias(false)));
-        torch::nn::init::orthogonal_(linear2->weight, 0.01);
+        dec_linear2 = register_module("dec_linear2", torch::nn::Linear(
+            torch::nn::LinearOptions(hidden_size, output_size).bias(false)));
+        torch::nn::init::orthogonal_(dec_linear2->weight, 0.01);
+
+        // Value head: hidden -> hidden -> 1
+        val_linear1 = register_module("val_linear1", torch::nn::Linear(
+            torch::nn::LinearOptions(hidden_size, hidden_size).bias(false)));
+        torch::nn::init::orthogonal_(val_linear1->weight, std::sqrt(2.0));
+
+        val_linear2 = register_module("val_linear2", torch::nn::Linear(
+            torch::nn::LinearOptions(hidden_size, 1).bias(false)));
+        torch::nn::init::orthogonal_(val_linear2->weight, 1.0);
     }
 
     std::tuple<Tensor, Tensor> forward(Tensor hidden) override {
-        Tensor x = torch::gelu(linear1->forward(hidden));
-        Tensor output = linear2->forward(x);
-        Tensor logits = output.narrow(1, 0, output_size);
-        Tensor value = output.narrow(1, output_size, 1);
+        // Policy head
+        Tensor logits = torch::gelu(dec_linear1->forward(hidden));
+        logits = dec_linear2->forward(logits);
+
+        // Value head
+        Tensor value = torch::gelu(val_linear1->forward(hidden));
+        value = val_linear2->forward(value);
+
+        // Cat and narrow for contiguous outputs
+        Tensor output = torch::cat({logits, value}, 1).contiguous();
+        logits = output.narrow(1, 0, output_size);
+        value = output.narrow(1, output_size, 1);
+
         return {logits, value.squeeze(1)};
     }
 };

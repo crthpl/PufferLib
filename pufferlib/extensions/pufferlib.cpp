@@ -419,7 +419,8 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
-    if (kernels) {
+    if (false) {
+    //if (kernels) {
         loss = fused_ppo_loss_optimized(
             logits,
             newvalue,
@@ -431,6 +432,8 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
             graph.mb_returns.to(logits.dtype()),
             adv_mean,
             adv_std,
+            graph.mb_ratio,
+            graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)}),
             hypers.clip_coef,
             hypers.vf_clip_coef,
             hypers.vf_coef,

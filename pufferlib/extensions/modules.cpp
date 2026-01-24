@@ -984,6 +984,8 @@ public:
         torch::Tensor returns,          // (N, T)
         torch::Tensor adv_mean,         // (1)
         torch::Tensor adv_std,          // (1)
+        torch::Tensor ratio_out,        // (N, T) - output for ratio
+        torch::Tensor newvalue_out,     // (N, T) - output for newvalue
         double clip_coef,
         double vf_clip_coef,
         double vf_coef,
@@ -1001,16 +1003,18 @@ public:
 
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-        auto loss_output = torch::zeros({1}, options_float);
+        auto loss_output = torch::empty({1}, options_float);
 
         // saved_for_backward not used by optimized backward, but kernel still writes to it
-        auto saved_for_backward = torch::empty({N * T, 5}, options_double);
+        auto saved_for_backward = torch::zeros({N * T, 5}, options_double);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_forward_optimized_float(
                 loss_output.data_ptr<float>(),
                 saved_for_backward.data_ptr<double>(),
+                ratio_out.data_ptr<float>(),
+                newvalue_out.data_ptr<float>(),
                 logits.data_ptr<float>(),
                 values_pred.data_ptr<float>(),
                 actions.data_ptr<int64_t>(),
@@ -1032,6 +1036,8 @@ public:
             launch_ppo_loss_forward_optimized_bf16(
                 loss_output.data_ptr<float>(),
                 saved_for_backward.data_ptr<double>(),
+                ratio_out.data_ptr<at::BFloat16>(),
+                newvalue_out.data_ptr<at::BFloat16>(),
                 logits.data_ptr<at::BFloat16>(),
                 values_pred.data_ptr<at::BFloat16>(),
                 actions.data_ptr<int64_t>(),
@@ -1139,7 +1145,9 @@ public:
             grad_logits,
             grad_values_pred,
             {}, {}, {}, {}, {}, {},  // actions, old_logprobs, advantages, prio, values, returns
-            {}, {}, {}, {}, {}, {}   // adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef
+            {}, {},                   // adv_mean, adv_std
+            {}, {},                   // ratio_out, newvalue_out (no grad needed)
+            {}, {}, {}, {}           // clip_coef, vf_clip_coef, vf_coef, ent_coef
         };
     }
 };
@@ -1155,6 +1163,8 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     torch::Tensor returns,
     torch::Tensor adv_mean,
     torch::Tensor adv_std,
+    torch::Tensor ratio_out,
+    torch::Tensor newvalue_out,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -1162,7 +1172,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
 ) {
     return PPOFusedLossOptimizedFunction::apply(logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, adv_mean,
-        adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef);
+        adv_std, ratio_out, newvalue_out, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
 // Reference implementation for mingru_gate (inference path)
