@@ -476,6 +476,158 @@ torch::autograd::tensor_list fused_scan(
     return FusedScanFunction::apply(combined, state);
 }
 
+// Checkpointed version: uses sparse checkpoints to reduce memory, recomputes in backward
+class FusedScanCheckpointedFunction : public torch::autograd::Function<FusedScanCheckpointedFunction> {
+public:
+    static torch::autograd::tensor_list forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor combined,  // (B, T, 3*H) = [hidden, gate, proj]
+        torch::Tensor state      // (B, 1, H)
+    ) {
+        TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
+        TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
+        TORCH_CHECK(combined.dtype() == state.dtype(), "dtypes must match");
+        TORCH_CHECK(combined.dim() == 3, "combined must be (B, T, 3*H)");
+        TORCH_CHECK(state.dim() == 3, "state must be (B, 1, H)");
+        TORCH_CHECK(state.size(0) == combined.size(0), "B must match");
+        TORCH_CHECK(state.size(1) == 1, "state T dim must be 1");
+        TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
+        TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
+                    "All tensors must be contiguous");
+
+        auto dtype = combined.dtype();
+        auto device = combined.device();
+        auto B = combined.size(0);
+        auto T = combined.size(1);
+        auto H = state.size(2);
+        auto T_buf = T + 1;
+
+        auto out = torch::empty({B, T, H}, state.options());
+        auto next_state = torch::empty({B, 1, H}, state.options());
+
+        // Sparse checkpoint buffers (still needed for backward recomputation)
+        auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        auto a_star = torch::empty({B, T_buf, H}, options_float);
+        auto s_vals = torch::empty({B, T_buf, H}, options_float);
+        auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_fused_scan_forward_checkpointed_float(
+                out.data_ptr<float>(),
+                next_state.data_ptr<float>(),
+                a_star.data_ptr<float>(),
+                s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
+                combined.data_ptr<float>(),
+                state.data_ptr<float>(),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(B),
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_fused_scan_forward_checkpointed_bf16(
+                out.data_ptr<at::BFloat16>(),
+                next_state.data_ptr<at::BFloat16>(),
+                a_star.data_ptr<float>(),
+                s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
+                combined.data_ptr<at::BFloat16>(),
+                state.data_ptr<at::BFloat16>(),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(B),
+                stream
+            );
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
+        }
+
+        ctx->save_for_backward({combined, state});
+        ctx->saved_data["a_star"] = a_star;
+        ctx->saved_data["s_vals"] = s_vals;
+        ctx->saved_data["log_values_buf"] = log_values_buf;
+
+        return {out, next_state};
+    }
+
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto combined = saved[0];
+        auto state = saved[1];
+
+        auto a_star_buf = ctx->saved_data["a_star"].toTensor();
+        auto s_vals = ctx->saved_data["s_vals"].toTensor();
+        auto log_values_buf = ctx->saved_data["log_values_buf"].toTensor();
+
+        auto grad_out = grad_outputs[0];
+        TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");
+
+        auto grad_next_state = grad_outputs[1];
+        TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
+
+        auto dtype = combined.dtype();
+        auto B = combined.size(0);
+        auto T = combined.size(1);
+        auto H = state.size(2);
+
+        auto grad_combined = torch::empty_like(combined);
+        auto grad_state = torch::empty_like(state);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_fused_scan_backward_checkpointed_float(
+                grad_combined.data_ptr<float>(),
+                grad_state.data_ptr<float>(),
+                grad_out.data_ptr<float>(),
+                grad_next_state.data_ptr<float>(),
+                combined.data_ptr<float>(),
+                state.data_ptr<float>(),
+                a_star_buf.data_ptr<float>(),
+                s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(B),
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_fused_scan_backward_checkpointed_bf16(
+                grad_combined.data_ptr<at::BFloat16>(),
+                grad_state.data_ptr<at::BFloat16>(),
+                grad_out.data_ptr<at::BFloat16>(),
+                grad_next_state.data_ptr<at::BFloat16>(),
+                combined.data_ptr<at::BFloat16>(),
+                state.data_ptr<at::BFloat16>(),
+                a_star_buf.data_ptr<float>(),
+                s_vals.data_ptr<float>(),
+                log_values_buf.data_ptr<float>(),
+                static_cast<int>(T),
+                static_cast<int>(H),
+                static_cast<int>(B),
+                stream
+            );
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype");
+        }
+
+        return {grad_combined, grad_state};
+    }
+};
+
+// Named entrypoint: fused_scan_checkpointed(combined, state) -> {out, next_state}
+// Same interface as fused_scan but uses checkpointed kernels for reduced memory
+torch::autograd::tensor_list fused_scan_checkpointed(
+    torch::Tensor combined,
+    torch::Tensor state
+) {
+    return FusedScanCheckpointedFunction::apply(combined, state);
+}
+
 class LogCumsumExpFunction : public torch::autograd::Function<LogCumsumExpFunction> {
 public:
     static torch::autograd::tensor_list forward(

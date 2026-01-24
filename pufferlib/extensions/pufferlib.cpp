@@ -117,7 +117,7 @@ float cosine_annealing(float lr_base, float lr_min, int t, int T) {
 }
 
 std::tuple<VecEnv*, Tensor, Tensor, Tensor, Tensor, Tensor>
-create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwargs) {
+create_environments(int64_t num_envs, int num_buffers, const std::string& env_name, Dict* env_kwargs) {
     std::string name = env_name;
     if (name.rfind("puffer_", 0) == 0) {
         name = name.substr(7);
@@ -155,7 +155,7 @@ create_environments(int64_t num_envs, const std::string& env_name, Dict* env_kwa
         exit(1);
     }
 
-    VecEnv* vec = create_envs(num_envs, 2, true, 0, env_kwargs);
+    VecEnv* vec = create_envs(num_envs, num_buffers, true, 0, env_kwargs);
     int total_agents = vec->num_agents;
     printf("DEBUG create_environments: num_envs=%d, vec->size=%d, vec->num_agents=%d\n",
         (int)num_envs, vec->size, vec->num_agents);
@@ -288,7 +288,8 @@ typedef struct {
     bool captured;
     Tensor adv_mean;
     Tensor adv_std;
-    Tensor act_sizes;  // CUDA int32 tensor of action head sizes for MultiDiscrete
+    Tensor act_sizes;      // CUDA int32 tensor of action head sizes for MultiDiscrete
+    Tensor act_sizes_cpu;  // CPU int64 tensor (pre-computed to avoid alloc during graph replay)
     int epoch;
     uint64_t rng_seed;
     Tensor rng_offset;  // CUDA tensor so increment is graphable
@@ -355,7 +356,7 @@ Tensor initial_state_impl(PuffeRL& pufferl, int64_t batch_size, torch::Device de
 }
 
 void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
-        uint64_t rng_seed, Tensor& rng_offset, Tensor& act_sizes) {
+        uint64_t rng_seed, Tensor& rng_offset, Tensor& act_sizes, Tensor& act_sizes_cpu) {
     torch::NoGradGuard no_grad;
 
     auto [logits, value, state_out] = policy->forward(graph.obs, graph.state);
@@ -367,33 +368,22 @@ void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
         int num_action_heads = graph.actions.size(1);
         logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
 
-        if (num_action_heads == 1) {
-            // Discrete
-            Tensor log_probs = torch::log_softmax(logits, 1);
-            Tensor action = at::multinomial(log_probs.exp(), 1, true).squeeze(1);
-            Tensor logprob = log_probs.gather(1, action.unsqueeze(1)).squeeze(1);
-            graph.actions.select(1, 0).copy_(action.to(torch::kFloat64), false);
-            graph.logprobs.copy_(logprob, false);
-        } else {
-            // MultiDiscrete
-            auto sizes_vec = act_sizes.cpu().to(torch::kInt64).contiguous();
-            auto split_logits = torch::split(logits, c10::IntArrayRef(sizes_vec.data_ptr<int64_t>(), num_action_heads), 1);
-            std::vector<Tensor> transposed;
-            for (const auto& t : split_logits) transposed.push_back(t.t());
-            logits = torch::nn::utils::rnn::pad_sequence(transposed, false, -INFINITY).permute({1, 2, 0});
+        // Split logits by action head sizes and sample each head independently
+        auto split_logits = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+        std::vector<Tensor> actions_vec;
+        std::vector<Tensor> logprobs_vec;
 
-            Tensor normalized_logits = logits - logits.logsumexp(-1, true);
-            Tensor probs = torch::softmax(logits, -1);
-            probs = torch::nan_to_num(probs, 1e-8, 1e-8, 1e-8);
-
-            auto shape = probs.sizes().vec();
-            shape.pop_back();
-            Tensor action = at::multinomial(probs.reshape({-1, probs.size(-1)}), 1, true).reshape(shape);
-            Tensor logprob = normalized_logits.gather(-1, action.unsqueeze(-1)).squeeze(-1);
-
-            graph.actions.copy_(action.t().to(torch::kFloat64), false);
-            graph.logprobs.copy_(logprob.sum(0), false);
+        for (int h = 0; h < num_action_heads; h++) {
+            Tensor head_logits = split_logits[h];
+            Tensor log_probs = torch::log_softmax(head_logits, 1);
+            Tensor action = at::multinomial(log_probs.exp(), 1, true);
+            Tensor logprob = log_probs.gather(1, action);
+            actions_vec.push_back(action);
+            logprobs_vec.push_back(logprob);
         }
+        // Stack and copy - no per-iteration allocations
+        graph.actions.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
+        graph.logprobs.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
         graph.value.copy_(value.flatten(), false);
     }
     graph.state.copy_(state_out, false);
@@ -422,7 +412,7 @@ void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
 }
 
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
-        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes) {
+        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu) {
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
@@ -446,38 +436,29 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
         )[0];
     } else {
         int num_action_heads = graph.mb_actions.size(-1);
-        Tensor newlogprob;
-        Tensor entropy;
+        int batch = hypers.minibatch_segments * hypers.horizon;
 
-        if (num_action_heads == 1) {
-            // Discrete
-            Tensor flat_logits = logits.reshape({-1, logits.size(-1)});
-            Tensor flat_actions = graph.mb_actions.reshape({-1});
-            Tensor logprobs_new = torch::log_softmax(flat_logits, 1);
-            Tensor probs_new = logprobs_new.exp();
-            Tensor newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-            newlogprob = newlogprob_flat.reshape({hypers.minibatch_segments, hypers.horizon});
-            entropy = - (probs_new * logprobs_new).sum(1).mean();
-        } else {
-            // MultiDiscrete: action!=None path
-            int batch = hypers.minibatch_segments * hypers.horizon;
-            Tensor flat_logits = logits.reshape({batch, -1});
-            flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
+        // Split logits by action head sizes and compute log probs for each head
+        Tensor flat_logits = logits.reshape({batch, -1});
+        flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
+        auto split_logits = torch::split(flat_logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
 
-            auto sizes_vec = act_sizes.cpu().to(torch::kInt64).contiguous();
-            auto split_logits = torch::split(flat_logits, c10::IntArrayRef(sizes_vec.data_ptr<int64_t>(), num_action_heads), 1);
-            std::vector<Tensor> transposed;
-            for (const auto& t : split_logits) transposed.push_back(t.t());
-            Tensor padded_logits = torch::nn::utils::rnn::pad_sequence(transposed, false, -INFINITY).permute({1, 2, 0});
+        std::vector<Tensor> logprobs_vec;
+        std::vector<Tensor> entropies_vec;
 
-            Tensor normalized_logits = padded_logits - padded_logits.logsumexp(-1, true);
-            Tensor probs = torch::softmax(padded_logits, -1);
-
-            Tensor action = graph.mb_actions.reshape({batch, -1}).t().to(torch::kInt64);
-            Tensor logprob = normalized_logits.gather(-1, action.unsqueeze(-1)).squeeze(-1);
-            newlogprob = logprob.sum(0).reshape({hypers.minibatch_segments, hypers.horizon});
-            entropy = - (probs * normalized_logits).sum(-1).sum(0).mean();
+        for (int h = 0; h < num_action_heads; h++) {
+            Tensor head_logits = split_logits[h];
+            Tensor log_probs = torch::log_softmax(head_logits, 1);
+            Tensor probs = log_probs.exp();
+            Tensor head_actions = graph.mb_actions.select(-1, h).reshape({batch}).to(torch::kInt64);
+            Tensor logprob = log_probs.gather(1, head_actions.unsqueeze(1));
+            logprobs_vec.push_back(logprob);
+            entropies_vec.push_back(-(probs * log_probs).sum(1, true));
         }
+
+        // Stack and reduce - no per-iteration allocations
+        Tensor newlogprob = torch::cat(logprobs_vec, 1).sum(1).reshape({hypers.minibatch_segments, hypers.horizon});
+        Tensor entropy = torch::cat(entropies_vec, 1).sum(1).mean();
 
         // Compute ratio
         Tensor logratio = newlogprob - graph.mb_logprobs;
@@ -594,15 +575,17 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // act_sizes: 1D tensor of action space sizes per head
     // num_action_heads: number of action heads (for MultiDiscrete)
     // act_n: sum of action space sizes (decoder output dim)
-    auto [vec, obs, actions, rewards, terminals, act_sizes] = create_environments(hypers.num_envs, env_name, env_kwargs);
+    auto [vec, obs, actions, rewards, terminals, act_sizes] = create_environments(hypers.num_envs, hypers.num_buffers, env_name, env_kwargs);
     int num_action_heads = actions.size(1);
     int act_n = act_sizes.sum().item<int>();
+
     pufferl->vec = vec;
     pufferl->env.obs = obs;
     pufferl->env.actions = actions;
     pufferl->env.rewards = rewards;
     pufferl->env.terminals = terminals;
     pufferl->act_sizes = act_sizes;
+    pufferl->act_sizes_cpu = act_sizes.cpu().to(torch::kInt64).contiguous();
 
     int input_size = obs.size(1);
     int hidden_size = hypers.hidden_size;
@@ -672,11 +655,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
         auto* p = pufferl.get();
         capture_graph(&pufferl->rollout_graph, [p]() {
-            forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes);
+            forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes, p->act_sizes_cpu);
         });
         capture_graph(&pufferl->train_forward_graph, [p]() {
             train_forward_call(p->graph, p->policy, p->muon,
-                p->hypers, p->adv_mean, p->adv_std, p->act_sizes);
+                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu);
         });
 
         for (int i = 0; i < hypers.horizon; ++i) {
@@ -807,7 +790,7 @@ void rollouts_impl(PuffeRL& pufferl) {
             pufferl.rollout_graph.replay();
         } else {
             forward_call(pufferl.graph, pufferl.policy, hypers.kernels,
-                pufferl.rng_seed, pufferl.rng_offset, pufferl.act_sizes);
+                pufferl.rng_seed, pufferl.rng_offset, pufferl.act_sizes, pufferl.act_sizes_cpu);
         }
         profile_end(hypers.profile);
 
@@ -937,7 +920,7 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_forward_graph.replay();
         } else {
             train_forward_call(pufferl.graph, pufferl.policy, pufferl.muon,
-                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes);
+                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu);
         }
         profile_end(hypers.profile);
 

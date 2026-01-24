@@ -143,10 +143,13 @@ void c_step(Target* env) {
         Agent* agent = &env->agents[i];
         agent->ticks_since_reward += 1;
 
-        agent->heading += ((float)env->actions[2*i] - 4.0f)/12.0f;
+        int action0 = (int)env->actions[i*2];
+        int action1 = (int)env->actions[i*2 + 1];
+
+        agent->heading += ((float)action0 - 4.0f)/12.0f;
         agent->heading = clip(agent->heading, 0, 2*PI);
 
-        agent->speed += 1.0f*((float)env->actions[2*i + 1] - 2.0f);
+        agent->speed += 1.0f*((float)action1 - 2.0f);
         agent->speed = clip(agent->speed, -20.0f, 20.0f);
 
         agent->x += agent->speed*cosf(agent->heading);

@@ -14,13 +14,17 @@
 #include <string.h>
 #include <dlfcn.h>
 
-#include "pufferlib/extensions/vecenv.h"
 
 #ifdef USE_TORCH
 #include "pufferlib/extensions/pufferlib.cpp"
-#include "pufferlib/extensions/cuda/modules.cu"
+#include "pufferlib/extensions/cuda/kernels.cu"
+// #include "pufferlib/extensions/modules.cpp"
 using namespace pufferlib;
-#else
+#endif
+
+#include "pufferlib/extensions/vecenv.h"
+
+#ifndef USE_TORCH
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
 
@@ -697,6 +701,23 @@ void run_fusedscan_backward(FusedScanArgs* args) {
         args->T, args->H, args->B, 0);
 }
 
+void run_fusedscan_forward_checkpointed(FusedScanArgs* args) {
+    launch_fused_scan_forward_checkpointed<float>(
+        args->out, args->next_state,
+        args->a_star, args->s_vals, args->log_values_buf,
+        args->combined, args->state,
+        args->T, args->H, args->B, 0);
+}
+
+void run_fusedscan_backward_checkpointed(FusedScanArgs* args) {
+    launch_fused_scan_backward_checkpointed<float>(
+        args->grad_combined, args->grad_state,
+        args->grad_out, args->grad_next_state,
+        args->combined, args->state,
+        args->a_star, args->s_vals, args->log_values_buf,
+        args->T, args->H, args->B, 0);
+}
+
 #ifdef USE_TORCH
 
 typedef struct {
@@ -745,6 +766,82 @@ void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
     fused_scan_cpp(args->combined, args->state);
 }
 
+void test_fusedscan_checkpointed_correct(FusedScanArgsTorch* args) {
+    // Run reference (non-checkpointed) kernel forward
+    auto combined_ref = args->combined.clone().requires_grad_(true);
+    auto state_ref = args->state.clone().requires_grad_(true);
+    combined_ref.retain_grad();
+    state_ref.retain_grad();
+    auto ref_outputs = fused_scan(combined_ref, state_ref);
+    auto ref_out = ref_outputs[0];
+    auto ref_next_state = ref_outputs[1];
+
+    // Run checkpointed forward kernel via raw launch
+    auto opts = torch::TensorOptions().dtype(args->combined.dtype()).device(torch::kCUDA);
+    auto opts_float = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    
+    auto out_ckpt = torch::empty({args->B, args->T, args->H}, opts);
+    auto next_state_ckpt = torch::empty({args->B, 1, args->H}, opts);
+    auto a_star = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    auto s_vals = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    auto log_values_buf = torch::empty({args->B, args->T + 1, args->H}, opts_float);
+    
+    launch_fused_scan_forward_checkpointed<float>(
+        out_ckpt.data_ptr<float>(),
+        next_state_ckpt.data_ptr<float>(),
+        a_star.data_ptr<float>(),
+        s_vals.data_ptr<float>(),
+        log_values_buf.data_ptr<float>(),
+        args->combined.data_ptr<float>(),
+        args->state.data_ptr<float>(),
+        args->T, args->H, args->B,
+        at::cuda::getCurrentCUDAStream());
+    cudaDeviceSynchronize();
+
+    // Numerical comparison - use same tolerances as other tests
+    float rtol = 1e-3f, atol = 1e-4f;
+    bool out_match = torch::allclose(out_ckpt, ref_out, rtol, atol);
+    float out_max_diff = (out_ckpt - ref_out).abs().max().item<float>();
+    bool next_state_match = torch::allclose(next_state_ckpt, ref_next_state, rtol, atol);
+    float next_state_max_diff = (next_state_ckpt - ref_next_state).abs().max().item<float>();
+
+    printf("  checkpointed forward correctness: out=%s(%.2e) next_state=%s(%.2e)\n",
+           out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff,
+           next_state_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", next_state_max_diff);
+
+    // Test backward pass - run reference backward
+    torch::autograd::backward({ref_out, ref_next_state}, {args->grad_out, args->grad_next_state});
+    auto grad_combined_ref = combined_ref.grad().clone();
+    auto grad_state_ref = state_ref.grad().clone();
+
+    // Run checkpointed backward
+    auto grad_combined_ckpt = torch::empty_like(args->combined);
+    auto grad_state_ckpt = torch::empty_like(args->state);
+
+    launch_fused_scan_backward_checkpointed<float>(
+        grad_combined_ckpt.data_ptr<float>(),
+        grad_state_ckpt.data_ptr<float>(),
+        args->grad_out.data_ptr<float>(),
+        args->grad_next_state.data_ptr<float>(),
+        args->combined.data_ptr<float>(),
+        args->state.data_ptr<float>(),
+        a_star.data_ptr<float>(),
+        s_vals.data_ptr<float>(),
+        log_values_buf.data_ptr<float>(),
+        args->T, args->H, args->B,
+        at::cuda::getCurrentCUDAStream());
+    cudaDeviceSynchronize();
+
+    bool grad_combined_match = torch::allclose(grad_combined_ckpt, grad_combined_ref, rtol, atol);
+    float grad_combined_max_diff = (grad_combined_ckpt - grad_combined_ref).abs().max().item<float>();
+    bool grad_state_match = torch::allclose(grad_state_ckpt, grad_state_ref, rtol, atol);
+    float grad_state_max_diff = (grad_state_ckpt - grad_state_ref).abs().max().item<float>();
+
+    printf("  checkpointed backward correctness: grad_combined=%s(%.2e) grad_state=%s(%.2e)\n",
+           grad_combined_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_combined_max_diff,
+           grad_state_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_state_max_diff);
+}
+
 #endif
 
 void profile_fusedscan(int batch, int seq, int hidden) {
@@ -759,8 +856,16 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     float bwd_ms = profile_kernel((kernel_fn)run_fusedscan_backward, args);
     print_timing("\tbackward", bwd_ms, batch*seq);
 
+    float fwd_ckpt_ms = profile_kernel((kernel_fn)run_fusedscan_forward_checkpointed, args);
+    print_timing("\tforward (checkpointed)", fwd_ckpt_ms, batch*seq);
+
+    float bwd_ckpt_ms = profile_kernel((kernel_fn)run_fusedscan_backward_checkpointed, args);
+    print_timing("\tbackward (checkpointed)", bwd_ckpt_ms, batch*seq);
+
 #ifdef USE_TORCH
     FusedScanArgsTorch* args_torch = create_fusedscanargs_torch(args);
+
+    test_fusedscan_checkpointed_correct(args_torch);
 
     float fwd_torch_ms = profile_kernel((kernel_fn)run_fusedscan_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, batch*seq);
@@ -1064,6 +1169,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
     free_ppolossargs(args);
 }
 
+/*
 // ============================================================================
 // sample_logits profiling
 // ============================================================================
@@ -1208,6 +1314,7 @@ void profile_samplelogits(int batch, int num_actions) {
 
     free_samplelogitsargs(args);
 }
+*/
 
 // ============================================================================
 // forward_call profiling (inference forward pass) - using GraphBuf
@@ -1219,24 +1326,38 @@ typedef struct {
     std::shared_ptr<PolicyMinGRU> policy;
     GraphBuf graph;
     Tensor rng_offset;
+    Tensor act_sizes;
+    Tensor act_sizes_cpu;
     uint64_t seed;
     bool use_kernels;
 } ForwardCallArgs;
 
 ForwardCallArgs* create_forwardcallargs(int batch, int input_size, int hidden_size,
-                                        int num_atns, int num_layers, bool use_kernels) {
+                                        int act_n, int num_layers, bool use_kernels) {
+    // act_n = total action space size (decoder output size)
+    // For discrete: num_action_heads=1, act_sizes=[act_n]
+    // For multidiscrete: num_action_heads=len(act_sizes), act_n=sum(act_sizes)
+    int num_action_heads = 1;  // Using discrete for profiling
+
     ForwardCallArgs* args = new ForwardCallArgs();
     args->use_kernels = use_kernels;
     args->seed = 42;
 
-    // Create policy
-    args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
+    // Create policy with default encoder/decoder
+    auto enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
+    auto dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, 1, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
 
     // Use create_graph factory (minibatch_segments=0 since not used for inference)
-    args->graph = create_graph(batch, input_size, 0, 0, num_layers, hidden_size, 1, args->policy.get());
+    // num_action_heads=1 for discrete action space
+    args->graph = create_graph(batch, input_size, 0, 0, num_layers, hidden_size, 1, num_action_heads, args->policy.get());
     args->graph.obs = torch::randn({batch, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
     args->rng_offset = torch::zeros({1}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+
+    // Create act_sizes tensor: for discrete, single entry with total action count
+    args->act_sizes = torch::tensor({act_n}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    args->act_sizes_cpu = torch::tensor({(int64_t)act_n}, torch::dtype(torch::kInt64));
 
     return args;
 }
@@ -1246,7 +1367,7 @@ void free_forwardcallargs(ForwardCallArgs* args) {
 }
 
 void run_forward_call(ForwardCallArgs* args) {
-    forward_call(args->graph, args->policy.get(), args->use_kernels, args->seed, args->rng_offset);
+    forward_call(args->graph, args->policy.get(), args->use_kernels, args->seed, args->rng_offset, args->act_sizes, args->act_sizes_cpu);
 }
 
 #endif
@@ -1299,7 +1420,8 @@ typedef struct {
     int buf; // current buffer index
 } RolloutCopyArgs;
 
-RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffers, int input_size) {
+RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffers, int input_size, int num_action_heads = 1) {
+    // num_action_heads = number of action heads (1 for discrete, >1 for multidiscrete)
     RolloutCopyArgs* args = new RolloutCopyArgs();
     args->horizon = horizon;
     args->num_envs = num_envs;
@@ -1310,13 +1432,13 @@ RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffe
     int block_size = num_envs / num_buffers;
 
     // Use factory functions
-    args->rollouts = create_rollouts(horizon, num_envs, input_size);
+    args->rollouts = create_rollouts(horizon, num_envs, input_size, num_action_heads);
     args->env = create_env(num_envs, input_size);
 
     // Create minimal graph for rollout (only rollout tensors needed, use dummy policy for state)
     auto opts = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
     args->graph.obs = torch::randn({block_size, input_size}, opts);
-    args->graph.actions = torch::randint(0, 4, {block_size}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    args->graph.actions = torch::randint(0, 4, {block_size, num_action_heads}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     args->graph.logprobs = torch::randn({block_size}, opts);
     args->graph.value = torch::randn({block_size}, opts);
 
@@ -1371,12 +1493,17 @@ typedef struct {
     HypersT hypers;
     Tensor adv_mean;
     Tensor adv_std;
+    Tensor act_sizes_cpu;
     bool use_kernels;
 } TrainForwardArgs;
 
 TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_size,
-                                          int hidden_size, int num_atns, int num_layers,
+                                          int hidden_size, int act_n, int num_layers,
                                           bool use_kernels) {
+    // act_n = total action space size (decoder output size)
+    // For discrete: num_action_heads=1, act_sizes=[act_n]
+    int num_action_heads = 1;  // Using discrete for profiling
+
     TrainForwardArgs* args = new TrainForwardArgs();
     args->use_kernels = use_kernels;
 
@@ -1389,8 +1516,10 @@ TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_s
     args->hypers.ent_coef = 0.01f;
     args->hypers.max_grad_norm = 0.5f;
 
-    // Create policy
-    args->policy = std::make_shared<PolicyMinGRU>(input_size, num_atns, hidden_size, 1, num_layers, use_kernels);
+    // Create policy with default encoder/decoder
+    auto enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
+    auto dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, 1, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
 
     // Create Muon optimizer
@@ -1398,11 +1527,24 @@ TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_s
         torch::optim::MuonOptions(0.0003).momentum(0.95).eps(1e-8));
 
     // Use create_graph factory (batch=0 since not used for training)
-    args->graph = create_graph(0, input_size, segments, horizon, num_layers, hidden_size, 1, args->policy.get());
+    // num_action_heads=1 for discrete action space
+    args->graph = create_graph(0, input_size, segments, horizon, num_layers, hidden_size, 1, num_action_heads, args->policy.get());
+
+    // Initialize mb_* tensors with test data for training
+    args->graph.mb_obs = torch::randn({segments, horizon, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->graph.mb_actions = torch::randint(0, act_n, {segments, horizon, num_action_heads}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+    args->graph.mb_logprobs = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA)) * 0.1f - 2.0f;  // ~log probs
+    args->graph.mb_advantages = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->graph.mb_values = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->graph.mb_returns = args->graph.mb_advantages + args->graph.mb_values;
+    args->graph.mb_prio = torch::ones({segments, 1}, torch::dtype(DTYPE).device(torch::kCUDA));
 
     // Adv normalization tensors
     args->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
     args->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
+
+    // Create act_sizes_cpu tensor: for discrete, single entry with total action count
+    args->act_sizes_cpu = torch::tensor({(int64_t)act_n}, torch::dtype(torch::kInt64));
 
     return args;
 }
@@ -1413,7 +1555,7 @@ void free_trainforwardargs(TrainForwardArgs* args) {
 }
 
 void run_train_forward_call(TrainForwardArgs* args) {
-    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std);
+    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std, args->act_sizes_cpu);
 }
 
 #endif
@@ -1503,21 +1645,21 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
 
     // Create kwargs for breakout
     Dict* kwargs = create_dict(32);
-    dict_set_int(kwargs, "frameskip", 4);
-    dict_set_int(kwargs, "width", 576);
-    dict_set_int(kwargs, "height", 330);
-    dict_set_int(kwargs, "paddle_width", 62);
-    dict_set_int(kwargs, "paddle_height", 8);
-    dict_set_int(kwargs, "ball_width", 32);
-    dict_set_int(kwargs, "ball_height", 32);
-    dict_set_int(kwargs, "brick_width", 32);
-    dict_set_int(kwargs, "brick_height", 12);
-    dict_set_int(kwargs, "brick_rows", 6);
-    dict_set_int(kwargs, "brick_cols", 18);
-    dict_set_int(kwargs, "initial_ball_speed", 256);
-    dict_set_int(kwargs, "max_ball_speed", 448);
-    dict_set_int(kwargs, "paddle_speed", 620);
-    dict_set_int(kwargs, "continuous", 0);
+    dict_set(kwargs, "frameskip", 4);
+    dict_set(kwargs, "width", 576);
+    dict_set(kwargs, "height", 330);
+    dict_set(kwargs, "paddle_width", 62);
+    dict_set(kwargs, "paddle_height", 8);
+    dict_set(kwargs, "ball_width", 32);
+    dict_set(kwargs, "ball_height", 32);
+    dict_set(kwargs, "brick_width", 32);
+    dict_set(kwargs, "brick_height", 12);
+    dict_set(kwargs, "brick_rows", 6);
+    dict_set(kwargs, "brick_cols", 18);
+    dict_set(kwargs, "initial_ball_speed", 256);
+    dict_set(kwargs, "max_ball_speed", 448);
+    dict_set(kwargs, "paddle_speed", 620);
+    dict_set(kwargs, "continuous", 0);
 
     // Create environments
     VecEnv* vec = profile_create_envs(num_envs, num_buffers, true, 0, kwargs);
@@ -1649,7 +1791,7 @@ int main(int argc, char** argv) {
         profile_logcoeffsandvalues(BT, T, H);
         profile_logcumsumexp(BT, T, H);
         profile_fusedscan(BT, T, H);
-        profile_samplelogits(BR, A);
+        //profile_samplelogits(BR, A);
         profile_ppoloss(BT, T, A);
     }
 

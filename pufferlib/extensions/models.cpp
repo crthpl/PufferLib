@@ -145,13 +145,13 @@ public:
                 out = proj * out;
             }
         } else {
-            // Training path: fully fused kernel
+            // Training path: fully fused kernel with checkpointing for reduced memory
             if (kernels) {
-                // fused_scan takes combined (B, T, 3*H) directly
+                // fused_scan_checkpointed takes combined (B, T, 3*H) directly
                 // output already has layout [hidden, gate, proj] from to_hidden_and_gate
-                TORCH_CHECK(output.is_contiguous(), "output not contiguous before fused_scan");
-                TORCH_CHECK(state.is_contiguous(), "state not contiguous before fused_scan");
-                auto scan_out = fused_scan(output, state);
+                TORCH_CHECK(output.is_contiguous(), "output not contiguous before fused_scan_checkpointed");
+                TORCH_CHECK(state.is_contiguous(), "state not contiguous before fused_scan_checkpointed");
+                auto scan_out = fused_scan_checkpointed(output, state);
                 out = scan_out[0];                // (B, T, H) = sigmoid(proj) * scan_result
                 next_prev_hidden = scan_out[1];   // (B, 1, H) = raw scan_result at T
             } else {
