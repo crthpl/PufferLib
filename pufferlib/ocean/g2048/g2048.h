@@ -165,43 +165,27 @@ static inline void place_tile_at_random_cell(Game* game, unsigned char tile) {
 
 void set_scaffolding_curriculum(Game* game) {
     if (game->lifetime_max_tile < 14) {
+        // Spawn one high tile from 8192 to 65536
         int curriculum = rand() % 5;
-
-        // Spawn one high tile from 8192, 16384, 32768, 65536
         unsigned char high_tile = max(12 + curriculum, game->lifetime_max_tile);
         place_tile_at_random_cell(game, high_tile);
 
     } else {
-        // base=14 until 65536 reached, then base=15 to practice for 131072
+        // base=14 until 65536 reached, then base=15 for 131072 practice
+        // All random placement, 1-2 tiles max
         unsigned char base = (game->lifetime_max_tile >= 16) ? 15 : 14;
-        int curriculum = rand() % 8;
+        int curriculum = rand() % 4;
 
-        if (curriculum < 2) { // curriculum 0, 1
-            place_tile_at_random_cell(game, base + curriculum);
-
+        if (curriculum == 0) {
+            place_tile_at_random_cell(game, base);
+        } else if (curriculum == 1) {
+            place_tile_at_random_cell(game, base + 1);
         } else if (curriculum == 2) {
-            // Place the tiles in the second row, so that they can be moved up in the first move
-            unsigned char tiles[] = {base, base - 1};
-            memcpy(game->grid[1], tiles, 2);
-            game->empty_count -= 2;
-        } else if (curriculum == 3) {  // harder
-            game->grid[1][0] = base; game->empty_count--;
-            place_tile_at_random_cell(game, base - 1);
-        } else if (curriculum == 4) {
-            unsigned char tiles[] = {base + 1, base};
-            memcpy(game->grid[1], tiles, 2);
-            game->empty_count -= 2;
-        } else if (curriculum == 5) {  // harder
-            game->grid[1][0] = base + 1; game->empty_count--;
-            place_tile_at_random_cell(game, base);
-        } else if (curriculum == 6) {
-            unsigned char tiles[] = {base + 1, base, base - 1};
-            memcpy(game->grid[1], tiles, 3);
-            game->empty_count -= 3;
-        } else if (curriculum == 7) {  // harder
-            game->grid[1][0] = base + 1; game->empty_count--;
             place_tile_at_random_cell(game, base);
             place_tile_at_random_cell(game, base - 1);
+        } else {
+            place_tile_at_random_cell(game, base + 1);
+            place_tile_at_random_cell(game, base);
         }
     }
 }
