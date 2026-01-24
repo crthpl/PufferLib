@@ -16,8 +16,13 @@
 #include <cstdio>
 #include <cstdint>
 
+#define WARP_SIZE 32
+#define PPO_THREADS 256
+#define FULL_MASK 0xffffffff
+
 #define SEQ_SIZE 256
 #define BLOCK_SIZE 256
+#define CHECKPOINT_INTERVAL 4  // Sparse checkpoint interval for optimized kernels
 inline int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
@@ -829,6 +834,94 @@ __global__ void fused_scan_forward_kernel(
     next_state[state_idx] = T(scan_result);
 }
 
+
+// Optimized forward kernel with checkpointing
+// Writes checkpoints only every CHECKPOINT_INTERVAL timesteps (vs every time)
+// Uses fast math intrinsics for better performance
+template<typename T>
+__global__ void fused_scan_forward_kernel_checkpointed(
+    T* __restrict__ out,                 // (B, T, H)
+    T* __restrict__ next_state,          // (B, 1, H)
+    float* __restrict__ a_star_buf,      // (B, T+1, H)
+    float* __restrict__ s_buf,           // (B, T+1, H)
+    float* __restrict__ log_values_buf,  // (B, T+1, H)
+    const T* __restrict__ combined,      // (B, T, 3*H)
+    const T* __restrict__ state,         // (B, 1, H)
+    int T_seq,
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int bH = b * H;
+    int H3 = 3 * H;
+    int H2 = 2 * H;
+    int bHT = bH * T_seq;
+    int out_base = bHT + h;
+    int cbase = 3 * bHT;
+
+    float a_star = 0.0f;
+    float log_value = 0.0f;
+
+    // Handle t=0 outside the loop: use log(state), coeff = 0
+    float s = __logf(float(state[bH + h]));
+    log_value = s;
+
+    int T_out = T_seq + 1;
+    int buf_base = b * T_out * H + h;
+    int buf_curr = buf_base;
+    a_star_buf[buf_curr] = a_star;
+    s_buf[buf_curr] = s;
+    log_values_buf[buf_curr] = log_value;
+
+    const T* combined_h_base = &combined[cbase + h];
+    const T* combined_g_base = &combined[cbase + H + h];
+    const T* combined_p_base = &combined[cbase + H2 + h];
+
+    // Loop t=1..T_seq with sparse checkpointing
+    float scan_result = 0.0f;
+    int out_curr = out_base;
+    int t_offset = 0;
+
+    for (int t = 1; t < T_seq + 1; t++) {
+        float hidden_val = float(combined_h_base[t_offset]);
+        float gate_val = float(combined_g_base[t_offset]);
+        float proj_val = float(combined_p_base[t_offset]);
+
+        float log_coeff_val;
+        log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value);
+
+        // a_star[t] = sum_{i=0}^t log_coeffs[i]
+        a_star += log_coeff_val;
+
+        float z = log_value - a_star;
+        float max_val = fmaxf(s, z);
+        s = max_val + log1pf(__expf(-fabsf(s - z)));
+
+        scan_result = __expf(a_star + s);
+        float proj_sigmoid = sigmoid(proj_val);
+
+        out[out_curr] = T(proj_sigmoid * scan_result);
+
+        buf_curr += H;
+        out_curr += H;
+        t_offset += H3;
+
+        if (t % CHECKPOINT_INTERVAL == 0) {
+            a_star_buf[buf_curr] = a_star;
+            s_buf[buf_curr] = s;
+            log_values_buf[buf_curr] = log_value;
+        }
+    }
+
+    // Write timestep T to next_state (raw scan_result, no proj, for recurrence)
+    next_state[bH + h] = T(scan_result);
+}
+
 // Fully fused backward: chains through sigmoid(proj)*out and log_coeffs_and_values
 // Takes combined (B, T, 3*H), outputs grad_combined (B, T, 3*H) = [grad_hidden, grad_gate, grad_proj]
 template<typename T>
@@ -946,6 +1039,156 @@ __global__ void fused_scan_backward_kernel(
         }
     }
 }
+
+// Optimized backward kernel with sparse checkpoint loading
+// Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
+// Uses fast math intrinsics for better performance
+template<typename T>
+__global__ void fused_scan_backward_kernel_checkpointed(
+    T* __restrict__ grad_combined,         // (B, T, 3*H)
+    T* __restrict__ grad_state,            // (B, 1, H)
+    const T* __restrict__ grad_out,        // (B, T, H)
+    const T* __restrict__ grad_next_state, // (B, 1, H)
+    const T* __restrict__ combined,        // (B, T, 3*H)
+    const T* __restrict__ state,           // (B, 1, H)
+    const float* __restrict__ a_star_buf,  // (B, T+1, H)
+    const float* __restrict__ s_buf,       // (B, T+1, H)
+    const float* __restrict__ log_values_buf, // (B, T+1, H)
+    int T_seq,                             // (T)
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int bHT = b * H * T_seq;
+    int cbase = 3 * bHT;
+    int H3 = 3 * H;
+    int H2 = 2 * H;
+    const int state_idx = b * H + h;
+    const int out_base = bHT + h;
+    
+    const T* combined_h_base = &combined[cbase + h];
+    const T* combined_g_base = &combined[cbase + H + h];
+    const T* combined_p_base = &combined[cbase + H2 + h];
+    
+    T* grad_combined_h_base = &grad_combined[cbase + h];
+    T* grad_combined_g_base = &grad_combined[cbase + H + h];
+    T* grad_combined_p_base = &grad_combined[cbase + H2 + h];
+    
+    int T_out = T_seq + 1;
+    int buf_base = b * T_out * H + h;
+
+    float acc = 0.0;
+    float s_val_next = 0.0;
+    float carry_grad_a = 0.0;
+    
+    for (int chunk_end = T_seq; chunk_end > 0; chunk_end -= CHECKPOINT_INTERVAL) {
+        int chunk_start = (chunk_end > CHECKPOINT_INTERVAL) ? (chunk_end - CHECKPOINT_INTERVAL) : 0;
+        int chunk_len = chunk_end - chunk_start;
+        
+        // Chunk storage in registers
+        float chunk_a_star[CHECKPOINT_INTERVAL];
+        float chunk_s[CHECKPOINT_INTERVAL];
+        float chunk_log_values[CHECKPOINT_INTERVAL];
+        float chunk_hidden[CHECKPOINT_INTERVAL];
+        float chunk_gate[CHECKPOINT_INTERVAL];
+        
+        // Load checkpoint from global memory
+        int ckpt_buf_idx = buf_base + chunk_start * H;
+        float recomp_a_star = a_star_buf[ckpt_buf_idx];
+        float recomp_s = s_buf[ckpt_buf_idx];
+        float recomp_log_value = log_values_buf[ckpt_buf_idx];
+        
+        // Recompute and store from chunk_start to chunk_end
+        for (int i = 0; i < chunk_len; ++i) {
+            int t = chunk_start + 1 + i;
+            int t_offset = (t - 1) * H3;
+            float hv = float(combined_h_base[t_offset]);
+            float gv = float(combined_g_base[t_offset]);
+            
+            float lc;
+            log_coeffs_and_values_fwd(gv, hv, &lc, &recomp_log_value);
+            recomp_a_star += lc;
+            
+            float z = recomp_log_value - recomp_a_star;
+            float mv = fmaxf(recomp_s, z);
+            recomp_s = mv + log1pf(__expf(-fabsf(recomp_s - z)));
+            
+            chunk_a_star[i] = recomp_a_star;
+            chunk_s[i] = recomp_s;
+            chunk_log_values[i] = recomp_log_value;
+            chunk_hidden[i] = hv;
+            chunk_gate[i] = gv;
+        }
+        
+        for (int i = chunk_len - 1; i >= 0; --i) {
+            int t = chunk_start + 1 + i;
+            int t_offset = (t - 1) * H3;
+            
+            float a_star_t = chunk_a_star[i];
+            float s_t = chunk_s[i];
+            float log_value_t = chunk_log_values[i];
+            float hidden_val = chunk_hidden[i];
+            float gate_val = chunk_gate[i];
+            
+            float proj_val = float(combined_p_base[t_offset]);
+            
+            float scan_result = __expf(a_star_t + s_t);
+            float z = log_value_t - a_star_t;
+            
+            float grad_out_val = float(grad_out[out_base + (t - 1) * H]);
+            
+            float grad_scan_from_next = (t == T_seq) ? float(grad_next_state[state_idx]) : 0.0f;
+            
+            float proj_sigmoid = sigmoid(proj_val);
+            float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
+            float grad_proj = grad_out_val * scan_result * proj_sigmoid * (1.0f - proj_sigmoid);
+            
+            float grad_log_h = grad_scan_result * scan_result;
+            float grad_s = grad_log_h;
+            
+            if (t == T_seq) {
+                acc = grad_s;
+            } else {
+                acc = grad_s + acc * __expf(s_t - s_val_next);
+            }
+            float grad_z = acc * __expf(z - s_t);
+            s_val_next = s_t;
+            
+            float grad_a = grad_log_h + carry_grad_a - grad_z;
+            carry_grad_a = grad_a;
+            
+            float grad_g, grad_h;
+            log_coeffs_and_values_bwd(grad_a, grad_z, gate_val, hidden_val, &grad_g, &grad_h);
+            
+            grad_combined_h_base[t_offset] = T(grad_h);
+            grad_combined_g_base[t_offset] = T(grad_g);
+            grad_combined_p_base[t_offset] = T(grad_proj);
+        }
+    }
+    
+    int ckpt_0_idx = buf_base;
+    float a_star_0 = a_star_buf[ckpt_0_idx];
+    float s_0 = s_buf[ckpt_0_idx];
+    float log_value_0 = log_values_buf[ckpt_0_idx];
+    
+    float scan_result_0 = __expf(a_star_0 + s_0);
+    float z_0 = log_value_0 - a_star_0;
+    
+    float grad_scan_result_0 = 0.0f;
+    float grad_log_h_0 = grad_scan_result_0 * scan_result_0;
+    float grad_s_0 = grad_log_h_0;
+    
+    acc = grad_s_0 + acc * __expf(s_0 - s_val_next);
+    float grad_z_0 = acc * __expf(z_0 - s_0);
+    
+    grad_state[state_idx] = T(grad_z_0 / float(state[state_idx]));
+}
+
 
 /*
 template<typename T>
@@ -1244,6 +1487,42 @@ void launch_fused_scan_forward(
     }
 }
 
+template<typename T>
+void launch_fused_scan_forward_checkpointed(
+    T* out,
+    T* next_state,
+    float* a_star,
+    float* s_vals,
+    float* log_values_buf,  // (B, T+1, H)
+    const T* combined,  // (B, T, 3*H)
+    const T* state,
+    int T_seq,
+    int H,
+    int B,
+    cudaStream_t stream
+) {
+    int total = B * H;
+    int grid = grid_size(total);
+
+    fused_scan_forward_kernel_checkpointed<T><<<grid, BLOCK_SIZE, 0, stream>>>(
+        out,
+        next_state,
+        a_star,
+        s_vals,
+        log_values_buf,
+        combined,
+        state,
+        T_seq,
+        H,
+        B
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel launch error in checkpointed forward: %s\n", cudaGetErrorString(err));
+    }
+}
+
 // Fully fused backward launch: outputs grad_combined (B, T, 3*H) = [grad_hidden, grad_gate, grad_proj]
 template<typename T>
 void launch_fused_scan_backward(
@@ -1284,6 +1563,49 @@ void launch_fused_scan_backward(
         fprintf(stderr, "CUDA kernel launch error in backward: %s\n", cudaGetErrorString(err));
     }
 }
+
+// Optimized backward launch with sparse checkpoint loading
+// Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
+template<typename T>
+void launch_fused_scan_backward_checkpointed(
+    T* grad_combined,   // (B, T, 3*H)
+    T* grad_state,
+    const T* grad_out,
+    const T* grad_next_state,
+    const T* combined,  // (B, T, 3*H)
+    const T* state,
+    const float* a_star_buf,  // (B, T+1, H)
+    const float* s_buf,       // (B, T+1, H)
+    const float* log_values_buf,  // (B, T+1, H)
+    int T_seq,
+    int H,
+    int B,
+    cudaStream_t stream
+) {
+    int total = B * H;
+    int grid = grid_size(total);
+
+    fused_scan_backward_kernel_checkpointed<T><<<grid, BLOCK_SIZE, 0, stream>>>(
+        grad_combined,
+        grad_state,
+        grad_out,
+        grad_next_state,
+        combined,
+        state,
+        a_star_buf,
+        s_buf,
+        log_values_buf,
+        T_seq,
+        H,
+        B
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel launch error in checkpointed backward: %s\n", cudaGetErrorString(err));
+    }
+}
+
 
 /*
 __device__ __forceinline__ float log_add_exp(const float a, const float b) {
@@ -1458,6 +1780,344 @@ void launch_logcumsumexp_backward(
     if (err != cudaSuccess)
         fprintf(stderr, "Backward kernel error: %s\n", cudaGetErrorString(err));
 }
+
+template<typename T>
+__global__ void ppo_loss_forward_kernel_optimized(
+    float* __restrict__ loss,
+    double* __restrict__ saved_for_backward,
+    const T* __restrict__ logits,
+    const T* __restrict__ values_pred,
+    const int64_t* __restrict__ actions,
+    const T* __restrict__ old_logprobs,
+    const T* __restrict__ advantages,
+    const T* __restrict__ prio,
+    const T* __restrict__ values,
+    const T* __restrict__ returns,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * T_seq;
+    if (idx >= total_elements) return;
+
+    __shared__ float block_loss[PPO_THREADS];
+
+    int n = idx / T_seq;
+    int t = idx % T_seq;
+    int nt = n * T_seq + t;
+    int logits_offset = n * T_seq * A + t * A;
+    int act = actions[nt];
+
+    float max_logit = -INFINITY;
+    float sum = 0.0f;
+    float act_logit = 0.0f;
+
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+
+        // cache the action's logit
+        if (a == act) {
+            act_logit = l;
+        }
+
+        // rescale
+        if (l > max_logit) {
+            sum *= __expf(max_logit - l);
+            max_logit = l;
+        }
+        sum += __expf(l - max_logit);
+    }
+
+    float logsumexp = max_logit + __logf(sum);
+
+    float entropy = 0.0f;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float logp = l - logsumexp;
+        float p = __expf(logp);
+        entropy -= p * logp;
+    }
+
+    float new_logp = act_logit - logsumexp;
+    float old_logp = float(old_logprobs[nt]);
+    float adv = float(advantages[nt]);
+    float w = float(prio[n]);
+    float adv_normalized = (adv - adv_mean[0]) / (adv_std[0] + 1e-8f);
+
+    float logratio = new_logp - old_logp;
+    float ratio = __expf(logratio);
+
+    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+    float wa = -w * adv_normalized;
+    float pg_loss1 = wa * ratio;
+    float pg_loss2 = wa * ratio_clipped;
+    float pg_loss = fmaxf(pg_loss1, pg_loss2);
+
+    float val = float(values[nt]);
+    float ret = float(returns[nt]);
+    float val_pred = float(values_pred[nt]);
+
+    float v_error = val_pred - val;
+    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
+    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
+
+    float thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * entropy) / float(total_elements);
+
+    int tid = threadIdx.x;
+    block_loss[tid] = thread_loss;
+    __syncthreads();
+
+    for (int stride = PPO_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            block_loss[tid] += block_loss[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(loss, block_loss[0]);
+    }
+}
+
+
+template<typename T>
+__global__ void ppo_loss_backward_kernel_optimized(
+    T* __restrict__ grad_logits,
+    T* __restrict__ grad_values_pred,
+    const float* __restrict__ grad_loss,
+    const T* __restrict__ logits,
+    const T* __restrict__ values_pred,
+    const int64_t* __restrict__ actions,
+    const T* __restrict__ old_logprobs,
+    const T* __restrict__ advantages,
+    const T* __restrict__ prio,
+    const T* __restrict__ values,
+    const T* __restrict__ returns,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * T_seq;
+    if (idx >= total_elements) return;
+
+    float inv_NT = 1.0f / float(total_elements);
+    int n = idx / T_seq;
+    int t = idx % T_seq;
+    int nt = n * T_seq + t;
+    int logits_offset = n * T_seq * A + t * A;
+    int act = actions[nt];
+
+    float old_logp = float(old_logprobs[nt]);
+    float adv = float(advantages[nt]);
+    float w = float(prio[n]);
+    float val = float(values[nt]);
+    float ret = float(returns[nt]);
+    float val_pred = float(values_pred[nt]);
+
+    float max_logit = -INFINITY;
+    float sum = 0.0f;
+    float act_logit = 0.0f;
+
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        if (a == act) act_logit = l;
+
+        if (l > max_logit) {
+            sum *= __expf(max_logit - l);
+            max_logit = l;
+        }
+        sum += __expf(l - max_logit);
+    }
+    float logsumexp = max_logit + __logf(sum);
+
+    float entropy = 0.0f;
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float logp = l - logsumexp;
+        float p = __expf(logp);
+        entropy -= p * logp;
+    }
+
+    // recompute values that were saved in forward
+    float new_logp = act_logit - logsumexp;
+    float ratio = __expf(new_logp - old_logp);
+    float v_error = val_pred - val;
+    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
+
+    // nrmalize advantage
+    float adv_normalized = (adv - adv_mean[0]) / (adv_std[0] + 1e-8f);
+
+    // loss gradient scaling
+    float dL = grad_loss[0] * inv_NT;
+    float d_pg_loss = dL;
+    float d_entropy_term = dL * (-ent_coef);
+
+    // gradient wrt value function prediction
+    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
+
+    float d_val_pred = 0.0f;
+    if (use_clipped_vf) {
+        if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
+            d_val_pred = v_clipped - ret;
+        }
+    } else {
+        d_val_pred = val_pred - ret;
+    }
+    grad_values_pred[nt] = T(dL * vf_coef * d_val_pred);
+
+    // policy loss gradient
+    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+    float pg_loss1 = -w * adv_normalized * ratio;
+    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+
+    float d_ratio = -w * adv_normalized * d_pg_loss;
+    if (pg_loss2 > pg_loss1) {
+        if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
+            d_ratio = 0.0f;
+        }
+    }
+    float d_new_logp = d_ratio * ratio;
+
+    for (int a = 0; a < A; a++) {
+        float l = float(logits[logits_offset + a]);
+        float logp = l - logsumexp;
+        float p = __expf(logp);
+
+        float d_logit = (a == act) ? d_new_logp : 0.0f;
+        d_logit -= p * d_new_logp;
+
+        d_logit += d_entropy_term * p * (entropy - logp);
+        grad_logits[logits_offset + a] = T(d_logit);
+    }
+}
+
+template<typename T>
+inline void launch_ppo_loss_forward_optimized(
+    float* loss_output,
+    double* saved_for_backward,
+    const T* logits,
+    const T* values_pred,
+    const int64_t* actions,
+    const T* old_logprobs,
+    const T* advantages,
+    const T* prio,
+    const T* values,
+    const T* returns,
+    const float* adv_mean,
+    const float* adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N,
+    cudaStream_t stream
+) {
+    int total = N * T_seq;
+    int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+    ppo_loss_forward_kernel_optimized<T><<<grid, PPO_THREADS, 0, stream>>>(
+        loss_output,
+        saved_for_backward,
+        logits,
+        values_pred,
+        actions,
+        old_logprobs,
+        advantages,
+        prio,
+        values,
+        returns,
+        adv_mean,
+        adv_std,
+        clip_coef,
+        vf_clip_coef,
+        vf_coef,
+        ent_coef,
+        T_seq,
+        A,
+        N
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "PPO forward optimized kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+template<typename T>
+void launch_ppo_loss_backward_optimized(
+    T* grad_logits,
+    T* grad_values_pred,
+    const float* grad_loss,
+    const T* logits,
+    const T* values_pred,    // added: need to read val_pred directly
+    const int64_t* actions,
+    const T* old_logprobs,
+    const T* advantages,
+    const T* prio,
+    const T* values,
+    const T* returns,
+    const float* adv_mean,
+    const float* adv_std,
+    float clip_coef,
+    float vf_clip_coef,
+    float vf_coef,
+    float ent_coef,
+    int T_seq,
+    int A,
+    int N,
+    cudaStream_t stream
+) {
+    int total = N * T_seq;
+    int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+
+    ppo_loss_backward_kernel_optimized<T><<<grid, PPO_THREADS, 0, stream>>>(
+        grad_logits,
+        grad_values_pred,
+        grad_loss,
+        logits,
+        values_pred,
+        actions,
+        old_logprobs,
+        advantages,
+        prio,
+        values,
+        returns,
+        adv_mean,
+        adv_std,
+        clip_coef,
+        vf_clip_coef,
+        vf_coef,
+        ent_coef,
+        T_seq,
+        A,
+        N
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "PPO backward optimized kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
 
 template<typename T>
 __global__ void ppo_loss_forward_kernel(
@@ -2064,6 +2724,20 @@ void launch_fused_scan_forward_bf16(at::BFloat16* out, at::BFloat16* next_state,
 void launch_fused_scan_backward_bf16(at::BFloat16* grad_combined, at::BFloat16* grad_state, const at::BFloat16* grad_out, const at::BFloat16* grad_next_state, const at::BFloat16* combined, const at::BFloat16* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
     launch_fused_scan_backward<at::BFloat16>(grad_combined, grad_state, grad_out, grad_next_state, combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B, stream);
 }
+// Non-templated wrappers for checkpointed fused scan - Float
+void launch_fused_scan_forward_checkpointed_float(float* out, float* next_state, float* a_star, float* s_vals, float* log_values_buf, const float* combined, const float* state, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_forward_checkpointed<float>(out, next_state, a_star, s_vals, log_values_buf, combined, state, T_seq, H, B, stream);
+}
+void launch_fused_scan_backward_checkpointed_float(float* grad_combined, float* grad_state, const float* grad_out, const float* grad_next_state, const float* combined, const float* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_backward_checkpointed<float>(grad_combined, grad_state, grad_out, grad_next_state, combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B, stream);
+}
+// Non-templated wrappers for checkpointed fused scan - BFloat16
+void launch_fused_scan_forward_checkpointed_bf16(at::BFloat16* out, at::BFloat16* next_state, float* a_star, float* s_vals, float* log_values_buf, const at::BFloat16* combined, const at::BFloat16* state, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_forward_checkpointed<at::BFloat16>(out, next_state, a_star, s_vals, log_values_buf, combined, state, T_seq, H, B, stream);
+}
+void launch_fused_scan_backward_checkpointed_bf16(at::BFloat16* grad_combined, at::BFloat16* grad_state, const at::BFloat16* grad_out, const at::BFloat16* grad_next_state, const at::BFloat16* combined, const at::BFloat16* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
+    launch_fused_scan_backward_checkpointed<at::BFloat16>(grad_combined, grad_state, grad_out, grad_next_state, combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B, stream);
+}
 void launch_logcumsumexp_forward_bf16(at::BFloat16* out, double* s_buf, const at::BFloat16* x, int T_total, int H, int B, cudaStream_t stream) {
     launch_logcumsumexp_forward<at::BFloat16>(out, s_buf, x, T_total, H, B, stream);
 }
@@ -2078,6 +2752,20 @@ void launch_ppo_loss_backward_bf16(at::BFloat16* grad_logits, at::BFloat16* grad
 }
 void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
     launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
+}
+
+void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+
+void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
+}
+void launch_ppo_loss_backward_optimized_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
 
 #endif // PUFFERLIB_KERNELS_CU
