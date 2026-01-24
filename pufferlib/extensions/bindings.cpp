@@ -78,11 +78,10 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     HypersT hypers;
-    // Layout
+    // Layout (total_agents and num_buffers come from vec config)
     hypers.segments = get_config(kwargs, "segments");
     hypers.horizon = get_config(kwargs, "horizon");
-    hypers.num_envs = get_config(kwargs, "num_envs");
-    hypers.num_agents = get_config(kwargs, "num_agents");
+    hypers.total_agents = get_config(kwargs, "total_agents");
     hypers.num_buffers = get_config(kwargs, "num_buffers");
     hypers.minibatch_segments = get_config(kwargs, "minibatch_segments");
     hypers.total_minibatches = get_config(kwargs, "total_minibatches");
@@ -175,7 +174,7 @@ PYBIND11_MODULE(_C, m) {
     py::class_<HypersT>(m, "HypersT")
         .def_readwrite("segments", &HypersT::segments)
         .def_readwrite("horizon", &HypersT::horizon)
-        .def_readwrite("num_envs", &HypersT::num_envs)
+        .def_readwrite("total_agents", &HypersT::total_agents)
         .def_readwrite("num_buffers", &HypersT::num_buffers)
         .def_readwrite("minibatch_segments", &HypersT::minibatch_segments)
         .def_readwrite("total_minibatches", &HypersT::total_minibatches)

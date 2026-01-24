@@ -65,19 +65,18 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 class PuffeRL:
     def __init__(self, config, logger=None, verbose=True):
         env_kwargs = config['env_kwargs']
-        num_envs = int(env_kwargs['num_envs'])
-        num_agents = int(env_kwargs['num_agents'])
-        self.num_envs = num_envs
+
+        # total_agents and num_buffers come from vec config
+        total_agents = int(config['total_agents'])
+        num_buffers = int(config['num_buffers'])
+        self.total_agents = total_agents
+        self.agents_per_batch = total_agents
 
         # Reproducibility
         seed = config['seed']
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-
-        total_agents = num_envs * num_agents
-        self.total_agents = total_agents
-        self.agents_per_batch = total_agents
 
         # Experience
         if config['batch_size'] == 'auto' and config['bptt_horizon'] == 'auto':
@@ -153,8 +152,6 @@ class PuffeRL:
         config['max_epochs'] = epochs
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
-        config['num_envs'] = self.num_envs
-        config['num_agents'] = int(env_kwargs['num_agents'])
         config['cudagraphs'] = True
         config['kernels'] = True
         config['num_buffers'] = 2
@@ -213,8 +210,8 @@ class PuffeRL:
         '''
         obs, act, rew, term = _C.env_buffers(self.pufferl_cpp)
 
-        num_buffers = 2
-        block_size = int(self.num_envs / num_buffers)
+        num_buffers = self.config['num_buffers']
+        block_size = int(self.total_agents / num_buffers)
         with torch.no_grad():
             for i in range(self.config['bptt_horizon']):
                 buf = i % num_buffers
@@ -769,6 +766,10 @@ def check(env_name):
 
     import pufferlib.python_pufferl
     train_config = dict(**args['train'])
+    train_config['env_name'] = args['env_name']
+    train_config['env_kwargs'] = args['env']
+    train_config['total_agents'] = args['vec']['total_agents']
+    train_config['num_buffers'] = args['vec']['num_buffers']
     pufferl_python = pufferlib.python_pufferl.PuffeRL(train_config, vecenv, policy, verbose=False)
 
     pufferl_cpp = PuffeRL(train_config, verbose=False)
@@ -846,6 +847,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     train_config['env_name'] = args['env_name']
     train_config['env_kwargs'] = args['env']
     train_config['policy_kwargs'] = args['policy']
+    train_config['total_agents'] = args['vec']['total_agents']
+    train_config['num_buffers'] = args['vec']['num_buffers']
     pufferl = PuffeRL(train_config, logger, verbose)
     pufferl.logger.init(args)
 
@@ -903,6 +906,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
     args = args or load_config(env_name)
     train_config = dict(**args['train'])#, env=env_name)
+    train_config['env_name'] = args['env_name']
+    train_config['env_kwargs'] = args['env']
+    train_config['total_agents'] = args['vec']['total_agents']
+    train_config['num_buffers'] = args['vec']['num_buffers']
     pufferl = PuffeRL(train_config, logger, verbose)
     # Warmup
     for _ in range(3):

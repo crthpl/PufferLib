@@ -117,7 +117,7 @@ float cosine_annealing(float lr_base, float lr_min, int t, int T) {
 }
 
 std::tuple<VecEnv*, Tensor, Tensor, Tensor, Tensor, Tensor>
-create_environments(int64_t num_envs, int num_buffers, const std::string& env_name, Dict* env_kwargs) {
+create_environments(int num_buffers, int total_agents, const std::string& env_name, Dict* env_kwargs) {
     std::string name = env_name;
     if (name.rfind("puffer_", 0) == 0) {
         name = name.substr(7);
@@ -155,10 +155,15 @@ create_environments(int64_t num_envs, int num_buffers, const std::string& env_na
         exit(1);
     }
 
-    VecEnv* vec = create_envs(num_envs, num_buffers, true, 0, env_kwargs);
-    int total_agents = vec->num_agents;
-    printf("DEBUG create_environments: num_envs=%d, vec->size=%d, vec->num_agents=%d\n",
-        (int)num_envs, vec->size, vec->num_agents);
+    // Create vec_kwargs with total_agents and num_buffers
+    Dict* vec_kwargs = create_dict(8);
+    dict_set(vec_kwargs, "total_agents", (double)total_agents);
+    dict_set(vec_kwargs, "num_buffers", (double)num_buffers);
+
+    // my_vec_init allocates envs and determines how many are needed
+    VecEnv* vec = create_envs(num_buffers, true, 0, vec_kwargs, env_kwargs);
+    printf("DEBUG create_environments: vec->size=%d, vec->total_agents=%d\n",
+        vec->size, vec->total_agents);
 
     auto obs_dtype = to_torch_dtype(obs_t);
     auto atn_dtype = to_torch_dtype(act_t);
@@ -230,8 +235,7 @@ typedef struct {
     // Layout
     int segments;
     int horizon;
-    int num_envs;
-    int num_agents;
+    int total_agents;
     int num_buffers;
     int minibatch_segments;
     int total_minibatches;
@@ -391,9 +395,8 @@ void forward_call(GraphBuf& graph, PolicyMinGRU* policy, bool kernels,
 }
 
 void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
-        HypersT& hypers, int h, int buf) {
-    int total_agents = hypers.num_envs * hypers.num_agents;
-    int block_size = total_agents / hypers.num_buffers;
+        int total_agents, int num_buffers, int h, int buf) {
+    int block_size = total_agents / num_buffers;
 
     // Store with non-blocking copies
     // Layout is {horizon, segments, ...}, so select(0, h) gives contiguous {segments, ...}
@@ -575,7 +578,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // act_sizes: 1D tensor of action space sizes per head
     // num_action_heads: number of action heads (for MultiDiscrete)
     // act_n: sum of action space sizes (decoder output dim)
-    auto [vec, obs, actions, rewards, terminals, act_sizes] = create_environments(hypers.num_envs, hypers.num_buffers, env_name, env_kwargs);
+    auto [vec, obs, actions, rewards, terminals, act_sizes] = create_environments(hypers.num_buffers, hypers.total_agents, env_name, env_kwargs);
     int num_action_heads = actions.size(1);
     int act_n = act_sizes.sum().item<int>();
 
@@ -628,13 +631,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // Allocate buffers
     int segments = hypers.segments;
     int horizon = hypers.horizon;
-    int total_agents = hypers.num_envs * hypers.num_agents;
+    int total_agents = vec->total_agents;
     int batch = total_agents / hypers.num_buffers;
     int num_buffers = hypers.num_buffers;
     int minibatch_segments = hypers.minibatch_segments;
 
-    printf("DEBUG: num_envs=%d, num_agents=%d, total_agents=%d, segments=%d, batch=%d, num_buffers=%d\n",
-        hypers.num_envs, hypers.num_agents, total_agents, segments, batch, num_buffers);
+    printf("DEBUG: num_envs=%d, total_agents=%d, segments=%d, batch=%d, num_buffers=%d\n",
+        vec->size, total_agents, segments, batch, num_buffers);
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
     pufferl->graph = create_graph(batch, input_size, minibatch_segments, horizon,
@@ -662,11 +665,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu);
         });
 
+        int total_agents = vec->total_agents;
+        int num_buffers = hypers.num_buffers;
         for (int i = 0; i < hypers.horizon; ++i) {
-            for (int j = 0; j < hypers.num_buffers; ++j) {
+            for (int j = 0; j < num_buffers; ++j) {
                 pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
-                capture_graph(&pufferl->rollout_copy_graphs[i][j], [p, i, j]() {
-                    rollout_copy_call(p->rollouts, p->env, p->graph, p->hypers, i, j);
+                capture_graph(&pufferl->rollout_copy_graphs[i][j], [p, total_agents, num_buffers, i, j]() {
+                    rollout_copy_call(p->rollouts, p->env, p->graph, total_agents, num_buffers, i, j);
                 });
             }
         }
@@ -675,9 +680,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
     // Try num_threads=0 to disable threading for debugging
     int num_threads = 8;
-    int block_size = hypers.num_envs / 16;
-    if (hypers.num_envs < num_threads) {
-        num_threads = hypers.num_envs;
+    int block_size = vec->size / 16;
+    if (vec->size < num_threads) {
+        num_threads = vec->size;
     }
     if (block_size < 1) {
         block_size = 1;
@@ -768,7 +773,7 @@ void rollouts_impl(PuffeRL& pufferl) {
     HypersT& hypers = pufferl.hypers;
 
     int horizon = hypers.horizon;
-    int total_agents = hypers.num_envs * hypers.num_agents;
+    int total_agents = pufferl.vec->total_agents;
     int num_buffers = hypers.num_buffers;
     int block_size = total_agents / num_buffers;
     // TODO: You removed state zeros and reward clamping
@@ -800,7 +805,8 @@ void rollouts_impl(PuffeRL& pufferl) {
         if (hypers.cudagraphs) {
             pufferl.rollout_copy_graphs[h][buf].replay();
         } else {
-            rollout_copy_call(pufferl.rollouts, pufferl.env, pufferl.graph, hypers, h, buf);
+            rollout_copy_call(pufferl.rollouts, pufferl.env, pufferl.graph,
+                pufferl.vec->total_agents, num_buffers, h, buf);
         }
         profile_end(hypers.profile);
 

@@ -77,6 +77,33 @@ typedef struct WorkerArg {
 void my_log(Log* log, Dict* out);
 void my_init(Env* env, Dict* args);
 
+// Optional: Initialize all envs at once (for shared state, etc.)
+// Allocates and returns Env* array, sets *num_envs_out
+// vec_kwargs contains: total_agents, num_buffers
+// env_kwargs contains env-specific config
+// Default implementation allocates max possible envs and loops over my_init
+Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs);
+#ifndef MY_VEC_INIT
+Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
+    int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
+    // Allocate max possible envs (1 agent per env worst case)
+    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+
+    int num_envs = 0;
+    int agents_created = 0;
+    while (agents_created < total_agents) {
+        srand(num_envs);
+        my_init(&envs[num_envs], env_kwargs);
+        agents_created += envs[num_envs].num_agents;
+        num_envs++;
+    }
+    // Shrink to actual size needed
+    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
+    *num_envs_out = num_envs;
+    return envs;
+}
+#endif
+
 void* my_shared(Env* env, Dict* kwargs);
 #ifndef MY_SHARED
 void* my_shared(Env* env, Dict* kwargs) {
@@ -149,11 +176,11 @@ static void* c_threadmanager(void* arg) {
     VecEnv* vec = (VecEnv*)arg;
     Threading* threading = vec->threading;
 
-    int envs_per_buffer = vec->size / vec->buffers;
-    int agents_per_buffer = vec->num_agents / vec->buffers;
+    int agents_per_buffer = vec->total_agents / vec->buffers;
     atomic_int* buffer_states = threading->buffer_states;
     long iters = 0;
     int curr_buf = 0;
+    long min_expected = 0;
 
     while (1) {
         for (int buf=0; buf < vec->buffers; buf++) {
@@ -161,8 +188,10 @@ static void* c_threadmanager(void* arg) {
             bool cuda_ready = !threading->use_gpu || cudaStreamQuery(vec->streams[buf]) == cudaSuccess;
             if (state == ATN_READY_ON_GPU && cuda_ready) {
                 update_buffer_state(threading, buf, ATN_READY_ON_CPU);
+                int num_envs = vec->buffer_env_counts[buf];
                 pthread_mutex_lock(&threading->wake_mutex);
-                threading->end_index += envs_per_buffer;
+                threading->end_index += num_envs;
+                min_expected += num_envs;
                 pthread_cond_broadcast(&threading->wake_cond);
                 pthread_mutex_unlock(&threading->wake_mutex);
             }
@@ -171,7 +200,6 @@ static void* c_threadmanager(void* arg) {
                 continue;
             }
 
-            long min_expected = (iters + 1) * envs_per_buffer;
             threading->min_expected = min_expected;
             long min_completed = LONG_MAX;
             for (int i=0; i<threading->num_threads; i++) {
@@ -221,8 +249,11 @@ static void* c_threadmanager(void* arg) {
 }
  
 __attribute__((visibility("default")))
-VecEnv* create_environments(int num_envs, int buffers, bool use_gpu, int test_idx, Dict* kwargs) {
-    Env* envs = (Env*)calloc(num_envs, sizeof(Env));
+VecEnv* create_environments(int buffers, bool use_gpu, int test_idx, Dict* vec_kwargs, Dict* env_kwargs) {
+    // my_vec_init allocates envs and determines how many are needed
+    int num_envs = 0;
+    Env* envs = my_vec_init(&num_envs, vec_kwargs, env_kwargs);
+
     VecEnv* vec = (VecEnv*)calloc(1, sizeof(VecEnv));
     vec->envs = envs;
     vec->size = num_envs;
@@ -231,66 +262,109 @@ VecEnv* create_environments(int num_envs, int buffers, bool use_gpu, int test_id
     vec->threading->use_gpu = use_gpu;
     vec->threading->test_idx = test_idx;
 
-    int num_agents = 0;
+    // Get total_agents from vec config - this is the padded total
+    int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
+    int agents_per_buffer = total_agents / buffers;
+    vec->total_agents = total_agents;
+    vec->agents_per_buffer = agents_per_buffer;
+
+    // Allocate buffer tracking arrays
+    vec->buffer_env_starts = (int*)calloc(buffers, sizeof(int));
+    vec->buffer_env_counts = (int*)calloc(buffers, sizeof(int));
+
+    // Assign envs to buffers and validate
+    int current_buf = 0;
+    int current_buf_agents = 0;
+    vec->buffer_env_starts[0] = 0;
+
     for (int i = 0; i < num_envs; i++) {
-        srand(i);
-        my_init(&envs[i], kwargs);
-        num_agents += envs[i].num_agents;
+        int env_agents = envs[i].num_agents;
+
+        // Check if adding this env exceeds buffer limit
+        if (current_buf_agents + env_agents > agents_per_buffer) {
+            if (current_buf >= buffers - 1) {
+                fprintf(stderr, "ERROR: Env %d with %d agents overruns last buffer (has %d, limit %d)\n",
+                    i, env_agents, current_buf_agents, agents_per_buffer);
+                assert(0 && "my_vec_init created too many agents for buffer capacity");
+            }
+            current_buf++;
+            vec->buffer_env_starts[current_buf] = i;
+            current_buf_agents = 0;
+        }
+
+        vec->buffer_env_counts[current_buf]++;
+        current_buf_agents += env_agents;
     }
 
-    /*
-    vec->observations = calloc(num_agents*OBS_SIZE, sizeof(OBS_DTYPE));
-    vec->actions = (float*)calloc(num_agents*NUM_ATNS, sizeof(float));
-    vec->rewards = (float*)calloc(num_agents, sizeof(float));
-    vec->terminals = (unsigned char*)calloc(num_agents, sizeof(unsigned char));
-    */
-    //printf("Size of alloc: %d\n", num_agents*OBS_SIZE*sizeof(OBS_DTYPE));
-    //printf("Before allocated mem host\n");
+    // Allocate memory for total_agents (includes padding)
     if (use_gpu) {
         cudaSetDevice(0);
-        CHECK_CUDA(cudaHostAlloc((void**)&vec->observations, num_agents*OBS_SIZE*sizeof(OBS_DTYPE), cudaHostAllocPortable));
-        CHECK_CUDA(cudaHostAlloc((void**)&vec->actions, num_agents*NUM_ATNS*sizeof(double), cudaHostAllocPortable));
-        CHECK_CUDA(cudaHostAlloc((void**)&vec->rewards, num_agents*sizeof(float), cudaHostAllocPortable));
-        CHECK_CUDA(cudaHostAlloc((void**)&vec->terminals, num_agents*sizeof(float), cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc((void**)&vec->observations, total_agents*OBS_SIZE*sizeof(OBS_DTYPE), cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc((void**)&vec->actions, total_agents*NUM_ATNS*sizeof(double), cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc((void**)&vec->rewards, total_agents*sizeof(float), cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc((void**)&vec->terminals, total_agents*sizeof(float), cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc((void**)&vec->mask, total_agents*sizeof(float), cudaHostAllocPortable));
     } else {
-        vec->observations = calloc(num_agents*OBS_SIZE, sizeof(OBS_DTYPE));
-        vec->actions = calloc(num_agents*NUM_ATNS, sizeof(double));
-        vec->rewards = calloc(num_agents, sizeof(float));
-        vec->terminals = calloc(num_agents, sizeof(float));
+        vec->observations = calloc(total_agents*OBS_SIZE, sizeof(OBS_DTYPE));
+        vec->actions = calloc(total_agents*NUM_ATNS, sizeof(double));
+        vec->rewards = calloc(total_agents, sizeof(float));
+        vec->terminals = calloc(total_agents, sizeof(float));
+        vec->mask = calloc(total_agents, sizeof(float));
     }
 
-    memset(vec->observations, 0, num_agents*OBS_SIZE*sizeof(OBS_DTYPE));
-    memset(vec->actions, 0, num_agents*NUM_ATNS*sizeof(double));
-    memset(vec->rewards, 0, num_agents*sizeof(float));
-    memset(vec->terminals, 0, num_agents*sizeof(float));
-    //printf("allocated mem host\n");
+    memset(vec->observations, 0, total_agents*OBS_SIZE*sizeof(OBS_DTYPE));
+    memset(vec->actions, 0, total_agents*NUM_ATNS*sizeof(double));
+    memset(vec->rewards, 0, total_agents*sizeof(float));
+    memset(vec->terminals, 0, total_agents*sizeof(float));
+    memset(vec->mask, 0, total_agents*sizeof(float));
 
     if (use_gpu) {
-        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_observations, num_agents*OBS_SIZE*sizeof(OBS_DTYPE)));
-        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_actions, num_agents*NUM_ATNS*sizeof(double)));
-        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_rewards, num_agents*sizeof(float)));
-        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_terminals, num_agents*sizeof(float)));
-        cudaMemset(vec->gpu_observations, 0, num_agents*OBS_SIZE*sizeof(OBS_DTYPE));
-        cudaMemset(vec->gpu_actions, 0, num_agents*NUM_ATNS*sizeof(double));
-        cudaMemset(vec->gpu_rewards, 0, num_agents*sizeof(float));
-        cudaMemset(vec->gpu_terminals, 0, num_agents*sizeof(float));
+        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_observations, total_agents*OBS_SIZE*sizeof(OBS_DTYPE)));
+        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_actions, total_agents*NUM_ATNS*sizeof(double)));
+        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_rewards, total_agents*sizeof(float)));
+        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_terminals, total_agents*sizeof(float)));
+        CHECK_CUDA(cudaMalloc((void**)&vec->gpu_mask, total_agents*sizeof(float)));
+        cudaMemset(vec->gpu_observations, 0, total_agents*OBS_SIZE*sizeof(OBS_DTYPE));
+        cudaMemset(vec->gpu_actions, 0, total_agents*NUM_ATNS*sizeof(double));
+        cudaMemset(vec->gpu_rewards, 0, total_agents*sizeof(float));
+        cudaMemset(vec->gpu_terminals, 0, total_agents*sizeof(float));
+        cudaMemset(vec->gpu_mask, 0, total_agents*sizeof(float));
     } else {
         vec->gpu_observations = vec->observations;
         vec->gpu_actions = vec->actions;
         vec->gpu_rewards = vec->rewards;
         vec->gpu_terminals = vec->terminals;
+        vec->gpu_mask = vec->mask;
     }
 
-    vec->num_agents = num_agents;
+    // Assign env pointers and set mask for real agents
+    // Agents are laid out per-buffer with padding at end of each buffer
+    for (int buf = 0; buf < buffers; buf++) {
+        int buf_start = buf * agents_per_buffer;
+        int buf_agent = 0;
+        int env_start = vec->buffer_env_starts[buf];
+        int env_count = vec->buffer_env_counts[buf];
 
-    int agent = 0;
-    for (int i = 0; i < num_envs; i++) {
-        Env* env = &envs[i];
-        env->observations = (OBS_DTYPE*)vec->observations + agent*OBS_SIZE;
-        env->actions = vec->actions + agent*NUM_ATNS;
-        env->rewards = vec->rewards + agent;
-        env->terminals = vec->terminals + agent;
-        agent += env->num_agents;
+        for (int e = 0; e < env_count; e++) {
+            Env* env = &envs[env_start + e];
+            int slot = buf_start + buf_agent;
+            env->observations = (OBS_DTYPE*)vec->observations + slot*OBS_SIZE;
+            env->actions = vec->actions + slot*NUM_ATNS;
+            env->rewards = vec->rewards + slot;
+            env->terminals = vec->terminals + slot;
+
+            // Set mask to 1.0 for real agents
+            for (int a = 0; a < env->num_agents; a++) {
+                vec->mask[slot + a] = 1.0f;
+            }
+            buf_agent += env->num_agents;
+        }
+        // Remaining slots in buffer are padding (mask stays 0.0)
+    }
+
+    // Copy mask to GPU
+    if (use_gpu) {
+        cudaMemcpy(vec->gpu_mask, vec->mask, total_agents*sizeof(float), cudaMemcpyHostToDevice);
     }
 
     return vec;
@@ -361,19 +435,19 @@ void vec_reset(VecEnv* vec) {
     cudaMemcpy(
         vec->gpu_observations,
         vec->observations,
-        vec->num_agents*OBS_SIZE*sizeof(OBS_DTYPE),
+        vec->total_agents*OBS_SIZE*sizeof(OBS_DTYPE),
         cudaMemcpyHostToDevice
     );
     cudaMemcpy(
         vec->gpu_rewards,
         vec->rewards,
-        vec->num_agents*sizeof(float),
+        vec->total_agents*sizeof(float),
         cudaMemcpyHostToDevice
     );
     cudaMemcpy(
         vec->gpu_terminals,
         vec->terminals,
-        vec->num_agents*sizeof(float),
+        vec->total_agents*sizeof(float),
         cudaMemcpyHostToDevice
     );
     cudaDeviceSynchronize();
@@ -387,9 +461,9 @@ void vec_reset(VecEnv* vec) {
 }
 
 void vec_send(VecEnv* vec, int buffer) {
-    int envs_per_buffer = vec->size / vec->buffers;
-    int env_start = buffer * envs_per_buffer;
-    int agents_per_buffer = vec->num_agents / vec->buffers;
+    int env_start = vec->buffer_env_starts[buffer];
+    int env_count = vec->buffer_env_counts[buffer];
+    int agents_per_buffer = vec->total_agents / vec->buffers;
     int start = buffer * agents_per_buffer;
 
     Threading* threading = vec->threading;
@@ -403,7 +477,7 @@ void vec_send(VecEnv* vec, int buffer) {
             agents_per_buffer*NUM_ATNS*sizeof(double),
             cudaMemcpyDeviceToHost
         );
-        for (int i = env_start; i < env_start + envs_per_buffer; i++) {
+        for (int i = env_start; i < env_start + env_count; i++) {
             Env* env = &vec->envs[i];
             c_step(env);
         }

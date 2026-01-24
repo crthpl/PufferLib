@@ -32,7 +32,12 @@ typedef struct Threading Threading;
 typedef struct {
     Env* envs;
     int size;
-    int num_agents;
+    int total_agents;
+    int agents_per_buffer;  // Fixed size per buffer (includes padding)
+    int* buffer_env_starts; // Starting env index for each buffer
+    int* buffer_env_counts; // Number of envs in each buffer
+    float* mask;            // 1.0 for real agents, 0.0 for padding
+    float* gpu_mask;
     void* observations;
     double* actions;
     float* rewards;
@@ -109,7 +114,7 @@ void my_log(Log* log, Dict* out);
 // Define function types to be exported to the shared library
 // You don't need these, but you have to do some really gross
 // casts after loading the library without them.
-typedef VecEnv* (*create_environments_fn)(int num_envs, int buffers, bool use_gpu, int test_idx, Dict* kwargs);
+typedef VecEnv* (*create_environments_fn)(int buffers, bool use_gpu, int test_idx, Dict* vec_kwargs, Dict* env_kwargs);
 typedef Env* (*env_init_fn)(float* observations, double* actions, float* rewards,
         float* terminals, int seed, Dict* kwargs);
 typedef void (*create_threads_fn)(VecEnv* vec, int threads, int block_size);
