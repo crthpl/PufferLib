@@ -1,7 +1,7 @@
 #include "g2048.h"
 #include "g2048_net.h"
 
-#define OBS_DIM 289
+#define OBS_DIM 16
 #define HIDDEN_DIM 512
 
 // Set NO_RENDER to true to run evals without the render
@@ -11,12 +11,7 @@
 int main() {
     srand(time(NULL));
     Game env = {
-        .can_go_over_65536 = true,
-        .reward_scaler = 0.0,
-        .endgame_env_prob = 0.0,
         .scaffolding_ratio = 0.0,
-        .use_heuristic_rewards = false,
-        .snake_reward_weight = 0.0,
     };
     init(&env);
 
@@ -30,8 +25,8 @@ int main() {
     env.actions = actions;
     env.rewards = rewards;
 
-    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 3713541);
-    G2048Net* net = make_g2048net(weights, OBS_DIM, HIDDEN_DIM);
+    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 3466859);
+    G2048Net* net = make_g2048net(weights, HIDDEN_DIM);
     c_reset(&env);
     if (!NO_RENDER) c_render(&env);
     printf("Starting...\n");

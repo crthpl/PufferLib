@@ -6,9 +6,7 @@ def evaluate(env_name, load_model_path):
     args['env']['num_envs'] = 4096
     args['load_model_path'] = load_model_path
     # Turn off endgame_envs and scaffolding episodes, which do not report results
-    args['env']['endgame_env_prob'] = 0
     args['env']['scaffolding_ratio'] = 0
-    args['env']['can_go_over_65536'] = True
 
     vecenv = pufferl.load_env(env_name, args)
     policy = pufferl.load_policy(args, vecenv, env_name)
@@ -33,6 +31,7 @@ def evaluate(env_name, load_model_path):
     merge_scores = sum(n * s for n, s in zip(stats['n'], stats['merge_score'])) / num_episodes
     reached_32768 = sum(n * s for n, s in zip(stats['n'], stats['reached_32768'])) / num_episodes
     reached_65536 = sum(n * s for n, s in zip(stats['n'], stats['reached_65536'])) / num_episodes
+    reached_131072 = sum(n * s for n, s in zip(stats['n'], stats['reached_131072'])) / num_episodes
 
     print(f"Num episodes: {int(num_episodes)}")
     print(f"Max tile avg: {max_tiles:.1f}")
@@ -41,24 +40,9 @@ def evaluate(env_name, load_model_path):
     print(f"Merge score -- Avg: {merge_scores:.1f}, Max: {max(stats['merge_score']):.1f}")
     print(f"Reached 32768 prob: {reached_32768*100:.2f} %")
     print(f"Reached 65536 prob: {reached_65536*100:.2f} %")
+    print(f"Reached 131072 prob: {reached_131072*100:.2f} %")
 
     """
-    # hidden 256: https://wandb.ai/kywch/pufferlib/runs/nvd0pfuj?nw=nwuserkywch
-    Num episodes: 154406
-    Max tile avg: 22532.9
-    Episode length -- Avg: 16667.2, Max: 26659.1
-    Merge score -- Avg: 462797.9, Max: 744224.9
-    Reached 32768 prob: 46.08 %
-    Reached 65536 prob: 3.53 %
-
-    # hidden 512: https://wandb.ai/kywch/pufferlib/runs/2ch3my60?nw=nwuserkywch
-    Num episodes: 119243
-    Max tile avg: 30662.2
-    Episode length -- Avg: 21539.7, Max: 29680.3
-    Merge score -- Avg: 618011.8, Max: 918755.8
-    Reached 32768 prob: 68.25 %
-    Reached 65536 prob: 13.09 %
-
     # hidden 512 (replication): https://wandb.ai/kywch/pufferlib/runs/5thsjr61?nw=nwuserkywch
     Num episodes: 115652
     Max tile avg: 31773.2
@@ -66,17 +50,29 @@ def evaluate(env_name, load_model_path):
     Merge score -- Avg: 639395.6, Max: 909969.8
     Reached 32768 prob: 71.22 %
     Reached 65536 prob: 14.75 %
+
+    # embeddings: https://wandb.ai/thatguy11325/pufferlib/runs/g2f00pcm?nw=nwuserthatguy11325
+    Num episodes: 192276
+    Max tile avg: 33166.4
+    Episode length -- Avg: 26950.7, Max: 44906.1
+    Merge score -- Avg: 770645.8, Max: 1040367.2
+    Reached 32768 prob: 85.32 %
+    Reached 65536 prob: 10.15 %
+
+    # embeddings + new reward: https://wandb.ai/kywch/pufferlib/runs/1v5kls7l?nw=nwuserkywch
+    Num episodes: 95611
+    Max tile avg: 40980.9
+    Episode length -- Avg: 26792.1, Max: 37442.2
+    Merge score -- Avg: 779238.6, Max: 997571.8
+    Reached 32768 prob: 84.88 %
+    Reached 65536 prob: 33.96 %
+    Reached 131072 prob: 0.00 %    
     """
 
 def finetune(env_name, load_model_path):
     args = pufferl.load_config(env_name)
     args['load_model_path'] = load_model_path
-    # args['env']['use_sparse_reward'] = True
     args['env']['scaffolding_ratio'] = 0.85
-
-    # args['policy']['hidden_size'] = 512
-    # args['rnn']['input_size'] = 512
-    # args['rnn']['hidden_size'] = 512
 
     args['train']['total_timesteps'] = 1_000_000_000
     args['train']['learning_rate'] = 0.00005
@@ -90,12 +86,15 @@ def finetune(env_name, load_model_path):
 if __name__ == '__main__':
     import os
     import wandb
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--entity', type=str, default='kywch')
+    parser.add_argument('--run-id', type=str, default='1v5kls7l')
 
-    # https://wandb.ai/kywch/pufferlib/runs/5thsjr61?nw=nwuserkywch
-    wandb_run_id = '5thsjr61'
-    wandb.init(id=wandb_run_id, project='pufferlib', entity='kywch')
+    args = parser.parse_args()
 
-    artifact = wandb.use_artifact(f'{wandb_run_id}:latest')
+    wandb.init(id=args.run_id, project='pufferlib', entity=args.entity)
+    artifact = wandb.use_artifact(f'{args.run_id}:latest')
     data_dir = artifact.download()
     model_file = max(os.listdir(data_dir))
     model_path = f'{data_dir}/{model_file}'
