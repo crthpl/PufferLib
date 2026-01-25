@@ -119,9 +119,10 @@ typedef struct PacmanEnv {
         int chase_mode_length;
 
         float *observations;
-        int *actions;
+        double *actions;
         float *rewards;
-        char *terminals;
+        float *terminals;
+        int num_agents;
         Log log;
 
         int step_count;
@@ -229,9 +230,9 @@ void init(PacmanEnv *env) {
 void allocate(PacmanEnv *env) {
     init(env);
     env->observations = (float *)calloc(OBSERVATIONS_COUNT, sizeof(float));
-    env->actions = (int *)calloc(1, sizeof(int));
+    env->actions = (double *)calloc(1, sizeof(double));
     env->rewards = (float *)calloc(1, sizeof(float));
-    env->terminals = (char *)calloc(1, sizeof(char));
+    env->terminals = (float *)calloc(1, sizeof(float));
 }
 
 void c_close(PacmanEnv *env) {

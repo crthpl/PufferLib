@@ -153,10 +153,11 @@ void trigger_banner(Client* client, int type);
 struct CTowerClimb {
     Client* client;
     unsigned char* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     unsigned char* truncations;
+    int num_agents;
     Log log;
     Log buffer;
     float score;
@@ -235,9 +236,9 @@ CTowerClimb* allocate() {
     CTowerClimb* env = (CTowerClimb*)calloc(1, sizeof(CTowerClimb));
     init(env);
     env->observations = (unsigned char*)calloc(OBS_VISION+PLAYER_OBS, sizeof(unsigned char));
-    env->actions = (int*)calloc(1, sizeof(int));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
     return env;
 }
 
@@ -325,7 +326,7 @@ void compute_observations(CTowerClimb* env) {
 }
 
 void c_reset(CTowerClimb* env) {
-    env->terminals[0] = 0;
+    env->terminals[0] = 0.0f;
     env->rows_cleared = 0;
     env->goal_reached = false;
     env->celebrationStarted = false;

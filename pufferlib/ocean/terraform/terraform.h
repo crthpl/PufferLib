@@ -76,16 +76,16 @@ typedef struct Terraform {
     Client* client;
     Dozer* dozers;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
     float* returns;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     int size;
     int tick;
     float* orig_map;
     float* map;
     float* target_map;
-    int num_agents;
     int reset_frequency;
     float reward_scale;
     float initial_total_delta;  
@@ -576,16 +576,16 @@ void c_step(Terraform* env) {
         return;
     }
 
-    memset(env->terminals, 0, env->num_agents*sizeof(unsigned char));
+    memset(env->terminals, 0, env->num_agents*sizeof(float));
     memset(env->rewards, 0, env->num_agents*sizeof(float));
-    int (*actions)[3] = (int(*)[3])env->actions; 
+    double (*actions)[3] = (double(*)[3])env->actions;
     for (int i = 0; i < env->num_agents; i++) {
         env->agent_logs[i].episode_length = env->tick;
         Dozer* dozer = &env->dozers[i];
-        int* atn = actions[i];
-        float accel = ((float)atn[0] - 2.0f) / 2.0f; // Discrete(5) -> [-1, 1]
-        float steer = ((float)atn[1] - 2.0f) / 10.0f; // Discrete(5) -> [-0.2, 0.2]
-        int bucket_atn = atn[2];
+        double* atn = actions[i];
+        float accel = (atn[0] - 2.0) / 2.0; // Discrete(5) -> [-1, 1]
+        float steer = (atn[1] - 2.0) / 10.0; // Discrete(5) -> [-0.2, 0.2]
+        int bucket_atn = (int)atn[2];
 
         float cx = dozer->x + BUCKET_OFFSET*cosf(dozer->heading);
         float cy = dozer->y + BUCKET_OFFSET*sinf(dozer->heading);

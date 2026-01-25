@@ -64,9 +64,10 @@ typedef struct CGo CGo;
 struct CGo {
     Client* client;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     Log log;
     float score;
     int width;
@@ -154,9 +155,9 @@ void init(CGo* env) {
 void allocate(CGo* env) {
     init(env);
     env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*2 + 2, sizeof(float));
-    env->actions = (int*)calloc(1, sizeof(int));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
 }
 
 void c_close(CGo* env) {
@@ -519,7 +520,7 @@ void enemy_random_move(CGo* env){
         }
     }
     // If no move is possible, pass or end the game
-    env->terminals[0] = 1;
+    env->terminals[0] = 1.0f;
 }
 
 int find_group_liberty(CGo* env, int root){
@@ -623,7 +624,7 @@ void enemy_greedy_easy(CGo* env){
 void c_reset(CGo* env) {
     env->tick = 0;
     // We don't reset the log struct - leave it accumulating like in Pong
-    env->terminals[0] = 0;
+    env->terminals[0] = 0.0f;
     env->score = 0;
     for (int i = 0; i < (env->grid_size)*(env->grid_size); i++) {
         env->board_states[i] = 0;
@@ -664,7 +665,7 @@ void c_step(CGo* env) {
     // useful for training , can prob be a hyper param. Recommend to increase with larger board size
     float max_moves = 3 * env->grid_size * env->grid_size;
     if (env->tick > max_moves) {
-         env->terminals[0] = 1;
+         env->terminals[0] = 1.0f;
          end_game(env);
          compute_observations(env);
          return;

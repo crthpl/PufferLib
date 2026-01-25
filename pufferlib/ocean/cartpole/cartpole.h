@@ -31,11 +31,12 @@ struct Client {
 typedef struct Cartpole Cartpole;
 struct Cartpole {
     float* observations;
-    float* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     unsigned char* truncations;
     Log log;
+    int num_agents;
     Client* client;
     float x;
     float x_dot;
@@ -74,9 +75,9 @@ void init(Cartpole* env) {
 void allocate(Cartpole* env) {
     init(env);
     env->observations = (float*)calloc(4, sizeof(float));
-    env->actions = (float*)calloc(1, sizeof(float));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
 }
 
 void free_allocated(Cartpole* env) {

@@ -353,10 +353,11 @@ struct MOBA {
     unsigned char* ai_paths;
     int* ai_path_buffer;
     unsigned char* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     unsigned char* truncations;
+    int num_agents;
     Entity* entities;
     Reward* reward_components;
     Log log;
@@ -1489,21 +1490,21 @@ void step_players(MOBA* env) {
             }
             */
         } else {
-            int (*actions)[6] = (int(*)[6])env->actions;
+            double (*actions)[6] = (double(*)[6])env->actions;
             //float vel_y = (actions[pid][0] > 0) ? 1 : -1;
             //float vel_x = (actions[pid][1] > 0) ? 1 : -1;
-            float vel_y = actions[pid][0] / 300.0f;
-            float vel_x = actions[pid][1] / 300.0f;
+            float vel_y = actions[pid][0] / 300.0;
+            float vel_x = actions[pid][1] / 300.0;
             float mag = sqrtf(vel_y*vel_y + vel_x*vel_x);
             if (mag > 1) {
                 vel_y /= mag;
                 vel_x /= mag;
             }
 
-            int attack_target = actions[pid][2];
-            bool use_q = actions[pid][3];
-            bool use_w = actions[pid][4];
-            bool use_e = actions[pid][5];
+            int attack_target = (int)actions[pid][2];
+            bool use_q = (int)actions[pid][3];
+            bool use_w = (int)actions[pid][4];
+            bool use_e = (int)actions[pid][5];
 
             if (attack_target == 1 || attack_target == 0) {
                 // Scan everything
@@ -1788,9 +1789,9 @@ MOBA* allocate_moba(MOBA* env) {
     // TODO: Don't hardcode sizes
     int agents = (env->script_opponents) ? NUM_PLAYERS/2 : NUM_PLAYERS;
     env->observations = calloc(agents*(11*11*4 + 26), sizeof(unsigned char));
-    env->actions = calloc(agents*6, sizeof(int));
+    env->actions = calloc(agents*6, sizeof(double));
     env->rewards = calloc(agents, sizeof(float));
-    env->terminals = calloc(agents, sizeof(unsigned char));
+    env->terminals = calloc(agents, sizeof(float));
     env->truncations = calloc(agents, sizeof(unsigned char));
 
     unsigned char* game_map_npy = read_file("resources/moba/game_map.npy");
@@ -2192,16 +2193,16 @@ int c_render(MOBA* env) {
 
     int human = renderer->human_player;
     bool HUMAN_CONTROL = IsKeyDown(KEY_LEFT_SHIFT);
-    int (*actions)[6] = (int(*)[6])env->actions;
+    double (*actions)[6] = (double(*)[6])env->actions;
 
     // Clears so as to not let the nn spam actions
     if (HUMAN_CONTROL && frame % 12 == 0) {
-        actions[human][0] = 0;
-        actions[human][1] = 0;
-        actions[human][2] = 0;
-        actions[human][3] = 0;
-        actions[human][4] = 0;
-        actions[human][5] = 0;
+        actions[human][0] = 0.0;
+        actions[human][1] = 0.0;
+        actions[human][2] = 0.0;
+        actions[human][3] = 0.0;
+        actions[human][4] = 0.0;
+        actions[human][5] = 0.0;
     }
 
     // TODO: better way to null clicks?
@@ -2216,10 +2217,10 @@ int c_render(MOBA* env) {
             renderer->last_click_x = -1;
             renderer->last_click_y = -1;
         }
-       
+
         if (HUMAN_CONTROL) {
-            actions[human][0] = 300*dy;
-            actions[human][1] = 300*dx;
+            actions[human][0] = 300.0*dy;
+            actions[human][1] = 300.0*dx;
         }
     }
     if (IsKeyDown(KEY_ESCAPE)) {
@@ -2227,16 +2228,16 @@ int c_render(MOBA* env) {
     }
     if (HUMAN_CONTROL) {
         if (IsKeyDown(KEY_Q) || IsKeyPressed(KEY_Q)) {
-            actions[human][3] = 1;
+            actions[human][3] = 1.0;
         }
         if (IsKeyDown(KEY_W) || IsKeyPressed(KEY_W)) {
-            actions[human][4] = 1;
+            actions[human][4] = 1.0;
         }
         if (IsKeyDown(KEY_E) || IsKeyPressed(KEY_E)) {
-            actions[human][5] = 1;
+            actions[human][5] = 1.0;
         }
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            actions[human][2] = 2; // Target heroes
+            actions[human][2] = 2.0; // Target heroes
         }
     }
     // Num keys toggle selected player

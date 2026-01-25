@@ -181,9 +181,10 @@ typedef struct Enduro {
     Client* client;
     Log log;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     size_t obs_size;
     int num_envs;
     float width;
@@ -689,10 +690,7 @@ void init(Enduro* env) {
     env->parallaxFactor = 1.0f;
     env->dayCompleted = 0;
     env->lane = 1;
-    env->terminals[0] = 0;
 
-    // Reset rewards and logs
-    env->rewards[0] = 0.0f;
     // Initialize tracking variables
     env->tracking_episode_return = 0.0f;
     env->tracking_episode_length = 0.0f;
@@ -707,28 +705,13 @@ void init(Enduro* env) {
     env->tracking_days_failed = 0.0f;
     env->tracking_collisions_player_vs_car = 0.0f;
     env->tracking_collisions_player_vs_road = 0.0f;
-
-    env->log.episode_return = 0.0f;
-    env->log.episode_length = 0.0f;
-    env->log.score = 0.0f;
-    env->log.reward = 0.0f;
-    env->log.step_rew_car_passed_no_crash = 0.0f;
-    env->log.crashed_penalty = 0.0f;
-    env->log.passed_cars = 0.0f;
-    env->log.passed_by_enemy = 0.0f;
-    env->log.cars_to_pass = INITIAL_CARS_TO_PASS;
-    env->log.days_completed = 0;
-    env->log.days_failed = 0;
-    env->log.collisions_player_vs_car = 0.0f;
-    env->log.collisions_player_vs_road = 0.0f;
-    env->log.n = 0.0f;
 }
 
 void allocate(Enduro* env) {
     env->observations = (float*)calloc(env->obs_size, sizeof(float));
-    env->actions = (int*)calloc(1, sizeof(int));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
 }
 
 void free_allocated(Enduro* env) {

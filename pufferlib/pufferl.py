@@ -251,11 +251,8 @@ class PuffeRL:
         #torch.cuda.synchronize()
         logs = _C.log_environments(self.pufferl_cpp)
         if logs:
-            self.stats['perf'] = [logs['perf']]
-            self.stats['score'] = [logs['score']]
-            self.stats['episode_return'] = [logs['episode_return']]
-            self.stats['episode_length'] = [logs['episode_length']]
-            self.stats['n'] = [logs['n']]
+            for k, v in logs.items():
+                self.stats[k] = [v]
 
         self.global_step += config['batch_size']
         profile.end()

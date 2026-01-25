@@ -8,7 +8,7 @@ class Drone(pufferlib.PufferEnv):
     def __init__(
         self,
         num_envs=16,
-        num_drones=64,
+        num_agents=64,
         max_rings=5,
         render_mode=None,
         report_interval=1024,
@@ -26,7 +26,7 @@ class Drone(pufferlib.PufferEnv):
             low=-1, high=1, shape=(4,), dtype=np.float32
         )
 
-        self.num_agents = num_envs*num_drones
+        self.num_agents = num_envs*num_agents
         self.render_mode = render_mode
         self.report_interval = report_interval
         self.tick = 0
@@ -37,13 +37,13 @@ class Drone(pufferlib.PufferEnv):
         c_envs = []
         for i in range(num_envs):
             c_envs.append(binding.env_init(
-                self.observations[i*num_drones:(i+1)*num_drones],
-                self.actions[i*num_drones:(i+1)*num_drones],
-                self.rewards[i*num_drones:(i+1)*num_drones],
-                self.terminals[i*num_drones:(i+1)*num_drones],
-                self.truncations[i*num_drones:(i+1)*num_drones],
+                self.observations[i*num_agents:(i+1)*num_agents],
+                self.actions[i*num_agents:(i+1)*num_agents],
+                self.rewards[i*num_agents:(i+1)*num_agents],
+                self.terminals[i*num_agents:(i+1)*num_agents],
+                self.truncations[i*num_agents:(i+1)*num_agents],
                 i,
-                num_agents=num_drones,
+                num_agents=num_agents,
                 max_rings=max_rings,
             ))
 

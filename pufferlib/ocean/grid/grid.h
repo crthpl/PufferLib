@@ -99,9 +99,9 @@ struct Grid{
     unsigned char* grid;
     int* counts;
     unsigned char* observations;
-    float* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
 };
 
 void init_grid(Grid* env) {
@@ -128,9 +128,9 @@ Grid* allocate_grid(int max_size, int num_agents, int horizon,
     int obs_size = 2*vision + 1;
     env->observations = calloc(
         num_agents*obs_size*obs_size, sizeof(unsigned char));
-    env->actions = calloc(num_agents, sizeof(float));
+    env->actions = calloc(num_agents, sizeof(double));
     env->rewards = calloc(num_agents, sizeof(float));
-    env->terminals = calloc(num_agents, sizeof(unsigned char));
+    env->terminals = calloc(num_agents, sizeof(float));
     init_grid(env);
     return env;
 }
@@ -307,7 +307,7 @@ int move_to(Grid* env, int agent_idx, float y, float x) {
         return 1;
     } else if (dest == REWARD || dest == GOAL) {
         env->rewards[agent_idx] = 1.0;
-        env->terminals[agent_idx] = 1;
+        env->terminals[agent_idx] = 1.0f;
         add_log(env, agent_idx);
     } else if (is_key(dest)) {
         if (agent->held != -1) {
@@ -336,7 +336,7 @@ bool step_agent(Grid* env, int idx) {
     agent->prev_y = agent->y;
     agent->prev_x = agent->x;
 
-    float atn = env->actions[idx];
+    double atn = env->actions[idx];
     float direction = agent->direction;
 
     if (env->discretize) {
@@ -405,7 +405,7 @@ bool step_agent(Grid* env, int idx) {
 }
 
 void c_step(Grid* env) {
-    memset(env->terminals, 0, env->num_agents);
+    memset(env->terminals, 0, env->num_agents * sizeof(float));
     memset(env->rewards, 0, env->num_agents*sizeof(float));
     env->tick++;
 

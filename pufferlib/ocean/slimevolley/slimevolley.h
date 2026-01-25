@@ -294,7 +294,7 @@ void agent_display(Agent *agent, float bx, float by) {
     }
 }
 
-void agent_set_action(Agent* agent, float* action){
+void agent_set_action(Agent* agent, double* action){
     bool forward = false;
     bool backward = false;
     bool jump = false;
@@ -389,12 +389,12 @@ typedef struct {
     Ball* ball;
     int delay_frames; // frames to wait before starting
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
-    float* actions; // Required. int* for discrete/multidiscrete, float* for box
+    double* actions; // Required. double* for new API
     float* rewards; // Required
-    unsigned char* terminals; // Required. We don't yet have truncations as standard yet
+    float* terminals; // Required
     int num_agents; // Number of agents being trained. Either 1 or 2. If 1, the first agent is trained and the second is a bot.
     float* bot_observations; // Optional, for bot control
-    float* bot_actions; // Optional, for bot control
+    double* bot_actions; // Optional, for bot control
     int tick;
     Texture2D puffers;
 } SlimeVolley;
@@ -415,7 +415,7 @@ void init(SlimeVolley* env) {
     env->ball = malloc(sizeof(Ball));
     if (env->num_agents == 1) {
         env->bot_observations = calloc(12, sizeof(float));
-        env->bot_actions = calloc(3, sizeof(float));
+        env->bot_actions = calloc(3, sizeof(double));
     }
 }
 
@@ -483,7 +483,7 @@ void new_match(SlimeVolley* env) {
     env->delay_frames = INIT_DELAY_FRAMES;
 }
 
-void abranti_simple_bot(float* obs, float* action) {
+void abranti_simple_bot(float* obs, double* action) {
     // the bot policy. just 7 params but hard to beat.
     float x_agent = obs[0];
     float x_ball = obs[4];

@@ -70,10 +70,11 @@ struct Freeway {
     Client* client;
     Log log;
     float* observations;
-    int* actions;
+    double* actions;
     int* human_actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
 
     FreewayPlayer ai_player; // Player-Related
     FreewayPlayer human_player; 
@@ -160,9 +161,9 @@ void init(Freeway* env) {
 void allocate(Freeway* env) {
     init(env);
     env->observations = (float*)calloc(4 + NUM_LANES*MAX_ENEMIES_PER_LANE, sizeof(float));
-    env->actions = (int*)calloc(1, sizeof(int));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
 }
 
 void c_close(Freeway* env) {
@@ -296,8 +297,8 @@ void randomize_enemy_speed(Freeway* env) {
     for (int lane = 0; lane < NUM_LANES; lane++) {
         int delta_speed = (rand() % 3) - 1; // Randomly increase or decrease speed
         for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++) {
+            enemy = &env->enemies[lane*MAX_ENEMIES_PER_LANE + i];
             if (enemy->speed_randomization) {
-                enemy = &env->enemies[lane*MAX_ENEMIES_PER_LANE + i];
                 enemy->current_speed_idx = min(max(enemy->initial_speed_idx-2, enemy->current_speed_idx), enemy->initial_speed_idx+2);
                 enemy->current_speed_idx = min(max(0, enemy->current_speed_idx + delta_speed), 5);
                 enemy->enemy_vx = enemy->lane_idx < NUM_LANES/2 ? SPEED_VALUES[enemy->current_speed_idx] * TICK_RATE * env->width: -SPEED_VALUES[enemy->current_speed_idx] * TICK_RATE * env->width;

@@ -17,16 +17,16 @@ typedef struct DroneEnv DroneEnv;
 
 struct DroneEnv {
   float *observations;
-  float *actions;
+  double *actions;
   float *rewards;
-  unsigned char *terminals;
+  float *terminals;
+  int num_agents;
 
   Log log;
   int tick;
   int report_interval;
 
   DroneTask task;
-  int num_agents;
   Drone *agents;
 
   int max_rings;
@@ -186,9 +186,14 @@ void c_step(DroneEnv *env) {
   for (int i = 0; i < env->num_agents; i++) {
     Drone *agent = &env->agents[i];
     env->rewards[i] = 0;
-    env->terminals[i] = 0;
+    env->terminals[i] = 0.0f;
 
-    float *atn = &env->actions[4 * i];
+    float atn[4] = {
+      (float)env->actions[4 * i],
+      (float)env->actions[4 * i + 1],
+      (float)env->actions[4 * i + 2],
+      (float)env->actions[4 * i + 3]
+    };
     move_drone(agent, atn);
 
     bool out_of_bounds =
@@ -210,7 +215,7 @@ void c_step(DroneEnv *env) {
       if (ring_passage < 0) {
         env->rewards[i] = (float)ring_passage;
         agent->episode_return += (float)ring_passage;
-        env->terminals[i] = 1;
+        env->terminals[i] = 1.0f;
         add_log(env, i, false, true, false);
         reset_agent(env, agent, i);
         set_target(env->task, env->agents, i, env->num_agents);
@@ -242,14 +247,14 @@ void c_step(DroneEnv *env) {
     if (out_of_bounds) {
       env->rewards[i] -= 1.0f;
       agent->episode_return -= 1.0f;
-      env->terminals[i] = 1;
+      env->terminals[i] = 1.0f;
       add_log(env, i, true, false, false);
 
       reset_agent(env, agent, i);
       set_target(env->task, env->agents, i, env->num_agents);
       static_task_reward(agent, false);
     } else if (env->tick >= HORIZON - 1) {
-      env->terminals[i] = 1;
+      env->terminals[i] = 1.0f;
       add_log(env, i, false, false, true);
     }
   }
@@ -261,7 +266,11 @@ void c_step(DroneEnv *env) {
   compute_observations(env);
 }
 
-void c_close_client(Client* client);
+void c_render(DroneEnv *env) {
+}
+
+
+//void c_close_client(Client* client);
 
 void c_close(DroneEnv *env) {
   for (int i = 0; i < env->num_agents; i++) {
@@ -272,7 +281,7 @@ void c_close(DroneEnv *env) {
   free(env->ring_buffer);
 
   if (env->client != NULL) {
-    c_close_client(env->client);
+    //c_close_client(env->client);
   }
 }
 

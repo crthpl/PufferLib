@@ -40,9 +40,10 @@ typedef struct Client Client;
 typedef struct CTripleTriad CTripleTriad;
 struct CTripleTriad {
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     Log log;
     int card_width;
     int card_height;
@@ -171,9 +172,9 @@ void init_ctripletriad(CTripleTriad* env) {
 }
 
 void allocate_ctripletriad(CTripleTriad* env) {
-    env->actions = (int*)calloc(1, sizeof(int));
+    env->actions = (double*)calloc(1, sizeof(double));
     env->observations = (float*)calloc(env->width*env->height, sizeof(float));
-    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env->terminals = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     init_ctripletriad(env);
 }

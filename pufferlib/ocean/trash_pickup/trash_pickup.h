@@ -51,13 +51,13 @@ typedef struct {
     // Interface for PufferLib
     Client* client;
     char* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     Log log;
 
     int grid_size;
-    int num_agents;
     int num_trash;
     int num_bins;
     int max_steps;
@@ -361,15 +361,15 @@ void initialize_env(CTrashPickupEnv* env) {
 void allocate(CTrashPickupEnv* env) {
     initialize_env(env);
     env->observations = (char*)calloc(env->total_num_obs, sizeof(char));
-    env->actions = (int*)calloc(env->num_agents, sizeof(int));
+    env->actions = (double*)calloc(env->num_agents, sizeof(double));
     env->rewards = (float*)calloc(env->num_agents, sizeof(float));
-    env->terminals = (unsigned char*)calloc(env->num_agents, sizeof(unsigned char));
+    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 }
 
 void c_step(CTrashPickupEnv* env) {
     // Reset reward for each agent
     memset(env->rewards, 0, sizeof(float) * env->num_agents);
-    memset(env->terminals, 0, sizeof(unsigned char) * env->num_agents);
+    memset(env->terminals, 0, sizeof(float) * env->num_agents);
 
     for (int i = 0; i < env->num_agents; i++) {
         move_agent(env, i, env->actions[i]);
@@ -377,9 +377,11 @@ void c_step(CTrashPickupEnv* env) {
     }
 
     env->current_step++;
-    if (env->current_step >= env->max_steps || is_episode_over(env)) 
+    if (env->current_step >= env->max_steps || is_episode_over(env))
     {
-        memset(env->terminals, 1, sizeof(unsigned char) * env->num_agents);
+        for (int i = 0; i < env->num_agents; i++) {
+            env->terminals[i] = 1.0f;
+        }
 
         Log log = {0};
 

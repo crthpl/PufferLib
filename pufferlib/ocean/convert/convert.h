@@ -43,12 +43,12 @@ typedef struct {
     Agent* agents;
     Factory* factories;
     float* observations;
-    int* actions;
+    double* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
+    int num_agents;
     int width;
     int height;
-    int num_agents;
     int num_factories;
     int num_resources;
 } Convert;

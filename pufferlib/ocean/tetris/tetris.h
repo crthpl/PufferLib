@@ -71,9 +71,10 @@ typedef struct Tetris {
 	Client *client;
 	Log log;
 	float *observations;
-	int *actions;
+	double *actions;
 	float *rewards;
-	unsigned char *terminals;
+	float *terminals;
+	int num_agents;
 	int dim_obs;
 	int num_float_obs;
 
@@ -127,9 +128,9 @@ void allocate(Tetris *env) {
 	// grid, 6 floats, 4 one-hot tetrominoes encode (current, previews, hold) + self-inflicting noisy action bits
 	env->dim_obs = env->n_cols * env->n_rows + NUM_FLOAT_OBS + NUM_TETROMINOES * (NUM_PREVIEW + 2) + env->n_noise_obs;
 	env->observations = (float *)calloc(env->dim_obs, sizeof(float));
-	env->actions = (int *)calloc(1, sizeof(int));
+	env->actions = (double *)calloc(1, sizeof(double));
 	env->rewards = (float *)calloc(1, sizeof(float));
-	env->terminals = (unsigned char *)calloc(1, sizeof(unsigned char));
+	env->terminals = (float *)calloc(1, sizeof(float));
 }
 
 void c_close(Tetris *env) {
