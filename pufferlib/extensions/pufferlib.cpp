@@ -429,8 +429,9 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
         Tensor values_c = graph.mb_values.to(logits.dtype()).contiguous();
         Tensor returns_c = graph.mb_returns.to(logits.dtype()).contiguous();
     
-        Tensor mb_adv_mean = advantages_c.mean();
-        Tensor mb_adv_std = advantages_c.std();
+        // TODO!! we're not computing advantage mean/std over the minibatch currently instead were passing it in
+        // Tensor mb_adv_mean = advantages_c.mean();
+        // Tensor mb_adv_std = advantages_c.std();
 
         loss = fused_ppo_loss_optimized(
             logits_c,
@@ -441,8 +442,8 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
             prio_c,
             values_c,
             returns_c,
-            mb_adv_mean,
-            mb_adv_std,
+            adv_mean,
+            adv_std,
             graph.mb_ratio,
             graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)}),
             hypers.clip_coef,
