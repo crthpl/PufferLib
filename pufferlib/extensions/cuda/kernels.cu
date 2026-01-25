@@ -1694,7 +1694,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
         float d_logit = (a == act) ? d_new_logp : 0.0f;
         d_logit -= p * d_new_logp;
 
-        d_logit += d_entropy_term * p * (entropy - logp);
+        d_logit += d_entropy_term * p * (-entropy - logp);
         grad_logits[logits_offset + a] = T(d_logit);
     }
 }
