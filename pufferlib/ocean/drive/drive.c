@@ -224,6 +224,7 @@ void forward(DriveNet* net, float* observations, int* actions) {
     // Get action by taking argmax of actor output
     softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
 }
+
 void demo() {
 
     Drive env = {
@@ -244,7 +245,7 @@ void demo() {
     int steer_delta = 4;
     while (!WindowShouldClose()) {
         // Handle camera controls
-        int (*actions)[2] = (int(*)[2])env.actions;
+        double(*actions)[2] = (double(*)[2])env.actions;
         forward(net, env.observations, env.actions);
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             actions[env.human_agent_idx][0] = 3;
@@ -330,6 +331,6 @@ void performance_test() {
 
 int main() {
     demo();
-    // performance_test();
+    //performance_test();
     return 0;
 }

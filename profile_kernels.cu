@@ -31,6 +31,7 @@ using namespace pufferlib;
 
 const int WARMUP_ITERS = 1000;
 const int TIMING_ITERS = 10000;
+const float TIMEOUT_SEC = 5.0f;
 
 const int BUF = 2;
 const int BR = 4096;  // Rollout batch (no T dim)
@@ -1046,6 +1047,7 @@ void run_ppoloss_backward(PPOLossArgs* args) {
 }
 
 void run_ppoloss_forward_opt(PPOLossArgs* args) {
+    /*
     launch_ppo_loss_forward_optimized<float>(
         args->loss, args->saved_for_backward,
         args->logits, args->values_pred, args->actions,
@@ -1053,9 +1055,11 @@ void run_ppoloss_forward_opt(PPOLossArgs* args) {
         args->values, args->returns, args->adv_mean, args->adv_std,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
+        */
 }
 
 void run_ppoloss_backward_opt(PPOLossArgs* args) {
+    /*
     launch_ppo_loss_backward_optimized<float>(
         args->grad_logits, args->grad_values_pred, args->grad_loss,
         args->logits, args->values_pred, args->actions,
@@ -1063,6 +1067,7 @@ void run_ppoloss_backward_opt(PPOLossArgs* args) {
         args->values, args->returns, args->adv_mean, args->adv_std,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
+        */
 }
 
 #ifdef USE_TORCH
@@ -1228,6 +1233,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
         args->T, args->A, args->N, 0);
 
     // Run optimized forward
+    /*
     launch_ppo_loss_forward_optimized<float>(
         loss_opt, saved_opt,
         args->logits, args->values_pred, args->actions,
@@ -1235,6 +1241,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
         args->values, args->returns, args->adv_mean, args->adv_std,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
+        */
 
     // Run pure PyTorch reference (ground truth) - fused_ppo_loss_cpp is the correct implementation
     torch::Tensor torch_loss = fused_ppo_loss_cpp(
@@ -1875,12 +1882,12 @@ typedef struct {
     int act_n;
 } EnvSpeedArgs;
 
-EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads, int horizon) {
-    // Load breakout.so dynamically
-    void* handle = dlopen("./breakout.so", RTLD_NOW);
+EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_threads, int horizon) {
+    // Load drive.so dynamically
+    void* handle = dlopen("./drive.so", RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
-        fprintf(stderr, "Make sure to build breakout first: ./scripts/build_ocean.sh breakout fast\n");
+        fprintf(stderr, "Make sure to build drive first: ./scripts/build_vec.sh drive\n");
         return nullptr;
     }
     dlerror();
@@ -1893,7 +1900,7 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
     profile_vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
     profile_vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     int obs_n = *(int*)dlsym(handle, "OBS_N");
-    int act_n = *(int*)dlsym(handle, "ACT_N");
+    int num_atns = *(int*)dlsym(handle, "NUM_ATNS_EXPORT");
 
     const char* dlsym_error = dlerror();
     if (dlsym_error) {
@@ -1902,33 +1909,52 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
         return nullptr;
     }
 
-    // Create kwargs for breakout
-    Dict* kwargs = create_dict(32);
-    dict_set(kwargs, "frameskip", 4);
-    dict_set(kwargs, "width", 576);
-    dict_set(kwargs, "height", 330);
-    dict_set(kwargs, "paddle_width", 62);
-    dict_set(kwargs, "paddle_height", 8);
-    dict_set(kwargs, "ball_width", 32);
-    dict_set(kwargs, "ball_height", 32);
-    dict_set(kwargs, "brick_width", 32);
-    dict_set(kwargs, "brick_height", 12);
-    dict_set(kwargs, "brick_rows", 6);
-    dict_set(kwargs, "brick_cols", 18);
-    dict_set(kwargs, "initial_ball_speed", 256);
-    dict_set(kwargs, "max_ball_speed", 448);
-    dict_set(kwargs, "paddle_speed", 620);
-    dict_set(kwargs, "continuous", 0);
+    // Create vec_kwargs with total_agents and num_buffers
+    Dict* vec_kwargs = create_dict(8);
+    dict_set(vec_kwargs, "total_agents", (double)total_agents);
+    dict_set(vec_kwargs, "num_buffers", (double)num_buffers);
 
-    // Create environments
-    VecEnv* vec = profile_create_envs(num_envs, num_buffers, true, 0, kwargs);
+    // Create env_kwargs for drive
+    Dict* env_kwargs = create_dict(32);
+    dict_set(env_kwargs, "human_agent_idx", 0);
+    dict_set(env_kwargs, "reward_vehicle_collision", -0.5);
+    dict_set(env_kwargs, "reward_offroad_collision", -0.2);
+    dict_set(env_kwargs, "spawn_immunity_timer", 50);
+    dict_set(env_kwargs, "reward_goal_post_respawn", 0.25);
+    dict_set(env_kwargs, "reward_vehicle_collision_post_respawn", -0.5);
+    dict_set(env_kwargs, "num_maps", 10000);
+
+    // Create env_kwargs for breakout
+    /*
+    Dict* env_kwargs = create_dict(32);
+    dict_set(env_kwargs, "frameskip", 4);
+    dict_set(env_kwargs, "width", 576);
+    dict_set(env_kwargs, "height", 330);
+    dict_set(env_kwargs, "paddle_width", 62);
+    dict_set(env_kwargs, "paddle_height", 8);
+    dict_set(env_kwargs, "ball_width", 32);
+    dict_set(env_kwargs, "ball_height", 32);
+    dict_set(env_kwargs, "brick_width", 32);
+    dict_set(env_kwargs, "brick_height", 12);
+    dict_set(env_kwargs, "brick_rows", 6);
+    dict_set(env_kwargs, "brick_cols", 18);
+    dict_set(env_kwargs, "initial_ball_speed", 256);
+    dict_set(env_kwargs, "max_ball_speed", 448);
+    dict_set(env_kwargs, "paddle_speed", 620);
+    dict_set(env_kwargs, "continuous", 0);
+    */
+
+    // Create environments with new signature
+    VecEnv* vec = profile_create_envs(num_buffers, true, 0, vec_kwargs, env_kwargs);
     if (!vec) {
         fprintf(stderr, "Failed to create environments\n");
         return nullptr;
     }
 
     // Create threads
+    int num_envs = vec->size;
     int block_size = num_envs / num_threads;
+    if (block_size < 1) block_size = 1;
     profile_create_threads(vec, num_threads, block_size);
 
     // Reset
@@ -1942,7 +1968,7 @@ EnvSpeedArgs* create_envspeedargs(int num_envs, int num_buffers, int num_threads
     args->num_threads = num_threads;
     args->horizon = horizon;
     args->obs_n = obs_n;
-    args->act_n = act_n;
+    args->act_n = num_atns;
 
     return args;
 }
@@ -1974,16 +2000,26 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
     cudaEventCreate(&stop);
 
     // Warmup
+    auto start_time = std::chrono::steady_clock::now();
     for (int i = 0; i < 100; ++i) {
         run_env_rollout(args);
         cudaDeviceSynchronize();
+        auto now = std::chrono::steady_clock::now();
+        float elapsed = std::chrono::duration<float>(now - start_time).count();
+        if (elapsed > TIMEOUT_SEC) break;
     }
 
+    start_time = std::chrono::steady_clock::now();
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
+    float completed = 0;
     for (int i = 0; i < 1000; ++i) {
         run_env_rollout(args);
+        completed += 1;
+        auto now = std::chrono::steady_clock::now();
+        float elapsed = std::chrono::duration<float>(now - start_time).count();
+        if (elapsed > TIMEOUT_SEC) break;
     }
     cudaDeviceSynchronize();
     cudaEventRecord(stop);
@@ -1996,24 +2032,24 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    return ms / 1000;  // per rollout
+    return ms / completed;  // per rollout
 }
 
-void profile_envspeed(int num_envs, int num_buffers, int num_threads, int horizon) {
-    printf("env_speed (envs=%d, buffers=%d, threads=%d, horizon=%d)\n",
-           num_envs, num_buffers, num_threads, horizon);
+void profile_envspeed(int total_agents, int num_buffers, int num_threads, int horizon) {
+    printf("env_speed (total_agents=%d, buffers=%d, threads=%d, horizon=%d)\n",
+           total_agents, num_buffers, num_threads, horizon);
 
-    EnvSpeedArgs* args = create_envspeedargs(num_envs, num_buffers, num_threads, horizon);
+    EnvSpeedArgs* args = create_envspeedargs(total_agents, num_buffers, num_threads, horizon);
     if (!args) {
         printf("\tFailed to create env - skipping\n\n");
         return;
     }
 
-    printf("\tobs_n=%d, act_n=%d\n", args->obs_n, args->act_n);
+    printf("\tnum_envs=%d, obs_n=%d, num_atns=%d\n", args->num_envs, args->obs_n, args->act_n);
 
     // Profile full rollout (num_buffers * horizon steps)
     float rollout_ms = profile_env_rollout(args, "env_rollout");
-    int total_steps = num_envs * horizon;
+    int total_steps = total_agents * horizon;
     printf("\trollout time: %.2f ms (%d steps)\n", rollout_ms, total_steps);
 
     // Compute throughput
@@ -2067,7 +2103,7 @@ int main(int argc, char** argv) {
     }
 
     if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
-        // num_envs=8192, num_buffers=2, num_threads=8, horizon=64
+        // total_agents=8192, num_buffers=2, num_threads=8, horizon=64
         profile_envspeed(BUF*BR, BUF, 8, T);
     }
 

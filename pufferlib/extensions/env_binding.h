@@ -3,8 +3,31 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <limits.h>
 
-#include <cuda_runtime.h>
+// Forward declare CUDA types and functions to avoid conflicts with raylib's float3
+typedef int cudaError_t;
+typedef struct CUstream_st* cudaStream_t;
+typedef int cudaMemcpyKind;
+#define cudaSuccess 0
+#define cudaMemcpyHostToDevice 1
+#define cudaMemcpyDeviceToHost 2
+#define cudaHostAllocPortable 1
+#define cudaStreamNonBlocking 1
+
+extern cudaError_t cudaHostAlloc(void**, size_t, unsigned int);
+extern cudaError_t cudaMalloc(void**, size_t);
+extern cudaError_t cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
+extern cudaError_t cudaMemcpyAsync(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t);
+extern cudaError_t cudaMemset(void*, int, size_t);
+extern cudaError_t cudaFree(void*);
+extern cudaError_t cudaFreeHost(void*);
+extern cudaError_t cudaSetDevice(int);
+extern cudaError_t cudaDeviceSynchronize(void);
+extern cudaError_t cudaStreamSynchronize(cudaStream_t);
+extern cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned int);
+extern cudaError_t cudaStreamQuery(cudaStream_t);
+extern const char* cudaGetErrorString(cudaError_t);
 
 #include "vecenv.h"
 #include <stdatomic.h>
@@ -502,11 +525,12 @@ void vec_send(VecEnv* vec, int buffer) {
         cudaDeviceSynchronize();
     } else {
         if (threading->use_gpu) {
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 &vec->actions[start*NUM_ATNS],
                 &vec->gpu_actions[start*NUM_ATNS],
                 agents_per_buffer*NUM_ATNS*sizeof(double),
-                cudaMemcpyDeviceToHost
+                cudaMemcpyDeviceToHost,
+                vec->streams[buffer]
             );
         }
 

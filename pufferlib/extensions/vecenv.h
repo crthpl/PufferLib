@@ -8,7 +8,6 @@
 #ifndef __cplusplus
 #include <stdatomic.h>
 #endif
-#include <cuda_runtime.h>
 
 #define FLOAT 1
 #define INT 2

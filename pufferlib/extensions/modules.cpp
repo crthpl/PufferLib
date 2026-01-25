@@ -386,13 +386,8 @@ public:
             TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
         }
 
-        // Save inputs for backward (these go through autograd)
-        ctx->save_for_backward({combined, state});
-
-        // Save float buffers via saved_data to avoid autograd copy overhead
-        ctx->saved_data["a_star"] = a_star;
-        ctx->saved_data["s_vals"] = s_vals;
-        ctx->saved_data["log_values_buf"] = log_values_buf;
+        // Save all tensors for backward (ensures proper cleanup after backward)
+        ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
 
         return {out, next_state};
     }
@@ -403,11 +398,9 @@ public:
         auto saved = ctx->get_saved_variables();
         auto combined = saved[0];
         auto state = saved[1];
-
-        // Retrieve float buffers from saved_data (avoids autograd copy overhead)
-        auto a_star_buf = ctx->saved_data["a_star"].toTensor();
-        auto s_vals = ctx->saved_data["s_vals"].toTensor();
-        auto log_values_buf = ctx->saved_data["log_values_buf"].toTensor();
+        auto a_star_buf = saved[2];
+        auto s_vals = saved[3];
+        auto log_values_buf = saved[4];
 
         auto grad_out = grad_outputs[0];          // (B, T, H)
         TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");
@@ -544,10 +537,8 @@ public:
             TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
         }
 
-        ctx->save_for_backward({combined, state});
-        ctx->saved_data["a_star"] = a_star;
-        ctx->saved_data["s_vals"] = s_vals;
-        ctx->saved_data["log_values_buf"] = log_values_buf;
+        // Save all tensors for backward (ensures proper cleanup after backward)
+        ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
 
         return {out, next_state};
     }
@@ -559,10 +550,9 @@ public:
         auto saved = ctx->get_saved_variables();
         auto combined = saved[0];
         auto state = saved[1];
-
-        auto a_star_buf = ctx->saved_data["a_star"].toTensor();
-        auto s_vals = ctx->saved_data["s_vals"].toTensor();
-        auto log_values_buf = ctx->saved_data["log_values_buf"].toTensor();
+        auto a_star_buf = saved[2];
+        auto s_vals = saved[3];
+        auto log_values_buf = saved[4];
 
         auto grad_out = grad_outputs[0];
         TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");

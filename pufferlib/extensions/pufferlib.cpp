@@ -288,7 +288,7 @@ typedef struct {
     GraphBuf graph;
     at::cuda::CUDAGraph rollout_graph;
     at::cuda::CUDAGraph train_forward_graph;
-    at::cuda::CUDAGraph rollout_copy_graphs[64][2];
+    std::vector<std::vector<at::cuda::CUDAGraph>> rollout_copy_graphs;
     bool captured;
     Tensor adv_mean;
     Tensor adv_std;
@@ -669,7 +669,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
         int total_agents = vec->total_agents;
         int num_buffers = hypers.num_buffers;
-        for (int i = 0; i < hypers.horizon; ++i) {
+        int horizon = hypers.horizon;
+
+        // Resize rollout_copy_graphs to [horizon][num_buffers]
+        pufferl->rollout_copy_graphs.resize(horizon);
+        for (int i = 0; i < horizon; ++i) {
+            pufferl->rollout_copy_graphs[i].resize(num_buffers);
             for (int j = 0; j < num_buffers; ++j) {
                 pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
                 capture_graph(&pufferl->rollout_copy_graphs[i][j], [p, total_agents, num_buffers, i, j]() {
