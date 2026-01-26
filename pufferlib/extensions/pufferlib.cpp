@@ -420,30 +420,18 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
 
     Tensor loss;
     if (kernels) {
-        Tensor logits_c = logits.contiguous();
-        Tensor newvalue_c = newvalue.contiguous();
-        Tensor actions_c = graph.mb_actions.contiguous();
-        Tensor logprobs_c = graph.mb_logprobs.to(logits.dtype()).contiguous();
-        Tensor advantages_c = graph.mb_advantages.to(logits.dtype()).contiguous();
-        Tensor prio_c = graph.mb_prio.to(logits.dtype()).contiguous();
-        Tensor values_c = graph.mb_values.to(logits.dtype()).contiguous();
-        Tensor returns_c = graph.mb_returns.to(logits.dtype()).contiguous();
-    
-        // TODO!! we're not computing advantage mean/std over the minibatch currently instead were passing it in
-        // Tensor mb_adv_mean = advantages_c.mean();
-        // Tensor mb_adv_std = advantages_c.std();
-
+        auto [mb_adv_var, mb_adv_mean] = torch::var_mean(graph.mb_advantages);  // single kernel launch
         loss = fused_ppo_loss_optimized(
-            logits_c,
-            newvalue_c,
-            actions_c,
-            logprobs_c,
-            advantages_c,
-            prio_c,
-            values_c,
-            returns_c,
-            adv_mean,
-            adv_std,
+            logits,
+            newvalue,
+            graph.mb_actions,
+            graph.mb_logprobs.to(logits.dtype()),
+            graph.mb_advantages.to(logits.dtype()),
+            graph.mb_prio.to(logits.dtype()),
+            graph.mb_values.to(logits.dtype()),
+            graph.mb_returns.to(logits.dtype()),
+            mb_adv_mean,
+            mb_adv_var,  // variance, not std - kernel does sqrtf to avoid second kernel launch here
             graph.mb_ratio,
             graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)}),
             hypers.clip_coef,
