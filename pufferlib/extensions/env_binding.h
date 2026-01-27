@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <omp.h>
 
 // Forward declare CUDA types and functions to avoid conflicts with raylib's float3
 typedef int cudaError_t;
@@ -64,12 +65,36 @@ __attribute__((visibility("default"))) const int NUM_ATNS_EXPORT = NUM_ATNS;
 __attribute__((visibility("default"))) const int ACT_SIZES_EXPORT[NUM_ATNS] = ACT_SIZES;
 __attribute__((visibility("default"))) const int OBS_T = OBS_TYPE;
 __attribute__((visibility("default"))) const int ACT_T = ACT_TYPE;
+__attribute__((visibility("default"))) const size_t ENV_SIZE = sizeof(Env);
+
+// Helper to get num_agents from opaque Env pointer
+__attribute__((visibility("default"))) int env_num_agents(Env* env) {
+    return env->num_agents;
+}
+
+// Helper to set buffer pointers on opaque Env
+__attribute__((visibility("default"))) void env_set_buffers(Env* env,
+        void* observations, double* actions, float* rewards, float* terminals) {
+    env->observations = observations;
+    env->actions = actions;
+    env->rewards = rewards;
+    env->terminals = terminals;
+}
+
+// Direct step on all envs - for benchmarking vec overhead
+__attribute__((visibility("default"))) void vec_step_direct(VecEnv* vec) {
+    for (int i = 0; i < vec->size; i++) {
+        c_step(&vec->envs[i]);
+    }
+}
 
 #define INIT 0
 #define OBS_READY_ON_CPU 1
 #define OBS_READY_ON_GPU 2
 #define ATN_READY_ON_GPU 3
 #define ATN_READY_ON_CPU 4
+#define OMP_WAITING 5
+#define OMP_RUNNING 6
 
 typedef struct Threading {
     atomic_long* completed;
@@ -95,6 +120,17 @@ typedef struct WorkerArg {
     VecEnv* vec;
     int idx;
 } WorkerArg;
+
+typedef void (*net_callback_fn)(void* ctx, int buf, int t);
+
+typedef struct OMPWorkerArg {
+    VecEnv* vec;
+    int buf;
+    int horizon;
+    void* ctx;
+    net_callback_fn net_callback;
+} OMPWorkerArg;
+
 
 // Forward declarations for env-specific functions supplied by user
 void my_log(Log* log, Dict* out);
@@ -187,8 +223,14 @@ static void* c_threadstep(void* arg)
         threading->start_index = end;
         pthread_mutex_unlock(&threading->wake_mutex);
 
-        for (int i=start; i<end; i++) {
-            c_step(&vec->envs[i % num_envs]);
+        for (long i=start; i<end; i++) {
+            int idx = i % num_envs;
+            if (idx < 0 || idx >= num_envs) {
+                fprintf(stderr, "BOUNDS ERROR: idx=%d, num_envs=%d, i=%ld, start=%ld, end=%ld\n",
+                        idx, num_envs, i, start, end);
+                exit(1);
+            }
+            c_step(&vec->envs[idx]);
         }
         atomic_store(completed, end);
     }
@@ -270,7 +312,100 @@ static void* c_threadmanager(void* arg) {
         }
     }
 }
- 
+
+static void* omp_threadmanager(void* arg) {
+    OMPWorkerArg* worker_arg = (OMPWorkerArg*)arg;
+    VecEnv* vec = worker_arg->vec;
+    Threading* threading = vec->threading;
+    int buf = worker_arg->buf;
+    int horizon = worker_arg->horizon;
+    void* ctx = worker_arg->ctx;
+    net_callback_fn net_callback = worker_arg->net_callback;
+
+    assert(net_callback != NULL && "omp_threadmanager: net_callback is NULL");
+
+    int agents_per_buffer = vec->total_agents / vec->buffers;
+    int start = buf * agents_per_buffer;
+    int end = start + agents_per_buffer;
+    atomic_int* buffer_states = threading->buffer_states;
+    int omp_threads = threading->num_threads / vec->buffers;
+    if (omp_threads < 1) omp_threads = 1;
+
+    while (1) {
+        // Wait for start signal
+        while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {}
+
+        for (int t=0; t<horizon; t++) {
+            // Run policy forward, writes actions to gpu_actions
+            net_callback(ctx, buf, t);
+
+            // Transfer actions GPU -> CPU
+            if (threading->use_gpu) {
+                cudaDeviceSynchronize();
+                cudaMemcpyAsync(
+                    &vec->actions[start*NUM_ATNS],
+                    &vec->gpu_actions[start*NUM_ATNS],
+                    agents_per_buffer*NUM_ATNS*sizeof(double),
+                    cudaMemcpyDeviceToHost,
+                    vec->streams[buf]
+                );
+                cudaStreamSynchronize(vec->streams[buf]);
+            }
+
+            // Step all envs in this buffer
+            #pragma omp parallel for schedule(static) num_threads(omp_threads)
+            for (int i=start; i<end; i++) {
+                Env* env = &vec->envs[i];
+                c_step(env);
+            }
+
+            // Transfer obs/rewards/terminals CPU -> GPU
+            if (threading->use_gpu) {
+                cudaMemcpyAsync(
+                    &((OBS_DTYPE*)vec->gpu_observations)[start*OBS_SIZE],
+                    &((OBS_DTYPE*)vec->observations)[start*OBS_SIZE],
+                    agents_per_buffer*OBS_SIZE*sizeof(OBS_DTYPE),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                cudaMemcpyAsync(
+                    &vec->gpu_rewards[start],
+                    &vec->rewards[start],
+                    agents_per_buffer*sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                cudaMemcpyAsync(
+                    &vec->gpu_terminals[start],
+                    &vec->terminals[start],
+                    agents_per_buffer*sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    vec->streams[buf]
+                );
+                cudaStreamSynchronize(vec->streams[buf]);
+            }
+        }
+
+        // Signal done
+        atomic_store(&buffer_states[buf], OMP_WAITING);
+    }
+}
+
+__attribute__((visibility("default")))
+void vec_omp_step(VecEnv* vec) {
+    Threading* threading = vec->threading;
+
+    // Signal all buffers to start
+    for (int buf = 0; buf < vec->buffers; buf++) {
+        atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
+    }
+
+    // Wait for all buffers to finish
+    for (int buf = 0; buf < vec->buffers; buf++) {
+        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
+    }
+}
+
 __attribute__((visibility("default")))
 VecEnv* create_environments(int buffers, bool use_gpu, int test_idx, Dict* vec_kwargs, Dict* env_kwargs) {
     // my_vec_init allocates envs and determines how many are needed
@@ -393,7 +528,7 @@ VecEnv* create_environments(int buffers, bool use_gpu, int test_idx, Dict* vec_k
     return vec;
 }
 
-void create_threads(VecEnv* vec, int threads, int block_size) {
+void create_threads(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, int horizon) {
     //printf("Finished creating %d envs\n", num_envs);
     Threading* threading = vec->threading;
     threading->num_threads = threads;
@@ -404,12 +539,33 @@ void create_threads(VecEnv* vec, int threads, int block_size) {
     threading->num_buffers = vec->buffers;
 
     vec->streams = (cudaStream_t*)calloc(vec->buffers, sizeof(cudaStream_t));
-    for (int i = 0; i < vec->buffers; i++) {
-        cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+    if (threading->use_gpu) {
+        for (int i = 0; i < vec->buffers; i++) {
+            cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+        }
     }
 
+    if (threads == 0) {
+        return;
+    }
 
-    if (threads > 0) {
+    if (use_omp) {
+        OMPWorkerArg* worker_args = (OMPWorkerArg*)calloc(vec->buffers, sizeof(OMPWorkerArg));
+        threading->threads = (pthread_t*)calloc(vec->buffers, sizeof(pthread_t));
+        assert(threading->threads != NULL && "create_vecenv failed to allocate memory for threads\n");
+
+        for (int i = 0; i < vec->buffers; i++) {
+            OMPWorkerArg* arg = &worker_args[i];
+            arg->ctx = ctx;
+            arg->net_callback = net_callback;
+            arg->horizon = horizon;
+            arg->vec = vec;
+            arg->buf = i;
+
+            int err = pthread_create(&threading->threads[i], NULL, omp_threadmanager, (void*)(arg));
+            assert(err == 0 && "create_vecenv failed to create thread\n");
+        }
+    } else {
         WorkerArg* worker_args = (WorkerArg*)calloc(threads, sizeof(WorkerArg));
 
         threading->threads = (pthread_t*)calloc(threads + 1, sizeof(pthread_t));
@@ -455,27 +611,29 @@ void vec_reset(VecEnv* vec) {
         Env* env = &vec->envs[i];
         c_reset(env);
     }
-    cudaMemcpy(
-        vec->gpu_observations,
-        vec->observations,
-        vec->total_agents*OBS_SIZE*sizeof(OBS_DTYPE),
-        cudaMemcpyHostToDevice
-    );
-    cudaMemcpy(
-        vec->gpu_rewards,
-        vec->rewards,
-        vec->total_agents*sizeof(float),
-        cudaMemcpyHostToDevice
-    );
-    cudaMemcpy(
-        vec->gpu_terminals,
-        vec->terminals,
-        vec->total_agents*sizeof(float),
-        cudaMemcpyHostToDevice
-    );
-    cudaDeviceSynchronize();
- 
+
     Threading* threading = vec->threading;
+    if (threading->use_gpu) {
+        cudaMemcpy(
+            vec->gpu_observations,
+            vec->observations,
+            vec->total_agents*OBS_SIZE*sizeof(OBS_DTYPE),
+            cudaMemcpyHostToDevice
+        );
+        cudaMemcpy(
+            vec->gpu_rewards,
+            vec->rewards,
+            vec->total_agents*sizeof(float),
+            cudaMemcpyHostToDevice
+        );
+        cudaMemcpy(
+            vec->gpu_terminals,
+            vec->terminals,
+            vec->total_agents*sizeof(float),
+            cudaMemcpyHostToDevice
+        );
+        cudaDeviceSynchronize();
+    }
     if (threading->num_threads > 0) {
         for (int buf=0; buf < vec->buffers; buf++) {
             update_buffer_state(threading, buf, OBS_READY_ON_CPU);
@@ -486,43 +644,49 @@ void vec_reset(VecEnv* vec) {
 void vec_send(VecEnv* vec, int buffer) {
     int env_start = vec->buffer_env_starts[buffer];
     int env_count = vec->buffer_env_counts[buffer];
-    int agents_per_buffer = vec->total_agents / vec->buffers;
+    int agents_per_buffer = vec->agents_per_buffer;
     int start = buffer * agents_per_buffer;
 
     Threading* threading = vec->threading;
 
     // Single threaded
     if (threading->num_threads == 0) {
-        cudaDeviceSynchronize();
-        cudaMemcpy(
-            &vec->actions[start*NUM_ATNS],
-            &vec->gpu_actions[start*NUM_ATNS],
-            agents_per_buffer*NUM_ATNS*sizeof(double),
-            cudaMemcpyDeviceToHost
-        );
+
+        if (threading->use_gpu) {
+            cudaDeviceSynchronize();
+            cudaMemcpy(
+                &vec->actions[start*NUM_ATNS],
+                &vec->gpu_actions[start*NUM_ATNS],
+                agents_per_buffer*NUM_ATNS*sizeof(double),
+                cudaMemcpyDeviceToHost
+            );
+        }
+
         for (int i = env_start; i < env_start + env_count; i++) {
             Env* env = &vec->envs[i];
             c_step(env);
         }
-        cudaMemcpy(
-            &((OBS_DTYPE*)vec->gpu_observations)[start*OBS_SIZE],
-            &((OBS_DTYPE*)vec->observations)[start*OBS_SIZE],
-            agents_per_buffer*OBS_SIZE*sizeof(OBS_DTYPE),
-            cudaMemcpyHostToDevice
-        );
-        cudaMemcpy(
-            &vec->gpu_rewards[start],
-            &vec->rewards[start],
-            agents_per_buffer*sizeof(float),
-            cudaMemcpyHostToDevice
-        );
-        cudaMemcpy(
-            &vec->gpu_terminals[start],
-            &vec->terminals[start],
-            agents_per_buffer*sizeof(float),
-            cudaMemcpyHostToDevice
-        );
-        cudaDeviceSynchronize();
+        if (threading->use_gpu) {
+            cudaMemcpy(
+                &((OBS_DTYPE*)vec->gpu_observations)[start*OBS_SIZE],
+                &((OBS_DTYPE*)vec->observations)[start*OBS_SIZE],
+                agents_per_buffer*OBS_SIZE*sizeof(OBS_DTYPE),
+                cudaMemcpyHostToDevice
+            );
+            cudaMemcpy(
+                &vec->gpu_rewards[start],
+                &vec->rewards[start],
+                agents_per_buffer*sizeof(float),
+                cudaMemcpyHostToDevice
+            );
+            cudaMemcpy(
+                &vec->gpu_terminals[start],
+                &vec->terminals[start],
+                agents_per_buffer*sizeof(float),
+                cudaMemcpyHostToDevice
+            );
+            cudaDeviceSynchronize();
+        }
     } else {
         if (threading->use_gpu) {
             cudaMemcpyAsync(
@@ -540,7 +704,10 @@ void vec_send(VecEnv* vec, int buffer) {
 }
 
 void vec_recv(VecEnv* vec, int buffer) {
-    cudaDeviceSynchronize();
+    if (vec->threading->use_gpu) {
+        cudaDeviceSynchronize();
+    }
+
     Threading* threading = vec->threading;
     // TODO: Single stream architecture requires busy waiting here
     //printf("Recv buf %d\n", buffer);

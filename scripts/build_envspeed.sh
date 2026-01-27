@@ -1,24 +1,24 @@
 #!/bin/bash
 
-# Usage: ./build_vec.sh <env_name>
-
-ENV_NAME=${1:?Usage: ./build_vec.sh <env_name>}
+# Usage: ./build_envspeed.sh
 
 RAYLIB_NAME='raylib-5.5_linux_amd64'
 LINK_ARCHIVES="./$RAYLIB_NAME/lib/libraylib.a"
 
 FLAGS=(
-    -shared
     -Wall
     -I./$RAYLIB_NAME/include
     -I/usr/local/cuda/include
-    "pufferlib/extensions/${ENV_NAME}.c" -o "${ENV_NAME}.so"
+    -Ipufferlib/extensions
+    "pufferlib/extensions/test_envspeed.c"
+    "pufferlib/extensions/ini.c"
+    -o "test_envspeed"
     $LINK_ARCHIVES
     -lGL
     -lm
     -lpthread
-    -fopenmp
-    #-L/usr/local/cuda/lib64 -lcudart
+    -ldl
+    -L/usr/local/cuda/lib64 -lcudart
     -ferror-limit=3
     -DPLATFORM_DESKTOP
     # Bite me
@@ -33,4 +33,4 @@ FLAGS=(
     -fPIC
 )
 
-clang -O2 -DNDEBUG ${FLAGS[@]}
+clang -O2 -DNDEBUG -fopenmp ${FLAGS[@]}

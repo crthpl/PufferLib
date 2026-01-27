@@ -36,6 +36,7 @@ vec_reset_fn vec_reset;
 vec_step_fn vec_step;
 vec_send_fn vec_send;
 vec_recv_fn vec_recv;
+vec_omp_step_fn vec_omp_step;
 env_close_fn env_close;
 vec_close_fn vec_close;
 vec_log_fn vec_log;
@@ -138,6 +139,7 @@ create_environments(int num_buffers, int total_agents, const std::string& env_na
     vec_step = (vec_step_fn)dlsym(handle, "vec_step");
     vec_send = (vec_send_fn)dlsym(handle, "vec_send");
     vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
+    vec_omp_step = (vec_omp_step_fn)dlsym(handle, "vec_omp_step");
     env_close = (env_close_fn)dlsym(handle, "env_close");
     vec_close = (vec_close_fn)dlsym(handle, "vec_close");
     vec_log = (vec_log_fn)dlsym(handle, "vec_log");
@@ -275,6 +277,7 @@ typedef struct {
     bool cudagraphs;
     bool kernels;
     bool profile;
+    bool use_omp;
 } HypersT;
 
 typedef struct {
@@ -285,8 +288,8 @@ typedef struct {
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
     RolloutBuf rollouts;
     EnvBuf env;
-    GraphBuf graph;
-    at::cuda::CUDAGraph rollout_graph;
+    std::vector<GraphBuf> graphs;  // Per-buffer graph buffers for OMP
+    std::vector<at::cuda::CUDAGraph> rollout_graphs;  // Per-buffer rollout graphs
     at::cuda::CUDAGraph train_forward_graph;
     std::vector<std::vector<at::cuda::CUDAGraph>> rollout_copy_graphs;
     bool captured;
@@ -412,6 +415,44 @@ void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
     rollouts.terminals.select(0, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
 
     env.actions.narrow(0, buf*block_size, block_size).copy_(graph.actions, true);
+}
+
+// Callback for OMP threadmanager - runs policy forward for one (buf, t) step
+extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
+    torch::NoGradGuard no_grad;
+    PuffeRL* pufferl = (PuffeRL*)ctx;
+    HypersT& hypers = pufferl->hypers;
+
+    int total_agents = pufferl->vec->total_agents;
+    int num_buffers = hypers.num_buffers;
+    int block_size = total_agents / num_buffers;
+
+    // Copy obs from env buffer to graph input
+    auto& buf_state = pufferl->buffer_states[buf];
+    GraphBuf& graph = pufferl->graphs[buf];
+    graph.obs.copy_(pufferl->env.obs.narrow(0, buf*block_size, block_size), true);
+    graph.state.copy_(buf_state, false);
+
+    // Run policy forward
+    // profile_begin("rollout_graph", hypers.profile);
+    if (hypers.cudagraphs) {
+        pufferl->rollout_graphs[buf].replay();
+    } else {
+        forward_call(graph, pufferl->policy, hypers.kernels,
+            pufferl->rng_seed, pufferl->rng_offset, pufferl->act_sizes, pufferl->act_sizes_cpu);
+    }
+    // profile_end(hypers.profile);
+
+    // Copy outputs: state, rollout storage, actions to env
+    // profile_begin("rollout_copy_outputs", hypers.profile);
+    buf_state.copy_(graph.state_out, false);
+    if (hypers.cudagraphs) {
+        pufferl->rollout_copy_graphs[t][buf].replay();
+    } else {
+        rollout_copy_call(pufferl->rollouts, pufferl->env, graph,
+            total_agents, num_buffers, t, buf);
+    }
+    // profile_end(hypers.profile);
 }
 
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
@@ -642,8 +683,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         vec->size, total_agents, segments, batch, num_buffers);
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
-    pufferl->graph = create_graph(batch, input_size, minibatch_segments, horizon,
-        policy->num_layers, policy->hidden_size, policy->expansion_factor, num_action_heads, policy);
+    pufferl->graphs.resize(num_buffers);
+    for (int i = 0; i < num_buffers; i++) {
+        pufferl->graphs[i] = create_graph(batch, input_size, minibatch_segments, horizon,
+            policy->num_layers, policy->hidden_size, policy->expansion_factor, num_action_heads, policy);
+    }
 
     pufferl->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
     pufferl->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
@@ -655,21 +699,26 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     }
 
     if (hypers.cudagraphs) {
-        pufferl->rollout_graph = at::cuda::CUDAGraph();
         pufferl->train_forward_graph = at::cuda::CUDAGraph();
 
         auto* p = pufferl.get();
-        capture_graph(&pufferl->rollout_graph, [p]() {
-            forward_call(p->graph, p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes, p->act_sizes_cpu);
-        });
         capture_graph(&pufferl->train_forward_graph, [p]() {
-            train_forward_call(p->graph, p->policy, p->muon,
+            train_forward_call(p->graphs[0], p->policy, p->muon,
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
         });
 
         int total_agents = vec->total_agents;
         int num_buffers = hypers.num_buffers;
         int horizon = hypers.horizon;
+
+        // Per-buffer rollout graphs
+        pufferl->rollout_graphs.resize(num_buffers);
+        for (int b = 0; b < num_buffers; ++b) {
+            pufferl->rollout_graphs[b] = at::cuda::CUDAGraph();
+            capture_graph(&pufferl->rollout_graphs[b], [p, b]() {
+                forward_call(p->graphs[b], p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes, p->act_sizes_cpu);
+            });
+        }
 
         // Resize rollout_copy_graphs to [horizon][num_buffers]
         pufferl->rollout_copy_graphs.resize(horizon);
@@ -678,7 +727,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             for (int j = 0; j < num_buffers; ++j) {
                 pufferl->rollout_copy_graphs[i][j] = at::cuda::CUDAGraph();
                 capture_graph(&pufferl->rollout_copy_graphs[i][j], [p, total_agents, num_buffers, i, j]() {
-                    rollout_copy_call(p->rollouts, p->env, p->graph, total_agents, num_buffers, i, j);
+                    rollout_copy_call(p->rollouts, p->env, p->graphs[j], total_agents, num_buffers, i, j);
                 });
             }
         }
@@ -686,7 +735,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
     // Try num_threads=0 to disable threading for debugging
-    int num_threads = 8;
+    int num_threads = 16;
     int block_size = vec->size / 16;
     if (vec->size < num_threads) {
         num_threads = vec->size;
@@ -694,7 +743,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     if (block_size < 1) {
         block_size = 1;
     }
-    create_threads(vec, num_threads, block_size);
+    if (hypers.use_omp) {
+        create_threads(vec, num_threads, block_size, true, pufferl.get(), net_callback_wrapper, horizon);
+    } else {
+        create_threads(vec, num_threads, block_size, false, nullptr, nullptr, 0);
+    }
     vec_reset(vec);
 
     return pufferl;
@@ -730,8 +783,9 @@ void env_recv(PuffeRL& pufferl, int buf) {
 
 void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
     auto& buf_state = pufferl.buffer_states[buf];
-    pufferl.graph.obs.copy_(pufferl.env.obs.narrow(0, buf*block_size, block_size), true);
-    pufferl.graph.state.copy_(buf_state, false);
+    GraphBuf& graph = pufferl.graphs[buf];
+    graph.obs.copy_(pufferl.env.obs.narrow(0, buf*block_size, block_size), true);
+    graph.state.copy_(buf_state, false);
 }
 
 void env_send(PuffeRL& pufferl, int buf) {
@@ -798,21 +852,22 @@ void rollouts_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("rollout_graph", hypers.profile);
+        GraphBuf& graph = pufferl.graphs[buf];
         if (hypers.cudagraphs) {
-            pufferl.rollout_graph.replay();
+            pufferl.rollout_graphs[buf].replay();
         } else {
-            forward_call(pufferl.graph, pufferl.policy, hypers.kernels,
+            forward_call(graph, pufferl.policy, hypers.kernels,
                 pufferl.rng_seed, pufferl.rng_offset, pufferl.act_sizes, pufferl.act_sizes_cpu);
         }
         profile_end(hypers.profile);
 
         profile_begin("rollout_copy_outputs", hypers.profile);
         auto& buf_state = pufferl.buffer_states[buf];
-        buf_state.copy_(pufferl.graph.state_out, false);
+        buf_state.copy_(graph.state_out, false);
         if (hypers.cudagraphs) {
             pufferl.rollout_copy_graphs[h][buf].replay();
         } else {
-            rollout_copy_call(pufferl.rollouts, pufferl.env, pufferl.graph,
+            rollout_copy_call(pufferl.rollouts, pufferl.env, graph,
                 pufferl.vec->total_agents, num_buffers, h, buf);
         }
         profile_end(hypers.profile);
@@ -825,6 +880,10 @@ void rollouts_impl(PuffeRL& pufferl) {
         env_send(pufferl, buf);
         profile_end(hypers.profile);
     }
+}
+
+void rollouts_impl_omp(PuffeRL& pufferl) {
+    vec_omp_step(pufferl.vec);
 }
 
 void train_impl(PuffeRL& pufferl) {
@@ -925,14 +984,15 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        train_select_and_copy(pufferl.graph, rollouts, advantages, idx, mb_state, mb_prio);
+        GraphBuf& graph = pufferl.graphs[0];
+        train_select_and_copy(graph, rollouts, advantages, idx, mb_state, mb_prio);
         profile_end(hypers.profile);
 
         profile_begin("train_forward_graph", hypers.profile);
         if (hypers.cudagraphs) {
             pufferl.train_forward_graph.replay();
         } else {
-            train_forward_call(pufferl.graph, pufferl.policy, pufferl.muon,
+            train_forward_call(graph, pufferl.policy, pufferl.muon,
                 hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, hypers.kernels);
         }
         profile_end(hypers.profile);
@@ -942,12 +1002,12 @@ void train_impl(PuffeRL& pufferl) {
         // Source is {minibatch_segments, horizon}, need to transpose to {horizon, minibatch_segments}
         // Temporary: use slice instead of index_copy_ for contiguous test
         /*
-        pufferl.rollouts.ratio.slice(1, 0, minibatch_segments).copy_(pufferl.graph.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.slice(1, 0, minibatch_segments).copy_(pufferl.graph.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.ratio.slice(1, 0, minibatch_segments).copy_(graph.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.values.slice(1, 0, minibatch_segments).copy_(graph.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
         */
         // Original index_copy_ version:
-        pufferl.rollouts.ratio.index_copy_(1, idx, pufferl.graph.mb_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.index_copy_(1, idx, pufferl.graph.mb_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.ratio.index_copy_(1, idx, graph.mb_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.values.index_copy_(1, idx, graph.mb_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
 
     }
     pufferl.epoch += 1;

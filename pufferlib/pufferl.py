@@ -154,7 +154,8 @@ class PuffeRL:
         config['accumulate_minibatches'] = self.accumulate_minibatches
         config['cudagraphs'] = True
         config['kernels'] = True
-        config['num_buffers'] = 2
+        config['use_omp'] = True
+        config['num_buffers'] = 4
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.rollouts.observations
         self.actions = self.pufferl_cpp.rollouts.actions

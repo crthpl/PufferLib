@@ -79,11 +79,13 @@ extra_compile_args = [
     '-DPLATFORM_DESKTOP',
 ]
 extra_link_args = [
-    '-fwrapv'
+    '-fwrapv',
+    '-fopenmp',
 ]
 cxx_args = [
     '-fdiagnostics-color=always',
     '-std=c++17',
+    '-fopenmp',
 ]
 nvcc_args = [
     '-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1',

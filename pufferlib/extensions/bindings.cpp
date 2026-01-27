@@ -43,7 +43,11 @@ torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
-    rollouts_impl(pufferl);
+    if (pufferl.hypers.use_omp) {
+        rollouts_impl_omp(pufferl);
+    } else {
+        rollouts_impl(pufferl);
+    }
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {
@@ -120,6 +124,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.cudagraphs = get_config(kwargs, "cudagraphs");
     hypers.kernels = get_config(kwargs, "kernels");
     hypers.profile = get_config(kwargs, "profile");
+    hypers.use_omp = get_config(kwargs, "use_omp");
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
     Dict* env_kwargs = py_dict_to_c_dict(kwargs["env_kwargs"].cast<py::dict>());

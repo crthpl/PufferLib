@@ -77,6 +77,7 @@ FLAGS=(
     -lm
     -lpthread
     -ferror-limit=3
+    -fopenmp
     -DPLATFORM_DESKTOP
     # Bite me
     -Werror=incompatible-pointer-types
@@ -109,7 +110,7 @@ if [ "$MODE" = "local" ]; then
     clang -g -O0 ${FLAGS[@]}
 elif [ "$MODE" = "fast" ]; then
     echo "Building optimized $ENV for local testing..."
-    clang -pg -O2 -DNDEBUG ${FLAGS[@]}
+    clang -O2 -DNDEBUG ${FLAGS[@]}
     echo "Built to: $ENV"
 else
     echo "Invalid mode specified: local|fast|web"

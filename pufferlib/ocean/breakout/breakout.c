@@ -63,16 +63,22 @@ void demo() {
 
 void test_performance(int timeout) {
     Breakout env = {
-        .width = 512,
-        .height = 512,
-        .paddle_width = 20,
-        .paddle_height = 70,
-        .ball_width = 10,
-        .ball_height = 15,
-        .brick_width = 10,
-        .brick_height = 10,
-        .brick_rows = 5,
-        .brick_cols = 10,
+        .num_agents = 1,
+        .frameskip = 4,
+        .width = 576,
+        .height = 330,
+        .initial_paddle_width = 62,
+        .paddle_width = 62,
+        .paddle_height = 8,
+        .ball_width = 32,
+        .ball_height = 32,
+        .brick_width = 32,
+        .brick_height = 12,
+        .brick_rows = 6,
+        .brick_cols = 18,
+        .initial_ball_speed = 256,
+        .max_ball_speed = 448,
+        .paddle_speed = 620,
         .continuous = 0,
     };
     allocate(&env);
@@ -81,9 +87,11 @@ void test_performance(int timeout) {
     int start = time(NULL);
     int num_steps = 0;
     while (time(NULL) - start < timeout) {
-        env.actions[0] = rand() % 3;
-        c_step(&env);
-        num_steps++;
+        for (int i = 0; i < 1000; i++) {
+            //env.actions[0] = 1;//rand() % 3;
+            c_step(&env);
+            num_steps++;
+        }
     }
 
     int end = time(NULL);
@@ -92,7 +100,55 @@ void test_performance(int timeout) {
     free_allocated(&env);
 }
 
+void test_performance_multi(int num_envs, int timeout) {
+    Breakout* envs = (Breakout*)calloc(num_envs, sizeof(Breakout));
+    for (int i = 0; i < num_envs; i++) {
+        envs[i] = (Breakout){
+            .num_agents = 1,
+            .frameskip = 4,
+            .width = 576,
+            .height = 330,
+            .initial_paddle_width = 62,
+            .paddle_width = 62,
+            .paddle_height = 8,
+            .ball_width = 32,
+            .ball_height = 32,
+            .brick_width = 32,
+            .brick_height = 12,
+            .brick_rows = 6,
+            .brick_cols = 18,
+            .initial_ball_speed = 256,
+            .max_ball_speed = 448,
+            .paddle_speed = 620,
+            .continuous = 0,
+        };
+        allocate(&envs[i]);
+        c_reset(&envs[i]);
+    }
+
+    int start = time(NULL);
+    int num_steps = 0;
+    while (time(NULL) - start < timeout) {
+        for (int i = 0; i < num_envs; i++) {
+            envs[i].actions[0] = 1;
+            c_step(&envs[i]);
+            num_steps++;
+        }
+    }
+
+    int end = time(NULL);
+    float sps = num_steps / (end - start);
+    printf("Test Environment SPS: %f\n", sps);
+
+    for (int i = 0; i < num_envs; i++) {
+        free_allocated(&envs[i]);
+    }
+    free(envs);
+}
+
+
 int main() {
-    demo();
-    //test_performance(10);
+    //demo();
+    //test_performance(5);
+    test_performance_multi(65536, 5);
 }
