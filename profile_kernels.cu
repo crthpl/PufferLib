@@ -909,7 +909,7 @@ typedef struct {
     float* values;
     float* returns;
     float* adv_mean;
-    float* adv_std;
+    float* adv_var;  // variance, kernel does sqrt
     float* loss;
     double* saved_for_backward;
     float* grad_logits;
@@ -922,6 +922,11 @@ typedef struct {
     int N;
     int T;
     int A;
+    int logits_stride_n;
+    int logits_stride_t;
+    int logits_stride_a;
+    int values_stride_n;
+    int values_stride_t;
 } PPOLossArgs;
 
 PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
@@ -942,7 +947,7 @@ PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
     cudaMalloc(&args->values, NT * sizeof(float));
     cudaMalloc(&args->returns, NT * sizeof(float));
     cudaMalloc(&args->adv_mean, sizeof(float));
-    cudaMalloc(&args->adv_std, sizeof(float));
+    cudaMalloc(&args->adv_var, sizeof(float));
     cudaMalloc(&args->loss, sizeof(float));
     cudaMalloc(&args->saved_for_backward, NT * 5 * sizeof(double));
     cudaMalloc(&args->grad_logits, NTA * sizeof(float));
@@ -967,7 +972,7 @@ PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
         adv_sq_sum += advantages_buf[i] * advantages_buf[i];
     }
     float adv_mean = adv_sum / NT;
-    float adv_std = sqrtf(adv_sq_sum / NT - adv_mean * adv_mean);
+    float adv_var = adv_sq_sum / NT - adv_mean * adv_mean;
 
     for (int i = 0; i < NTA; ++i) {
         logits_buf[i] = rand1() * 2.0f;
@@ -992,7 +997,7 @@ PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
     cudaMemcpy(args->values, values_buf, NT * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(args->returns, returns_buf, NT * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(args->adv_mean, &adv_mean, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->adv_std, &adv_std, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->adv_var, &adv_var, sizeof(float), cudaMemcpyHostToDevice);
 
     float grad_loss_val = 1.0f;
     cudaMemcpy(args->grad_loss, &grad_loss_val, sizeof(float), cudaMemcpyHostToDevice);
@@ -1001,6 +1006,12 @@ PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
     args->vf_clip_coef = 0.1f;
     args->vf_coef = 0.5f;
     args->ent_coef = 0.01f;
+
+    args->logits_stride_n = seq * actions;  // T * A
+    args->logits_stride_t = actions;        // A
+    args->logits_stride_a = 1;
+    args->values_stride_n = seq;            // T
+    args->values_stride_t = 1;
 
     free(buf);
     free(actions_buf);
@@ -1017,7 +1028,7 @@ void free_ppolossargs(PPOLossArgs* args) {
     cudaFree(args->values);
     cudaFree(args->returns);
     cudaFree(args->adv_mean);
-    cudaFree(args->adv_std);
+    cudaFree(args->adv_var);
     cudaFree(args->loss);
     cudaFree(args->saved_for_backward);
     cudaFree(args->grad_logits);
@@ -1031,7 +1042,7 @@ void run_ppoloss_forward(PPOLossArgs* args) {
         args->loss, args->saved_for_backward,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
 }
@@ -1041,33 +1052,36 @@ void run_ppoloss_backward(PPOLossArgs* args) {
         args->grad_logits, args->grad_values_pred, args->grad_loss,
         args->logits, args->actions, args->old_logprobs,
         args->advantages, args->prio, args->values, args->returns,
-        args->saved_for_backward, args->adv_mean, args->adv_std,
+        args->saved_for_backward, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
 }
 
 void run_ppoloss_forward_opt(PPOLossArgs* args) {
-    /*
     launch_ppo_loss_forward_optimized<float>(
         args->loss, args->saved_for_backward,
+        nullptr, nullptr,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N, 0);
-        */
+        args->T, args->A, args->N,
+        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
+        args->values_stride_n, args->values_stride_t,
+        0);
 }
 
 void run_ppoloss_backward_opt(PPOLossArgs* args) {
-    /*
     launch_ppo_loss_backward_optimized<float>(
         args->grad_logits, args->grad_values_pred, args->grad_loss,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N, 0);
-        */
+        args->T, args->A, args->N,
+        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
+        args->values_stride_n, args->values_stride_t,
+        0);
 }
 
 #ifdef USE_TORCH
@@ -1082,7 +1096,7 @@ typedef struct {
     torch::Tensor values;
     torch::Tensor returns;
     torch::Tensor adv_mean;
-    torch::Tensor adv_std;
+    torch::Tensor adv_var;  // variance, kernel computes sqrt
     torch::Tensor loss;
     float clip_coef;
     float vf_clip_coef;
@@ -1115,17 +1129,18 @@ PPOLossArgsTorch* create_ppolossargs_torch(PPOLossArgs* raw) {
     args->values = torch::from_blob(raw->values, {raw->N, raw->T}, opts);
     args->returns = torch::from_blob(raw->returns, {raw->N, raw->T}, opts);
     args->adv_mean = torch::from_blob(raw->adv_mean, {1}, opts);
-    args->adv_std = torch::from_blob(raw->adv_std, {1}, opts);
+    args->adv_var = torch::from_blob(raw->adv_var, {1}, opts);
 
     return args;
 }
 
 void run_ppoloss_forward_torch(PPOLossArgsTorch* args) {
     torch::NoGradGuard no_grad;
+    auto adv_std = args->adv_var.sqrt();  // fused_ppo_loss expects std, not var
     fused_ppo_loss(
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, adv_std,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
 }
 
@@ -1137,10 +1152,11 @@ void run_ppoloss_backward_torch(PPOLossArgsTorch* args) {
 
 void run_ppoloss_forward_cpp(PPOLossArgsTorch* args) {
     torch::NoGradGuard no_grad;
+    auto adv_std = args->adv_var.sqrt();  // fused_ppo_loss_cpp expects std, not var
     fused_ppo_loss_cpp(
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, adv_std,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
 }
 
@@ -1167,6 +1183,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
 
 #ifdef USE_TORCH
     PPOLossArgsTorch* args_torch = create_ppolossargs_torch(args);
+    auto adv_std = args_torch->adv_var.sqrt();  // fused_ppo_loss/cpp expect std, not var
 
     float fwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_forward_torch, args_torch);
     print_timing("\tforward (torch)", fwd_torch_ms, NT);
@@ -1174,7 +1191,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
     args_torch->loss = fused_ppo_loss(
         args_torch->logits, args_torch->values_pred, args_torch->actions,
         args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
-        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, adv_std,
         args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef)[0];
 
     float bwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_backward_torch, args_torch);
@@ -1186,7 +1203,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
     args_torch->loss = fused_ppo_loss_cpp(
         args_torch->logits, args_torch->values_pred, args_torch->actions,
         args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
-        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, adv_std,
         args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef);
 
     float bwd_cpp_ms = profile_kernel((kernel_fn)run_ppoloss_backward_torch, args_torch);
@@ -1228,26 +1245,29 @@ void profile_ppoloss(int batch, int seq, int actions) {
         loss_orig, saved_orig,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
 
     // Run optimized forward
-    /*
     launch_ppo_loss_forward_optimized<float>(
         loss_opt, saved_opt,
+        nullptr, nullptr,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N, 0);
-        */
+        args->T, args->A, args->N,
+        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
+        args->values_stride_n, args->values_stride_t,
+        0);
 
     // Run pure PyTorch reference (ground truth) - fused_ppo_loss_cpp is the correct implementation
+    auto adv_std_torch = args_torch->adv_var.sqrt();  // fused_ppo_loss_cpp expects std
     torch::Tensor torch_loss = fused_ppo_loss_cpp(
         args_torch->logits, args_torch->values_pred, args_torch->actions,
         args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
-        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_std,
+        args_torch->values, args_torch->returns, args_torch->adv_mean, adv_std_torch,
         args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef);
 
     cudaDeviceSynchronize();
@@ -1287,7 +1307,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
         grad_logits_orig, grad_values_orig, args->grad_loss,
         args->logits, args->actions, args->old_logprobs,
         args->advantages, args->prio, args->values, args->returns,
-        saved_orig, args->adv_mean, args->adv_std,
+        saved_orig, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
         args->T, args->A, args->N, 0);
 
@@ -1295,9 +1315,12 @@ void profile_ppoloss(int batch, int seq, int actions) {
         grad_logits_opt, grad_values_opt, args->grad_loss,
         args->logits, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_std,
+        args->values, args->returns, args->adv_mean, args->adv_var,
         args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N, 0);
+        args->T, args->A, args->N,
+        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
+        args->values_stride_n, args->values_stride_t,
+        0);
 
     // Run torch backward using fused_ppo_loss_cpp (pure PyTorch, has proper autograd)
     bool torch_backward_ok = false;
@@ -2082,10 +2105,10 @@ int main(int argc, char** argv) {
     // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
 
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "all") == 0) {
-        profile_mingrugate(BR, H);
-        profile_logcoeffsandvalues(BT, T, H);
-        profile_logcumsumexp(BT, T, H);
-        profile_fusedscan(BT, T, H);
+        // profile_mingrugate(BR, H);
+        // profile_logcoeffsandvalues(BT, T, H);
+        // profile_logcumsumexp(BT, T, H);
+        // profile_fusedscan(BT, T, H);
         //profile_samplelogits(BR, A);
         profile_ppoloss(BT, T, A);
     }

@@ -973,7 +973,7 @@ public:
         torch::Tensor values,           // (N, T)
         torch::Tensor returns,          // (N, T)
         torch::Tensor adv_mean,         // (1)
-        torch::Tensor adv_std,          // (1)
+        torch::Tensor adv_var,          // (1) - variance, kernel computes sqrt
         torch::Tensor ratio_out,        // (N, T) - output for ratio
         torch::Tensor newvalue_out,     // (N, T) - output for newvalue
         double clip_coef,
@@ -999,6 +999,15 @@ public:
         auto saved_for_backward = torch::zeros({N * T, 5}, options_double);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+        // strides for non-contiguous tensor support
+        auto logits_strides = logits.strides();
+        auto values_strides = values_pred.strides();
+        int logits_stride_n = logits_strides[0];
+        int logits_stride_t = logits_strides[1];
+        int logits_stride_a = logits_strides[2];
+        int values_stride_n = values_strides[0];
+        int values_stride_t = values_strides[1];
+
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_forward_optimized_float(
                 loss_output.data_ptr<float>(),
@@ -1014,12 +1023,14 @@ public:
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
                 adv_mean.data_ptr<float>(),
-                adv_std.data_ptr<float>(),
+                adv_var.data_ptr<float>(),
                 static_cast<float>(clip_coef),
                 static_cast<float>(vf_clip_coef),
                 static_cast<float>(vf_coef),
                 static_cast<float>(ent_coef),
                 T, A, N,
+                logits_stride_n, logits_stride_t, logits_stride_a,
+                values_stride_n, values_stride_t,
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
@@ -1037,12 +1048,14 @@ public:
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
                 adv_mean.data_ptr<float>(),
-                adv_std.data_ptr<float>(),
+                adv_var.data_ptr<float>(),
                 static_cast<float>(clip_coef),
                 static_cast<float>(vf_clip_coef),
                 static_cast<float>(vf_coef),
                 static_cast<float>(ent_coef),
                 T, A, N,
+                logits_stride_n, logits_stride_t, logits_stride_a,
+                values_stride_n, values_stride_t,
                 stream
             );
         }
@@ -1053,7 +1066,7 @@ public:
         ctx->saved_data["ent_coef"] = ent_coef;
 
         ctx->save_for_backward({logits, values_pred, actions, old_logprobs, advantages,
-                                prio, values, returns, adv_mean, adv_std});
+                                prio, values, returns, adv_mean, adv_var});
 
         return {loss_output};
     }
@@ -1071,7 +1084,7 @@ public:
         auto values = saved[6].contiguous();
         auto returns = saved[7].contiguous();
         auto adv_mean = saved[8].contiguous();
-        auto adv_std = saved[9].contiguous();
+        auto adv_var = saved[9].contiguous();
 
         auto dtype = logits.dtype();
         auto N = logits.size(0);
@@ -1089,6 +1102,15 @@ public:
         auto grad_values_pred = torch::empty_like(values_pred);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+        // need strides
+        auto logits_strides = logits.strides();
+        auto values_strides = values_pred.strides();
+        int logits_stride_n = logits_strides[0];
+        int logits_stride_t = logits_strides[1];
+        int logits_stride_a = logits_strides[2];
+        int values_stride_n = values_strides[0];
+        int values_stride_t = values_strides[1];
+
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_backward_optimized_float(
                 grad_logits.data_ptr<float>(),
@@ -1103,10 +1125,12 @@ public:
                 values.data_ptr<float>(),
                 returns.data_ptr<float>(),
                 adv_mean.data_ptr<float>(),
-                adv_std.data_ptr<float>(),
+                adv_var.data_ptr<float>(),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
                 T, A, N,
+                logits_stride_n, logits_stride_t, logits_stride_a,
+                values_stride_n, values_stride_t,
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
@@ -1123,10 +1147,12 @@ public:
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
                 adv_mean.data_ptr<float>(),
-                adv_std.data_ptr<float>(),
+                adv_var.data_ptr<float>(),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
                 T, A, N,
+                logits_stride_n, logits_stride_t, logits_stride_a,
+                values_stride_n, values_stride_t,
                 stream
             );
         }
@@ -1152,7 +1178,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     torch::Tensor values,
     torch::Tensor returns,
     torch::Tensor adv_mean,
-    torch::Tensor adv_std,
+    torch::Tensor adv_var,  // variance, kernel does sqrt
     torch::Tensor ratio_out,
     torch::Tensor newvalue_out,
     float clip_coef,
@@ -1162,7 +1188,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
 ) {
     return PPOFusedLossOptimizedFunction::apply(logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, adv_mean,
-        adv_std, ratio_out, newvalue_out, clip_coef, vf_clip_coef, vf_coef, ent_coef);
+        adv_var, ratio_out, newvalue_out, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
 // Reference implementation for mingru_gate (inference path)

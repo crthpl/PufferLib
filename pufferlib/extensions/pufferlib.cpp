@@ -419,8 +419,8 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
 
     Tensor loss;
-    if (false) {
-    //if (kernels) {
+    if (kernels) {
+        auto [mb_adv_var, mb_adv_mean] = torch::var_mean(graph.mb_advantages);  // single kernel launch
         loss = fused_ppo_loss_optimized(
             logits,
             newvalue,
@@ -430,8 +430,8 @@ void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
             graph.mb_prio.to(logits.dtype()),
             graph.mb_values.to(logits.dtype()),
             graph.mb_returns.to(logits.dtype()),
-            adv_mean,
-            adv_std,
+            mb_adv_mean,
+            mb_adv_var,  // variance, not std - kernel does sqrtf to avoid second kernel launch here
             graph.mb_ratio,
             graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)}),
             hypers.clip_coef,
