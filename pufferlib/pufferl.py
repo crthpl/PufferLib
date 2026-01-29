@@ -249,7 +249,7 @@ class PuffeRL:
                 _C.python_vec_send(self.pufferl_cpp, buf)
         '''
 
-        #torch.cuda.synchronize()
+        torch.cuda.synchronize()
         logs = _C.log_environments(self.pufferl_cpp)
         if logs:
             for k, v in logs.items():

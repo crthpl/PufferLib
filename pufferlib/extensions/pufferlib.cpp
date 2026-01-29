@@ -19,7 +19,7 @@
 
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
-//#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <nvToolsExt.h>
 
@@ -292,6 +292,7 @@ typedef struct {
     std::vector<at::cuda::CUDAGraph> rollout_graphs;  // Per-buffer rollout graphs
     at::cuda::CUDAGraph train_forward_graph;
     std::vector<std::vector<at::cuda::CUDAGraph>> rollout_copy_graphs;
+    std::vector<at::cuda::CUDAStream> torch_streams;  // PyTorch-managed streams for OMP
     bool captured;
     Tensor adv_mean;
     Tensor adv_std;
@@ -423,6 +424,9 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
 
+    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
+    at::cuda::setCurrentCUDAStream(pufferl->torch_streams[buf]);
+ 
     int total_agents = pufferl->vec->total_agents;
     int num_buffers = hypers.num_buffers;
     int block_size = total_agents / num_buffers;
@@ -431,7 +435,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     auto& buf_state = pufferl->buffer_states[buf];
     GraphBuf& graph = pufferl->graphs[buf];
     graph.obs.copy_(pufferl->env.obs.narrow(0, buf*block_size, block_size), true);
-    graph.state.copy_(buf_state, false);
+    graph.state.copy_(buf_state, true);
 
     // Run policy forward
     // profile_begin("rollout_graph", hypers.profile);
@@ -445,7 +449,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Copy outputs: state, rollout storage, actions to env
     // profile_begin("rollout_copy_outputs", hypers.profile);
-    buf_state.copy_(graph.state_out, false);
+    buf_state.copy_(graph.state_out, true);
     if (hypers.cudagraphs) {
         pufferl->rollout_copy_graphs[t][buf].replay();
     } else {
@@ -453,6 +457,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             total_agents, num_buffers, t, buf);
     }
     // profile_end(hypers.profile);
+    
+    at::cuda::setCurrentCUDAStream(current_stream);
 }
 
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
@@ -745,6 +751,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     }
     if (hypers.use_omp) {
         create_threads(vec, num_threads, block_size, true, pufferl.get(), net_callback_wrapper, horizon);
+
+        // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
+        // This ensures PyTorch properly recognizes the streams for all operations
+        for (int i = 0; i < num_buffers; i++) {
+            pufferl->torch_streams.push_back(at::cuda::getStreamFromPool(false));
+            vec->streams[i] = pufferl->torch_streams[i].stream();
+        }
     } else {
         create_threads(vec, num_threads, block_size, false, nullptr, nullptr, 0);
     }
@@ -754,11 +767,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 }
 
 void python_vec_recv_impl(PuffeRL& pufferl, int buf) {
-    vec_recv(pufferl.vec, buf);
+    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 void python_vec_send_impl(PuffeRL& pufferl, int buf) {
-    vec_send(pufferl.vec, buf);
+    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 torch::autograd::tensor_list env_buffers_impl(PuffeRL& pufferl) {
@@ -778,7 +791,7 @@ inline void profile_end(bool enable) {
 }
 
 void env_recv(PuffeRL& pufferl, int buf) {
-    vec_recv(pufferl.vec, buf);
+    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
@@ -789,7 +802,7 @@ void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
 }
 
 void env_send(PuffeRL& pufferl, int buf) {
-    vec_send(pufferl.vec, buf);
+    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
@@ -951,6 +964,7 @@ void train_impl(PuffeRL& pufferl) {
     rollouts.ratio.fill_(1.0);
 
     Tensor advantages = torch::zeros_like(rollouts.values);
+
     compute_advantage(rollouts, advantages, hypers);
 
     pufferl.adv_mean.copy_(advantages.mean().detach());
@@ -1019,6 +1033,7 @@ void train_impl(PuffeRL& pufferl) {
     auto var_y = y_true.var();
     */
     //double explained_var = (var_y.abs() < 1e-8) ? NAN : (1 - (y_true - y_pred).var() / var_y).item<double>();
+    cudaStreamSynchronize(at::cuda::getCurrentCUDAStream());
 }
 
 // Profiler control for nsys --capture-range=cudaProfilerApi

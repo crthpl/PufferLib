@@ -27,10 +27,12 @@ FLAGS=(
     -Wno-incompatible-pointer-types-discards-qualifiers
     -Wno-error=array-parameter
     -fms-extensions
+    -fno-semantic-interposition
     #-fsanitize=address,undefined,bounds,pointer-overflow,leak
     #-fno-omit-frame-pointer
     #-fsanitize=thread
-    -fPIC
+    #-fPIC
+    -fvisibility=hidden
 )
 
 clang -O2 -DNDEBUG ${FLAGS[@]}
