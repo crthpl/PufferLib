@@ -123,7 +123,8 @@ typedef VecEnv* (*create_environments_fn)(int buffers, bool use_gpu, int test_id
 typedef Env* (*env_init_fn)(float* observations, double* actions, float* rewards,
         float* terminals, int seed, Dict* kwargs);
 typedef void (*net_callback_fn)(void* ctx, int buf, int t);
-typedef void (*create_threads_fn)(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, int horizon);
+typedef void (*thread_init_fn)(void* ctx, int buf);
+typedef void (*create_threads_fn)(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, thread_init_fn thread_init, int horizon);
 typedef void (*vec_omp_step_fn)(VecEnv* vec);
 typedef void (*omp_minimal_vecstep_fn)(VecEnv* vec);
 typedef void (*vec_reset_fn)(VecEnv* vec);

@@ -418,49 +418,6 @@ void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, GraphBuf& graph,
     env.actions.narrow(0, buf*block_size, block_size).copy_(graph.actions, true);
 }
 
-// Callback for OMP threadmanager - runs policy forward for one (buf, t) step
-extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
-    torch::NoGradGuard no_grad;
-    PuffeRL* pufferl = (PuffeRL*)ctx;
-    HypersT& hypers = pufferl->hypers;
-
-    at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
-    at::cuda::setCurrentCUDAStream(pufferl->torch_streams[buf]);
- 
-    int total_agents = pufferl->vec->total_agents;
-    int num_buffers = hypers.num_buffers;
-    int block_size = total_agents / num_buffers;
-
-    // Copy obs from env buffer to graph input
-    auto& buf_state = pufferl->buffer_states[buf];
-    GraphBuf& graph = pufferl->graphs[buf];
-    graph.obs.copy_(pufferl->env.obs.narrow(0, buf*block_size, block_size), true);
-    graph.state.copy_(buf_state, true);
-
-    // Run policy forward
-    // profile_begin("rollout_graph", hypers.profile);
-    if (hypers.cudagraphs) {
-        pufferl->rollout_graphs[buf].replay();
-    } else {
-        forward_call(graph, pufferl->policy, hypers.kernels,
-            pufferl->rng_seed, pufferl->rng_offset, pufferl->act_sizes, pufferl->act_sizes_cpu);
-    }
-    // profile_end(hypers.profile);
-
-    // Copy outputs: state, rollout storage, actions to env
-    // profile_begin("rollout_copy_outputs", hypers.profile);
-    buf_state.copy_(graph.state_out, true);
-    if (hypers.cudagraphs) {
-        pufferl->rollout_copy_graphs[t][buf].replay();
-    } else {
-        rollout_copy_call(pufferl->rollouts, pufferl->env, graph,
-            total_agents, num_buffers, t, buf);
-    }
-    // profile_end(hypers.profile);
-    
-    at::cuda::setCurrentCUDAStream(current_stream);
-}
-
 void train_forward_call(GraphBuf& graph, PolicyMinGRU* policy,
         torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu, bool kernels) {
     auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
@@ -596,6 +553,95 @@ void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func) {
     cudaDeviceSynchronize();
 
     at::cuda::setCurrentCUDAStream(current_stream);
+}
+
+void python_vec_recv_impl(PuffeRL& pufferl, int buf) {
+    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
+}
+
+void python_vec_send_impl(PuffeRL& pufferl, int buf) {
+    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
+}
+
+torch::autograd::tensor_list env_buffers_impl(PuffeRL& pufferl) {
+    return {pufferl.env.obs, pufferl.env.actions, pufferl.env.rewards, pufferl.env.terminals};
+}
+
+// ============================================================================
+// Rollout and train section functions
+// ============================================================================
+
+inline void profile_begin(const char* tag, bool enable) {
+    if (enable) { cudaDeviceSynchronize(); nvtxRangePushA(tag); }
+}
+
+inline void profile_end(bool enable) {
+    if (enable) { cudaDeviceSynchronize(); nvtxRangePop(); }
+}
+
+void env_recv(PuffeRL& pufferl, int buf) {
+    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
+}
+
+void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
+    auto& buf_state = pufferl.buffer_states[buf];
+    GraphBuf& graph = pufferl.graphs[buf];
+    graph.obs.copy_(pufferl.env.obs.narrow(0, buf*block_size, block_size), true);
+    graph.state.copy_(buf_state, false);
+}
+
+void env_send(PuffeRL& pufferl, int buf) {
+    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
+}
+
+void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
+    compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
+        rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
+        hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
+}
+
+// Thread initialization callback - sets CUDA stream once per thread
+extern "C" void thread_init_wrapper(void* ctx, int buf) {
+    PuffeRL* pufferl = (PuffeRL*)ctx;
+    at::cuda::setCurrentCUDAStream(pufferl->torch_streams[buf]);
+}
+
+// Callback for OMP threadmanager - runs policy forward for one (buf, t) step
+extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
+    torch::NoGradGuard no_grad;
+    PuffeRL* pufferl = (PuffeRL*)ctx;
+    HypersT& hypers = pufferl->hypers;
+
+    int total_agents = pufferl->vec->total_agents;
+    int num_buffers = hypers.num_buffers;
+    int block_size = total_agents / num_buffers;
+
+    // Copy obs from env buffer to graph input
+    auto& buf_state = pufferl->buffer_states[buf];
+    GraphBuf& graph = pufferl->graphs[buf];
+    graph.obs.copy_(pufferl->env.obs.narrow(0, buf*block_size, block_size), true);
+    graph.state.copy_(buf_state, true);
+
+    // Run policy forward
+    profile_begin("rollout_graph", hypers.profile);
+    if (hypers.cudagraphs) {
+        pufferl->rollout_graphs[buf].replay();
+    } else {
+        forward_call(graph, pufferl->policy, hypers.kernels,
+            pufferl->rng_seed, pufferl->rng_offset, pufferl->act_sizes, pufferl->act_sizes_cpu);
+    }
+    profile_end(hypers.profile);
+
+    // Copy outputs: state, rollout storage, actions to env
+    profile_begin("rollout_copy_outputs", hypers.profile);
+    buf_state.copy_(graph.state_out, true);
+    if (hypers.cudagraphs) {
+        pufferl->rollout_copy_graphs[t][buf].replay();
+    } else {
+        rollout_copy_call(pufferl->rollouts, pufferl->env, graph,
+            total_agents, num_buffers, t, buf);
+    }
+    profile_end(hypers.profile);
 }
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const std::string& env_name, Dict* env_kwargs) {
@@ -750,7 +796,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         block_size = 1;
     }
     if (hypers.use_omp) {
-        create_threads(vec, num_threads, block_size, true, pufferl.get(), net_callback_wrapper, horizon);
+        create_threads(vec, num_threads, block_size, true, pufferl.get(), net_callback_wrapper, thread_init_wrapper, horizon);
 
         // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
         // This ensures PyTorch properly recognizes the streams for all operations
@@ -759,57 +805,14 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             vec->streams[i] = pufferl->torch_streams[i].stream();
         }
     } else {
-        create_threads(vec, num_threads, block_size, false, nullptr, nullptr, 0);
+        create_threads(vec, num_threads, block_size, false, nullptr, nullptr, nullptr, 0);
     }
     vec_reset(vec);
 
     return pufferl;
 }
 
-void python_vec_recv_impl(PuffeRL& pufferl, int buf) {
-    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
-}
 
-void python_vec_send_impl(PuffeRL& pufferl, int buf) {
-    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
-}
-
-torch::autograd::tensor_list env_buffers_impl(PuffeRL& pufferl) {
-    return {pufferl.env.obs, pufferl.env.actions, pufferl.env.rewards, pufferl.env.terminals};
-}
-
-// ============================================================================
-// Rollout and train section functions
-// ============================================================================
-
-inline void profile_begin(const char* tag, bool enable) {
-    if (enable) { cudaDeviceSynchronize(); nvtxRangePushA(tag); }
-}
-
-inline void profile_end(bool enable) {
-    if (enable) { cudaDeviceSynchronize(); nvtxRangePop(); }
-}
-
-void env_recv(PuffeRL& pufferl, int buf) {
-    vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
-}
-
-void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
-    auto& buf_state = pufferl.buffer_states[buf];
-    GraphBuf& graph = pufferl.graphs[buf];
-    graph.obs.copy_(pufferl.env.obs.narrow(0, buf*block_size, block_size), true);
-    graph.state.copy_(buf_state, false);
-}
-
-void env_send(PuffeRL& pufferl, int buf) {
-    vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
-}
-
-void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
-    compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
-        rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
-        hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
-}
 
 std::tuple<Tensor, Tensor> compute_prio(Tensor& advantages,
         int minibatch_segments, int segments,

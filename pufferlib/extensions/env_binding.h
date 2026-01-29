@@ -115,6 +115,7 @@ typedef struct OMPWorkerArg {
     int horizon;
     void* ctx;
     net_callback_fn net_callback;
+    thread_init_fn thread_init;
 } OMPWorkerArg;
 
 // Forward declarations for env-specific functions supplied by user
@@ -315,8 +316,14 @@ static void* omp_threadmanager(void* arg) {
     int horizon = worker_arg->horizon;
     void* ctx = worker_arg->ctx;
     net_callback_fn net_callback = worker_arg->net_callback;
+    thread_init_fn thread_init = worker_arg->thread_init;
 
     assert(net_callback != NULL && "omp_threadmanager: net_callback is NULL");
+
+    // Initialize thread-local state (e.g., CUDA stream) once per thread
+    if (thread_init != NULL) {
+        thread_init(ctx, buf);
+    }
 
     int agents_per_buffer = vec->total_agents / vec->buffers;
     int agent_start = buf * agents_per_buffer;
@@ -522,7 +529,7 @@ EXPORT VecEnv* create_environments(int buffers, bool use_gpu, int test_idx, Dict
     return vec;
 }
 
-EXPORT void create_threads(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, int horizon) {
+EXPORT void create_threads(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, thread_init_fn thread_init, int horizon) {
     Threading* threading = vec->threading;
     threading->num_threads = threads;
     threading->block_size = block_size;
@@ -547,6 +554,7 @@ EXPORT void create_threads(VecEnv* vec, int threads, int block_size, bool use_om
             OMPWorkerArg* arg = &worker_args[i];
             arg->ctx = ctx;
             arg->net_callback = net_callback;
+            arg->thread_init = thread_init;
             arg->horizon = horizon;
             arg->vec = vec;
             arg->buf = i;
