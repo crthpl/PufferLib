@@ -6,9 +6,11 @@
 #include <limits.h>
 #include <omp.h>
 
+#include "vecenv.h"
+#include <stdatomic.h>
+
 // Forward declare CUDA types and functions to avoid conflicts with raylib's float3
 typedef int cudaError_t;
-typedef struct CUstream_st* cudaStream_t;
 typedef int cudaMemcpyKind;
 #define cudaSuccess 0
 #define cudaMemcpyHostToDevice 1
@@ -29,9 +31,6 @@ extern cudaError_t cudaStreamSynchronize(cudaStream_t);
 extern cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned int);
 extern cudaError_t cudaStreamQuery(cudaStream_t);
 extern const char* cudaGetErrorString(cudaError_t);
-
-#include "vecenv.h"
-#include <stdatomic.h>
 
 #define FLOAT 1
 #define INT 2
@@ -108,6 +107,10 @@ typedef struct WorkerArg {
     VecEnv* vec;
     int idx;
 } WorkerArg;
+
+// Callback function types for OMP threading
+typedef void (*net_callback_fn)(void* ctx, int buf, int t);
+typedef void (*thread_init_fn)(void* ctx, int buf);
 
 typedef struct OMPWorkerArg {
     VecEnv* vec;
@@ -773,4 +776,31 @@ EXPORT void vec_log(VecEnv* vec, Dict* out) {
     // User populates dict
     dict_set(out, "n", n);
     my_log(&aggregate, out);
+}
+
+// Single dlsym entry point - returns struct with all exports
+EXPORT EnvExports* get_env_exports(void) {
+    static EnvExports exports = {0};
+    static int initialized = 0;
+    if (!initialized) {
+        exports.create_environments = create_environments;
+        exports.create_threads = create_threads;
+        exports.env_init = env_init;
+        exports.vec_reset = vec_reset;
+        exports.vec_step = vec_step;
+        exports.vec_send = vec_send;
+        exports.vec_recv = vec_recv;
+        exports.vec_omp_step = vec_omp_step;
+        exports.env_close = env_close;
+        exports.vec_close = vec_close;
+        exports.vec_log = vec_log;
+        exports.vec_render = vec_render;
+        exports.obs_n = OBS_N;
+        exports.num_atns = NUM_ATNS_EXPORT;
+        exports.act_sizes = (int*)ACT_SIZES_EXPORT;
+        exports.obs_type = OBS_T;
+        exports.act_type = ACT_T;
+        initialized = 1;
+    }
+    return &exports;
 }

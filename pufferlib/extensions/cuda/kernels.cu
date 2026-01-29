@@ -655,7 +655,6 @@ __global__ void fused_scan_backward_kernel(
 
         // Read from combined for t >= 1 (still need gate/hidden for backward, proj for output gate)
         float gate_val = 0.0f, hidden_val = 0.0f, proj_val = 0.0f;
-        int combined_base = 0;
 
         if (t >= 1) {
             hidden_val = float(combined[hidden_adr]);
@@ -2034,7 +2033,6 @@ __global__ void ppo_loss_backward_kernel(
 
     // Gradients w.r.t. components
     double d_pg_loss = dL;                    // policy loss contributes dL
-    double d_v_loss = dL * vf_coef;           // value loss scaled by vf_coef
     double d_entropy_term = dL * (-ent_coef); // entropy bonus gradient
 
     // ===================================================
@@ -2083,7 +2081,6 @@ __global__ void ppo_loss_backward_kernel(
     }
 
     // --- Policy Loss Gradient ---
-    double logratio = new_logp - old_logp;
     double ratio_clipped = fmax(1.0f - clip_coef, fmin(1.0f + clip_coef, ratio));
     double pg_loss1 = -w * adv_normalized * ratio;
     double pg_loss2 = -w * adv_normalized * ratio_clipped;

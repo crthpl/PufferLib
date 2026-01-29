@@ -155,7 +155,7 @@ class PuffeRL:
         config['cudagraphs'] = True
         config['kernels'] = True
         config['use_omp'] = True
-        config['num_buffers'] = 4
+        config['num_buffers'] = 2
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.rollouts.observations
         self.actions = self.pufferl_cpp.rollouts.actions
@@ -765,6 +765,7 @@ def check(env_name):
     import pufferlib.python_pufferl
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
+    train_config['vec_kwargs'] = args['vec']
     train_config['env_kwargs'] = args['env']
     train_config['total_agents'] = args['vec']['total_agents']
     train_config['num_buffers'] = args['vec']['num_buffers']
@@ -843,6 +844,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
+    train_config['vec_kwargs'] = args['vec']
     train_config['env_kwargs'] = args['env']
     train_config['policy_kwargs'] = args['policy']
     train_config['total_agents'] = args['vec']['total_agents']
@@ -905,6 +907,7 @@ def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True
     args = args or load_config(env_name)
     train_config = dict(**args['train'])#, env=env_name)
     train_config['env_name'] = args['env_name']
+    train_config['vec_kwargs'] = args['vec']
     train_config['env_kwargs'] = args['env']
     train_config['total_agents'] = args['vec']['total_agents']
     train_config['num_buffers'] = args['vec']['num_buffers']

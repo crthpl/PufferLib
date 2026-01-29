@@ -9,6 +9,9 @@
 #include <stdatomic.h>
 #endif
 
+// Forward declare CUDA stream type
+typedef struct CUstream_st* cudaStream_t;
+
 #define FLOAT 1
 #define INT 2
 #define UNSIGNED_CHAR 3
@@ -27,17 +30,17 @@ typedef struct {
     int capacity;
 } Dict;
 
-typedef struct Env;
+typedef struct Env Env;
 typedef struct Threading Threading;
 
 typedef struct {
     Env* envs;
     int size;
     int total_agents;
-    int agents_per_buffer;  // Fixed size per buffer (includes padding)
-    int* buffer_env_starts; // Starting env index for each buffer
-    int* buffer_env_counts; // Number of envs in each buffer
-    float* mask;            // 1.0 for real agents, 0.0 for padding
+    int agents_per_buffer;
+    int* buffer_env_starts;
+    int* buffer_env_counts;
+    float* mask;
     float* gpu_mask;
     void* observations;
     double* actions;
@@ -52,14 +55,41 @@ typedef struct {
     int buffers;
 } VecEnv;
 
-Dict* create_dict(int capacity) {
+// Single struct containing all exported functions and data
+typedef struct {
+    // Functions
+    VecEnv* (*create_environments)(int buffers, bool use_gpu, int test_idx, Dict* vec_kwargs, Dict* env_kwargs);
+    void (*create_threads)(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx,
+                           void (*net_callback)(void* ctx, int buf, int t),
+                           void (*thread_init)(void* ctx, int buf),
+                           int horizon);
+    Env* (*env_init)(float* observations, double* actions, float* rewards, float* terminals, int seed, Dict* kwargs);
+    void (*vec_reset)(VecEnv* vec);
+    void (*vec_step)(VecEnv* vec, int buffer, cudaStream_t stream);
+    void (*vec_send)(VecEnv* vec, int buffer, cudaStream_t stream);
+    void (*vec_recv)(VecEnv* vec, int buffer, cudaStream_t stream);
+    void (*vec_omp_step)(VecEnv* vec);
+    void (*env_close)(Env* env);
+    void (*vec_close)(VecEnv* vec);
+    void (*vec_log)(VecEnv* vec, Dict* out);
+    void (*vec_render)(VecEnv* vec, int env_idx);
+    // Data
+    int obs_n;
+    int num_atns;
+    int* act_sizes;
+    int obs_type;
+    int act_type;
+} EnvExports;
+
+// Dict helper functions
+static inline Dict* create_dict(int capacity) {
     Dict* dict = (Dict*)calloc(1, sizeof(Dict));
     dict->capacity = capacity;
     dict->items = (DictItem*)calloc(capacity, sizeof(DictItem));
     return dict;
 }
 
-DictItem* dict_get_unsafe(Dict* dict, const char* key) {
+static inline DictItem* dict_get_unsafe(Dict* dict, const char* key) {
     for (int i = 0; i < dict->size; i++) {
         if (strcmp(dict->items[i].key, key) == 0) {
             return &dict->items[i];
@@ -68,77 +98,47 @@ DictItem* dict_get_unsafe(Dict* dict, const char* key) {
     return NULL;
 }
 
-DictItem* dict_get(Dict* dict, const char* key) {
+static inline DictItem* dict_get(Dict* dict, const char* key) {
     DictItem* item = dict_get_unsafe(dict, key);
     if (item == NULL) printf("dict_get failed to find key: %s\n", key);
     assert(item != NULL);
     return item;
 }
 
-void dict_set(Dict* dict, const char* key, double value) {
+static inline void dict_set(Dict* dict, const char* key, double value) {
     assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
-
     if (item != NULL) {
         item->value = value;
         return;
     }
-
     dict->items[dict->size].key = key;
     dict->items[dict->size].value = value;
     dict->size++;
 }
 
-void dict_set_ptr(Dict* dict, const char* key, void* ptr) {
+static inline void dict_set_ptr(Dict* dict, const char* key, void* ptr) {
     assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
-
     if (item != NULL) {
         item->ptr = ptr;
         return;
     }
-
     dict->items[dict->size].key = key;
     dict->items[dict->size].ptr = ptr;
     dict->size++;
 }
 
-void dict_set_int(Dict* dict, const char* key, int value) {
+static inline void dict_set_int(Dict* dict, const char* key, int value) {
     dict_set(dict, key, (double)value);
 }
 
+// Forward declarations for env-specific functions
+typedef struct Log Log;
+void my_log(Log* log, Dict* out);
 void* my_shared(Env* env, Dict* kwargs);
 void my_shared_close(Env* env);
 void* my_get(Env* env, Dict* out);
 int my_put(Env* env, Dict* kwargs);
-
-typedef struct Log;
-void my_log(Log* log, Dict* out);
-
-// Sharp bit (puffers have spikes)
-// Define function types to be exported to the shared library
-// You don't need these, but you have to do some really gross
-// casts after loading the library without them.
-typedef VecEnv* (*create_environments_fn)(int buffers, bool use_gpu, int test_idx, Dict* vec_kwargs, Dict* env_kwargs);
-typedef Env* (*env_init_fn)(float* observations, double* actions, float* rewards,
-        float* terminals, int seed, Dict* kwargs);
-typedef void (*net_callback_fn)(void* ctx, int buf, int t);
-typedef void (*thread_init_fn)(void* ctx, int buf);
-typedef void (*create_threads_fn)(VecEnv* vec, int threads, int block_size, bool use_omp, void* ctx, net_callback_fn net_callback, thread_init_fn thread_init, int horizon);
-typedef void (*vec_omp_step_fn)(VecEnv* vec);
-typedef void (*omp_minimal_vecstep_fn)(VecEnv* vec);
-typedef void (*vec_reset_fn)(VecEnv* vec);
-typedef void (*vec_step_fn)(VecEnv* vec, int buffer, void* stream);
-typedef void (*vec_recv_fn)(VecEnv* vec, int buffer, void* stream);
-typedef void (*vec_send_fn)(VecEnv* vec, int buffer, void* stream);
-typedef void (*env_close_fn)(Env* env);
-typedef void (*vec_close_fn)(VecEnv* vec);
-typedef void (*vec_render_fn)(VecEnv* vec, int env_idx);
-typedef void (*vec_log_fn)(VecEnv* vec, Dict* out);
-
-typedef void (*c_reset_fn)(Env* env);
-typedef void (*c_step_fn)(Env* env);
-typedef void (*c_close_fn)(Env* env);
-typedef void (*c_render_fn)(Env* env);
 
 #endif // PUFFERLIB_VECENV_H

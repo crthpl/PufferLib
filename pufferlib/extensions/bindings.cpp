@@ -22,29 +22,29 @@ pybind11::dict log_environments(pybind11::object pufferl_obj) {
 
 Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::Device device) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    return initial_state_impl(pufferl, batch_size, device);
+    return pufferl.policy->initial_state(batch_size, device);
 }
 
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    python_vec_recv_impl(pufferl, buf);
+    pufferl.env_exports->vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 void python_vec_send(pybind11::object pufferl_obj, int buf) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    python_vec_send_impl(pufferl, buf);
+    pufferl.env_exports->vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
 torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    return env_buffers_impl(pufferl);
+    return {pufferl.env.obs, pufferl.env.actions, pufferl.env.rewards, pufferl.env.terminals};
 }
 
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
     if (pufferl.hypers.use_omp) {
-        rollouts_impl_omp(pufferl);
+        pufferl.env_exports->vec_omp_step(pufferl.vec);
     } else {
         rollouts_impl(pufferl);
     }
@@ -75,7 +75,11 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
     Dict* c_dict = create_dict(py_dict.size());
     for (auto item : py_dict) {
         const char* key = PyUnicode_AsUTF8(item.first.ptr());
-        dict_set(c_dict, key, item.second.cast<double>());
+        try {
+            dict_set(c_dict, key, item.second.cast<double>());
+        } catch (const py::cast_error&) {
+            // Skip non-numeric values
+        }
     }
     return c_dict;
 }
@@ -127,10 +131,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.use_omp = get_config(kwargs, "use_omp");
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
+    Dict* vec_kwargs = py_dict_to_c_dict(kwargs["vec_kwargs"].cast<py::dict>());
     Dict* env_kwargs = py_dict_to_c_dict(kwargs["env_kwargs"].cast<py::dict>());
 
     pybind11::gil_scoped_release no_gil;
-    return create_pufferl_impl(hypers, env_name, env_kwargs);
+    return create_pufferl_impl(hypers, env_name, vec_kwargs, env_kwargs);
 }
 
 TORCH_LIBRARY(pufferlib, m) {

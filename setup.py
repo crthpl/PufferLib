@@ -27,6 +27,11 @@ from torch.utils.cpp_extension import (
 # may require `uv pip install --no-build-isolation` or `python setup.py build_ext --inplace`
 BUID_CUDA_EXT = bool(CUDA_HOME or ROCM_HOME)
 
+# Use ccache if available for faster rebuilds
+if shutil.which('ccache'):
+    os.environ.setdefault('CC', 'ccache cc')
+    os.environ.setdefault('CXX', 'ccache c++')
+
 # Build with DEBUG=1 to enable debug symbols
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
@@ -114,13 +119,13 @@ if DEBUG:
 else:
     extra_compile_args += [
         '-O2',
-        '-flto',
+        '-flto=auto',
     ]
     extra_link_args += [
         '-O2',
     ]
     cxx_args += [
-        '-O3',
+        '-O',
     ]
     nvcc_args += [
         '-O3',
@@ -130,7 +135,6 @@ system = platform.system()
 if system == 'Linux':
     extra_compile_args += [
         '-Wno-alloc-size-larger-than',
-        '-Wno-implicit-function-declaration',
         '-fmax-errors=3',
     ]
     extra_link_args += [

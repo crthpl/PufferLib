@@ -79,8 +79,10 @@ class DyT : public torch::nn::Module {
 
 
 class MinGRULayer : public torch::nn::Module {
-private:
+public:
     int64_t dim;
+    int64_t expansion_factor;
+    bool kernels;
     torch::nn::Linear to_hidden_and_gate{nullptr};
     //Tensor to_hidden_and_gate_bf16{nullptr};
     torch::nn::Linear to_out{nullptr};
@@ -88,10 +90,6 @@ private:
     //RMSNorm rmsnorm{nullptr};
     std::shared_ptr<RMSNorm> norm{nullptr};
     //std::shared_ptr<DyT> dyt{nullptr};
-    bool kernels;
-
-public:
-    int64_t expansion_factor;
     MinGRULayer(int64_t dim, int64_t expansion_factor = 1., bool kernels = true)
         : dim(dim), expansion_factor(expansion_factor), kernels(kernels) {
 
@@ -582,19 +580,18 @@ class G2048Decoder : public Decoder {
 
 
 class PolicyMinGRU : public torch::nn::Module {
-private:
+public:
+    int64_t input_size;
+    int64_t hidden_size;
+    float expansion_factor;
+    int64_t num_atns;
+    int64_t num_layers;
+    bool kernels;
+
     std::shared_ptr<Encoder> encoder{nullptr};
     std::shared_ptr<Decoder> decoder{nullptr};
     torch::nn::ModuleList mingru{nullptr};
-    bool kernels;
-
-public:
     torch::nn::Linear value{nullptr};
-    int64_t input_size;
-    int64_t hidden_size;
-    int64_t num_atns;
-    int64_t num_layers;
-    float expansion_factor;
 
     PolicyMinGRU(std::shared_ptr<Encoder> enc, std::shared_ptr<Decoder> dec, int64_t input_size, int64_t num_atns, int64_t hidden_size = 128, int64_t expansion_factor = 1, int64_t num_layers = 1, bool kernels = true)
         : input_size(input_size), hidden_size(hidden_size), expansion_factor(expansion_factor),

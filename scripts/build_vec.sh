@@ -31,7 +31,7 @@ FLAGS=(
     #-fsanitize=address,undefined,bounds,pointer-overflow,leak
     #-fno-omit-frame-pointer
     #-fsanitize=thread
-    #-fPIC
+    -fPIC
     -fvisibility=hidden
 )
 
