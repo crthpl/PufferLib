@@ -8,7 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,13 +17,13 @@
 
 
 #ifdef USE_TORCH
-#include "pufferlib/extensions/pufferlib.cpp"
+#include <torch/torch.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/cuda/CUDAGraph.h>
 #include "pufferlib/extensions/cuda/kernels.cu"
-// #include "pufferlib/extensions/modules.cpp"
-using namespace pufferlib;
+#include "pufferlib/extensions/modules.cpp"
 #endif
-
-#include "pufferlib/extensions/vecenv.h"
 
 #ifndef USE_TORCH
 #include "pufferlib/extensions/cuda/kernels.cu"
@@ -47,6 +47,13 @@ void print_timing(const char* name, float ms, int N) {
     printf("  %-18s %6.1f us  %6.2f M elem/s\n", name, ms * 1000, N / ms / 1e3);
 }
 
+// Wall-clock time for timeout checks (only checked every BATCH_SIZE iters)
+float get_time_sec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9f;
+}
+
 void warmup_gpu() {
     // Warm up GPU clocks with some busy work
     float* dummy;
@@ -58,22 +65,41 @@ void warmup_gpu() {
     cudaFree(dummy);
 }
 
+const int BATCH_SIZE = 100;  // Check timeout every BATCH_SIZE iterations
+
 float profile_kernel(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    // Warmup with timeout
+    float warmup_start = get_time_sec();
     for (int i = 0; i < WARMUP_ITERS; ++i) {
         fn(args);
-        cudaDeviceSynchronize();
+        if (i % BATCH_SIZE == 0) {
+            cudaDeviceSynchronize();
+            if (get_time_sec() - warmup_start > TIMEOUT_SEC) break;
+        }
     }
+    cudaDeviceSynchronize();
 
+    // Timed runs with timeout - check wall clock every BATCH_SIZE iters
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
-    for (int i = 0; i < TIMING_ITERS; ++i) {
-        fn(args);
+
+    float timing_start = get_time_sec();
+    long iters = 0;
+    float elapsed = 0;
+    while (elapsed < TIMEOUT_SEC) {
+        for (int i = 0; i < BATCH_SIZE; ++i) {
+            fn(args);
+        }
+        iters += BATCH_SIZE;
+        cudaDeviceSynchronize();
+        elapsed = get_time_sec() - timing_start;
     }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     if (name) nvtxRangePop();
@@ -85,8 +111,10 @@ float profile_kernel(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEventDestroy(stop);
 
     cudaDeviceSynchronize();
+#ifdef USE_TORCH
     c10::cuda::CUDACachingAllocator::emptyCache();
-    return ms / TIMING_ITERS;
+#endif
+    return ms / iters;
 }
 
 #ifdef USE_TORCH
@@ -96,13 +124,20 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     at::cuda::CUDAGraph cuda_graph;
     at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
 
+    // Warmup with timeout
     at::cuda::CUDAStream warmup_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(warmup_stream);
+    float warmup_start = get_time_sec();
     for (int i = 0; i < WARMUP_ITERS; ++i) {
         fn(args);
+        if (i % BATCH_SIZE == 0) {
+            warmup_stream.synchronize();
+            if (get_time_sec() - warmup_start > TIMEOUT_SEC) break;
+        }
     }
     warmup_stream.synchronize();
 
+    // Capture graph
     at::cuda::CUDAStream cap_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(cap_stream);
     cuda_graph.capture_begin();
@@ -117,12 +152,23 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    // Timed runs with timeout
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
-    for (int i = 0; i < TIMING_ITERS; ++i) {
-        cuda_graph.replay();
+
+    float timing_start = get_time_sec();
+    long iters = 0;
+    float elapsed = 0;
+    while (elapsed < TIMEOUT_SEC) {
+        for (int i = 0; i < BATCH_SIZE; ++i) {
+            cuda_graph.replay();
+        }
+        iters += BATCH_SIZE;
+        cudaDeviceSynchronize();
+        elapsed = get_time_sec() - timing_start;
     }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     if (name) nvtxRangePop();
@@ -133,7 +179,7 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    return ms / TIMING_ITERS;
+    return ms / iters;
 }
 #endif
 
@@ -899,6 +945,489 @@ void profile_fusedscan(int batch, int seq, int hidden) {
     free_fusedscanargs(args);
 }
 
+// =============================================================================
+// FCMax: Simple FC -> Max kernel (no intermediate ReLU layer)
+// Input: x (B, N, D_in), W (D_out, D_in), b (D_out)
+// Output: (B, D_out) = max_over_N(x @ W.T + b)
+// =============================================================================
+
+typedef struct {
+    float* x;              // (B, N, D_in)
+    float* W;              // (D_out, D_in)
+    float* b;              // (D_out)
+    float* out;            // (B, D_out)
+    int* argmax_indices;   // (B, D_out)
+    float* grad_x;         // (B, N, D_in)
+    float* grad_W;         // (D_out, D_in)
+    float* grad_b;         // (D_out)
+    float* grad_out;       // (B, D_out)
+    int B;
+    int N;
+    int D_in;
+    int D_out;
+} FCMaxArgs;
+
+FCMaxArgs* create_fcmaxargs(int batch, int num_points, int d_in, int d_out) {
+    FCMaxArgs* args = (FCMaxArgs*)calloc(1, sizeof(FCMaxArgs));
+    args->B = batch;
+    args->N = num_points;
+    args->D_in = d_in;
+    args->D_out = d_out;
+
+    int N_x = batch * num_points * d_in;
+    int N_W = d_out * d_in;
+    int N_out = batch * d_out;
+
+    cudaMalloc(&args->x, N_x * sizeof(float));
+    cudaMalloc(&args->W, N_W * sizeof(float));
+    cudaMalloc(&args->b, d_out * sizeof(float));
+    cudaMalloc(&args->out, N_out * sizeof(float));
+    cudaMalloc(&args->argmax_indices, N_out * sizeof(int));
+    cudaMalloc(&args->grad_x, N_x * sizeof(float));
+    cudaMalloc(&args->grad_W, N_W * sizeof(float));
+    cudaMalloc(&args->grad_b, d_out * sizeof(float));
+    cudaMalloc(&args->grad_out, N_out * sizeof(float));
+
+    float* x_buf = (float*)malloc(N_x * sizeof(float));
+    float* W_buf = (float*)malloc(N_W * sizeof(float));
+    float* b_buf = (float*)malloc(d_out * sizeof(float));
+    float* grad_out_buf = (float*)malloc(N_out * sizeof(float));
+
+    for (int i = 0; i < N_x; ++i) x_buf[i] = rand1();
+    for (int i = 0; i < N_W; ++i) W_buf[i] = rand1() * 0.1f;
+    for (int i = 0; i < d_out; ++i) b_buf[i] = 0.0f;
+    for (int i = 0; i < N_out; ++i) grad_out_buf[i] = rand1();
+
+    cudaMemcpy(args->x, x_buf, N_x * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->W, W_buf, N_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->b, b_buf, d_out * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->grad_out, grad_out_buf, N_out * sizeof(float), cudaMemcpyHostToDevice);
+
+    free(x_buf);
+    free(W_buf);
+    free(b_buf);
+    free(grad_out_buf);
+    return args;
+}
+
+void free_fcmaxargs(FCMaxArgs* args) {
+    cudaFree(args->x);
+    cudaFree(args->W);
+    cudaFree(args->b);
+    cudaFree(args->out);
+    cudaFree(args->argmax_indices);
+    cudaFree(args->grad_x);
+    cudaFree(args->grad_W);
+    cudaFree(args->grad_b);
+    cudaFree(args->grad_out);
+    free(args);
+}
+
+void run_fcmax_forward(FCMaxArgs* args) {
+    launch_fc_max_forward_float(
+        args->out, args->argmax_indices,
+        args->x, args->W, args->b,
+        args->B, args->N, args->D_in, args->D_out, 0);
+}
+
+void run_fcmax_backward(FCMaxArgs* args) {
+    cudaMemset(args->grad_x, 0, args->B * args->N * args->D_in * sizeof(float));
+    cudaMemset(args->grad_W, 0, args->D_out * args->D_in * sizeof(float));
+    cudaMemset(args->grad_b, 0, args->D_out * sizeof(float));
+
+    launch_fc_max_backward_float(
+        args->grad_x, args->grad_W, args->grad_b,
+        args->grad_out, args->x, args->W,
+        args->argmax_indices,
+        args->B, args->N, args->D_in, args->D_out, 0);
+}
+
+#ifdef USE_TORCH
+
+typedef struct {
+    torch::Tensor x;       // (B, N, D_in)
+    torch::Tensor W;       // (D_out, D_in)
+    torch::Tensor b;       // (D_out)
+    torch::Tensor out;     // (B, D_out)
+    torch::Tensor grad_out;// (B, D_out)
+    int B, N, D_in, D_out;
+} FCMaxArgsTorch;
+
+FCMaxArgsTorch* create_fcmaxargs_torch(FCMaxArgs* raw) {
+    FCMaxArgsTorch* args = new FCMaxArgsTorch();
+    args->B = raw->B;
+    args->N = raw->N;
+    args->D_in = raw->D_in;
+    args->D_out = raw->D_out;
+
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    args->x = torch::from_blob(raw->x, {raw->B, raw->N, raw->D_in}, opts).clone().requires_grad_(true);
+    args->W = torch::from_blob(raw->W, {raw->D_out, raw->D_in}, opts).clone().requires_grad_(true);
+    args->b = torch::from_blob(raw->b, {raw->D_out}, opts).clone().requires_grad_(true);
+    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->D_out}, opts).clone();
+
+    return args;
+}
+
+void run_fcmax_forward_torch(FCMaxArgsTorch* args) {
+    torch::NoGradGuard no_grad;
+    fc_max(args->x, args->W, args->b);
+}
+
+void run_fcmax_backward_torch(FCMaxArgsTorch* args) {
+    // Recompute forward each time since backward frees the graph
+    auto out = fc_max(args->x, args->W, args->b);
+    if (args->x.grad().defined()) args->x.grad().zero_();
+    if (args->W.grad().defined()) args->W.grad().zero_();
+    if (args->b.grad().defined()) args->b.grad().zero_();
+    out.backward(args->grad_out);
+}
+
+void run_fcmax_forward_cpp(FCMaxArgsTorch* args) {
+    torch::NoGradGuard no_grad;
+    fc_max_cpp(args->x, args->W, args->b);
+}
+
+void test_fcmax_correct(FCMaxArgsTorch* args) {
+    auto x_fused = args->x.detach().clone().requires_grad_(true);
+    auto W_fused = args->W.detach().clone().requires_grad_(true);
+    auto b_fused = args->b.detach().clone().requires_grad_(true);
+    auto fused_out = fc_max(x_fused, W_fused, b_fused);
+
+    auto x_ref = args->x.detach().clone().requires_grad_(true);
+    auto W_ref = args->W.detach().clone().requires_grad_(true);
+    auto b_ref = args->b.detach().clone().requires_grad_(true);
+    auto ref_out = fc_max_cpp(x_ref, W_ref, b_ref);
+
+    float rtol = 1e-3f, atol = 1e-4f;
+    bool out_match = torch::allclose(fused_out, ref_out, rtol, atol);
+    float out_max_diff = (fused_out - ref_out).abs().max().item<float>();
+
+    printf("  forward correctness: out=%s(%.2e)\n",
+           out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff);
+
+    // Backward
+    fused_out.backward(args->grad_out);
+    ref_out.backward(args->grad_out);
+
+    bool grad_x_match = torch::allclose(x_fused.grad(), x_ref.grad(), rtol, atol);
+    float grad_x_max_diff = (x_fused.grad() - x_ref.grad()).abs().max().item<float>();
+    bool grad_W_match = torch::allclose(W_fused.grad(), W_ref.grad(), rtol, atol);
+    float grad_W_max_diff = (W_fused.grad() - W_ref.grad()).abs().max().item<float>();
+
+    printf("  backward correctness: grad_x=%s(%.2e) grad_W=%s(%.2e)\n",
+           grad_x_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_x_max_diff,
+           grad_W_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_W_max_diff);
+}
+
+#endif
+
+void profile_fcmax(int batch, int num_points, int d_in, int d_out) {
+    FCMaxArgs* args = create_fcmaxargs(batch, num_points, d_in, d_out);
+
+    printf("fc_max (B=%d, N=%d, D_in=%d, D_out=%d)\n", batch, num_points, d_in, d_out);
+
+    float fwd_ms = profile_kernel((kernel_fn)run_fcmax_forward, args);
+    print_timing("\tforward", fwd_ms, batch);
+
+    float bwd_ms = profile_kernel((kernel_fn)run_fcmax_backward, args);
+    print_timing("\tbackward", bwd_ms, batch);
+
+#ifdef USE_TORCH
+    FCMaxArgsTorch* args_torch = create_fcmaxargs_torch(args);
+
+    test_fcmax_correct(args_torch);
+
+    float fwd_torch_ms = profile_kernel((kernel_fn)run_fcmax_forward_torch, args_torch);
+    print_timing("\tforward (torch)", fwd_torch_ms, batch);
+
+    args_torch->out = fc_max(args_torch->x, args_torch->W, args_torch->b);
+
+    float bwd_torch_ms = profile_kernel((kernel_fn)run_fcmax_backward_torch, args_torch);
+    print_timing("\tbackward (torch)", bwd_torch_ms, batch);
+
+    float fwd_cpp_ms = profile_kernel((kernel_fn)run_fcmax_forward_cpp, args_torch);
+    print_timing("\tforward (cpp)", fwd_cpp_ms, batch);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_fcmax_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch);
+
+    delete args_torch;
+#endif
+    printf("\n");
+
+    free_fcmaxargs(args);
+}
+
+// FCReluFCMax: Fused FC -> ReLU -> FC -> Max kernel
+// Input: x (B, N, D_in), W1 (D_mid, D_in), b1 (D_mid), W2 (D_out, D_mid), b2 (D_out)
+// Output: (B, D_out) = max_over_N(FC2(ReLU(FC1(x))))
+typedef struct {
+    float* x;              // (B, N, D_in)
+    float* W1;             // (D_mid, D_in)
+    float* b1;             // (D_mid)
+    float* W2;             // (D_out, D_mid)
+    float* b2;             // (D_out)
+    float* out;            // (B, D_out)
+    int* argmax_indices;   // (B, D_out)
+    float* fc1_at_argmax;  // (B, D_out, D_mid)
+    float* grad_x;         // (B, N, D_in)
+    float* grad_W1;        // (D_mid, D_in)
+    float* grad_b1;        // (D_mid)
+    float* grad_W2;        // (D_out, D_mid)
+    float* grad_b2;        // (D_out)
+    float* grad_out;       // (B, D_out)
+    int B;
+    int N;
+    int D_in;
+    int D_mid;
+    int D_out;
+} FCReluFCMaxArgs;
+
+FCReluFCMaxArgs* create_fcrelufcmaxargs(int batch, int num_points, int d_in, int d_mid, int d_out) {
+    FCReluFCMaxArgs* args = (FCReluFCMaxArgs*)calloc(1, sizeof(FCReluFCMaxArgs));
+    args->B = batch;
+    args->N = num_points;
+    args->D_in = d_in;
+    args->D_mid = d_mid;
+    args->D_out = d_out;
+
+    int N_x = batch * num_points * d_in;
+    int N_W1 = d_mid * d_in;
+    int N_W2 = d_out * d_mid;
+    int N_out = batch * d_out;
+    int N_fc1_at_argmax = batch * d_out * d_mid;
+
+    cudaMalloc(&args->x, N_x * sizeof(float));
+    cudaMalloc(&args->W1, N_W1 * sizeof(float));
+    cudaMalloc(&args->b1, d_mid * sizeof(float));
+    cudaMalloc(&args->W2, N_W2 * sizeof(float));
+    cudaMalloc(&args->b2, d_out * sizeof(float));
+    cudaMalloc(&args->out, N_out * sizeof(float));
+    cudaMalloc(&args->argmax_indices, N_out * sizeof(int));
+    cudaMalloc(&args->fc1_at_argmax, N_fc1_at_argmax * sizeof(float));
+    cudaMalloc(&args->grad_x, N_x * sizeof(float));
+    cudaMalloc(&args->grad_W1, N_W1 * sizeof(float));
+    cudaMalloc(&args->grad_b1, d_mid * sizeof(float));
+    cudaMalloc(&args->grad_W2, N_W2 * sizeof(float));
+    cudaMalloc(&args->grad_b2, d_out * sizeof(float));
+    cudaMalloc(&args->grad_out, N_out * sizeof(float));
+
+    // Allocate and initialize host buffers
+    float* x_buf = (float*)malloc(N_x * sizeof(float));
+    float* W1_buf = (float*)malloc(N_W1 * sizeof(float));
+    float* b1_buf = (float*)malloc(d_mid * sizeof(float));
+    float* W2_buf = (float*)malloc(N_W2 * sizeof(float));
+    float* b2_buf = (float*)malloc(d_out * sizeof(float));
+    float* grad_out_buf = (float*)malloc(N_out * sizeof(float));
+
+    for (int i = 0; i < N_x; ++i) x_buf[i] = rand1();
+    for (int i = 0; i < N_W1; ++i) W1_buf[i] = rand1() * 0.1f;
+    for (int i = 0; i < d_mid; ++i) b1_buf[i] = 0.0f;
+    for (int i = 0; i < N_W2; ++i) W2_buf[i] = rand1() * 0.1f;
+    for (int i = 0; i < d_out; ++i) b2_buf[i] = 0.0f;
+    for (int i = 0; i < N_out; ++i) grad_out_buf[i] = rand1();
+
+    cudaMemcpy(args->x, x_buf, N_x * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->W1, W1_buf, N_W1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->b1, b1_buf, d_mid * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->W2, W2_buf, N_W2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->b2, b2_buf, d_out * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(args->grad_out, grad_out_buf, N_out * sizeof(float), cudaMemcpyHostToDevice);
+
+    free(x_buf);
+    free(W1_buf);
+    free(b1_buf);
+    free(W2_buf);
+    free(b2_buf);
+    free(grad_out_buf);
+    return args;
+}
+
+void free_fcrelufcmaxargs(FCReluFCMaxArgs* args) {
+    cudaFree(args->x);
+    cudaFree(args->W1);
+    cudaFree(args->b1);
+    cudaFree(args->W2);
+    cudaFree(args->b2);
+    cudaFree(args->out);
+    cudaFree(args->argmax_indices);
+    cudaFree(args->fc1_at_argmax);
+    cudaFree(args->grad_x);
+    cudaFree(args->grad_W1);
+    cudaFree(args->grad_b1);
+    cudaFree(args->grad_W2);
+    cudaFree(args->grad_b2);
+    cudaFree(args->grad_out);
+    free(args);
+}
+
+void run_fcrelufcmax_forward(FCReluFCMaxArgs* args) {
+    launch_fc_relu_fc_max_forward<float>(
+        args->out, args->argmax_indices, args->fc1_at_argmax,
+        args->x, args->W1, args->b1, args->W2, args->b2,
+        args->B, args->N, args->D_in, args->D_mid, args->D_out, 0);
+}
+
+void run_fcrelufcmax_backward(FCReluFCMaxArgs* args) {
+    // Zero gradients before backward (kernel uses atomicAdd)
+    cudaMemset(args->grad_x, 0, args->B * args->N * args->D_in * sizeof(float));
+    cudaMemset(args->grad_W1, 0, args->D_mid * args->D_in * sizeof(float));
+    cudaMemset(args->grad_b1, 0, args->D_mid * sizeof(float));
+    cudaMemset(args->grad_W2, 0, args->D_out * args->D_mid * sizeof(float));
+    cudaMemset(args->grad_b2, 0, args->D_out * sizeof(float));
+
+    launch_fc_relu_fc_max_backward<float>(
+        args->grad_x, args->grad_W1, args->grad_b1, args->grad_W2, args->grad_b2,
+        args->grad_out, args->x, args->W1, args->W2,
+        args->argmax_indices, args->fc1_at_argmax,
+        args->B, args->N, args->D_in, args->D_mid, args->D_out, 0);
+}
+
+#ifdef USE_TORCH
+
+typedef struct {
+    torch::Tensor x;       // (B, N, D_in)
+    torch::Tensor W1;      // (D_mid, D_in)
+    torch::Tensor b1;      // (D_mid)
+    torch::Tensor W2;      // (D_out, D_mid)
+    torch::Tensor b2;      // (D_out)
+    torch::Tensor out;     // (B, D_out)
+    torch::Tensor grad_out;// (B, D_out)
+    int B;
+    int N;
+    int D_in;
+    int D_mid;
+    int D_out;
+} FCReluFCMaxArgsTorch;
+
+FCReluFCMaxArgsTorch* create_fcrelufcmaxargs_torch(FCReluFCMaxArgs* raw) {
+    FCReluFCMaxArgsTorch* args = new FCReluFCMaxArgsTorch();
+    args->B = raw->B;
+    args->N = raw->N;
+    args->D_in = raw->D_in;
+    args->D_mid = raw->D_mid;
+    args->D_out = raw->D_out;
+
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    args->x = torch::from_blob(raw->x, {raw->B, raw->N, raw->D_in}, opts).requires_grad_(true);
+    args->W1 = torch::from_blob(raw->W1, {raw->D_mid, raw->D_in}, opts).requires_grad_(true);
+    args->b1 = torch::from_blob(raw->b1, {raw->D_mid}, opts).requires_grad_(true);
+    args->W2 = torch::from_blob(raw->W2, {raw->D_out, raw->D_mid}, opts).requires_grad_(true);
+    args->b2 = torch::from_blob(raw->b2, {raw->D_out}, opts).requires_grad_(true);
+    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->D_out}, opts);
+
+    return args;
+}
+
+void run_fcrelufcmax_forward_torch(FCReluFCMaxArgsTorch* args) {
+    torch::NoGradGuard no_grad;
+    fc_relu_fc_max(args->x, args->W1, args->b1, args->W2, args->b2);
+}
+
+void run_fcrelufcmax_backward_torch(FCReluFCMaxArgsTorch* args) {
+    // Recompute forward each time since backward frees the graph
+    auto out = fc_relu_fc_max(args->x, args->W1, args->b1, args->W2, args->b2);
+    args->x.mutable_grad() = torch::Tensor();
+    args->W1.mutable_grad() = torch::Tensor();
+    args->b1.mutable_grad() = torch::Tensor();
+    args->W2.mutable_grad() = torch::Tensor();
+    args->b2.mutable_grad() = torch::Tensor();
+    out.backward(args->grad_out);
+}
+
+void run_fcrelufcmax_forward_cpp(FCReluFCMaxArgsTorch* args) {
+    torch::NoGradGuard no_grad;
+    fc_relu_fc_max_cpp(args->x, args->W1, args->b1, args->W2, args->b2);
+}
+
+void test_fcrelufcmax_correct(FCReluFCMaxArgsTorch* args) {
+    // Run fused kernel forward
+    auto x_fused = args->x.detach().clone().requires_grad_(true);
+    auto W1_fused = args->W1.detach().clone().requires_grad_(true);
+    auto b1_fused = args->b1.detach().clone().requires_grad_(true);
+    auto W2_fused = args->W2.detach().clone().requires_grad_(true);
+    auto b2_fused = args->b2.detach().clone().requires_grad_(true);
+    auto fused_out = fc_relu_fc_max(x_fused, W1_fused, b1_fused, W2_fused, b2_fused);
+
+    // Run reference (unfused) forward
+    auto x_ref = args->x.detach().clone().requires_grad_(true);
+    auto W1_ref = args->W1.detach().clone().requires_grad_(true);
+    auto b1_ref = args->b1.detach().clone().requires_grad_(true);
+    auto W2_ref = args->W2.detach().clone().requires_grad_(true);
+    auto b2_ref = args->b2.detach().clone().requires_grad_(true);
+    auto ref_out = fc_relu_fc_max_cpp(x_ref, W1_ref, b1_ref, W2_ref, b2_ref);
+
+    // Numerical comparison
+    float rtol = 1e-3f, atol = 1e-4f;
+    bool out_match = torch::allclose(fused_out, ref_out, rtol, atol);
+    float out_max_diff = (fused_out - ref_out).abs().max().item<float>();
+
+    printf("  forward correctness: out=%s(%.2e)\n",
+           out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff);
+
+    // Test backward pass
+    torch::autograd::backward({fused_out}, {args->grad_out});
+    torch::autograd::backward({ref_out}, {args->grad_out});
+
+    bool grad_x_match = torch::allclose(x_fused.grad(), x_ref.grad(), rtol, atol);
+    float grad_x_max_diff = (x_fused.grad() - x_ref.grad()).abs().max().item<float>();
+    bool grad_W1_match = torch::allclose(W1_fused.grad(), W1_ref.grad(), rtol, atol);
+    float grad_W1_max_diff = (W1_fused.grad() - W1_ref.grad()).abs().max().item<float>();
+    bool grad_W2_match = torch::allclose(W2_fused.grad(), W2_ref.grad(), rtol, atol);
+    float grad_W2_max_diff = (W2_fused.grad() - W2_ref.grad()).abs().max().item<float>();
+
+    printf("  backward correctness: grad_x=%s(%.2e) grad_W1=%s(%.2e) grad_W2=%s(%.2e)\n",
+           grad_x_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_x_max_diff,
+           grad_W1_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_W1_max_diff,
+           grad_W2_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_W2_max_diff);
+}
+
+#endif
+
+void profile_fcrelufcmax(int batch, int num_points, int d_in, int d_mid, int d_out) {
+    FCReluFCMaxArgs* args = create_fcrelufcmaxargs(batch, num_points, d_in, d_mid, d_out);
+
+    printf("fc_relu_fc_max (B=%d, N=%d, D_in=%d, D_mid=%d, D_out=%d)\n",
+           batch, num_points, d_in, d_mid, d_out);
+
+    float fwd_ms = profile_kernel((kernel_fn)run_fcrelufcmax_forward, args);
+    print_timing("\tforward", fwd_ms, batch);
+
+    float bwd_ms = profile_kernel((kernel_fn)run_fcrelufcmax_backward, args);
+    print_timing("\tbackward", bwd_ms, batch);
+
+#ifdef USE_TORCH
+    FCReluFCMaxArgsTorch* args_torch = create_fcrelufcmaxargs_torch(args);
+
+    test_fcrelufcmax_correct(args_torch);
+
+    float fwd_torch_ms = profile_kernel((kernel_fn)run_fcrelufcmax_forward_torch, args_torch);
+    print_timing("\tforward (torch)", fwd_torch_ms, batch);
+
+    args_torch->out = fc_relu_fc_max(args_torch->x, args_torch->W1, args_torch->b1, args_torch->W2, args_torch->b2);
+
+    float bwd_torch_ms = profile_kernel((kernel_fn)run_fcrelufcmax_backward_torch, args_torch);
+    print_timing("\tbackward (torch)", bwd_torch_ms, batch);
+
+    float fwd_cpp_ms = profile_kernel((kernel_fn)run_fcrelufcmax_forward_cpp, args_torch);
+    print_timing("\tforward (cpp)", fwd_cpp_ms, batch);
+
+    args_torch->out = fc_relu_fc_max_cpp(args_torch->x, args_torch->W1, args_torch->b1, args_torch->W2, args_torch->b2);
+
+    float bwd_cpp_ms = profile_kernel((kernel_fn)run_fcrelufcmax_backward_torch, args_torch);
+    print_timing("\tbackward (cpp)", bwd_cpp_ms, batch);
+
+    float fwd_graph_ms = profile_graph((kernel_fn)run_fcrelufcmax_forward_cpp, args_torch);
+    print_timing("\tforward (graph)", fwd_graph_ms, batch);
+
+    delete args_torch;
+#endif
+    printf("\n");
+
+    free_fcrelufcmaxargs(args);
+}
+
 typedef struct {
     float* logits;
     float* values_pred;
@@ -1609,6 +2138,13 @@ void profile_samplelogits(int batch, int num_actions) {
 */
 
 // ============================================================================
+// OUTDATED TESTS BELOW - GraphBuf and DLL loading no longer used
+// Uncomment and update when needed
+// ============================================================================
+
+#if 0  // Disabled - uses outdated GraphBuf/DLL patterns
+
+// ============================================================================
 // forward_call profiling (inference forward pass) - using GraphBuf
 // ============================================================================
 
@@ -2083,13 +2619,16 @@ void profile_envspeed(int total_agents, int num_buffers, int num_threads, int ho
     printf("\n");
 }
 
+#endif  // Disabled outdated tests
+
 void print_usage(const char* prog) {
     printf("Usage: %s <profile>\n", prog);
     printf("  kernels        - Individual kernel profiling (no nsys needed)\n");
-    printf("  forwardcall    - Inference forward pass\n");
-    printf("  trainforward   - Training forward + backward + optimizer\n");
-    printf("  rolloutcopy    - Rollout buffer copy operations\n");
-    printf("  envspeed       - Environment step throughput\n");
+    // Disabled - these tests use outdated GraphBuf/DLL patterns
+    // printf("  forwardcall    - Inference forward pass\n");
+    // printf("  trainforward   - Training forward + backward + optimizer\n");
+    // printf("  rolloutcopy    - Rollout buffer copy operations\n");
+    // printf("  envspeed       - Environment step throughput\n");
     printf("  all            - Run all profiles\n");
 }
 
@@ -2110,25 +2649,31 @@ int main(int argc, char** argv) {
         // profile_logcumsumexp(BT, T, H);
         // profile_fusedscan(BT, T, H);
         //profile_samplelogits(BR, A);
-        profile_ppoloss(BT, T, A);
+        //profile_ppoloss(BT, T, A);
+
+        // FCMax: simple FC -> Max (no intermediate layer)
+        // Drive encoder dimensions: partner (B, 63, 7) -> 128, road (B, 200, 13) -> 128
+        profile_fcmax(BR, 63, 7, 128);    // partner encoder
+        profile_fcmax(BR, 200, 13, 128);  // road encoder
+
+        // FCReluFCMax: FC -> ReLU -> FC -> Max (for comparison)
+        profile_fcrelufcmax(BR, 63, 7, 128, 128);   // partner encoder
+        profile_fcrelufcmax(BR, 200, 13, 128, 128); // road encoder
     }
 
-    if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
-        profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
-    }
-
-    if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
-        profile_trainforwardcall(BT, T, INPUT_SIZE, H, A, 1);
-    }
-
-    if (strcmp(profile, "rolloutcopy") == 0 || strcmp(profile, "all") == 0) {
-        profile_rolloutcopycall(T, BR, 1, INPUT_SIZE);
-    }
-
-    if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
-        // total_agents=8192, num_buffers=2, num_threads=8, horizon=64
-        profile_envspeed(BUF*BR, BUF, 8, T);
-    }
+    // Disabled - these tests use outdated GraphBuf/DLL patterns
+    // if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
+    //     profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
+    // }
+    // if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
+    //     profile_trainforwardcall(BT, T, INPUT_SIZE, H, A, 1);
+    // }
+    // if (strcmp(profile, "rolloutcopy") == 0 || strcmp(profile, "all") == 0) {
+    //     profile_rolloutcopycall(T, BR, 1, INPUT_SIZE);
+    // }
+    // if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
+    //     profile_envspeed(BUF*BR, BUF, 8, T);
+    // }
 
     return 0;
 }

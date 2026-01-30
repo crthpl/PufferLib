@@ -149,6 +149,8 @@ TORCH_LIBRARY(_C, m) {
     m.def("log_coeffs_and_values(Tensor gate, Tensor hidden) -> (Tensor, Tensor)");
     m.def("fused_scan(Tensor combined, Tensor state) -> (Tensor, Tensor)");
     m.def("fused_ppo_loss(Tensor logits, Tensor values, Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio, Tensor values, Tensor returns, Tensor adv_mean, Tensor adv_std, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) -> Tensor");
+    m.def("fc_relu_fc_max(Tensor x, Tensor W1, Tensor b1, Tensor W2, Tensor b2) -> Tensor");
+    m.def("fc_max(Tensor x, Tensor W, Tensor b) -> Tensor");
     m.def("policy_forward(Tensor obs, Tensor state) -> (Tensor, Tensor, Tensor)");
 }
 
@@ -163,6 +165,10 @@ PYBIND11_MODULE(_C, m) {
     m.def("log_coeffs_and_values", &log_coeffs_and_values);
     m.def("fused_scan", &fused_scan);
     m.def("fused_ppo_loss", &fused_ppo_loss);
+    m.def("fc_relu_fc_max", &fc_relu_fc_max);
+    m.def("fc_relu_fc_max_cpp", &fc_relu_fc_max_cpp);
+    m.def("fc_max", &fc_max);
+    m.def("fc_max_cpp", &fc_max_cpp);
     m.def("sample_logits", &sample_logits);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);

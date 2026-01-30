@@ -1415,4 +1415,297 @@ std::vector<torch::Tensor> sample_logits_cpp(
     return {actions, sampled_logprobs};
 }
 
+// =============================================================================
+// FCReluFCMax: Fused FC -> ReLU -> FC -> Max autograd function
+// Input: x (B, N, D_in) - batch of N points, each with D_in features
+// W1 (D_mid, D_in), b1 (D_mid) - first linear layer (applied as x @ W1.T + b1)
+// W2 (D_out, D_mid), b2 (D_out) - second linear layer
+// Output: (B, D_out) - max over N dimension after FC -> ReLU -> FC
+// =============================================================================
+
+class FCReluFCMaxFunction : public torch::autograd::Function<FCReluFCMaxFunction> {
+public:
+    static torch::autograd::tensor_list forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor x,      // (B, N, D_in)
+        torch::Tensor W1,     // (D_mid, D_in)
+        torch::Tensor b1,     // (D_mid)
+        torch::Tensor W2,     // (D_out, D_mid)
+        torch::Tensor b2      // (D_out)
+    ) {
+        TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
+        TORCH_CHECK(W1.is_cuda(), "W1 must be on CUDA");
+        TORCH_CHECK(W2.is_cuda(), "W2 must be on CUDA");
+        TORCH_CHECK(x.dim() == 3, "x must be (B, N, D_in)");
+        TORCH_CHECK(W1.dim() == 2, "W1 must be (D_mid, D_in)");
+        TORCH_CHECK(W2.dim() == 2, "W2 must be (D_out, D_mid)");
+        TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+        TORCH_CHECK(W1.is_contiguous(), "W1 must be contiguous");
+        TORCH_CHECK(W2.is_contiguous(), "W2 must be contiguous");
+
+        auto dtype = x.dtype();
+        auto device = x.device();
+        auto B = x.size(0);
+        auto N = x.size(1);
+        auto D_in = x.size(2);
+        auto D_mid = W1.size(0);
+        auto D_out = W2.size(0);
+
+        TORCH_CHECK(W1.size(1) == D_in, "W1 must be (D_mid, D_in)");
+        TORCH_CHECK(W2.size(1) == D_mid, "W2 must be (D_out, D_mid)");
+        TORCH_CHECK(b1.size(0) == D_mid, "b1 must be (D_mid)");
+        TORCH_CHECK(b2.size(0) == D_out, "b2 must be (D_out)");
+
+        auto out = torch::empty({B, D_out}, x.options());
+        auto argmax_indices = torch::empty({B, D_out}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+        auto fc1_at_argmax = torch::empty({B, D_out, D_mid}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_fc_relu_fc_max_forward_float(
+                out.data_ptr<float>(),
+                argmax_indices.data_ptr<int>(),
+                fc1_at_argmax.data_ptr<float>(),
+                x.data_ptr<float>(),
+                W1.data_ptr<float>(),
+                b1.data_ptr<float>(),
+                W2.data_ptr<float>(),
+                b2.data_ptr<float>(),
+                static_cast<int>(B),
+                static_cast<int>(N),
+                static_cast<int>(D_in),
+                static_cast<int>(D_mid),
+                static_cast<int>(D_out),
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_fc_relu_fc_max_forward_bf16(
+                out.data_ptr<at::BFloat16>(),
+                argmax_indices.data_ptr<int>(),
+                fc1_at_argmax.data_ptr<float>(),
+                x.data_ptr<at::BFloat16>(),
+                W1.data_ptr<at::BFloat16>(),
+                b1.data_ptr<at::BFloat16>(),
+                W2.data_ptr<at::BFloat16>(),
+                b2.data_ptr<at::BFloat16>(),
+                static_cast<int>(B),
+                static_cast<int>(N),
+                static_cast<int>(D_in),
+                static_cast<int>(D_mid),
+                static_cast<int>(D_out),
+                stream
+            );
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
+        }
+
+        ctx->save_for_backward({x, W1, b1, W2, b2, argmax_indices, fc1_at_argmax});
+
+        return {out};
+    }
+
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto x = saved[0];
+        auto W1 = saved[1];
+        auto b1 = saved[2];
+        auto W2 = saved[3];
+        auto b2 = saved[4];
+        auto argmax_indices = saved[5];
+        auto fc1_at_argmax = saved[6];
+
+        auto grad_out = grad_outputs[0].contiguous();
+        auto dtype = x.dtype();
+
+        auto B = x.size(0);
+        auto N = x.size(1);
+        auto D_in = x.size(2);
+        auto D_mid = W1.size(0);
+        auto D_out = W2.size(0);
+
+        // Initialize gradients to zero (backward kernel uses atomicAdd)
+        auto grad_x = torch::zeros_like(x);
+        auto grad_W1 = torch::zeros_like(W1);
+        auto grad_b1 = torch::zeros_like(b1);
+        auto grad_W2 = torch::zeros_like(W2);
+        auto grad_b2 = torch::zeros_like(b2);
+
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        if (dtype == torch::kFloat32) {
+            launch_fc_relu_fc_max_backward_float(
+                grad_x.data_ptr<float>(),
+                grad_W1.data_ptr<float>(),
+                grad_b1.data_ptr<float>(),
+                grad_W2.data_ptr<float>(),
+                grad_b2.data_ptr<float>(),
+                grad_out.data_ptr<float>(),
+                x.data_ptr<float>(),
+                W1.data_ptr<float>(),
+                W2.data_ptr<float>(),
+                argmax_indices.data_ptr<int>(),
+                fc1_at_argmax.data_ptr<float>(),
+                static_cast<int>(B),
+                static_cast<int>(N),
+                static_cast<int>(D_in),
+                static_cast<int>(D_mid),
+                static_cast<int>(D_out),
+                stream
+            );
+        } else if (dtype == torch::kBFloat16) {
+            launch_fc_relu_fc_max_backward_bf16(
+                grad_x.data_ptr<at::BFloat16>(),
+                grad_W1.data_ptr<at::BFloat16>(),
+                grad_b1.data_ptr<at::BFloat16>(),
+                grad_W2.data_ptr<at::BFloat16>(),
+                grad_b2.data_ptr<at::BFloat16>(),
+                grad_out.data_ptr<at::BFloat16>(),
+                x.data_ptr<at::BFloat16>(),
+                W1.data_ptr<at::BFloat16>(),
+                W2.data_ptr<at::BFloat16>(),
+                argmax_indices.data_ptr<int>(),
+                fc1_at_argmax.data_ptr<float>(),
+                static_cast<int>(B),
+                static_cast<int>(N),
+                static_cast<int>(D_in),
+                static_cast<int>(D_mid),
+                static_cast<int>(D_out),
+                stream
+            );
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype in backward");
+        }
+
+        return {grad_x, grad_W1, grad_b1, grad_W2, grad_b2};
+    }
+};
+
+// Named entrypoint: fc_relu_fc_max(x, W1, b1, W2, b2) -> out
+torch::Tensor fc_relu_fc_max(
+    torch::Tensor x,
+    torch::Tensor W1,
+    torch::Tensor b1,
+    torch::Tensor W2,
+    torch::Tensor b2
+) {
+    return FCReluFCMaxFunction::apply(x, W1, b1, W2, b2)[0];
+}
+
+// Reference implementation for testing
+torch::Tensor fc_relu_fc_max_cpp(
+    torch::Tensor x,      // (B, N, D_in)
+    torch::Tensor W1,     // (D_mid, D_in)
+    torch::Tensor b1,     // (D_mid)
+    torch::Tensor W2,     // (D_out, D_mid)
+    torch::Tensor b2      // (D_out)
+) {
+    // FC1: x @ W1.T + b1 -> (B, N, D_mid)
+    auto fc1 = torch::addmm(b1, x.flatten(0, 1), W1.t()).view({x.size(0), x.size(1), -1});
+    // ReLU
+    auto relu_out = torch::relu(fc1);
+    // FC2: relu_out @ W2.T + b2 -> (B, N, D_out)
+    auto fc2 = torch::addmm(b2, relu_out.flatten(0, 1), W2.t()).view({x.size(0), x.size(1), -1});
+    // Max over N dimension
+    return std::get<0>(fc2.max(1));
+}
+
+// =============================================================================
+// FCMax: Simple FC -> Max (no intermediate ReLU layer)
+// =============================================================================
+
+class FCMaxFunction : public torch::autograd::Function<FCMaxFunction> {
+public:
+    static torch::autograd::tensor_list forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor x,      // (B, N, D_in)
+        torch::Tensor W,      // (D_out, D_in)
+        torch::Tensor b       // (D_out)
+    ) {
+        int B = x.size(0);
+        int N = x.size(1);
+        int D_in = x.size(2);
+        int D_out = W.size(0);
+
+        auto out = torch::empty({B, D_out}, x.options());
+        auto argmax = torch::empty({B, D_out}, torch::dtype(torch::kInt32).device(x.device()));
+
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "fc_max_forward", [&] {
+            if constexpr (std::is_same_v<scalar_t, float>) {
+                launch_fc_max_forward_float(
+                    out.data_ptr<float>(),
+                    argmax.data_ptr<int>(),
+                    x.data_ptr<float>(),
+                    W.data_ptr<float>(),
+                    b.data_ptr<float>(),
+                    B, N, D_in, D_out, stream);
+            }
+        });
+
+        ctx->save_for_backward({x, W, argmax});
+        ctx->saved_data["B"] = B;
+        ctx->saved_data["N"] = N;
+        ctx->saved_data["D_in"] = D_in;
+        ctx->saved_data["D_out"] = D_out;
+
+        return {out, argmax};
+    }
+
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto x = saved[0];
+        auto W = saved[1];
+        auto argmax = saved[2];
+        auto grad_out = grad_outputs[0];
+
+        int B = ctx->saved_data["B"].toInt();
+        int N = ctx->saved_data["N"].toInt();
+        int D_in = ctx->saved_data["D_in"].toInt();
+        int D_out = ctx->saved_data["D_out"].toInt();
+
+        auto grad_x = torch::zeros_like(x);
+        auto grad_W = torch::zeros_like(W);
+        auto grad_b = torch::zeros({D_out}, x.options());
+
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "fc_max_backward", [&] {
+            if constexpr (std::is_same_v<scalar_t, float>) {
+                launch_fc_max_backward_float(
+                    grad_x.data_ptr<float>(),
+                    grad_W.data_ptr<float>(),
+                    grad_b.data_ptr<float>(),
+                    grad_out.data_ptr<float>(),
+                    x.data_ptr<float>(),
+                    W.data_ptr<float>(),
+                    argmax.data_ptr<int>(),
+                    B, N, D_in, D_out, stream);
+            }
+        });
+
+        return {grad_x, grad_W, grad_b};
+    }
+};
+
+// Named entrypoint: fc_max(x, W, b) -> out
+torch::Tensor fc_max(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
+    return FCMaxFunction::apply(x, W, b)[0];
+}
+
+// Reference implementation for testing
+torch::Tensor fc_max_cpp(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
+    // FC: x @ W.T + b -> (B, N, D_out)
+    auto fc = torch::addmm(b, x.flatten(0, 1), W.t()).view({x.size(0), x.size(1), -1});
+    // Max over N dimension
+    return std::get<0>(fc.max(1));
+}
+
 #endif // PUFFERLIB_MODULES_CPP
