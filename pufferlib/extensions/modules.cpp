@@ -1043,12 +1043,12 @@ public:
                 values_pred.data_ptr<at::BFloat16>(),
                 actions.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
-                advantages.data_ptr<at::BFloat16>(),
+                advantages.data_ptr<float>(), // keep in fp32 for precision and training stability
                 prio.data_ptr<at::BFloat16>(),
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
-                adv_mean.data_ptr<at::BFloat16>(),
-                adv_var.data_ptr<at::BFloat16>(),
+                adv_mean.data_ptr<float>(), // fp32 training and precision
+                adv_var.data_ptr<float>(),  // fp32 training and precision
                 static_cast<float>(clip_coef),
                 static_cast<float>(vf_clip_coef),
                 static_cast<float>(vf_coef),
@@ -1098,8 +1098,9 @@ public:
 
         auto grad_loss = grad_outputs[0].to(torch::kFloat32).contiguous();
 
-        auto grad_logits = torch::empty_like(logits);
-        auto grad_values_pred = torch::empty_like(values_pred);
+        // keep gradients in fp32 for precision / training stability issues
+        auto grad_logits = torch::empty(logits.sizes(), logits.options().dtype(torch::kFloat32));
+        auto grad_values_pred = torch::empty(values_pred.sizes(), values_pred.options().dtype(torch::kFloat32));
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // need strides
@@ -1135,19 +1136,19 @@ public:
             );
         } else if (dtype == torch::kBFloat16) {
             launch_ppo_loss_backward_optimized_bf16(
-                grad_logits.data_ptr<at::BFloat16>(),
-                grad_values_pred.data_ptr<at::BFloat16>(),
+                grad_logits.data_ptr<float>(),
+                grad_values_pred.data_ptr<float>(),
                 grad_loss.data_ptr<float>(),
                 logits.data_ptr<at::BFloat16>(),
                 values_pred.data_ptr<at::BFloat16>(),
                 actions.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
-                advantages.data_ptr<at::BFloat16>(),
+                advantages.data_ptr<float>(), // keep in fp32
                 prio.data_ptr<at::BFloat16>(),
                 values.data_ptr<at::BFloat16>(),
                 returns.data_ptr<at::BFloat16>(),
-                adv_mean.data_ptr<at::BFloat16>(),
-                adv_var.data_ptr<at::BFloat16>(),
+                adv_mean.data_ptr<float>(),
+                adv_var.data_ptr<float>(),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
                 T, A, N,

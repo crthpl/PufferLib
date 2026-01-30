@@ -195,7 +195,7 @@ TrainGraph create_train_graph(int minibatch_segments, int horizon, int input_siz
     g.mb_ratio = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_actions = torch::zeros({minibatch_segments, horizon, num_atns}, options).to(torch::kInt64);
     g.mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
-    g.mb_advantages = torch::zeros({minibatch_segments, horizon}, options);
+    g.mb_advantages = torch::zeros({minibatch_segments, horizon}, options.dtype(torch::kFloat32));  // fp32 precision
     g.mb_prio = torch::zeros({minibatch_segments, 1}, options);
     g.mb_values = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_returns = torch::zeros({minibatch_segments, horizon}, options);
@@ -820,7 +820,7 @@ void train_impl(PuffeRL& pufferl) {
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
     rollouts.ratio.fill_(1.0);
 
-    Tensor advantages = torch::zeros_like(rollouts.values);
+    Tensor advantages = torch::zeros_like(rollouts.values, torch::kFloat32);  // fp32 precision
 
     compute_advantage(rollouts, advantages, hypers);
     pufferl.adv_mean.copy_(advantages.mean().detach());

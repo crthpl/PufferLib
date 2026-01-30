@@ -1474,12 +1474,12 @@ __global__ void ppo_loss_forward_kernel_optimized(
     const T* __restrict__ values_pred,
     const int64_t* __restrict__ actions,
     const T* __restrict__ old_logprobs,
-    const T* __restrict__ advantages,
+    const float* __restrict__ advantages,
     const T* __restrict__ prio,
     const T* __restrict__ values,
     const T* __restrict__ returns,
-    const T* __restrict__ adv_mean,
-    const T* __restrict__ adv_var,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_var,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -1588,19 +1588,19 @@ __global__ void ppo_loss_forward_kernel_optimized(
 
 template<typename T>
 __global__ void ppo_loss_backward_kernel_optimized(
-    T* __restrict__ grad_logits,
-    T* __restrict__ grad_values_pred,
+    float* __restrict__ grad_logits,
+    float* __restrict__ grad_values_pred,
     const float* __restrict__ grad_loss,
     const T* __restrict__ logits,
     const T* __restrict__ values_pred,
     const int64_t* __restrict__ actions,
     const T* __restrict__ old_logprobs,
-    const T* __restrict__ advantages,
+    const float* __restrict__ advantages,
     const T* __restrict__ prio,
     const T* __restrict__ values,
     const T* __restrict__ returns,
-    const T* __restrict__ adv_mean,
-    const T* __restrict__ adv_var,
+    const float* __restrict__ adv_mean,
+    const float* __restrict__ adv_var,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -1686,7 +1686,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
     } else {
         d_val_pred = val_pred - ret;
     }
-    grad_values_pred[values_idx] = T(dL * vf_coef * d_val_pred);
+    grad_values_pred[values_idx] = dL * vf_coef * d_val_pred;
 
     // policy loss gradient
     float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
@@ -1710,7 +1710,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
         d_logit -= p * d_new_logp;
 
         d_logit += d_entropy_term * p * (-entropy - logp);
-        grad_logits[logits_base + a * logits_stride_a] = T(d_logit);
+        grad_logits[logits_base + a * logits_stride_a] = d_logit;
     }
 }
 
@@ -1724,12 +1724,12 @@ inline void launch_ppo_loss_forward_optimized(
     const T* values_pred,
     const int64_t* actions,
     const T* old_logprobs,
-    const T* advantages,
+    const float* advantages,  // always fp32 for precision
     const T* prio,
     const T* values,
     const T* returns,
-    const T* adv_mean,
-    const T* adv_var,
+    const float* adv_mean, // keep fp32
+    const float* adv_var, // keep fp32
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -1784,19 +1784,19 @@ inline void launch_ppo_loss_forward_optimized(
 
 template<typename T>
 void launch_ppo_loss_backward_optimized(
-    T* grad_logits,
-    T* grad_values_pred,
+    float* grad_logits,
+    float* grad_values_pred,
     const float* grad_loss,
     const T* logits,
     const T* values_pred,    // added: need to read val_pred directly
     const int64_t* actions,
     const T* old_logprobs,
-    const T* advantages,
+    const float* advantages,
     const T* prio,
     const T* values,
     const T* returns,
-    const T* adv_mean,
-    const T* adv_var,  // variance, not std
+    const float* adv_mean,
+    const float* adv_var,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -2481,10 +2481,10 @@ void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_va
     launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
 
-void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const at::BFloat16* adv_mean, const at::BFloat16* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
     launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
-void launch_ppo_loss_backward_optimized_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const at::BFloat16* adv_mean, const at::BFloat16* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+void launch_ppo_loss_backward_optimized_bf16(float* grad_logits, float* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
     launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
 
