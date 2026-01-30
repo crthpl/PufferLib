@@ -172,27 +172,6 @@ create_environments(int num_buffers, int total_agents, const std::string& env_na
 }
 
 typedef struct {
-    Tensor obs;
-    Tensor actions;
-    Tensor state;
-    Tensor state_out;
-    Tensor value;
-    Tensor logprobs;
-} RolloutGraph;
-
-RolloutGraph create_rollout_graph(int batch, int input_size, int num_atns, PolicyMinGRU* policy) {
-    RolloutGraph g;
-    auto options = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
-    g.obs = torch::zeros({batch, input_size}, options);
-    g.actions = torch::zeros({batch, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
-    g.value = torch::zeros(batch, options);
-    g.logprobs = torch::zeros(batch, options);
-    g.state = policy->initial_state(batch, torch::kCUDA);
-    g.state_out = policy->initial_state(batch, torch::kCUDA);
-    return g;
-}
-
-typedef struct {
     Tensor mb_obs;
     Tensor mb_state;
     Tensor mb_actions;
@@ -302,14 +281,10 @@ typedef struct {
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
     RolloutBuf rollouts;
     EnvBuf env;
-    std::vector<RolloutGraph> rollout_bufs;  // Per-buffer rollout graph buffers
-    TrainGraph train_buf;                     // Single train graph buffer
-    std::vector<at::cuda::CUDAGraph> rollout_input_cudagraphs;  // Per-buffer input copy CUDA graphs
-    std::vector<at::cuda::CUDAGraph> rollout_cudagraphs;  // Per-buffer rollout CUDA graphs
+    TrainGraph train_buf;
+    std::vector<std::vector<at::cuda::CUDAGraph>> fused_rollout_cudagraphs;  // [horizon][num_buffers]
     at::cuda::CUDAGraph train_cudagraph;
-    std::vector<std::vector<at::cuda::CUDAGraph>> rollout_copy_cudagraphs;
     std::vector<at::cuda::CUDAStream> torch_streams;  // PyTorch-managed streams for OMP
-    bool captured;
     Tensor adv_mean;
     Tensor adv_std;
     Tensor act_sizes;      // CUDA int32 tensor of action head sizes for MultiDiscrete
@@ -325,60 +300,66 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
     return out;
 }
 
-
-void forward_call(RolloutGraph& graph, PolicyMinGRU* policy, bool kernels,
-        uint64_t rng_seed, Tensor& rng_offset, Tensor& act_sizes, Tensor& act_sizes_cpu) {
+// Fused rollout step: reads from env, runs forward, writes directly to rollouts storage
+// Eliminates intermediate RolloutGraph buffers when cudagraphed
+void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     torch::NoGradGuard no_grad;
+    HypersT& hypers = pufferl.hypers;
+    int total_agents = pufferl.vec->total_agents;
+    int num_buffers = hypers.num_buffers;
+    int block_size = total_agents / num_buffers;
 
-    auto [logits, value, state_out] = policy->forward(graph.obs, graph.state);
+    // Get slices for this buffer
+    Tensor obs_slice = pufferl.env.obs.narrow(0, buf*block_size, block_size);
+    Tensor& state = pufferl.buffer_states[buf];
 
-    if (kernels) {
-        sample_logits(logits, value, graph.actions, graph.logprobs,
-            graph.value, act_sizes, rng_seed, rng_offset);
+    // Run policy forward
+    auto [logits, value, state_out] = pufferl.policy->forward(obs_slice, state);
+
+    // Get output slices in rollouts storage
+    Tensor actions_out = pufferl.rollouts.actions.select(0, h).narrow(0, buf*block_size, block_size);
+    Tensor logprobs_out = pufferl.rollouts.logprobs.select(0, h).narrow(0, buf*block_size, block_size);
+    Tensor values_out = pufferl.rollouts.values.select(0, h).narrow(0, buf*block_size, block_size);
+
+    // Sample actions and write directly to rollouts
+    if (hypers.kernels) {
+        sample_logits(logits, value, actions_out, logprobs_out,
+            values_out, pufferl.act_sizes, pufferl.rng_seed, pufferl.rng_offset);
     } else {
-        int num_action_heads = graph.actions.size(1);
+        int num_action_heads = actions_out.size(1);
         logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
 
-        // Split logits by action head sizes and sample each head independently
-        auto split_logits = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+        auto split_logits = torch::split(logits, c10::IntArrayRef(pufferl.act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
         std::vector<Tensor> actions_vec;
         std::vector<Tensor> logprobs_vec;
 
-        for (int h = 0; h < num_action_heads; h++) {
-            Tensor head_logits = split_logits[h];
+        for (int i = 0; i < num_action_heads; i++) {
+            Tensor head_logits = split_logits[i];
             Tensor log_probs = torch::log_softmax(head_logits, 1);
             Tensor action = at::multinomial(log_probs.exp(), 1, true);
             Tensor logprob = log_probs.gather(1, action);
             actions_vec.push_back(action);
             logprobs_vec.push_back(logprob);
         }
-        // Stack and copy - no per-iteration allocations
-        graph.actions.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
-        graph.logprobs.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
-        graph.value.copy_(value.flatten(), false);
+        actions_out.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
+        logprobs_out.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
+        values_out.copy_(value.flatten(), false);
     }
-    graph.state.copy_(state_out, false);
-    graph.state_out.copy_(state_out, false);
-}
 
-void rollout_copy_call(RolloutBuf& rollouts, EnvBuf& env, RolloutGraph& graph,
-        int total_agents, int num_buffers, int h, int buf) {
-    int block_size = total_agents / num_buffers;
+    // Update state
+    state.copy_(state_out, false);
 
-    // Store with non-blocking copies
-    // Layout is {horizon, segments, ...}, so select(0, h) gives contiguous {segments, ...}
-    rollouts.observations.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.obs, true);
-    rollouts.actions.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.actions, true);
-    rollouts.logprobs.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.logprobs, true);
-    rollouts.values.select(0, h).narrow(0, buf*block_size, block_size).copy_(graph.value, true);
+    // Copy obs to rollouts
+    pufferl.rollouts.observations.select(0, h).narrow(0, buf*block_size, block_size).copy_(obs_slice, true);
 
-    Tensor rewards_batch = env.rewards.narrow(0, buf*block_size, block_size);
-    rollouts.rewards.select(0, h).narrow(0, buf*block_size, block_size).copy_(rewards_batch, true);
+    // Copy rewards and terminals from env to rollouts
+    pufferl.rollouts.rewards.select(0, h).narrow(0, buf*block_size, block_size).copy_(
+        pufferl.env.rewards.narrow(0, buf*block_size, block_size), true);
+    pufferl.rollouts.terminals.select(0, h).narrow(0, buf*block_size, block_size).copy_(
+        pufferl.env.terminals.narrow(0, buf*block_size, block_size), true);
 
-    Tensor terminals_batch = env.terminals.narrow(0, buf*block_size, block_size);
-    rollouts.terminals.select(0, h).narrow(0, buf*block_size, block_size).copy_(terminals_batch, true);
-
-    env.actions.narrow(0, buf*block_size, block_size).copy_(graph.actions, true);
+    // Copy actions to env for next step
+    pufferl.env.actions.narrow(0, buf*block_size, block_size).copy_(actions_out, true);
 }
 
 void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy,
@@ -535,13 +516,6 @@ void env_recv(PuffeRL& pufferl, int buf) {
     pufferl.env_exports->vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
 
-void rollout_copy_inputs(PuffeRL& pufferl, int buf, int block_size) {
-    auto& buf_state = pufferl.buffer_states[buf];
-    RolloutGraph& graph = pufferl.rollout_bufs[buf];
-    graph.obs.copy_(pufferl.env.obs.narrow(0, buf*block_size, block_size), true);
-    graph.state.copy_(buf_state, false);
-}
-
 void env_send(PuffeRL& pufferl, int buf) {
     pufferl.env_exports->vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
 }
@@ -564,37 +538,12 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
 
-    int total_agents = pufferl->vec->total_agents;
-    int num_buffers = hypers.num_buffers;
-    int block_size = total_agents / num_buffers;
-
-    // Copy obs from env buffer to graph input
-    profile_begin("rollout_copy_inputs", hypers.profile);
+    profile_begin("fused_rollout", hypers.profile);
     if (hypers.cudagraphs) {
-        pufferl->rollout_input_cudagraphs[buf].replay();
+        // Fused cudagraph: input copy + forward + output copy in one shot
+        pufferl->fused_rollout_cudagraphs[t][buf].replay();
     } else {
-        rollout_copy_inputs(*pufferl, buf, block_size);
-    }
-    profile_end(hypers.profile);
-
-    // Run policy forward
-    profile_begin("rollout_graph", hypers.profile);
-    if (hypers.cudagraphs) {
-        pufferl->rollout_cudagraphs[buf].replay();
-    } else {
-        forward_call(pufferl->rollout_bufs[buf], pufferl->policy, hypers.kernels,
-            pufferl->rng_seed, pufferl->rng_offset, pufferl->act_sizes, pufferl->act_sizes_cpu);
-    }
-    profile_end(hypers.profile);
-
-    // Copy outputs: state, rollout storage, actions to env
-    profile_begin("rollout_copy_outputs", hypers.profile);
-    pufferl->buffer_states[buf].copy_(pufferl->rollout_bufs[buf].state_out, true);
-    if (hypers.cudagraphs) {
-        pufferl->rollout_copy_cudagraphs[t][buf].replay();
-    } else {
-        rollout_copy_call(pufferl->rollouts, pufferl->env, pufferl->rollout_bufs[buf],
-            total_agents, num_buffers, t, buf);
+        fused_rollout_step(*pufferl, t, buf);
     }
     profile_end(hypers.profile);
 }
@@ -687,10 +636,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         vec->size, total_agents, segments, batch, num_buffers);
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
-    pufferl->rollout_bufs.resize(num_buffers);
-    for (int i = 0; i < num_buffers; i++) {
-        pufferl->rollout_bufs[i] = create_rollout_graph(batch, input_size, num_action_heads, policy);
-    }
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
         policy->num_layers, policy->hidden_size, policy->expansion_factor, num_action_heads);
 
@@ -712,34 +657,19 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
         });
 
-        int total_agents = vec->total_agents;
-        int num_buffers = hypers.num_buffers;
-        int horizon = hypers.horizon;
-
-        // Per-buffer rollout and copy cudagraphs
-        int block_size = total_agents / num_buffers;
-        pufferl->rollout_input_cudagraphs.resize(num_buffers);
-        pufferl->rollout_cudagraphs.resize(num_buffers);
-        pufferl->rollout_copy_cudagraphs.resize(horizon);
+        // Fused rollout cudagraphs: [horizon][num_buffers]
+        // Each graph does input copy + forward + output copy in one shot
+        pufferl->fused_rollout_cudagraphs.resize(horizon);
         for (int h = 0; h < horizon; ++h) {
-            pufferl->rollout_copy_cudagraphs[h].resize(num_buffers);
-        }
-        for (int b = 0; b < num_buffers; ++b) {
-            pufferl->rollout_input_cudagraphs[b] = at::cuda::CUDAGraph();
-            capture_graph(&pufferl->rollout_input_cudagraphs[b], [p, b, block_size]() {
-                rollout_copy_inputs(*p, b, block_size);
-            });
-            pufferl->rollout_cudagraphs[b] = at::cuda::CUDAGraph();
-            capture_graph(&pufferl->rollout_cudagraphs[b], [p, b]() {
-                forward_call(p->rollout_bufs[b], p->policy, p->hypers.kernels, p->rng_seed, p->rng_offset, p->act_sizes, p->act_sizes_cpu);
-            });
-            for (int h = 0; h < horizon; ++h) {
-                pufferl->rollout_copy_cudagraphs[h][b] = at::cuda::CUDAGraph();
-                capture_graph(&pufferl->rollout_copy_cudagraphs[h][b], [p, total_agents, num_buffers, h, b]() {
-                    rollout_copy_call(p->rollouts, p->env, p->rollout_bufs[b], total_agents, num_buffers, h, b);
+            pufferl->fused_rollout_cudagraphs[h].resize(num_buffers);
+            for (int b = 0; b < num_buffers; ++b) {
+                pufferl->fused_rollout_cudagraphs[h][b] = at::cuda::CUDAGraph();
+                capture_graph(&pufferl->fused_rollout_cudagraphs[h][b], [p, h, b]() {
+                    fused_rollout_step(*p, h, b);
                 });
             }
         }
+
     }
 
     // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
@@ -805,7 +735,6 @@ void rollouts_impl(PuffeRL& pufferl) {
     HypersT& hypers = pufferl.hypers;
 
     int horizon = hypers.horizon;
-    int total_agents = pufferl.vec->total_agents;
     int num_buffers = hypers.num_buffers;
     // TODO: You removed state zeros and reward clamping
 
