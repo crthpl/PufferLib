@@ -120,12 +120,16 @@ else:
     extra_compile_args += [
         '-O2',
         '-flto=auto',
+        '-fno-semantic-interposition',
+        '-fvisibility=hidden',
     ]
     extra_link_args += [
         '-O2',
     ]
     cxx_args += [
-        '-O',
+        '-O2',
+        '-fno-semantic-interposition',
+        '-Wno-c++11-narrowing',
     ]
     nvcc_args += [
         '-O3',
@@ -277,6 +281,64 @@ cmdclass = {
     "build_profiler": ProfilerBuildExt,
 }
 
+# Static env builds: clang-compiled env + gcc/nvcc torch extension
+STATIC_ENVS = {
+    'breakout': {
+        'obs_size': 118,
+        'num_atns': 1,
+        'static_src': 'pufferlib/extensions/static_breakout.c',
+        'static_lib': 'pufferlib/extensions/libstatic_breakout.a',
+    },
+    'drive': {
+        'obs_size': 1848,
+        'num_atns': 2,
+        'static_src': 'pufferlib/extensions/static_drive.c',
+        'static_lib': 'pufferlib/extensions/libstatic_drive.a',
+    },
+}
+
+def create_static_env_build_class(env_name, env_config):
+    """Create a build class that compiles env with clang and links with torch extension."""
+    class StaticEnvBuildExt(cpp_extension.BuildExtension):
+        def run(self):
+            import subprocess
+
+            # Step 1: Build static library with clang
+            static_src = env_config['static_src']
+            static_lib = env_config['static_lib']
+            static_obj = static_lib.replace('.a', '.o')
+
+            clang_cmd = [
+                'clang', '-c', '-O2', '-DNDEBUG',
+                '-I.', f'-I./{RAYLIB_NAME}/include', '-I/usr/local/cuda/include',
+                '-DPLATFORM_DESKTOP',
+                '-fno-semantic-interposition', '-fvisibility=hidden',
+                '-fPIC', '-fopenmp',
+                static_src, '-o', static_obj
+            ]
+            print(f'Building static env with clang: {" ".join(clang_cmd)}')
+            subprocess.check_call(clang_cmd)
+
+            ar_cmd = ['ar', 'rcs', static_lib, static_obj]
+            print(f'Creating static library: {" ".join(ar_cmd)}')
+            subprocess.check_call(ar_cmd)
+
+            # Step 2: Build torch extension linked against this env's static lib
+            # Filter to only the pufferlib._C extension
+            self.extensions = [e for e in self.extensions if e.name == 'pufferlib._C']
+
+            # Update extra_objects to use this env's static lib
+            for ext in self.extensions:
+                ext.extra_objects = [RAYLIB_A, static_lib]
+
+            super().run()
+
+    return StaticEnvBuildExt
+
+# Add build_<env> for static-linked envs
+for env_name, env_config in STATIC_ENVS.items():
+    cmdclass[f"build_{env_name}"] = create_static_env_build_class(env_name, env_config)
+
 if not NO_OCEAN:
     def create_env_build_class(full_name):
         class EnvBuildExt(build_ext):
@@ -285,10 +347,10 @@ if not NO_OCEAN:
                 super().run()
         return EnvBuildExt
 
-    # Add a build_<env> command for each env
+    # Add a build_<env>_so command for each env (dynamic .so build)
     for c_ext in c_extensions:
         env_name = c_ext.name.split('.')[-2]
-        cmdclass[f"build_{env_name}"] = create_env_build_class(c_ext.name)
+        cmdclass[f"build_{env_name}_so"] = create_env_build_class(c_ext.name)
 
 
 # Check if CUDA compiler is available. You need cuda dev, not just runtime.
@@ -311,6 +373,8 @@ if not NO_TRAIN:
         extension = CppExtension
 
     import torch
+    # Note: Use build_<envname> (e.g. build_breakout, build_drive) to build with static env linking
+    # build_torch alone won't link any env - it's for the training code only
     torch_extensions = [
        extension(
             "pufferlib._C",
@@ -322,7 +386,7 @@ if not NO_TRAIN:
             },
             extra_link_args=extra_link_args,
             extra_objects=[RAYLIB_A],
-            libraries=[nvtx_lib],
+            libraries=[nvtx_lib, 'omp5'],
             library_dirs=[nvtx_lib_dir],
         ),
     ]

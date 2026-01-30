@@ -1,5 +1,5 @@
-// static_breakout.h - Declarations for static breakout library
-// Implementation in static_breakout.c, compiled with clang
+// static_envbinding.h - Shared types for static env linking
+// Included by both env .c files and pufferlib.cpp
 
 #pragma once
 
@@ -8,8 +8,9 @@
 #include <stdio.h>
 #include <assert.h>
 
-// Forward declare CUDA stream type
-typedef struct CUstream_st* cudaStream_t;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Type constants
 #define FLOAT 1
@@ -18,7 +19,7 @@ typedef struct CUstream_st* cudaStream_t;
 #define DOUBLE 4
 #define CHAR 5
 
-// Dict from vecenv.h
+// Dict types
 typedef struct {
     const char* key;
     double value;
@@ -66,18 +67,15 @@ static inline void dict_set(Dict* dict, const char* key, double value) {
     dict->size++;
 }
 
-// Forward declare Breakout - don't include breakout.h to avoid duplicate BRICK_COLORS
-struct Breakout;
+// Forward declare CUDA stream type
+typedef struct CUstream_st* cudaStream_t;
 
-#define OBS_SIZE 118
-#define NUM_ATNS 1
-
-typedef void (*net_callback_fn)(void* ctx, int buf, int t);
-typedef void (*thread_init_fn)(void* ctx, int buf);
-
+// Threading state
 typedef struct StaticThreading StaticThreading;
+
+// Generic VecEnv - envs is void* to be type-agnostic
 typedef struct StaticVec {
-    struct Breakout* envs;
+    void* envs;
     int size;
     int total_agents;
     int buffers;
@@ -94,18 +92,33 @@ typedef struct StaticVec {
     float* gpu_terminals;
     cudaStream_t* streams;
     StaticThreading* threading;
+    int obs_size;
+    int num_atns;
 } StaticVec;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// Callback types
+typedef void (*net_callback_fn)(void* ctx, int buf, int t);
+typedef void (*thread_init_fn)(void* ctx, int buf);
+typedef void (*step_fn)(void* env);
 
-StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* env_kwargs);
+// Functions implemented by env's static library
+StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* vec_kwargs, Dict* env_kwargs);
 void static_vec_reset(StaticVec* vec);
-void static_vec_omp_step(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     void* ctx, net_callback_fn net_callback, thread_init_fn thread_init);
+void static_vec_omp_step(StaticVec* vec);
+
+// Env info
+int get_obs_size(void);
+int get_num_atns(void);
+int* get_act_sizes(void);
+
+// Optional shared state functions
+void* my_shared(void* env, Dict* kwargs);
+void my_shared_close(void* env);
+void* my_get(void* env, Dict* out);
+int my_put(void* env, Dict* kwargs);
 
 #ifdef __cplusplus
 }

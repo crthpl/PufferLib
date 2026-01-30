@@ -26,7 +26,7 @@
 #include <iostream>
 #include <vector>
 
-#include "static_breakout.h"
+#include "static_envbinding.h"
 
 typedef torch::Tensor Tensor;
 
@@ -128,18 +128,20 @@ typedef struct {
 
 std::tuple<StaticVec*, Tensor>
 create_environments(int num_buffers, int total_agents, const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs, EnvBuf& env) {
-    StaticVec* vec = create_static_vec(total_agents, num_buffers, env_kwargs);
+    StaticVec* vec = create_static_vec(total_agents, num_buffers, vec_kwargs, env_kwargs);
     printf("DEBUG create_environments: vec->size=%d, vec->total_agents=%d\n",
         vec->size, vec->total_agents);
 
-    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, OBS_SIZE}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    env.actions = torch::from_blob(vec->gpu_actions, {total_agents, NUM_ATNS}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    int obs_size = get_obs_size();
+    int num_atns = get_num_atns();
+
+    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, obs_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    env.actions = torch::from_blob(vec->gpu_actions, {total_agents, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     env.rewards = torch::from_blob(vec->gpu_rewards, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     env.terminals = torch::from_blob(vec->gpu_terminals, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
     // Create act_sizes tensor on CUDA (needed for sample_logits kernel)
-    static int act_sizes_data[] = {3};
-    Tensor act_sizes = torch::from_blob(act_sizes_data, {NUM_ATNS}, torch::dtype(torch::kInt32)).to(torch::kCUDA);
+    Tensor act_sizes = torch::from_blob(get_act_sizes(), {num_atns}, torch::dtype(torch::kInt32)).to(torch::kCUDA);
 
     return std::make_tuple(vec, act_sizes);
 }
@@ -440,8 +442,9 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy,
     muon->zero_grad();
 }
 
-// Capture
-void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func) {
+// Capture with shared memory pool
+void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func,
+                   at::cuda::MempoolId_t pool) {
     /* Checklist for avoiding diabolical capture bugs:
      * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
      * 2. Make sure input/output buffer pointers don't change
@@ -461,7 +464,7 @@ void capture_graph(at::cuda::CUDAGraph* graph, std::function<void()> func) {
 
     auto cap_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(cap_stream);
-    graph->capture_begin();
+    graph->capture_begin(pool);
     func();
     graph->capture_end();
     cap_stream.synchronize();
@@ -623,13 +626,16 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         pufferl->train_cudagraph = at::cuda::CUDAGraph();
 
         auto* p = pufferl.get();
+        auto train_pool = at::cuda::graph_pool_handle();
         capture_graph(&pufferl->train_cudagraph, [p]() {
             train_forward_call(p->train_buf, p->policy, p->muon,
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
-        });
+        }, train_pool);
 
         // Fused rollout cudagraphs: [horizon][num_buffers]
         // Each graph does input copy + forward + output copy in one shot
+        // Use shared memory pool to reduce memory usage across graphs
+        auto rollout_pool = at::cuda::graph_pool_handle();
         pufferl->fused_rollout_cudagraphs.resize(horizon);
         for (int h = 0; h < horizon; ++h) {
             pufferl->fused_rollout_cudagraphs[h].resize(num_buffers);
@@ -637,16 +643,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
                 pufferl->fused_rollout_cudagraphs[h][b] = at::cuda::CUDAGraph();
                 capture_graph(&pufferl->fused_rollout_cudagraphs[h][b], [p, h, b]() {
                     fused_rollout_step(*p, h, b);
-                });
+                }, rollout_pool);
             }
         }
 
     }
-
-    // Static breakout - OMP only
-    int num_threads = 16;
-    if (hypers.use_omp) {
-        create_static_threads(vec, num_threads, horizon, pufferl.get(), net_callback_wrapper, thread_init_wrapper);
 
         // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
         // This ensures PyTorch properly recognizes the streams for all operations
@@ -654,6 +655,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             pufferl->torch_streams.push_back(at::cuda::getStreamFromPool(false));
             vec->streams[i] = pufferl->torch_streams[i].stream();
         }
+
+
+    // Static breakout - OMP only
+    int num_threads = 16;
+    if (hypers.use_omp) {
+        create_static_threads(vec, num_threads, horizon, pufferl.get(), net_callback_wrapper, thread_init_wrapper);
+
     }
     static_vec_reset(vec);
 

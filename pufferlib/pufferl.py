@@ -152,10 +152,10 @@ class PuffeRL:
         config['max_epochs'] = epochs
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
-        config['cudagraphs'] = True
+        config['cudagraphs'] = False
         config['kernels'] = True
         config['use_omp'] = True
-        config['num_buffers'] = 2
+        config['num_buffers'] = config['num_buffers']
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.rollouts.observations
         self.actions = self.pufferl_cpp.rollouts.actions
