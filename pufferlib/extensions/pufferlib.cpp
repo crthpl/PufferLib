@@ -33,7 +33,8 @@ typedef torch::Tensor Tensor;
 // CUDA kernel wrappers
 #include "modules.cpp"
 
-auto DTYPE = torch::kFloat32;
+auto DTYPE = torch::kBFloat16;
+auto DTYPE_FP32 = torch::kFloat32;  // master weights
 
 namespace pufferlib {
 
@@ -214,14 +215,14 @@ typedef struct {
 
 RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_atns) {
     RolloutBuf r;
-    r.observations = torch::zeros({horizon, segments, input_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.observations = torch::zeros({horizon, segments, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
     r.actions = torch::zeros({horizon, segments, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     r.values = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
-    r.logprobs = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    r.rewards = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    r.terminals = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    r.ratio = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-    r.importance = torch::zeros({horizon, segments}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    r.logprobs = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
+    r.rewards = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
+    r.terminals = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
+    r.ratio = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
+    r.importance = torch::zeros({horizon, segments}, torch::dtype(DTYPE).device(torch::kCUDA));
     return r;
 }
 
@@ -273,7 +274,8 @@ typedef struct {
 } HypersT;
 
 typedef struct {
-    PolicyMinGRU* policy;
+    PolicyMinGRU* policy_bf16;  // Working weights (bf16) - used for forward/backward
+    PolicyMinGRU* policy_fp32;  // Master weights (fp32) - used for optimizer
     VecEnv* vec;
     torch::optim::Muon* muon;
     EnvExports* env_exports;
@@ -313,8 +315,8 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     Tensor obs_slice = pufferl.env.obs.narrow(0, buf*block_size, block_size);
     Tensor& state = pufferl.buffer_states[buf];
 
-    // Run policy forward
-    auto [logits, value, state_out] = pufferl.policy->forward(obs_slice, state);
+    // Run policy forward using bf16 working weights
+    auto [logits, value, state_out] = pufferl.policy_bf16->forward(obs_slice, state);
 
     // Get output slices in rollouts storage
     Tensor actions_out = pufferl.rollouts.actions.select(0, h).narrow(0, buf*block_size, block_size);
@@ -362,9 +364,9 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     pufferl.env.actions.narrow(0, buf*block_size, block_size).copy_(actions_out, true);
 }
 
-void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy,
+void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32,
         torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu, bool kernels) {
-    auto [logits, newvalue] = policy->forward_train(graph.mb_obs.to(DTYPE), graph.mb_state);
+    auto [logits, newvalue] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
 
     Tensor loss;
     if (kernels) {
@@ -373,11 +375,11 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy,
             logits,
             newvalue,
             graph.mb_actions,
-            graph.mb_logprobs.to(logits.dtype()),
-            graph.mb_advantages.to(logits.dtype()),
-            graph.mb_prio.to(logits.dtype()),
-            graph.mb_values.to(logits.dtype()),
-            graph.mb_returns.to(logits.dtype()),
+            graph.mb_logprobs,
+            graph.mb_advantages,
+            graph.mb_prio,
+            graph.mb_values,
+            graph.mb_returns,
             mb_adv_mean,
             mb_adv_var,  // variance, not std - kernel does sqrtf to avoid second kernel launch here
             graph.mb_ratio,
@@ -438,34 +440,20 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy,
 
         // Total loss
         loss = pg_loss + hypers.vf_coef*v_loss - hypers.ent_coef*entropy;
-        /*
-        {
-            torch::NoGradGuard no_grad;
-
-            // Accumulate stats
-            pg_sum += pg_loss.detach();
-            v_sum += v_loss.detach();
-            ent_sum += entropy.detach();
-            total_sum += loss.detach();
-
-            // KL and clipping diagnostics (matches Python)
-            auto old_kl = (-logratio).mean();
-            auto kl = ((ratio_new - 1) - logratio).mean();
-            auto cf = (ratio_new - 1.0).abs().gt(hypers.clip_coef).to(torch::kFloat32).mean();
-            auto imp = ratio_new.mean();
-
-            old_approx_kl_sum += old_kl.detach();
-            approx_kl_sum += kl.detach();
-            clipfrac_sum += cf.detach();
-            importance_sum += imp.detach();
-        }
-        */
     }
 
+    // computes gradients on bf16 weights
     loss.backward();
-    clip_grad_norm_(policy->parameters(), hypers.max_grad_norm);
+    
+    // copy gradients from bf16 to fp32, then optimizer step on fp32 master weights
+    copy_gradients_to_fp32(policy_bf16, policy_fp32);
+    clip_grad_norm_(policy_fp32->parameters(), hypers.max_grad_norm);
     muon->step();
     muon->zero_grad();
+    policy_bf16->zero_grad();  // also need to clear bf16 gradients
+    
+    // sync updated fp32 weights back to bf16 for next forward pass
+    sync_policy_weights(policy_bf16, policy_fp32);
 }
 
 // Capture
@@ -594,35 +582,53 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     // Create encoder/decoder based on env_name
     // Decoder output size is act_n (sum of all action space sizes)
-    std::shared_ptr<Encoder> enc;
-    std::shared_ptr<Decoder> dec;
-    if (env_name == "puffer_snake") {
-        enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
-    } else if (env_name == "puffer_g2048") {
-        enc = std::make_shared<G2048Encoder>(input_size, hidden_size);
-        dec = std::make_shared<G2048Decoder>(hidden_size, act_n);
-    } else if (env_name == "puffer_nmmo3") {
-        enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
-        dec = std::make_shared<NMMO3Decoder>(hidden_size, act_n);
-    } else if (env_name == "puffer_drive") {
-        enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
-    } else {
-        enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
-    }
+    // We need two sets for mixed-precision: fp32 (master) and bf16 (working)
+    auto create_encoder_decoder = [&]() -> std::pair<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>> {
+        std::shared_ptr<Encoder> enc;
+        std::shared_ptr<Decoder> dec;
+        if (env_name == "puffer_snake") {
+            enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+        } else if (env_name == "puffer_g2048") {
+            enc = std::make_shared<G2048Encoder>(input_size, hidden_size);
+            dec = std::make_shared<G2048Decoder>(hidden_size, act_n);
+        } else if (env_name == "puffer_nmmo3") {
+            enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
+            dec = std::make_shared<NMMO3Decoder>(hidden_size, act_n);
+        } else if (env_name == "puffer_drive") {
+            enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+        } else {
+            enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+        }
+        return {enc, dec};
+    };
 
-    PolicyMinGRU* policy = new PolicyMinGRU(enc, dec, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
-    policy->to(torch::kCUDA);
-    policy->to(DTYPE);
-    pufferl->policy = policy;
+    // Create fp32 master policy (for optimizer - precise gradient accumulation)
+    auto [enc_fp32, dec_fp32] = create_encoder_decoder();
+    PolicyMinGRU* policy_fp32 = new PolicyMinGRU(enc_fp32, dec_fp32, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
+    policy_fp32->to(torch::kCUDA);
+    policy_fp32->to(DTYPE_FP32);
+    pufferl->policy_fp32 = policy_fp32;
 
+    // Create bf16 working policy (for forward/backward - fast Tensor Core ops)
+    auto [enc_bf16, dec_bf16] = create_encoder_decoder();
+    PolicyMinGRU* policy_bf16 = new PolicyMinGRU(enc_bf16, dec_bf16, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
+    policy_bf16->to(torch::kCUDA);
+    policy_bf16->to(DTYPE);
+    pufferl->policy_bf16 = policy_bf16;
+
+    // Sync bf16 weights from fp32 initially
+    sync_policy_weights(policy_bf16, policy_fp32);
+
+    // Optimizer uses fp32 master weights for precise gradient accumulation
     float lr = hypers.lr;
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
-    pufferl->muon = new torch::optim::Muon(policy->parameters(),
+    pufferl->muon = new torch::optim::Muon(policy_fp32->parameters(),
         torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
+
 
     // Allocate buffers
     int segments = hypers.segments;
@@ -637,7 +643,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
-        policy->num_layers, policy->hidden_size, policy->expansion_factor, num_action_heads);
+        policy_bf16->num_layers, policy_bf16->hidden_size, policy_bf16->expansion_factor, num_action_heads);
 
     pufferl->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
     pufferl->adv_std = torch::ones({1}, torch::dtype(DTYPE).device(torch::kCUDA));
@@ -645,7 +651,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // Per-buffer states: each is {num_layers, block_size, hidden} for contiguous access
     pufferl->buffer_states.resize(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
-        pufferl->buffer_states[i] = policy->initial_state(batch, torch::kCUDA);
+        pufferl->buffer_states[i] = policy_bf16->initial_state(batch, torch::kCUDA);
     }
 
     if (hypers.cudagraphs) {
@@ -653,7 +659,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
         auto* p = pufferl.get();
         capture_graph(&pufferl->train_cudagraph, [p]() {
-            train_forward_call(p->train_buf, p->policy, p->muon,
+            train_forward_call(p->train_buf, p->policy_bf16, p->policy_fp32, p->muon,
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
         });
 
@@ -798,7 +804,8 @@ void train_impl(PuffeRL& pufferl) {
     Tensor clipfrac_sum = torch::zeros({}, scalar_opts);
     Tensor importance_sum = torch::zeros({}, scalar_opts);
 
-    PolicyMinGRU* policy = pufferl.policy;
+    PolicyMinGRU* policy_bf16 = pufferl.policy_bf16;
+    // PolicyMinGRU* policy_fp32 = pufferl.policy_fp32;
     torch::optim::Muon* muon = pufferl.muon;
 
     if (anneal_lr) {
@@ -816,7 +823,6 @@ void train_impl(PuffeRL& pufferl) {
     Tensor advantages = torch::zeros_like(rollouts.values);
 
     compute_advantage(rollouts, advantages, hypers);
-
     pufferl.adv_mean.copy_(advantages.mean().detach());
     pufferl.adv_std.copy_(advantages.std().detach());
 
@@ -825,7 +831,7 @@ void train_impl(PuffeRL& pufferl) {
     cudaEventCreate(&stop);
 
     Tensor mb_state = torch::zeros(
-        {policy->num_layers, minibatch_segments, 1, (int64_t)(policy->hidden_size*policy->expansion_factor)},
+        {policy_bf16->num_layers, minibatch_segments, 1, (int64_t)(policy_bf16->hidden_size*policy_bf16->expansion_factor)},
         torch::dtype(DTYPE).device(rollouts.values.device())
     );
 
@@ -856,7 +862,7 @@ void train_impl(PuffeRL& pufferl) {
         if (hypers.cudagraphs) {
             pufferl.train_cudagraph.replay();
         } else {
-            train_forward_call(graph, pufferl.policy, pufferl.muon,
+            train_forward_call(graph, pufferl.policy_bf16, pufferl.policy_fp32, pufferl.muon,
                 hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, hypers.kernels);
         }
         profile_end(hypers.profile);
@@ -864,14 +870,8 @@ void train_impl(PuffeRL& pufferl) {
         // Update global ratio and values in-place (matches Python)
         // Buffers are {horizon, segments}, so index_copy_ along dim 1 (segments)
         // Source is {minibatch_segments, horizon}, need to transpose to {horizon, minibatch_segments}
-        // Temporary: use slice instead of index_copy_ for contiguous test
-        /*
-        pufferl.rollouts.ratio.slice(1, 0, minibatch_segments).copy_(graph.ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.slice(1, 0, minibatch_segments).copy_(graph.newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        */
-        // Original index_copy_ version:
-        pufferl.rollouts.ratio.index_copy_(1, idx, graph.mb_ratio.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
-        pufferl.rollouts.values.index_copy_(1, idx, graph.mb_newvalue.detach().squeeze(-1).to(torch::kFloat32).transpose(0, 1));
+        pufferl.rollouts.ratio.index_copy_(1, idx, graph.mb_ratio.detach().squeeze(-1).to(DTYPE).transpose(0, 1));
+        pufferl.rollouts.values.index_copy_(1, idx, graph.mb_newvalue.detach().squeeze(-1).to(DTYPE).transpose(0, 1));
 
     }
     pufferl.epoch += 1;
