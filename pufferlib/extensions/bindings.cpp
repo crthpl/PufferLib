@@ -26,13 +26,11 @@ Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::De
 }
 
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    pufferl.env_exports->vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
+    // Not used in static/OMP path
 }
 
 void python_vec_send(pybind11::object pufferl_obj, int buf) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    pufferl.env_exports->vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
+    // Not used in static/OMP path
 }
 
 torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
@@ -44,7 +42,7 @@ void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
     if (pufferl.hypers.use_omp) {
-        pufferl.env_exports->vec_omp_step(pufferl.vec);
+        static_vec_omp_step(pufferl.vec);
     } else {
         rollouts_impl(pufferl);
     }

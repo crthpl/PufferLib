@@ -13,7 +13,6 @@
 #include <cuda_profiler_api.h>
 
 #include <atomic>
-#include "vecenv.h"
 #include <dlfcn.h>
 #include "muon.h"
 
@@ -27,6 +26,7 @@
 #include <iostream>
 #include <vector>
 
+#include "static_breakout.h"
 
 typedef torch::Tensor Tensor;
 
@@ -42,10 +42,6 @@ namespace pufferlib {
 
 // Model classes are in models.cpp
 #include "models.cpp"
-
-// Function pointer type for loading exports
-typedef EnvExports* (*get_env_exports_fn)(void);
-
 
 torch::Dtype to_torch_dtype(int dtype) {
     if (dtype == FLOAT) {
@@ -130,45 +126,22 @@ typedef struct {
     Tensor terminals;
 } EnvBuf;
 
-std::tuple<EnvExports*, VecEnv*, Tensor>
+std::tuple<StaticVec*, Tensor>
 create_environments(int num_buffers, int total_agents, const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs, EnvBuf& env) {
-    std::string name = env_name;
-    if (name.rfind("puffer_", 0) == 0) {
-        name = name.substr(7);
-    }
-    std::string so_path = "./" + name + ".so";
-    void* handle = dlopen(so_path.c_str(), RTLD_NOW);
-    if (!handle) {
-        fprintf(stderr, "dlopen error: %s\n", dlerror());
-        exit(1);
-    }
-    dlerror();
-
-    // Single dlsym call to get all exports
-    get_env_exports_fn get_exports = (get_env_exports_fn)dlsym(handle, "get_env_exports");
-    const char* dlsym_error = dlerror();
-    if (dlsym_error) {
-        fprintf(stderr, "dlsym error: %s\n", dlsym_error);
-        dlclose(handle);
-        exit(1);
-    }
-    EnvExports* env_exports = get_exports();
-
-    VecEnv* vec = env_exports->create_environments(num_buffers, true, 0, vec_kwargs, env_kwargs);
+    StaticVec* vec = create_static_vec(total_agents, num_buffers, env_kwargs);
     printf("DEBUG create_environments: vec->size=%d, vec->total_agents=%d\n",
         vec->size, vec->total_agents);
 
-    auto obs_dtype = to_torch_dtype(env_exports->obs_type);
-
-    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, env_exports->obs_n}, torch::dtype(obs_dtype).device(torch::kCUDA));
-    env.actions = torch::from_blob(vec->gpu_actions, {total_agents, env_exports->num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, OBS_SIZE}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    env.actions = torch::from_blob(vec->gpu_actions, {total_agents, NUM_ATNS}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     env.rewards = torch::from_blob(vec->gpu_rewards, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     env.terminals = torch::from_blob(vec->gpu_terminals, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
     // Create act_sizes tensor on CUDA (needed for sample_logits kernel)
-    Tensor act_sizes = torch::from_blob(env_exports->act_sizes, {env_exports->num_atns}, torch::dtype(torch::kInt32)).to(torch::kCUDA);
+    static int act_sizes_data[] = {3};
+    Tensor act_sizes = torch::from_blob(act_sizes_data, {NUM_ATNS}, torch::dtype(torch::kInt32)).to(torch::kCUDA);
 
-    return std::make_tuple(env_exports, vec, act_sizes);
+    return std::make_tuple(vec, act_sizes);
 }
 
 typedef struct {
@@ -274,9 +247,8 @@ typedef struct {
 
 typedef struct {
     PolicyMinGRU* policy;
-    VecEnv* vec;
+    StaticVec* vec;
     torch::optim::Muon* muon;
-    EnvExports* env_exports;
     HypersT hypers;
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
     RolloutBuf rollouts;
@@ -296,7 +268,7 @@ typedef struct {
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
     Dict* out = create_dict(32);
-    pufferl.env_exports->vec_log(pufferl.vec, out);
+    static_vec_log(pufferl.vec, out);
     return out;
 }
 
@@ -513,11 +485,11 @@ inline void profile_end(bool enable) {
 }
 
 void env_recv(PuffeRL& pufferl, int buf) {
-    pufferl.env_exports->vec_recv(pufferl.vec, buf, pufferl.vec->streams[buf]);
+    // Not used in static/OMP path
 }
 
 void env_send(PuffeRL& pufferl, int buf) {
-    pufferl.env_exports->vec_send(pufferl.vec, buf, pufferl.vec->streams[buf]);
+    // Not used in static/OMP path
 }
 
 void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
@@ -577,11 +549,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // act_sizes: 1D tensor of action space sizes per head
     // num_action_heads: number of action heads (for MultiDiscrete)
     // act_n: sum of action space sizes (decoder output dim)
-    auto [env_exports, vec, act_sizes] = create_environments(hypers.num_buffers, hypers.total_agents, env_name, vec_kwargs, env_kwargs, pufferl->env);
+    auto [vec, act_sizes] = create_environments(hypers.num_buffers, hypers.total_agents, env_name, vec_kwargs, env_kwargs, pufferl->env);
     int num_action_heads = pufferl->env.actions.size(1);
     int act_n = act_sizes.sum().item<int>();
 
-    pufferl->env_exports = env_exports;
     pufferl->vec = vec;
     pufferl->act_sizes = act_sizes;
     pufferl->act_sizes_cpu = act_sizes.cpu().to(torch::kInt64).contiguous();
@@ -672,18 +643,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     }
 
-    // FAILS IF DONE AFTER CREATE_ENVIRONMENTS
-    // Try num_threads=0 to disable threading for debugging
+    // Static breakout - OMP only
     int num_threads = 16;
-    int block_size = vec->size / 16;
-    if (vec->size < num_threads) {
-        num_threads = vec->size;
-    }
-    if (block_size < 1) {
-        block_size = 1;
-    }
     if (hypers.use_omp) {
-        pufferl->env_exports->create_threads(vec, num_threads, block_size, true, pufferl.get(), net_callback_wrapper, thread_init_wrapper, horizon);
+        create_static_threads(vec, num_threads, horizon, pufferl.get(), net_callback_wrapper, thread_init_wrapper);
 
         // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
         // This ensures PyTorch properly recognizes the streams for all operations
@@ -691,10 +654,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             pufferl->torch_streams.push_back(at::cuda::getStreamFromPool(false));
             vec->streams[i] = pufferl->torch_streams[i].stream();
         }
-    } else {
-        pufferl->env_exports->create_threads(vec, num_threads, block_size, false, nullptr, nullptr, nullptr, 0);
     }
-    pufferl->env_exports->vec_reset(vec);
+    static_vec_reset(vec);
 
     return pufferl;
 }
