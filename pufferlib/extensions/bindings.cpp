@@ -129,6 +129,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.kernels = get_config(kwargs, "kernels");
     hypers.profile = get_config(kwargs, "profile");
     hypers.use_omp = get_config(kwargs, "use_omp");
+    hypers.bf16 = get_config(kwargs, "bf16");
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
     Dict* vec_kwargs = py_dict_to_c_dict(kwargs["vec_kwargs"].cast<py::dict>());
