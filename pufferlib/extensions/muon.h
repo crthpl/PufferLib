@@ -47,6 +47,9 @@ struct TORCH_API MuonParamState
 class TORCH_API Muon : public Optimizer {
  public:
   torch::Tensor lr;
+  torch::Tensor weight_buffer;  // Contiguous weight buffer for batched updates
+  torch::Tensor momentum_buffer;  // Contiguous momentum buffer
+
   explicit Muon(
       const std::vector<OptimizerParamGroup>& param_groups,
       MuonOptions defaults = {})
@@ -62,6 +65,40 @@ class TORCH_API Muon : public Optimizer {
   }
   explicit Muon(std::vector<Tensor> params, MuonOptions defaults = {})
       : Muon({OptimizerParamGroup(std::move(params))}, std::move(defaults)) {}
+
+  // Create contiguous weight buffer from params for batched updates
+  void init_contiguous_weights() {
+    torch::NoGradGuard no_grad;
+    auto& params = param_groups_[0].params();
+
+    // Count total size
+    int64_t total_size = 0;
+    for (auto& p : params) {
+      total_size += p.numel();
+    }
+
+    // Allocate single contiguous buffer
+    auto device = params[0].device();
+    weight_buffer = torch::zeros({total_size},
+        torch::dtype(torch::kFloat32).device(device));
+    weight_buffer.set_requires_grad(true);
+
+    // Copy params into buffer and replace with views
+    int64_t offset = 0;
+    for (auto& p : params) {
+      int64_t size = p.numel();
+      auto shape = p.sizes().vec();
+
+      // Copy current values into buffer
+      weight_buffer.narrow(0, offset, size).copy_(p.flatten());
+
+      // Replace param data with view into buffer
+      torch::Tensor view = weight_buffer.narrow(0, offset, size).view(shape);
+      p.set_data(view);
+
+      offset += size;
+    }
+  }
 
   torch::Tensor step(LossClosure closure = nullptr) override;
   //void save(serialize::OutputArchive& archive) const override;

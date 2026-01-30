@@ -60,54 +60,40 @@ torch::Dtype to_torch_dtype(int dtype) {
     return torch::kFloat32;
 }
 
-// Torch is stupid. Had to clip out a redundant cuda sync.
+// Fast clip_grad_norm_ for contiguous weights
+// Cats all grads for one-shot norm computation, then scales each grad
 void clip_grad_norm_(
     const std::vector<Tensor>& parameters,
-    double max_norm,
-    double norm_type = 2.0
+    double max_norm
     ) {
-  std::vector<Tensor> params_with_grad;
+  // Collect flattened grads
+  std::vector<Tensor> flat_grads;
+  flat_grads.reserve(parameters.size());
 
   for (const auto& param : parameters) {
     auto& grad = param.grad();
     if (grad.defined()) {
-      params_with_grad.push_back(param);
+      flat_grads.push_back(grad.flatten());
     }
   }
 
-  if (params_with_grad.empty()) {
+  if (flat_grads.empty()) {
     return;
   }
 
-  Tensor total_norm_tensor;
-  if (norm_type == std::numeric_limits<double>::infinity()) {
-    std::vector<Tensor> norms;
-    norms.reserve(params_with_grad.size());
+  // Single cat + norm (avoids per-param norm calls)
+  Tensor all_grads = torch::cat(flat_grads);
+  Tensor total_norm = all_grads.norm(2);
 
-    for (const auto& param : params_with_grad) {
-      norms.emplace_back(param.grad().data().abs().max());
+  // Compute clip coefficient
+  Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
+
+  // Scale each grad in-place
+  for (const auto& param : parameters) {
+    auto& grad = param.grad();
+    if (grad.defined()) {
+      grad.mul_(clip_coef);
     }
-    total_norm_tensor =
-        (norms.size() == 1) ? norms[0] : torch::max(torch::stack(norms));
-  } else if (norm_type == 0) {
-    total_norm_tensor =
-        torch::full({}, static_cast<double>(params_with_grad.size()));
-  } else {
-    std::vector<Tensor> norms;
-    norms.reserve(params_with_grad.size());
-
-    for (const auto& param : params_with_grad) {
-      norms.emplace_back(param.grad().data().norm(norm_type));
-    }
-    total_norm_tensor =
-        (norms.size() == 1) ? norms[0] : torch::stack(norms).norm(norm_type);
-  }
-
-  Tensor clip_coef = max_norm / (total_norm_tensor + 1e-6);
-  Tensor clip_coef_clamped =
-      torch::clamp(clip_coef, std::nullopt /* min */, 1.0 /* max */);
-  for (auto& param : params_with_grad) {
-    param.grad().data().mul_(clip_coef_clamped);
   }
 }
 
@@ -597,6 +583,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     float eps = hypers.eps;
     pufferl->muon = new torch::optim::Muon(policy->parameters(),
         torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
+    pufferl->muon->init_contiguous_weights();
+    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weight_buffer.numel());
 
     // Allocate buffers
     int segments = hypers.segments;
