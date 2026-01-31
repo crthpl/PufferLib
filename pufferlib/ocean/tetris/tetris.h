@@ -45,8 +45,8 @@ const float REWARD_COMBO[5] = {0, 0.1, 0.3, 0.5, 1.0};
 typedef struct Log {
 	float perf;
 	float score;
-	float ep_length;
-	float ep_return;
+	float episode_length;
+	float episode_return;
 	float lines_deleted;
 	float avg_combo;
 	float atn_frac_soft_drop;
@@ -101,7 +101,7 @@ typedef struct Tetris {
 	int cur_tetromino_col;
 	int cur_tetromino_rot;
 
-	float ep_return;
+	float episode_return;
 	int lines_deleted;
 	int count_combos;
 	int game_level;
@@ -149,8 +149,8 @@ void free_allocated(Tetris *env) {
 void add_log(Tetris *env) {
 	env->log.score += env->score;
 	env->log.perf += env->score / ((float)PERSONAL_BEST);
-	env->log.ep_length += env->tick;
-	env->log.ep_return += env->ep_return;
+	env->log.episode_length += env->tick;
+	env->log.episode_return += env->episode_return;
 	env->log.lines_deleted += env->lines_deleted;
 	env->log.avg_combo += env->count_combos > 0 ? ((float)env->lines_deleted) / ((float)env->count_combos) : 1.0f;
 	env->log.atn_frac_hard_drop += env->atn_count_hard_drop / ((float)env->tick);
@@ -426,7 +426,7 @@ void c_reset(Tetris *env) {
 	env->tick_garbage = 0;
 	env->can_swap = 1;
 
-	env->ep_return = 0.0;
+	env->episode_return = 0.0;
 	env->count_combos = 0;
 	env->lines_deleted = 0;
 	env->atn_count_hard_drop = 0;
@@ -478,7 +478,7 @@ void place_tetromino(Tetris *env) {
 		env->lines_deleted += lines_deleted;
 		env->score += SCORE_COMBO[lines_deleted];
 		env->rewards[0] += REWARD_COMBO[lines_deleted];
-		env->ep_return += REWARD_COMBO[lines_deleted];
+		env->episode_return += REWARD_COMBO[lines_deleted];
 
 		// These determine the game difficulty. Consider making them args.
 		env->game_level = 1 + env->lines_deleted / LINES_PER_LEVEL;
@@ -506,7 +506,7 @@ void c_step(Tetris *env) {
 			env->cur_tetromino_col -= 1;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
+			env->episode_return += REWARD_INVALID_ACTION;
 		}
 	}
 	if (action == ACTION_RIGHT) {
@@ -514,7 +514,7 @@ void c_step(Tetris *env) {
 			env->cur_tetromino_col += 1;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
+			env->episode_return += REWARD_INVALID_ACTION;
 		}
 	}
 	if (action == ACTION_ROTATE) {
@@ -522,10 +522,10 @@ void c_step(Tetris *env) {
 		if (can_rotate(env)) {
 			env->cur_tetromino_rot = (env->cur_tetromino_rot + 1) % NUM_ROTATIONS;
 			env->rewards[0] += REWARD_ROTATE;
-			env->ep_return += REWARD_ROTATE;
+			env->episode_return += REWARD_ROTATE;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
+			env->episode_return += REWARD_INVALID_ACTION;
 		}
 	}
 	if (action == ACTION_SOFT_DROP) {
@@ -534,10 +534,10 @@ void c_step(Tetris *env) {
 			env->cur_tetromino_row += 1;
 			env->score += SCORE_SOFT_DROP;
 			// env->rewards[0] += REWARD_SOFT_DROP;
-			// env->ep_return += REWARD_SOFT_DROP;
+			// env->episode_return += REWARD_SOFT_DROP;
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
+			env->episode_return += REWARD_INVALID_ACTION;
 		}
 	}
 	if (action == ACTION_HOLD) {
@@ -561,7 +561,7 @@ void c_step(Tetris *env) {
 			}
 		} else {
 			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
+			env->episode_return += REWARD_INVALID_ACTION;
 		}
 	}
 	if (action == ACTION_HARD_DROP) {
@@ -570,7 +570,7 @@ void c_step(Tetris *env) {
 			env->cur_tetromino_row += 1;
 			// NOTE: this seems to be a super effective reward trick
 			env->rewards[0] += REWARD_HARD_DROP;
-			env->ep_return += REWARD_HARD_DROP;
+			env->episode_return += REWARD_HARD_DROP;
 		}
 		env->score += SCORE_HARD_DROP;
 		place_tetromino(env);

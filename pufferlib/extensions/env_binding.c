@@ -1,111 +1,48 @@
-// static_breakout.c - Compiled with clang into libstatic_breakout.a
-// Then linked into the torch extension
+// static_envbinding.c - Template for static env binding
+// Include this AFTER defining: Env, OBS_SIZE, NUM_ATNS, my_init, my_log, c_step, c_reset
 
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdbool.h>
-#include <assert.h>
 #include <omp.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <cuda_runtime.h>
 
-// Dict from vecenv.h
-typedef struct {
-    const char* key;
-    double value;
-    void* ptr;
-} DictItem;
+#include "env_binding.h"
+#include "binding.h"
 
-typedef struct {
-    DictItem* items;
-    int size;
-    int capacity;
-} Dict;
+// Forward declare CUDA types and functions to avoid conflicts with raylib's float3
+typedef int cudaError_t;
+typedef int cudaMemcpyKind;
+#define cudaSuccess 0
+#define cudaMemcpyHostToDevice 1
+#define cudaMemcpyDeviceToHost 2
+#define cudaHostAllocPortable 1
+#define cudaStreamNonBlocking 1
 
-static inline DictItem* dict_get_unsafe(Dict* dict, const char* key) {
-    for (int i = 0; i < dict->size; i++) {
-        if (strcmp(dict->items[i].key, key) == 0) {
-            return &dict->items[i];
-        }
-    }
-    return NULL;
-}
+extern cudaError_t cudaHostAlloc(void**, size_t, unsigned int);
+extern cudaError_t cudaMalloc(void**, size_t);
+extern cudaError_t cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
+extern cudaError_t cudaMemcpyAsync(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t);
+extern cudaError_t cudaMemset(void*, int, size_t);
+extern cudaError_t cudaFree(void*);
+extern cudaError_t cudaFreeHost(void*);
+extern cudaError_t cudaSetDevice(int);
+extern cudaError_t cudaDeviceSynchronize(void);
+extern cudaError_t cudaStreamSynchronize(cudaStream_t);
+extern cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned int);
+extern cudaError_t cudaStreamQuery(cudaStream_t);
+extern const char* cudaGetErrorString(cudaError_t);
 
-static inline DictItem* dict_get(Dict* dict, const char* key) {
-    DictItem* item = dict_get_unsafe(dict, key);
-    if (item == NULL) printf("dict_get failed to find key: %s\n", key);
-    assert(item != NULL);
-    return item;
-}
-
-static inline void dict_set(Dict* dict, const char* key, double value) {
-    assert(dict->size < dict->capacity);
-    DictItem* item = dict_get_unsafe(dict, key);
-    if (item != NULL) {
-        item->value = value;
-        return;
-    }
-    dict->items[dict->size].key = key;
-    dict->items[dict->size].value = value;
-    dict->size++;
-}
-
-// Breakout config
-#define OBS_SIZE 118
-#define NUM_ATNS 1
-
-// Include breakout env
-#include "../ocean/breakout/breakout.h"
-
-#define Env Breakout
-
-// Init for breakout
-void breakout_env_init(Env* env, Dict* kwargs) {
-    env->num_agents = 1;
-    env->frameskip = (int)dict_get(kwargs, "frameskip")->value;
-    env->width = (int)dict_get(kwargs, "width")->value;
-    env->height = (int)dict_get(kwargs, "height")->value;
-    env->initial_paddle_width = (int)dict_get(kwargs, "paddle_width")->value;
-    env->paddle_height = (int)dict_get(kwargs, "paddle_height")->value;
-    env->ball_width = (int)dict_get(kwargs, "ball_width")->value;
-    env->ball_height = (int)dict_get(kwargs, "ball_height")->value;
-    env->brick_width = (int)dict_get(kwargs, "brick_width")->value;
-    env->brick_height = (int)dict_get(kwargs, "brick_height")->value;
-    env->brick_rows = (int)dict_get(kwargs, "brick_rows")->value;
-    env->brick_cols = (int)dict_get(kwargs, "brick_cols")->value;
-    env->initial_ball_speed = (int)dict_get(kwargs, "initial_ball_speed")->value;
-    env->max_ball_speed = (int)dict_get(kwargs, "max_ball_speed")->value;
-    env->paddle_speed = (int)dict_get(kwargs, "paddle_speed")->value;
-    env->continuous = (int)dict_get(kwargs, "continuous")->value;
-    init(env);
-}
-
-// Log for breakout
-void breakout_env_log(Log* log, Dict* out) {
-    dict_set(out, "perf", log->perf);
-    dict_set(out, "score", log->score);
-    dict_set(out, "episode_return", log->episode_return);
-    dict_set(out, "episode_length", log->episode_length);
-}
-
-// Threading state
 #define OMP_WAITING 5
 #define OMP_RUNNING 6
 
-typedef void (*net_callback_fn)(void* ctx, int buf, int t);
-typedef void (*thread_init_fn)(void* ctx, int buf);
-
-typedef struct StaticThreading {
+struct StaticThreading {
     atomic_int* buffer_states;
     int num_threads;
     int num_buffers;
     pthread_t* threads;
-} StaticThreading;
+};
 
 typedef struct StaticOMPArg {
-    void* vec;
+    StaticVec* vec;
     int buf;
     int horizon;
     void* ctx;
@@ -113,31 +50,10 @@ typedef struct StaticOMPArg {
     thread_init_fn thread_init;
 } StaticOMPArg;
 
-// Minimal VecEnv for static breakout
-typedef struct StaticVec {
-    Env* envs;
-    int size;
-    int total_agents;
-    int buffers;
-    int agents_per_buffer;
-    int* buffer_env_starts;
-    int* buffer_env_counts;
-    float* observations;
-    double* actions;
-    float* rewards;
-    float* terminals;
-    float* gpu_observations;
-    double* gpu_actions;
-    float* gpu_rewards;
-    float* gpu_terminals;
-    cudaStream_t* streams;
-    StaticThreading* threading;
-} StaticVec;
-
 // OMP thread manager
 static void* static_omp_threadmanager(void* arg) {
     StaticOMPArg* worker_arg = (StaticOMPArg*)arg;
-    StaticVec* vec = (StaticVec*)worker_arg->vec;
+    StaticVec* vec = worker_arg->vec;
     StaticThreading* threading = vec->threading;
     int buf = worker_arg->buf;
     int horizon = worker_arg->horizon;
@@ -157,6 +73,8 @@ static void* static_omp_threadmanager(void* arg) {
     int num_workers = threading->num_threads / vec->buffers;
     if (num_workers < 1) num_workers = 1;
 
+    Env* envs = (Env*)vec->envs;
+
     while (1) {
         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {}
         cudaStream_t stream = vec->streams[buf];
@@ -173,7 +91,7 @@ static void* static_omp_threadmanager(void* arg) {
 
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
-                c_step(&vec->envs[i]);
+                c_step(&envs[i]);
             }
 
             cudaMemcpyAsync(
@@ -207,22 +125,48 @@ void static_vec_omp_step(StaticVec* vec) {
     }
 }
 
-StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* env_kwargs) {
+// Optional: Initialize all envs at once (for shared state, variable agents per env, etc.)
+// Default implementation creates one env per agent using my_init
+#ifndef MY_VEC_INIT
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
+    int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
+    int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
+    int agents_per_buffer = total_agents / num_buffers;
+
+    // Default: one env per agent
+    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+    for (int b = 0; b < num_buffers; b++) {
+        buffer_env_starts[b] = b * agents_per_buffer;
+        buffer_env_counts[b] = agents_per_buffer;
+    }
+
+    for (int i = 0; i < total_agents; i++) {
+        srand(i);
+        my_init(&envs[i], env_kwargs);
+    }
+
+    *num_envs_out = total_agents;
+    return envs;
+}
+#endif
+
+StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* vec_kwargs, Dict* env_kwargs) {
     StaticVec* vec = (StaticVec*)calloc(1, sizeof(StaticVec));
     vec->total_agents = total_agents;
     vec->buffers = num_buffers;
     vec->agents_per_buffer = total_agents / num_buffers;
-    vec->size = total_agents;
+    vec->obs_size = OBS_SIZE;
+    vec->num_atns = NUM_ATNS;
 
-    vec->envs = (Env*)calloc(total_agents, sizeof(Env));
     vec->buffer_env_starts = (int*)calloc(num_buffers, sizeof(int));
     vec->buffer_env_counts = (int*)calloc(num_buffers, sizeof(int));
 
-    int envs_per_buffer = total_agents / num_buffers;
-    for (int b = 0; b < num_buffers; b++) {
-        vec->buffer_env_starts[b] = b * envs_per_buffer;
-        vec->buffer_env_counts[b] = envs_per_buffer;
-    }
+    // Let my_vec_init allocate and initialize envs, fill buffer info
+    int num_envs = 0;
+    vec->envs = my_vec_init(&num_envs, vec->buffer_env_starts, vec->buffer_env_counts,
+                            vec_kwargs, env_kwargs);
+    vec->size = num_envs;
 
     cudaHostAlloc((void**)&vec->observations, total_agents * OBS_SIZE * sizeof(float), cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(double), cudaHostAllocPortable);
@@ -239,27 +183,35 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* env_kwargs
     cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
     cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
 
+    // Streams allocated here, created in create_static_threads
     vec->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
-    for (int i = 0; i < num_buffers; i++) {
-        cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
-    }
 
-    for (int i = 0; i < total_agents; i++) {
-        Env* env = &vec->envs[i];
-        env->observations = vec->observations + i * OBS_SIZE;
-        env->actions = vec->actions + i * NUM_ATNS;
-        env->rewards = vec->rewards + i;
-        env->terminals = vec->terminals + i;
-        srand(i);
-        breakout_env_init(env, env_kwargs);
+    // Assign pointers to envs based on buffer layout
+    Env* envs = (Env*)vec->envs;
+    for (int buf = 0; buf < num_buffers; buf++) {
+        int buf_start = buf * vec->agents_per_buffer;
+        int buf_agent = 0;
+        int env_start = vec->buffer_env_starts[buf];
+        int env_count = vec->buffer_env_counts[buf];
+
+        for (int e = 0; e < env_count; e++) {
+            Env* env = &envs[env_start + e];
+            int slot = buf_start + buf_agent;
+            env->observations = vec->observations + slot * OBS_SIZE;
+            env->actions = vec->actions + slot * NUM_ATNS;
+            env->rewards = vec->rewards + slot;
+            env->terminals = vec->terminals + slot;
+            buf_agent += env->num_agents;
+        }
     }
 
     return vec;
 }
 
 void static_vec_reset(StaticVec* vec) {
+    Env* envs = (Env*)vec->envs;
     for (int i = 0; i < vec->size; i++) {
-        c_reset(&vec->envs[i]);
+        c_reset(&envs[i]);
     }
     cudaMemcpy(vec->gpu_observations, vec->observations,
         vec->total_agents * OBS_SIZE * sizeof(float), cudaMemcpyHostToDevice);
@@ -278,6 +230,11 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     vec->threading->buffer_states = (atomic_int*)calloc(vec->buffers, sizeof(atomic_int));
     vec->threading->threads = (pthread_t*)calloc(vec->buffers, sizeof(pthread_t));
 
+    // Create CUDA streams here, not in create_static_vec
+    for (int i = 0; i < vec->buffers; i++) {
+        cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+    }
+
     StaticOMPArg* args = (StaticOMPArg*)calloc(vec->buffers, sizeof(StaticOMPArg));
     for (int i = 0; i < vec->buffers; i++) {
         args[i].vec = vec;
@@ -291,14 +248,15 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
 }
 
 void static_vec_log(StaticVec* vec, Dict* out) {
+    Env* envs = (Env*)vec->envs;
     Log aggregate = {0};
     for (int i = 0; i < vec->size; i++) {
-        aggregate.perf += vec->envs[i].log.perf;
-        aggregate.score += vec->envs[i].log.score;
-        aggregate.episode_return += vec->envs[i].log.episode_return;
-        aggregate.episode_length += vec->envs[i].log.episode_length;
-        aggregate.n += vec->envs[i].log.n;
-        memset(&vec->envs[i].log, 0, sizeof(Log));
+        aggregate.perf += envs[i].log.perf;
+        aggregate.score += envs[i].log.score;
+        aggregate.episode_return += envs[i].log.episode_return;
+        aggregate.episode_length += envs[i].log.episode_length;
+        aggregate.n += envs[i].log.n;
+        memset(&envs[i].log, 0, sizeof(Log));
     }
     if (aggregate.n > 0) {
         float n = aggregate.n;
@@ -307,6 +265,34 @@ void static_vec_log(StaticVec* vec, Dict* out) {
         aggregate.episode_return /= n;
         aggregate.episode_length /= n;
         dict_set(out, "n", n);
-        breakout_env_log(&aggregate, out);
+        my_log(&aggregate, out);
     }
 }
+
+int get_obs_size(void) { return OBS_SIZE; }
+int get_num_atns(void) { return NUM_ATNS; }
+static int _act_sizes[] = ACT_SIZES;
+int* get_act_sizes(void) { return _act_sizes; }
+
+// Optional shared state functions - default implementations
+#ifndef MY_SHARED
+void* my_shared(void* env, Dict* kwargs) {
+    return NULL;
+}
+#endif
+
+#ifndef MY_SHARED_CLOSE
+void my_shared_close(void* env) {}
+#endif
+
+#ifndef MY_GET
+void* my_get(void* env, Dict* out) {
+    return NULL;
+}
+#endif
+
+#ifndef MY_PUT
+int my_put(void* env, Dict* kwargs) {
+    return 0;
+}
+#endif

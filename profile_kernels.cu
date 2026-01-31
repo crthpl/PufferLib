@@ -3,8 +3,11 @@
 //
 // Without torch: nvcc -O3 -arch=sm_80 profile_kernels.cu -o profile_kernels -I.
 // With torch:    Build with cmake/pytorch and -DUSE_TORCH
+// With env:      ./scripts/build_profile_kernels.sh <env_name>
 //
-// Run: ./profile_kernels
+// Run: ./profile_kernels <profile>
+//   kernels  - Individual kernel profiling
+//   envspeed - Environment step throughput (requires -DUSE_STATIC_ENV)
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -12,8 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dlfcn.h>
 #include <cmath>
+#include <chrono>
 
 
 #ifdef USE_TORCH
@@ -22,16 +25,17 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include "pufferlib/extensions/cuda/kernels.cu"
-#include "pufferlib/extensions/modules.cpp"
+#include "pufferlib/extensions/pufferlib.cpp"
+using namespace pufferlib;
 #endif
 
 #ifndef USE_TORCH
 #include "pufferlib/extensions/cuda/kernels.cu"
 #endif
 
-const int WARMUP_ITERS = 1000;
-const int TIMING_ITERS = 10000;
-const float TIMEOUT_SEC = 5.0f;
+const int WARMUP_ITERS = 100;
+const int TIMING_ITERS = 1000;
+const float TIMEOUT_SEC = 3.0f;
 
 const int BUF = 2;
 const int BR = 4096;  // Rollout batch (no T dim)
@@ -1990,7 +1994,6 @@ void profile_ppoloss(int batch, int seq, int actions) {
     free_ppolossargs(args);
 }
 
-/*
 // ============================================================================
 // sample_logits profiling
 // ============================================================================
@@ -1998,10 +2001,11 @@ void profile_ppoloss(int batch, int seq, int actions) {
 typedef struct {
     float* logits;        // (B, A)
     float* value;         // (B, 1)
-    double* actions;      // (B,) - float64 for discrete/continuous compatibility
+    double* actions;      // (B, 1) - float64 for discrete/continuous compatibility
     float* logprobs;      // (B,)
     float* value_out;     // (B,)
     int64_t* offset;      // RNG offset (on device for CUDA graph support)
+    int* act_sizes;       // (1,) - single action head
     uint64_t seed;
     int B;
     int A;
@@ -2017,17 +2021,18 @@ SampleLogitsArgs* create_samplelogitsargs(int batch, int num_actions) {
     int N_batch = batch;
 
     cudaMalloc(&args->logits, N_logits * sizeof(float));
-    cudaMalloc(&args->value, N_batch * sizeof(float));  // (B, 1) flattened
+    cudaMalloc(&args->value, N_batch * sizeof(float));
     cudaMalloc(&args->actions, N_batch * sizeof(double));
     cudaMalloc(&args->logprobs, N_batch * sizeof(float));
     cudaMalloc(&args->value_out, N_batch * sizeof(float));
     cudaMalloc(&args->offset, sizeof(int64_t));
-    cudaMemset(args->offset, 0, sizeof(int64_t));  // Initialize offset to 0
+    cudaMalloc(&args->act_sizes, sizeof(int));
+    cudaMemset(args->offset, 0, sizeof(int64_t));
+    cudaMemcpy(args->act_sizes, &num_actions, sizeof(int), cudaMemcpyHostToDevice);
 
     float* logits_buf = (float*)malloc(N_logits * sizeof(float));
     float* value_buf = (float*)malloc(N_batch * sizeof(float));
 
-    // Initialize logits and value with random values
     for (int i = 0; i < N_logits; ++i) {
         logits_buf[i] = rand1() * 5.0f;
     }
@@ -2050,6 +2055,7 @@ void free_samplelogitsargs(SampleLogitsArgs* args) {
     cudaFree(args->logprobs);
     cudaFree(args->value_out);
     cudaFree(args->offset);
+    cudaFree(args->act_sizes);
     free(args);
 }
 
@@ -2057,12 +2063,10 @@ void run_samplelogits_forward(SampleLogitsArgs* args) {
     launch_sample_logits<float>(
         args->actions, args->logprobs, args->value_out,
         args->logits, args->value,
-        args->seed, args->offset,
-        args->A, args->B,
-        args->A,  // logits_stride = A (contiguous)
-        1,        // value_stride = 1 (contiguous, 1D)
-        0);
-    // Note: not incrementing offset here since this is just for profiling
+        args->act_sizes, args->seed, args->offset,
+        1,  // num_atns
+        args->B, args->A, 1,  // B, logits_stride, value_stride
+        0);  // stream
 }
 
 #ifdef USE_TORCH
@@ -2070,10 +2074,11 @@ void run_samplelogits_forward(SampleLogitsArgs* args) {
 typedef struct {
     torch::Tensor logits;       // (B, A)
     torch::Tensor value;        // (B, 1) - input
-    torch::Tensor actions;      // (B,) float64 - output
+    torch::Tensor actions;      // (B, 1) float64 - output
     torch::Tensor logprobs;     // (B,) - output
     torch::Tensor value_out;    // (B,) - output
     torch::Tensor offset;       // (1,) int64 - RNG offset tensor
+    torch::Tensor act_sizes;    // (1,) int32 - action sizes
     uint64_t seed;
     int B;
     int A;
@@ -2088,18 +2093,19 @@ SampleLogitsArgsTorch* create_samplelogitsargs_torch(SampleLogitsArgs* raw) {
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     args->logits = torch::from_blob(raw->logits, {raw->B, raw->A}, opts);
     args->value = torch::from_blob(raw->value, {raw->B, 1}, opts);
-    args->actions = torch::empty({raw->B}, opts.dtype(torch::kFloat64));
+    args->actions = torch::empty({raw->B, 1}, opts.dtype(torch::kFloat64));
     args->logprobs = torch::empty({raw->B}, opts);
     args->value_out = torch::empty({raw->B}, opts);
     args->offset = torch::zeros({1}, opts.dtype(torch::kInt64));
+    args->act_sizes = torch::tensor({raw->A}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     return args;
 }
 
 void run_samplelogits_forward_torch(SampleLogitsArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    sample_logits(args->logits, args->value, args->actions, args->logprobs, args->value_out, args->seed, args->offset);
-    args->offset.add_(1);  // Increment with CUDA op
+    sample_logits(args->logits, args->value, args->actions, args->logprobs,
+        args->value_out, args->act_sizes, args->seed, args->offset);
 }
 
 void run_samplelogits_forward_cpp(SampleLogitsArgsTorch* args) {
@@ -2135,52 +2141,57 @@ void profile_samplelogits(int batch, int num_actions) {
 
     free_samplelogitsargs(args);
 }
-*/
 
 // ============================================================================
 // OUTDATED TESTS BELOW - GraphBuf and DLL loading no longer used
 // Uncomment and update when needed
 // ============================================================================
 
-#if 0  // Disabled - uses outdated GraphBuf/DLL patterns
-
 // ============================================================================
-// forward_call profiling (inference forward pass) - using GraphBuf
+// forward_call profiling (inference forward pass)
 // ============================================================================
 
 #ifdef USE_TORCH
 
 typedef struct {
     std::shared_ptr<PolicyMinGRU> policy;
-    GraphBuf graph;
+    Tensor obs;
+    Tensor state;
+    Tensor actions;
+    Tensor logprobs;
+    Tensor values;
     Tensor rng_offset;
     Tensor act_sizes;
     Tensor act_sizes_cpu;
     uint64_t seed;
     bool use_kernels;
+    int batch;
+    int num_atns;
 } ForwardCallArgs;
 
 ForwardCallArgs* create_forwardcallargs(int batch, int input_size, int hidden_size,
                                         int act_n, int num_layers, bool use_kernels) {
-    // act_n = total action space size (decoder output size)
-    // For discrete: num_action_heads=1, act_sizes=[act_n]
-    // For multidiscrete: num_action_heads=len(act_sizes), act_n=sum(act_sizes)
     int num_action_heads = 1;  // Using discrete for profiling
+    int expansion_factor = 1;
 
     ForwardCallArgs* args = new ForwardCallArgs();
     args->use_kernels = use_kernels;
     args->seed = 42;
+    args->batch = batch;
+    args->num_atns = num_action_heads;
 
     // Create policy with default encoder/decoder
     auto enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
     auto dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
-    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, 1, num_layers, use_kernels);
+    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, expansion_factor, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
 
-    // Use create_graph factory (minibatch_segments=0 since not used for inference)
-    // num_action_heads=1 for discrete action space
-    args->graph = create_graph(batch, input_size, 0, 0, num_layers, hidden_size, 1, num_action_heads, args->policy.get());
-    args->graph.obs = torch::randn({batch, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
+    // Create tensors directly
+    args->obs = torch::randn({batch, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->state = args->policy->initial_state(batch, torch::kCUDA);
+    args->actions = torch::zeros({batch, num_action_heads}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
+    args->logprobs = torch::zeros({batch}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    args->values = torch::zeros({batch}, torch::dtype(DTYPE).device(torch::kCUDA));
     args->rng_offset = torch::zeros({1}, torch::dtype(torch::kInt64).device(torch::kCUDA));
 
     // Create act_sizes tensor: for discrete, single entry with total action count
@@ -2195,7 +2206,36 @@ void free_forwardcallargs(ForwardCallArgs* args) {
 }
 
 void run_forward_call(ForwardCallArgs* args) {
-    forward_call(args->graph, args->policy.get(), args->use_kernels, args->seed, args->rng_offset, args->act_sizes, args->act_sizes_cpu);
+    torch::NoGradGuard no_grad;
+
+    // Run policy forward
+    auto [logits, value, state_out] = args->policy->forward(args->obs, args->state);
+
+    // Sample actions
+    if (args->use_kernels) {
+        sample_logits(logits, value, args->actions, args->logprobs,
+            args->values, args->act_sizes, args->seed, args->rng_offset);
+    } else {
+        int num_action_heads = args->num_atns;
+        logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+        auto split_logits = torch::split(logits, c10::IntArrayRef(args->act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+        std::vector<Tensor> actions_vec;
+        std::vector<Tensor> logprobs_vec;
+        for (int i = 0; i < num_action_heads; i++) {
+            Tensor head_logits = split_logits[i];
+            Tensor log_probs = torch::log_softmax(head_logits, 1);
+            Tensor action = at::multinomial(log_probs.exp(), 1, true);
+            Tensor logprob = log_probs.gather(1, action);
+            actions_vec.push_back(action);
+            logprobs_vec.push_back(logprob);
+        }
+        args->actions.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
+        args->logprobs.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
+        args->values.copy_(value.flatten(), false);
+    }
+
+    // Update state
+    args->state.copy_(state_out, false);
 }
 
 #endif
@@ -2232,81 +2272,7 @@ void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atn
 }
 
 // ============================================================================
-// rollout_copy_call profiling - using RolloutBuf, GraphBuf, EnvBuf
-// ============================================================================
-
-#ifdef USE_TORCH
-
-typedef struct {
-    RolloutBuf rollouts;
-    GraphBuf graph;
-    EnvBuf env;
-    int horizon;
-    int num_envs;
-    int num_buffers;
-    int h;   // current timestep
-    int buf; // current buffer index
-} RolloutCopyArgs;
-
-RolloutCopyArgs* create_rolloutcopyargs(int horizon, int num_envs, int num_buffers, int input_size, int num_action_heads = 1) {
-    // num_action_heads = number of action heads (1 for discrete, >1 for multidiscrete)
-    RolloutCopyArgs* args = new RolloutCopyArgs();
-    args->horizon = horizon;
-    args->num_envs = num_envs;
-    args->num_buffers = num_buffers;
-    args->h = 0;
-    args->buf = 0;
-
-    int block_size = num_envs / num_buffers;
-
-    // Use factory functions
-    args->rollouts = create_rollouts(horizon, num_envs, input_size, num_action_heads);
-    args->env = create_env(num_envs, input_size);
-
-    // Create minimal graph for rollout (only rollout tensors needed, use dummy policy for state)
-    auto opts = torch::TensorOptions().dtype(DTYPE).device(torch::kCUDA);
-    args->graph.obs = torch::randn({block_size, input_size}, opts);
-    args->graph.actions = torch::randint(0, 4, {block_size, num_action_heads}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
-    args->graph.logprobs = torch::randn({block_size}, opts);
-    args->graph.value = torch::randn({block_size}, opts);
-
-    return args;
-}
-
-void free_rolloutcopyargs(RolloutCopyArgs* args) {
-    delete args;
-}
-
-void run_rollout_copy_call(RolloutCopyArgs* args) {
-    rollout_copy_call(args->rollouts, args->env, args->graph, args->num_envs, args->num_buffers, args->h, args->buf);
-}
-
-#endif
-
-void profile_rolloutcopycall(int horizon, int num_envs, int num_buffers, int input_size) {
-#ifdef USE_TORCH
-    int block_size = num_envs / num_buffers;
-    printf("rollout_copy_call (H=%d, envs=%d, buffers=%d, block=%d)\n",
-           horizon, num_envs, num_buffers, block_size);
-
-    RolloutCopyArgs* args = create_rolloutcopyargs(horizon, num_envs, num_buffers, input_size);
-
-    float copy_ms = profile_kernel((kernel_fn)run_rollout_copy_call, args, "rollout_copy");
-    print_timing("\tcopy ops", copy_ms, block_size);
-
-    float copy_graph_ms = profile_graph((kernel_fn)run_rollout_copy_call, args, "rollout_copy_graph");
-    print_timing("\tcopy (graph)", copy_graph_ms, block_size);
-
-    free_rolloutcopyargs(args);
-
-    printf("\n");
-#else
-    printf("rollout_copy_call: requires USE_TORCH\n\n");
-#endif
-}
-
-// ============================================================================
-// train_forward_call profiling - using GraphBuf
+// train_forward_call profiling - using TrainGraph
 // ============================================================================
 
 #ifdef USE_TORCH
@@ -2314,7 +2280,7 @@ void profile_rolloutcopycall(int horizon, int num_envs, int num_buffers, int inp
 typedef struct {
     std::shared_ptr<PolicyMinGRU> policy;
     torch::optim::Muon* muon;
-    GraphBuf graph;
+    TrainGraph train_buf;
     HypersT hypers;
     Tensor adv_mean;
     Tensor adv_std;
@@ -2325,9 +2291,8 @@ typedef struct {
 TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_size,
                                           int hidden_size, int act_n, int num_layers,
                                           bool use_kernels) {
-    // act_n = total action space size (decoder output size)
-    // For discrete: num_action_heads=1, act_sizes=[act_n]
     int num_action_heads = 1;  // Using discrete for profiling
+    int expansion_factor = 1;
 
     TrainForwardArgs* args = new TrainForwardArgs();
     args->use_kernels = use_kernels;
@@ -2344,25 +2309,26 @@ TrainForwardArgs* create_trainforwardargs(int segments, int horizon, int input_s
     // Create policy with default encoder/decoder
     auto enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
     auto dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
-    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, 1, num_layers, use_kernels);
+    args->policy = std::make_shared<PolicyMinGRU>(enc, dec, input_size, act_n, hidden_size, expansion_factor, num_layers, use_kernels);
     args->policy->to(torch::kCUDA);
+    args->policy->to(DTYPE);
 
     // Create Muon optimizer
     args->muon = new torch::optim::Muon(args->policy->parameters(),
         torch::optim::MuonOptions(0.0003).momentum(0.95).eps(1e-8));
 
-    // Use create_graph factory (batch=0 since not used for training)
-    // num_action_heads=1 for discrete action space
-    args->graph = create_graph(0, input_size, segments, horizon, num_layers, hidden_size, 1, num_action_heads, args->policy.get());
+    // Use create_train_graph factory
+    args->train_buf = pufferlib::create_train_graph(segments, horizon, input_size,
+        num_layers, hidden_size, expansion_factor, num_action_heads);
 
     // Initialize mb_* tensors with test data for training
-    args->graph.mb_obs = torch::randn({segments, horizon, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
-    args->graph.mb_actions = torch::randint(0, act_n, {segments, horizon, num_action_heads}, torch::dtype(torch::kInt64).device(torch::kCUDA));
-    args->graph.mb_logprobs = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA)) * 0.1f - 2.0f;  // ~log probs
-    args->graph.mb_advantages = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
-    args->graph.mb_values = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
-    args->graph.mb_returns = args->graph.mb_advantages + args->graph.mb_values;
-    args->graph.mb_prio = torch::ones({segments, 1}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->train_buf.mb_obs = torch::randn({segments, horizon, input_size}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->train_buf.mb_actions = torch::randint(0, act_n, {segments, horizon, num_action_heads}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+    args->train_buf.mb_logprobs = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA)) * 0.1f - 2.0f;
+    args->train_buf.mb_advantages = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->train_buf.mb_values = torch::randn({segments, horizon}, torch::dtype(DTYPE).device(torch::kCUDA));
+    args->train_buf.mb_returns = args->train_buf.mb_advantages + args->train_buf.mb_values;
+    args->train_buf.mb_prio = torch::ones({segments, 1}, torch::dtype(DTYPE).device(torch::kCUDA));
 
     // Adv normalization tensors
     args->adv_mean = torch::zeros({1}, torch::dtype(DTYPE).device(torch::kCUDA));
@@ -2380,7 +2346,8 @@ void free_trainforwardargs(TrainForwardArgs* args) {
 }
 
 void run_train_forward_call(TrainForwardArgs* args) {
-    train_forward_call(args->graph, args->policy.get(), args->muon, args->hypers, args->adv_mean, args->adv_std, args->act_sizes_cpu, args->use_kernels);
+    pufferlib::train_forward_call(args->train_buf, args->policy.get(), args->muon,
+        args->hypers, args->adv_mean, args->adv_std, args->act_sizes_cpu, args->use_kernels);
 }
 
 #endif
@@ -2420,72 +2387,41 @@ void profile_trainforwardcall(int segments, int horizon, int input_size,
 }
 
 // ============================================================================
-// Environment speed test (breakout)
+// Environment speed test - uses static linking (compile with specific env)
 // ============================================================================
 
-// Function pointers for env interface (loaded dynamically)
-static create_environments_fn profile_create_envs = nullptr;
-static create_threads_fn profile_create_threads = nullptr;
-static vec_reset_fn profile_vec_reset = nullptr;
-static vec_send_fn profile_vec_send = nullptr;
-static vec_recv_fn profile_vec_recv = nullptr;
-static vec_close_fn profile_vec_close = nullptr;
+#ifdef USE_STATIC_ENV
+
+#include "pufferlib/extensions/static_envbinding.h"
+
+// Empty callback for OMP test (no-op, just testing env stepping speed)
+static void empty_net_callback(void* ctx, int buf, int t) {
+    (void)ctx; (void)buf; (void)t;
+}
+
+static void empty_thread_init(void* ctx, int buf) {
+    (void)ctx; (void)buf;
+}
 
 typedef struct {
-    VecEnv* vec;
+    StaticVec* vec;
     int num_envs;
     int num_buffers;
     int num_threads;
     int horizon;
-    int obs_n;
-    int act_n;
+    int obs_size;
+    int num_atns;
 } EnvSpeedArgs;
 
 EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_threads, int horizon) {
-    // Load drive.so dynamically
-    void* handle = dlopen("./drive.so", RTLD_NOW);
-    if (!handle) {
-        fprintf(stderr, "dlopen error: %s\n", dlerror());
-        fprintf(stderr, "Make sure to build drive first: ./scripts/build_vec.sh drive\n");
-        return nullptr;
-    }
-    dlerror();
-
-    // Load function pointers
-    profile_create_envs = (create_environments_fn)dlsym(handle, "create_environments");
-    profile_create_threads = (create_threads_fn)dlsym(handle, "create_threads");
-    profile_vec_reset = (vec_reset_fn)dlsym(handle, "vec_reset");
-    profile_vec_send = (vec_send_fn)dlsym(handle, "vec_send");
-    profile_vec_recv = (vec_recv_fn)dlsym(handle, "vec_recv");
-    profile_vec_close = (vec_close_fn)dlsym(handle, "vec_close");
-    int obs_n = *(int*)dlsym(handle, "OBS_N");
-    int num_atns = *(int*)dlsym(handle, "NUM_ATNS_EXPORT");
-
-    const char* dlsym_error = dlerror();
-    if (dlsym_error) {
-        fprintf(stderr, "dlsym error: %s\n", dlsym_error);
-        dlclose(handle);
-        return nullptr;
-    }
-
     // Create vec_kwargs with total_agents and num_buffers
     Dict* vec_kwargs = create_dict(8);
     dict_set(vec_kwargs, "total_agents", (double)total_agents);
     dict_set(vec_kwargs, "num_buffers", (double)num_buffers);
 
-    // Create env_kwargs for drive
+    // Create env_kwargs - loaded from config in real usage, use defaults here
     Dict* env_kwargs = create_dict(32);
-    dict_set(env_kwargs, "human_agent_idx", 0);
-    dict_set(env_kwargs, "reward_vehicle_collision", -0.5);
-    dict_set(env_kwargs, "reward_offroad_collision", -0.2);
-    dict_set(env_kwargs, "spawn_immunity_timer", 50);
-    dict_set(env_kwargs, "reward_goal_post_respawn", 0.25);
-    dict_set(env_kwargs, "reward_vehicle_collision_post_respawn", -0.5);
-    dict_set(env_kwargs, "num_maps", 10000);
-
-    // Create env_kwargs for breakout
-    /*
-    Dict* env_kwargs = create_dict(32);
+    // Breakout defaults
     dict_set(env_kwargs, "frameskip", 4);
     dict_set(env_kwargs, "width", 576);
     dict_set(env_kwargs, "height", 330);
@@ -2501,23 +2437,22 @@ EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_thr
     dict_set(env_kwargs, "max_ball_speed", 448);
     dict_set(env_kwargs, "paddle_speed", 620);
     dict_set(env_kwargs, "continuous", 0);
-    */
 
-    // Create environments with new signature
-    VecEnv* vec = profile_create_envs(num_buffers, true, 0, vec_kwargs, env_kwargs);
+    // Create environments using static binding
+    StaticVec* vec = create_static_vec(total_agents, num_buffers, vec_kwargs, env_kwargs);
     if (!vec) {
         fprintf(stderr, "Failed to create environments\n");
         return nullptr;
     }
 
-    // Create threads
     int num_envs = vec->size;
-    int block_size = num_envs / num_threads;
-    if (block_size < 1) block_size = 1;
-    profile_create_threads(vec, num_threads, block_size);
+    printf("Created %d envs for %d total_agents\n", num_envs, total_agents);
+
+    // Create threads for OMP stepping
+    create_static_threads(vec, num_threads, horizon, nullptr, empty_net_callback, empty_thread_init);
 
     // Reset
-    profile_vec_reset(vec);
+    static_vec_reset(vec);
     cudaDeviceSynchronize();
 
     EnvSpeedArgs* args = (EnvSpeedArgs*)calloc(1, sizeof(EnvSpeedArgs));
@@ -2526,31 +2461,20 @@ EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_thr
     args->num_buffers = num_buffers;
     args->num_threads = num_threads;
     args->horizon = horizon;
-    args->obs_n = obs_n;
-    args->act_n = num_atns;
+    args->obs_size = get_obs_size();
+    args->num_atns = get_num_atns();
 
     return args;
 }
 
 void free_envspeedargs(EnvSpeedArgs* args) {
-    if (args && args->vec) {
-        profile_vec_close(args->vec);
-    }
+    // Note: no static_vec_close yet, just free the args
     free(args);
 }
 
-// Run full rollout iteration: iterate through all buffers * horizon
+// Run full rollout using OMP threading
 void run_env_rollout(EnvSpeedArgs* args) {
-    int num_buffers = args->num_buffers;
-    int horizon = args->horizon;
-    VecEnv* vec = args->vec;
-
-    for (int i = 0; i < num_buffers * horizon; ++i) {
-        int buf = i % num_buffers;
-        profile_vec_recv(vec, buf);
-        // In real usage, policy forward would happen here (async on GPU)
-        profile_vec_send(vec, buf);
-    }
+    static_vec_omp_step(args->vec);
 }
 
 float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
@@ -2560,7 +2484,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
 
     // Warmup
     auto start_time = std::chrono::steady_clock::now();
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 10; ++i) {
         run_env_rollout(args);
         cudaDeviceSynchronize();
         auto now = std::chrono::steady_clock::now();
@@ -2595,7 +2519,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
 }
 
 void profile_envspeed(int total_agents, int num_buffers, int num_threads, int horizon) {
-    printf("env_speed (total_agents=%d, buffers=%d, threads=%d, horizon=%d)\n",
+    printf("env_speed_static (total_agents=%d, buffers=%d, threads=%d, horizon=%d)\n",
            total_agents, num_buffers, num_threads, horizon);
 
     EnvSpeedArgs* args = create_envspeedargs(total_agents, num_buffers, num_threads, horizon);
@@ -2604,9 +2528,9 @@ void profile_envspeed(int total_agents, int num_buffers, int num_threads, int ho
         return;
     }
 
-    printf("\tnum_envs=%d, obs_n=%d, num_atns=%d\n", args->num_envs, args->obs_n, args->act_n);
+    printf("\tnum_envs=%d, obs_size=%d, num_atns=%d\n", args->num_envs, args->obs_size, args->num_atns);
 
-    // Profile full rollout (num_buffers * horizon steps)
+    // Profile full rollout (horizon steps per OMP call)
     float rollout_ms = profile_env_rollout(args, "env_rollout");
     int total_steps = total_agents * horizon;
     printf("\trollout time: %.2f ms (%d steps)\n", rollout_ms, total_steps);
@@ -2619,16 +2543,18 @@ void profile_envspeed(int total_agents, int num_buffers, int num_threads, int ho
     printf("\n");
 }
 
-#endif  // Disabled outdated tests
+#endif  // USE_STATIC_ENV
 
 void print_usage(const char* prog) {
     printf("Usage: %s <profile>\n", prog);
     printf("  kernels        - Individual kernel profiling (no nsys needed)\n");
-    // Disabled - these tests use outdated GraphBuf/DLL patterns
-    // printf("  forwardcall    - Inference forward pass\n");
-    // printf("  trainforward   - Training forward + backward + optimizer\n");
-    // printf("  rolloutcopy    - Rollout buffer copy operations\n");
-    // printf("  envspeed       - Environment step throughput\n");
+#ifdef USE_TORCH
+    printf("  forwardcall    - Inference forward pass\n");
+    printf("  trainforward   - Training forward + backward + optimizer\n");
+#endif
+#ifdef USE_STATIC_ENV
+    printf("  envspeed       - Environment step throughput (static linked)\n");
+#endif
     printf("  all            - Run all profiles\n");
 }
 
@@ -2644,12 +2570,12 @@ int main(int argc, char** argv) {
     // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
 
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "all") == 0) {
-        // profile_mingrugate(BR, H);
-        // profile_logcoeffsandvalues(BT, T, H);
-        // profile_logcumsumexp(BT, T, H);
-        // profile_fusedscan(BT, T, H);
-        //profile_samplelogits(BR, A);
-        //profile_ppoloss(BT, T, A);
+        profile_mingrugate(BR, H);
+        profile_logcoeffsandvalues(BT, T, H);
+        profile_logcumsumexp(BT, T, H);
+        profile_fusedscan(BT, T, H);
+        profile_samplelogits(BR, A);
+        profile_ppoloss(BT, T, A);
 
         // FCMax: simple FC -> Max (no intermediate layer)
         // Drive encoder dimensions: partner (B, 63, 7) -> 128, road (B, 200, 13) -> 128
@@ -2661,19 +2587,20 @@ int main(int argc, char** argv) {
         profile_fcrelufcmax(BR, 200, 13, 128, 128); // road encoder
     }
 
-    // Disabled - these tests use outdated GraphBuf/DLL patterns
-    // if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
-    //     profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
-    // }
-    // if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
-    //     profile_trainforwardcall(BT, T, INPUT_SIZE, H, A, 1);
-    // }
-    // if (strcmp(profile, "rolloutcopy") == 0 || strcmp(profile, "all") == 0) {
-    //     profile_rolloutcopycall(T, BR, 1, INPUT_SIZE);
-    // }
-    // if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
-    //     profile_envspeed(BUF*BR, BUF, 8, T);
-    // }
+#ifdef USE_TORCH
+    if (strcmp(profile, "forwardcall") == 0 || strcmp(profile, "all") == 0) {
+        profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
+    }
+    if (strcmp(profile, "trainforward") == 0 || strcmp(profile, "all") == 0) {
+        profile_trainforwardcall(BT, T, INPUT_SIZE, H, A, 1);
+    }
+#endif
+
+#ifdef USE_STATIC_ENV
+    if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
+        profile_envspeed(BUF*BR, BUF, 16, T);
+    }
+#endif
 
     return 0;
 }

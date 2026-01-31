@@ -26,7 +26,7 @@
 #include <iostream>
 #include <vector>
 
-#include "static_envbinding.h"
+#include "env_binding.h"
 
 typedef torch::Tensor Tensor;
 

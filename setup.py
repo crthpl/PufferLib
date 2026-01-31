@@ -233,11 +233,13 @@ if not NO_OCEAN:
 class ProfilerBuildExt(build_ext):
     user_options = build_ext.user_options + [
         ('no-torch', None, 'Build profiler without torch support'),
+        ('env=', None, 'Static env to link (e.g., breakout, drive)'),
     ]
 
     def initialize_options(self):
         super().initialize_options()
         self.no_torch = False
+        self.env = None
 
     def finalize_options(self):
         super().finalize_options()
@@ -251,7 +253,7 @@ class ProfilerBuildExt(build_ext):
         out = 'profile_kernels'
 
         nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
-        arch = '-arch=sm_80'
+        arch = '-arch=sm_89'
 
         cmd = [nvcc, '-O3', arch, '-I.', src, '-o', out]
 
@@ -259,7 +261,7 @@ class ProfilerBuildExt(build_ext):
             out = 'profile_kernels_torch'
             lib_paths = cpp_ext.library_paths()
             nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
-            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-I.']
+            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-I.', f'-I./{RAYLIB_NAME}/include', '-Ipufferlib/extensions']
             cmd += ['-I' + sysconfig.get_path('include')]
             cmd += ['-I' + p for p in cpp_ext.include_paths()]
             cmd += ['-L' + p for p in lib_paths]
@@ -267,6 +269,15 @@ class ProfilerBuildExt(build_ext):
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
             cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl']
+
+            # Add static env if specified
+            if self.env:
+                static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
+                if not os.path.exists(static_lib):
+                    raise RuntimeError(f'Static library not found: {static_lib}\n'
+                                       f'Build it first with: python setup.py build_{self.env}')
+                cmd += ['-DUSE_STATIC_ENV', static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL', '-lomp5']
+
             cmd += ['pufferlib/extensions/muon.cpp', 'pufferlib/extensions/cuda/advantage.cu', src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
@@ -282,41 +293,37 @@ cmdclass = {
 }
 
 # Static env builds: clang-compiled env + gcc/nvcc torch extension
-STATIC_ENVS = {
-    'breakout': {
-        'obs_size': 118,
-        'num_atns': 1,
-        'static_src': 'pufferlib/extensions/static_breakout.c',
-        'static_lib': 'pufferlib/extensions/libstatic_breakout.a',
-    },
-    'drive': {
-        'obs_size': 1848,
-        'num_atns': 2,
-        'static_src': 'pufferlib/extensions/static_drive.c',
-        'static_lib': 'pufferlib/extensions/libstatic_drive.a',
-    },
-}
+# Discover envs by listing folders in pufferlib/ocean
+OCEAN_DIR = 'pufferlib/ocean'
+STATIC_ENVS = [
+    name for name in os.listdir(OCEAN_DIR)
+    if os.path.isdir(os.path.join(OCEAN_DIR, name))
+    and not name.startswith('__')
+    and os.path.exists(f'pufferlib/ocean/{name}/binding.h')
+]
 
-def create_static_env_build_class(env_name, env_config):
+def create_static_env_build_class(env_name):
     """Create a build class that compiles env with clang and links with torch extension."""
     class StaticEnvBuildExt(cpp_extension.BuildExtension):
         def run(self):
             import subprocess
 
             # Step 1: Build static library with clang
-            static_src = env_config['static_src']
-            static_lib = env_config['static_lib']
-            static_obj = static_lib.replace('.a', '.o')
+            # env_binding.c includes binding.h from the env's directory
+            env_binding_src = 'pufferlib/extensions/env_binding.c'
+            static_lib = f'pufferlib/extensions/libstatic_{env_name}.a'
+            static_obj = f'pufferlib/extensions/libstatic_{env_name}.o'
 
             clang_cmd = [
                 'clang', '-c', '-O2', '-DNDEBUG',
-                '-I.', f'-I./{RAYLIB_NAME}/include', '-I/usr/local/cuda/include',
+                '-I.', '-Ipufferlib/extensions', f'-Ipufferlib/ocean/{env_name}',
+                f'-I./{RAYLIB_NAME}/include', '-I/usr/local/cuda/include',
                 '-DPLATFORM_DESKTOP',
                 '-fno-semantic-interposition', '-fvisibility=hidden',
                 '-fPIC', '-fopenmp',
-                static_src, '-o', static_obj
+                env_binding_src, '-o', static_obj
             ]
-            print(f'Building static env with clang: {" ".join(clang_cmd)}')
+            print(f'Building static env: {" ".join(clang_cmd)}')
             subprocess.check_call(clang_cmd)
 
             ar_cmd = ['ar', 'rcs', static_lib, static_obj]
@@ -336,8 +343,8 @@ def create_static_env_build_class(env_name, env_config):
     return StaticEnvBuildExt
 
 # Add build_<env> for static-linked envs
-for env_name, env_config in STATIC_ENVS.items():
-    cmdclass[f"build_{env_name}"] = create_static_env_build_class(env_name, env_config)
+for env_name in STATIC_ENVS:
+    cmdclass[f"build_{env_name}"] = create_static_env_build_class(env_name)
 
 if not NO_OCEAN:
     def create_env_build_class(full_name):

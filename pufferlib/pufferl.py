@@ -152,7 +152,7 @@ class PuffeRL:
         config['max_epochs'] = epochs
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
-        config['cudagraphs'] = False
+        config['cudagraphs'] = True
         config['kernels'] = True
         config['use_omp'] = True
         config['num_buffers'] = config['num_buffers']
