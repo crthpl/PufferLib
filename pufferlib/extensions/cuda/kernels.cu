@@ -2384,6 +2384,355 @@ void launch_sample_logits(
     }
 }
 
+// =============================================================================
+// FCMax: Fused FC -> Max kernel
+// Input: x (B, N, D_in), W (D_out, D_in), b (D_out)
+// Output: out (B, D_out) = max_over_N(x @ W.T + b)
+// Each thread computes one (b, d_out) output element
+// N-fold memory bandwidth reduction vs separate FC + Max kernels
+// =============================================================================
+
+template<typename T>
+__global__ void fc_max_forward_kernel(
+    T* __restrict__ out,                // (B, D_out)
+    int* __restrict__ argmax_indices,   // (B, D_out) - which N produced the max
+    const T* __restrict__ x,            // (B, N, D_in)
+    const T* __restrict__ W,            // (D_out, D_in)
+    const T* __restrict__ b,            // (D_out)
+    int B, int N, int D_in, int D_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_out) return;
+
+    int batch = idx / D_out;
+    int d_out = idx % D_out;
+
+    float bias = float(b[d_out]);
+    float max_val = -INFINITY;
+    int argmax_n = 0;
+
+    // Iterate over all N points, compute FC output, track max
+    for (int n = 0; n < N; n++) {
+        float val = bias;
+        for (int di = 0; di < D_in; di++) {
+            val += float(x[batch * N * D_in + n * D_in + di]) * float(W[d_out * D_in + di]);
+        }
+        if (val > max_val) {
+            max_val = val;
+            argmax_n = n;
+        }
+    }
+
+    out[idx] = T(max_val);
+    argmax_indices[idx] = argmax_n;
+}
+
+template<typename T>
+__global__ void fc_max_backward_kernel(
+    T* __restrict__ grad_x,             // (B, N, D_in)
+    T* __restrict__ grad_W,             // (D_out, D_in)
+    T* __restrict__ grad_b,             // (D_out)
+    const T* __restrict__ grad_out,     // (B, D_out)
+    const T* __restrict__ x,            // (B, N, D_in)
+    const T* __restrict__ W,            // (D_out, D_in)
+    const int* __restrict__ argmax_indices, // (B, D_out)
+    int B, int N, int D_in, int D_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_out) return;
+
+    int batch = idx / D_out;
+    int d_out = idx % D_out;
+
+    float g_out = float(grad_out[idx]);
+    int argmax_n = argmax_indices[idx];
+
+    // grad_b[d_out] += g_out
+    atomicAdd(reinterpret_cast<float*>(&grad_b[d_out]), g_out);
+
+    // Backprop through FC at argmax position only
+    for (int di = 0; di < D_in; di++) {
+        int x_idx = batch * N * D_in + argmax_n * D_in + di;
+        int w_idx = d_out * D_in + di;
+
+        // grad_W[d_out, di] += g_out * x[batch, argmax_n, di]
+        atomicAdd(reinterpret_cast<float*>(&grad_W[w_idx]), g_out * float(x[x_idx]));
+
+        // grad_x[batch, argmax_n, di] += g_out * W[d_out, di]
+        atomicAdd(reinterpret_cast<float*>(&grad_x[x_idx]), g_out * float(W[w_idx]));
+    }
+}
+
+template<typename T>
+void launch_fc_max_forward(
+    T* out, int* argmax_indices,
+    const T* x, const T* W, const T* b,
+    int B, int N, int D_in, int D_out,
+    cudaStream_t stream
+) {
+    int total = B * D_out;
+    int grid = grid_size(total);
+    fc_max_forward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
+        out, argmax_indices, x, W, b, B, N, D_in, D_out);
+}
+
+template<typename T>
+void launch_fc_max_backward(
+    T* grad_x, T* grad_W, T* grad_b,
+    const T* grad_out, const T* x, const T* W,
+    const int* argmax_indices,
+    int B, int N, int D_in, int D_out,
+    cudaStream_t stream
+) {
+    int total = B * D_out;
+    int grid = grid_size(total);
+    fc_max_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
+        grad_x, grad_W, grad_b, grad_out, x, W, argmax_indices, B, N, D_in, D_out);
+}
+
+// Non-templated wrappers
+void launch_fc_max_forward_float(
+    float* out, int* argmax_indices,
+    const float* x, const float* W, const float* b,
+    int B, int N, int D_in, int D_out, cudaStream_t stream
+) {
+    launch_fc_max_forward<float>(out, argmax_indices, x, W, b, B, N, D_in, D_out, stream);
+}
+
+void launch_fc_max_backward_float(
+    float* grad_x, float* grad_W, float* grad_b,
+    const float* grad_out, const float* x, const float* W,
+    const int* argmax_indices,
+    int B, int N, int D_in, int D_out, cudaStream_t stream
+) {
+    launch_fc_max_backward<float>(grad_x, grad_W, grad_b, grad_out, x, W, argmax_indices, B, N, D_in, D_out, stream);
+}
+
+// =============================================================================
+// FCReluFCMax: Fused FC -> ReLU -> FC -> Max kernel for Drive encoder
+// Avoids materializing intermediate buffers (B, N, D_mid) and (B, N, D_out)
+// Input: x (B, N, D_in), W1 (D_in, D_mid), b1 (D_mid), W2 (D_mid, D_out), b2 (D_out)
+// FC operations applied pointwise to each of N points, then max over N dimension
+// Output: out (B, D_out) = max_over_N(FC2(ReLU(FC1(x))))
+// =============================================================================
+
+// Optimized kernel: one block per batch element, threads cooperate on FC1
+// D_out threads per block, each computes one output element
+// Two-pass: first find argmax, then recompute FC1 at argmax for backward
+template<typename T>
+__global__ void fc_relu_fc_max_forward_kernel(
+    T* __restrict__ out,                // (B, D_out)
+    int* __restrict__ argmax_indices,   // (B, D_out) - which N produced the max
+    float* __restrict__ fc1_at_argmax,  // (B, D_out, D_mid) - FC1 ReLU output at argmax for backward
+    const T* __restrict__ x,            // (B, N, D_in)
+    const T* __restrict__ W1,           // (D_mid, D_in) - transposed for x @ W1.T + b1
+    const T* __restrict__ b1,           // (D_mid)
+    const T* __restrict__ W2,           // (D_out, D_mid) - transposed for fc1 @ W2.T + b2
+    const T* __restrict__ b2,           // (D_out)
+    int B,
+    int N,
+    int D_in,
+    int D_mid,
+    int D_out
+) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+
+    int tid = threadIdx.x;  // 0..D_out-1
+
+    // Shared memory for cooperative FC1 computation
+    extern __shared__ float shared_mem[];
+    float* fc1_shared = shared_mem;                    // D_mid floats
+    float* x_shared = shared_mem + D_mid;              // D_in floats
+
+    // Each thread tracks its own max for its d_out
+    float max_val = -INFINITY;
+    int argmax_n = 0;
+
+    float my_b2 = (tid < D_out) ? float(b2[tid]) : 0.0f;
+
+    // Pass 1: Iterate over all N points to find max and argmax
+    for (int n = 0; n < N; n++) {
+        // Cooperatively load x[b, n, :] into shared memory
+        if (tid < D_in) {
+            x_shared[tid] = float(x[b * N * D_in + n * D_in + tid]);
+        }
+        __syncthreads();
+
+        // Threads cooperate to compute FC1: first D_mid threads each compute one element
+        if (tid < D_mid) {
+            float fc1_val = float(b1[tid]);
+            for (int di = 0; di < D_in; di++) {
+                fc1_val += x_shared[di] * float(W1[tid * D_in + di]);
+            }
+            fc1_shared[tid] = fmaxf(fc1_val, 0.0f);  // ReLU
+        }
+        __syncthreads();
+
+        // Each thread computes FC2 for its d_out using shared FC1 output
+        if (tid < D_out) {
+            float fc2_val = my_b2;
+            for (int dm = 0; dm < D_mid; dm++) {
+                fc2_val += fc1_shared[dm] * float(W2[tid * D_mid + dm]);
+            }
+
+            if (fc2_val > max_val) {
+                max_val = fc2_val;
+                argmax_n = n;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write max output and argmax
+    if (tid < D_out) {
+        int out_idx = b * D_out + tid;
+        out[out_idx] = T(max_val);
+        argmax_indices[out_idx] = argmax_n;
+
+        // Pass 2: Each thread independently computes FC1 at its argmax_n
+        // This has some redundant computation but avoids serialization
+        for (int dm = 0; dm < D_mid; dm++) {
+            float fc1_val = float(b1[dm]);
+            for (int di = 0; di < D_in; di++) {
+                fc1_val += float(x[b * N * D_in + argmax_n * D_in + di]) * float(W1[dm * D_in + di]);
+            }
+            fc1_at_argmax[b * D_out * D_mid + tid * D_mid + dm] = fmaxf(fc1_val, 0.0f);
+        }
+    }
+}
+
+template<typename T>
+__global__ void fc_relu_fc_max_backward_kernel(
+    T* __restrict__ grad_x,             // (B, N, D_in) - accumulated
+    T* __restrict__ grad_W1,            // (D_mid, D_in) - accumulated
+    T* __restrict__ grad_b1,            // (D_mid) - accumulated
+    T* __restrict__ grad_W2,            // (D_out, D_mid) - accumulated
+    T* __restrict__ grad_b2,            // (D_out) - accumulated
+    const T* __restrict__ grad_out,     // (B, D_out)
+    const T* __restrict__ x,            // (B, N, D_in)
+    const T* __restrict__ W1,           // (D_mid, D_in)
+    const T* __restrict__ W2,           // (D_out, D_mid)
+    const int* __restrict__ argmax_indices,  // (B, D_out)
+    const float* __restrict__ fc1_at_argmax, // (B, D_out, D_mid)
+    int B,
+    int N,
+    int D_in,
+    int D_mid,
+    int D_out
+) {
+    // Each thread handles one (b, d_out) gradient
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_out) return;
+
+    int b = idx / D_out;
+    int d_out = idx % D_out;
+
+    float g_out = float(grad_out[idx]);
+    int argmax_n = argmax_indices[idx];
+
+    // grad_b2[d_out] += g_out
+    atomicAdd(reinterpret_cast<float*>(&grad_b2[d_out]), g_out);
+
+    // Backprop through FC2 and ReLU
+    for (int dm = 0; dm < D_mid; dm++) {
+        int w2_idx = d_out * D_mid + dm;
+        float fc1_relu_val = fc1_at_argmax[b * D_out * D_mid + d_out * D_mid + dm];
+
+        // grad_W2[d_out, dm] += g_out * fc1_relu[dm]
+        atomicAdd(reinterpret_cast<float*>(&grad_W2[w2_idx]), g_out * fc1_relu_val);
+
+        // grad through ReLU: passes if fc1_relu > 0
+        float grad_fc1 = (fc1_relu_val > 0.0f) ? (g_out * float(W2[w2_idx])) : 0.0f;
+
+        // grad_b1[dm] += grad_fc1
+        atomicAdd(reinterpret_cast<float*>(&grad_b1[dm]), grad_fc1);
+
+        // Backprop through FC1
+        for (int di = 0; di < D_in; di++) {
+            int x_idx = b * N * D_in + argmax_n * D_in + di;
+            int w1_idx = dm * D_in + di;
+
+            // grad_W1[dm, di] += grad_fc1 * x[b, argmax_n, di]
+            atomicAdd(reinterpret_cast<float*>(&grad_W1[w1_idx]), grad_fc1 * float(x[x_idx]));
+
+            // grad_x[b, argmax_n, di] += grad_fc1 * W1[dm, di]
+            atomicAdd(reinterpret_cast<float*>(&grad_x[x_idx]), grad_fc1 * float(W1[w1_idx]));
+        }
+    }
+}
+
+template<typename T>
+void launch_fc_relu_fc_max_forward(
+    T* out,
+    int* argmax_indices,
+    float* fc1_at_argmax,
+    const T* x,
+    const T* W1,
+    const T* b1,
+    const T* W2,
+    const T* b2,
+    int B,
+    int N,
+    int D_in,
+    int D_mid,
+    int D_out,
+    cudaStream_t stream
+) {
+    // One block per batch element
+    // Need max(D_mid, D_out) threads: D_mid for cooperative FC1, D_out for FC2 outputs
+    int threads = (D_mid > D_out) ? D_mid : D_out;
+    // Shared memory: fc1_shared (D_mid) + x_shared (D_in)
+    size_t shared_mem_size = (D_mid + D_in) * sizeof(float);
+
+    fc_relu_fc_max_forward_kernel<T><<<B, threads, shared_mem_size, stream>>>(
+        out, argmax_indices, fc1_at_argmax,
+        x, W1, b1, W2, b2,
+        B, N, D_in, D_mid, D_out
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fc_relu_fc_max_forward kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+template<typename T>
+void launch_fc_relu_fc_max_backward(
+    T* grad_x,
+    T* grad_W1,
+    T* grad_b1,
+    T* grad_W2,
+    T* grad_b2,
+    const T* grad_out,
+    const T* x,
+    const T* W1,
+    const T* W2,
+    const int* argmax_indices,
+    const float* fc1_at_argmax,
+    int B,
+    int N,
+    int D_in,
+    int D_mid,
+    int D_out,
+    cudaStream_t stream
+) {
+    int total = B * D_out;
+    int grid = grid_size(total);
+
+    fc_relu_fc_max_backward_kernel<T><<<grid, BLOCK_SIZE, 0, stream>>>(
+        grad_x, grad_W1, grad_b1, grad_W2, grad_b2,
+        grad_out, x, W1, W2,
+        argmax_indices, fc1_at_argmax,
+        B, N, D_in, D_mid, D_out
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fc_relu_fc_max_backward kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
 // Non-templated wrappers for float
 void launch_mingru_gate_inference_float(float* out, float* next_state, const float* combined, const float* state_in, int H, int B, cudaStream_t stream) {
     launch_mingru_gate_inference<float>(out, next_state, combined, state_in, H, B, stream);
@@ -2420,6 +2769,12 @@ void launch_ppo_loss_backward_float(float* grad_logits, float* grad_values_pred,
 }
 void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
     launch_sample_logits<float>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
+}
+void launch_fc_relu_fc_max_forward_float(float* out, int* argmax_indices, float* fc1_at_argmax, const float* x, const float* W1, const float* b1, const float* W2, const float* b2, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
+    launch_fc_relu_fc_max_forward<float>(out, argmax_indices, fc1_at_argmax, x, W1, b1, W2, b2, B, N, D_in, D_mid, D_out, stream);
+}
+void launch_fc_relu_fc_max_backward_float(float* grad_x, float* grad_W1, float* grad_b1, float* grad_W2, float* grad_b2, const float* grad_out, const float* x, const float* W1, const float* W2, const int* argmax_indices, const float* fc1_at_argmax, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
+    launch_fc_relu_fc_max_backward<float>(grad_x, grad_W1, grad_b1, grad_W2, grad_b2, grad_out, x, W1, W2, argmax_indices, fc1_at_argmax, B, N, D_in, D_mid, D_out, stream);
 }
 
 // Non-templated wrappers for BFloat16
@@ -2472,6 +2827,12 @@ void launch_ppo_loss_backward_bf16(at::BFloat16* grad_logits, at::BFloat16* grad
 }
 void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
     launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
+}
+void launch_fc_relu_fc_max_forward_bf16(at::BFloat16* out, int* argmax_indices, float* fc1_at_argmax, const at::BFloat16* x, const at::BFloat16* W1, const at::BFloat16* b1, const at::BFloat16* W2, const at::BFloat16* b2, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
+    launch_fc_relu_fc_max_forward<at::BFloat16>(out, argmax_indices, fc1_at_argmax, x, W1, b1, W2, b2, B, N, D_in, D_mid, D_out, stream);
+}
+void launch_fc_relu_fc_max_backward_bf16(at::BFloat16* grad_x, at::BFloat16* grad_W1, at::BFloat16* grad_b1, at::BFloat16* grad_W2, at::BFloat16* grad_b2, const at::BFloat16* grad_out, const at::BFloat16* x, const at::BFloat16* W1, const at::BFloat16* W2, const int* argmax_indices, const float* fc1_at_argmax, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
+    launch_fc_relu_fc_max_backward<at::BFloat16>(grad_x, grad_W1, grad_b1, grad_W2, grad_b2, grad_out, x, W1, W2, argmax_indices, fc1_at_argmax, B, N, D_in, D_mid, D_out, stream);
 }
 
 void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {

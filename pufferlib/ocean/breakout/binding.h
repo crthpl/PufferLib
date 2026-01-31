@@ -1,4 +1,4 @@
-#include "../ocean/breakout/breakout.h"
+#include "breakout.h"
 #define OBS_SIZE 118
 #define NUM_ATNS 1
 #define ACT_SIZES {3}

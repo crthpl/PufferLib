@@ -110,58 +110,61 @@ Tensor Muon::step(LossClosure closure) {
     at::AutoGradMode enable_grad(true);
     loss = closure();
   }
+
   for (auto& group : param_groups_) {
-    for (auto& p : group.params()) {
-      if (!p.grad().defined()) {
-        continue;
-      }
-      const auto& grad = p.grad();
-      TORCH_CHECK(!grad.is_sparse(), "Muon does not support sparse gradients");
-      auto param_state = state_.find(p.unsafeGetTensorImpl());
-      auto& options = static_cast<MuonOptions&>(group.options());
+    auto& options = static_cast<MuonOptions&>(group.options());
+    auto momentum_coef = options.momentum();
+    auto weight_decay = options.weight_decay();
 
-      // Perform stepweight decay
-      /*
-      if (options.weight_decay() != 0) {
-        p.mul_(1 - options.lr() * options.weight_decay());
-      }
-      */
-
-      // State initialization
-      if (param_state == state_.end()) {
-        auto state = std::make_unique<MuonParamState>();
-        state->step(0);
-        state->momentum_buffer(torch::zeros_like(p, MemoryFormat::Preserve));
-        state_[p.unsafeGetTensorImpl()] = std::move(state);
+    // Fast path: use contiguous buffers
+    if (weight_buffer.defined()) {
+      // Initialize momentum buffer lazily to match weight_buffer
+      if (!momentum_buffer.defined()) {
+        momentum_buffer = torch::zeros_like(weight_buffer);
       }
 
-      auto& state =
-          static_cast<MuonParamState&>(*state_[p.unsafeGetTensorImpl()]);
-      auto& buf = state.momentum_buffer();
-      auto& momentum = options.momentum();
-      auto weight_decay = options.weight_decay();
-
-      state.step(state.step() + 1);
-
-      // Nesterov momentum. Do not use EMA
-      buf.mul_(momentum);
-      buf.add_(grad);
-      grad.add_(buf*momentum);
-
-      torch::Tensor update = grad.clone();
-
-      if (grad.dim() >= 2) {
-          auto G = update.view({update.size(0), -1});
-          update = _zeropower_via_newtonschulz(G); // original has hardcoded steps and eps
-          double ratio = (double)update.size(-2) / (double)update.size(-1);
-          double scale = std::sqrt(std::max(1.0, ratio)); // Matches heavyball and Keller
-          update.mul_(scale);
+      // Build full-size grad tensor (zeros for unused params)
+      Tensor all_grads = torch::zeros_like(weight_buffer);
+      int64_t offset = 0;
+      for (auto& p : group.params()) {
+        int64_t size = p.numel();
+        if (p.grad().defined()) {
+          all_grads.narrow(0, offset, size).copy_(p.grad().flatten());
+        }
+        offset += size;
       }
 
-      if (options.weight_decay() != 0) {
-        p.mul_(1 - lr * weight_decay);
-      }  
-      p.sub_(lr*update.view(p.sizes()));
+      // Batched Nesterov momentum (one mul_, one add_ each)
+      momentum_buffer.mul_(momentum_coef);
+      momentum_buffer.add_(all_grads);
+      all_grads.add_(momentum_buffer, momentum_coef);
+
+      // Newton-Schulz per-param and build full-size update tensor
+      Tensor all_updates = torch::zeros_like(weight_buffer);
+      offset = 0;
+      for (auto& p : group.params()) {
+        int64_t size = p.numel();
+        if (p.grad().defined()) {
+          Tensor update = all_grads.narrow(0, offset, size).view(p.sizes());
+
+          if (p.dim() >= 2) {
+            auto G = update.view({update.size(0), -1});
+            update = _zeropower_via_newtonschulz(G);
+            double ratio = (double)update.size(-2) / (double)update.size(-1);
+            double scale = std::sqrt(std::max(1.0, ratio));
+            update.mul_(scale);
+          }
+
+          all_updates.narrow(0, offset, size).copy_(update.flatten());
+        }
+        offset += size;
+      }
+
+      // Single batched param update (one mul_, one sub_)
+      if (weight_decay != 0) {
+        weight_buffer.mul_(1 - lr * weight_decay);
+      }
+      weight_buffer.sub_(all_updates * lr);
     }
   }
   return loss;

@@ -432,62 +432,87 @@ class NMMO3Decoder : public Decoder {
 };
 
 // Drive encoder: ego/partner/road encoders with max pooling
+// Two modes:
+//   use_fused_kernel=true:  FC -> Max (fused kernel, no intermediate layer)
+//   use_fused_kernel=false: Linear -> LayerNorm -> Linear -> Max (original torch)
 class DriveEncoder : public Encoder {
     public:
-        // Ego encoder: Linear -> LayerNorm -> Linear
+        // Ego encoder: Linear -> ReLU -> Linear (no max pooling, single point)
         torch::nn::Linear ego_linear1{nullptr};
-        torch::nn::LayerNorm ego_norm{nullptr};
         torch::nn::Linear ego_linear2{nullptr};
-        // Road encoder: Linear -> LayerNorm -> Linear
+
+        // Road encoder weights - fused mode: single FC layer
+        Tensor road_W{nullptr};
+        Tensor road_b{nullptr};
+        // Road encoder modules - torch mode: Linear -> LayerNorm -> Linear
         torch::nn::Linear road_linear1{nullptr};
-        torch::nn::LayerNorm road_norm{nullptr};
+        torch::nn::LayerNorm road_ln{nullptr};
         torch::nn::Linear road_linear2{nullptr};
-        // Partner encoder: Linear -> LayerNorm -> Linear
+
+        // Partner encoder weights - fused mode: single FC layer
+        Tensor partner_W{nullptr};
+        Tensor partner_b{nullptr};
+        // Partner encoder modules - torch mode: Linear -> LayerNorm -> Linear
         torch::nn::Linear partner_linear1{nullptr};
-        torch::nn::LayerNorm partner_norm{nullptr};
+        torch::nn::LayerNorm partner_ln{nullptr};
         torch::nn::Linear partner_linear2{nullptr};
+
         // Shared embedding
         torch::nn::Linear shared_linear{nullptr};
         int input_size;
         int hidden_size;
+        bool use_fused_kernel;
 
-    DriveEncoder(int64_t input_size, int64_t hidden_size)
-        : input_size(128), hidden_size(hidden_size) {
-        // Ego encoder: 7 -> 128 -> 128
+    DriveEncoder(int64_t input_size, int64_t hidden_size, bool use_fused_kernel = true)
+        : input_size(128), hidden_size(hidden_size), use_fused_kernel(use_fused_kernel) {
+
+        // Ego encoder: 7 -> 128 -> 128 (Linear -> ReLU -> Linear)
         ego_linear1 = register_module("ego_linear1", torch::nn::Linear(
             torch::nn::LinearOptions(7, 128).bias(true)));
         torch::nn::init::orthogonal_(ego_linear1->weight, std::sqrt(2.0));
         torch::nn::init::constant_(ego_linear1->bias, 0.0);
-        ego_norm = register_module("ego_norm", torch::nn::LayerNorm(
-            torch::nn::LayerNormOptions({128})));
         ego_linear2 = register_module("ego_linear2", torch::nn::Linear(
             torch::nn::LinearOptions(128, 128).bias(true)));
         torch::nn::init::orthogonal_(ego_linear2->weight, std::sqrt(2.0));
         torch::nn::init::constant_(ego_linear2->bias, 0.0);
 
-        // Road encoder: 13 -> 128 -> 128 (6 continuous + 7 one-hot)
-        road_linear1 = register_module("road_linear1", torch::nn::Linear(
-            torch::nn::LinearOptions(13, 128).bias(true)));
-        torch::nn::init::orthogonal_(road_linear1->weight, std::sqrt(2.0));
-        torch::nn::init::constant_(road_linear1->bias, 0.0);
-        road_norm = register_module("road_norm", torch::nn::LayerNorm(
-            torch::nn::LayerNormOptions({128})));
-        road_linear2 = register_module("road_linear2", torch::nn::Linear(
-            torch::nn::LinearOptions(128, 128).bias(true)));
-        torch::nn::init::orthogonal_(road_linear2->weight, std::sqrt(2.0));
-        torch::nn::init::constant_(road_linear2->bias, 0.0);
+        if (use_fused_kernel) {
+            // Fused mode: single FC -> Max (no intermediate layer)
+            // Road: 13 -> 128 (6 continuous + 7 one-hot)
+            road_W = register_parameter("road_W", torch::empty({128, 13}));
+            road_b = register_parameter("road_b", torch::zeros({128}));
+            torch::nn::init::orthogonal_(road_W, std::sqrt(2.0));
 
-        // Partner encoder: 7 -> 128 -> 128
-        partner_linear1 = register_module("partner_linear1", torch::nn::Linear(
-            torch::nn::LinearOptions(7, 128).bias(true)));
-        torch::nn::init::orthogonal_(partner_linear1->weight, std::sqrt(2.0));
-        torch::nn::init::constant_(partner_linear1->bias, 0.0);
-        partner_norm = register_module("partner_norm", torch::nn::LayerNorm(
-            torch::nn::LayerNormOptions({128})));
-        partner_linear2 = register_module("partner_linear2", torch::nn::Linear(
-            torch::nn::LinearOptions(128, 128).bias(true)));
-        torch::nn::init::orthogonal_(partner_linear2->weight, std::sqrt(2.0));
-        torch::nn::init::constant_(partner_linear2->bias, 0.0);
+            // Partner: 7 -> 128
+            partner_W = register_parameter("partner_W", torch::empty({128, 7}));
+            partner_b = register_parameter("partner_b", torch::zeros({128}));
+            torch::nn::init::orthogonal_(partner_W, std::sqrt(2.0));
+        } else {
+            // Torch mode: Linear -> LayerNorm -> Linear -> Max
+            // Road: 13 -> 128 -> 128
+            road_linear1 = register_module("road_linear1", torch::nn::Linear(
+                torch::nn::LinearOptions(13, 128).bias(true)));
+            torch::nn::init::orthogonal_(road_linear1->weight, std::sqrt(2.0));
+            torch::nn::init::constant_(road_linear1->bias, 0.0);
+            road_ln = register_module("road_ln", torch::nn::LayerNorm(
+                torch::nn::LayerNormOptions({128})));
+            road_linear2 = register_module("road_linear2", torch::nn::Linear(
+                torch::nn::LinearOptions(128, 128).bias(true)));
+            torch::nn::init::orthogonal_(road_linear2->weight, std::sqrt(2.0));
+            torch::nn::init::constant_(road_linear2->bias, 0.0);
+
+            // Partner: 7 -> 128 -> 128
+            partner_linear1 = register_module("partner_linear1", torch::nn::Linear(
+                torch::nn::LinearOptions(7, 128).bias(true)));
+            torch::nn::init::orthogonal_(partner_linear1->weight, std::sqrt(2.0));
+            torch::nn::init::constant_(partner_linear1->bias, 0.0);
+            partner_ln = register_module("partner_ln", torch::nn::LayerNorm(
+                torch::nn::LayerNormOptions({128})));
+            partner_linear2 = register_module("partner_linear2", torch::nn::Linear(
+                torch::nn::LinearOptions(128, 128).bias(true)));
+            torch::nn::init::orthogonal_(partner_linear2->weight, std::sqrt(2.0));
+            torch::nn::init::constant_(partner_linear2->bias, 0.0);
+        }
 
         // Shared embedding: 3*128 -> hidden_size
         shared_linear = register_module("shared_linear", torch::nn::Linear(
@@ -505,22 +530,41 @@ class DriveEncoder : public Encoder {
         Tensor partner_obs = x.narrow(1, 7, 63*7);
         Tensor road_obs = x.narrow(1, 7 + 63*7, 200*7);
 
-        // Ego encoding
-        Tensor ego_features = ego_linear2->forward(ego_norm->forward(ego_linear1->forward(ego_obs)));
+        // Ego encoding: Linear -> ReLU -> Linear (single point, no max)
+        Tensor ego_features = ego_linear2->forward(torch::relu(ego_linear1->forward(ego_obs)));
 
-        // Partner encoding with max pooling
-        Tensor partner_objects = partner_obs.view({B, 63, 7});
-        Tensor partner_enc = partner_linear2->forward(partner_norm->forward(partner_linear1->forward(partner_objects)));
-        Tensor partner_features = std::get<0>(partner_enc.max(1));  // max pool over 63 objects
+        // Partner encoding
+        Tensor partner_objects = partner_obs.view({B, 63, 7}).contiguous();
+        Tensor partner_features;
+        if (use_fused_kernel) {
+            // Fused FC -> Max kernel
+            partner_features = fc_max(partner_objects, partner_W, partner_b);
+        } else {
+            // Torch: Linear -> LayerNorm -> Linear -> Max
+            auto h = partner_linear1->forward(partner_objects);  // (B, 63, 128)
+            h = partner_ln->forward(h);
+            h = partner_linear2->forward(h);  // (B, 63, 128)
+            partner_features = std::get<0>(h.max(1));  // (B, 128)
+        }
 
-        // Road encoding with one-hot and max pooling
+        // Road encoding with one-hot
         Tensor road_objects = road_obs.view({B, 200, 7});
         Tensor road_continuous = road_objects.narrow(2, 0, 6);
         Tensor road_categorical = road_objects.narrow(2, 6, 1).squeeze(2);
         Tensor road_onehot = torch::one_hot(road_categorical.to(torch::kInt64), 7).to(torch::kFloat32);
-        Tensor road_combined = torch::cat({road_continuous, road_onehot}, 2);  // (B, 200, 13)
-        Tensor road_enc = road_linear2->forward(road_norm->forward(road_linear1->forward(road_combined)));
-        Tensor road_features = std::get<0>(road_enc.max(1));  // max pool over 200 objects
+        Tensor road_combined = torch::cat({road_continuous, road_onehot}, 2).contiguous();  // (B, 200, 13)
+
+        Tensor road_features;
+        if (use_fused_kernel) {
+            // Fused FC -> Max kernel
+            road_features = fc_max(road_combined, road_W, road_b);
+        } else {
+            // Torch: Linear -> LayerNorm -> Linear -> Max
+            auto h = road_linear1->forward(road_combined);  // (B, 200, 128)
+            h = road_ln->forward(h);
+            h = road_linear2->forward(h);  // (B, 200, 128)
+            road_features = std::get<0>(h.max(1));  // (B, 128)
+        }
 
         // Concatenate and shared embedding: GELU -> Linear -> ReLU
         Tensor concat_features = torch::cat({ego_features, road_features, partner_features}, 1);

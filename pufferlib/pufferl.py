@@ -155,7 +155,7 @@ class PuffeRL:
         config['cudagraphs'] = True
         config['kernels'] = True
         config['use_omp'] = True
-        config['num_buffers'] = 2
+        config['num_buffers'] = config['num_buffers']
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.rollouts.observations
         self.actions = self.pufferl_cpp.rollouts.actions
