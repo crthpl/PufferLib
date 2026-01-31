@@ -152,10 +152,6 @@ class PuffeRL:
         config['max_epochs'] = epochs
         config['total_minibatches'] = self.total_minibatches
         config['accumulate_minibatches'] = self.accumulate_minibatches
-        config['cudagraphs'] = True
-        config['kernels'] = True
-        config['use_omp'] = True
-        config['num_buffers'] = config['num_buffers']
         self.pufferl_cpp = _C.create_pufferl(config)
         self.observations = self.pufferl_cpp.rollouts.observations
         self.actions = self.pufferl_cpp.rollouts.actions
@@ -326,7 +322,8 @@ class PuffeRL:
         return logs
 
     def close(self):
-        os._exit(0)
+        #os._exit(0)
+        return
         self.vecenv.close()
         self.utilization.stop()
         model_path = self.save_checkpoint()
@@ -732,6 +729,10 @@ class WandbLogger:
         self.run_id = wandb.run.id
         self.should_upload_model = not args['no_model_upload']
 
+    def init(self, args):
+        pass
+        
+
     def log(self, logs, step):
         self.wandb.log(logs, step=step)
 
@@ -741,8 +742,8 @@ class WandbLogger:
         self.wandb.run.log_artifact(artifact)
 
     def close(self, model_path):
-        if self.should_upload_model:
-            self.upload_model(model_path)
+        #if self.should_upload_model:
+        #    self.upload_model(model_path)
         self.wandb.finish()
 
     def download(self):
@@ -899,7 +900,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
-    pufferl.logger.log_cost(uptime)
+    #pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path)
     return all_logs
 
@@ -1345,7 +1346,7 @@ def make_parser():
     parser.add_argument('--fps', type=float, default=15)
     parser.add_argument('--max-runs', type=int, default=1200, help='Max number of sweep runs')
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
-    parser.add_argument('--wandb-project', type=str, default='pufferlib')
+    parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
     parser.add_argument('--neptune-name', type=str, default='pufferai')

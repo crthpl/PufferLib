@@ -11,8 +11,8 @@
 void my_init(Env* env, Dict* kwargs) {
     env->width = dict_get(kwargs, "width")->value;
     env->height = dict_get(kwargs, "height")->value;
-    env->num_agents = dict_get(kwargs, "num_agents")->value;
-    env->num_goals = dict_get(kwargs, "num_goals")->value;
+    env->num_agents = 8;
+    env->num_goals = 4;
     init(env);
 }
 

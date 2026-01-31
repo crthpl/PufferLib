@@ -657,12 +657,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     }
 
-        // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
-        // This ensures PyTorch properly recognizes the streams for all operations
-        for (int i = 0; i < num_buffers; i++) {
-            pufferl->torch_streams.push_back(at::cuda::getStreamFromPool(false));
-            vec->streams[i] = pufferl->torch_streams[i].stream();
-        }
+    // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
+    // This ensures PyTorch properly recognizes the streams for all operations
+    for (int i = 0; i < num_buffers; i++) {
+        pufferl->torch_streams.push_back(at::cuda::getStreamFromPool(false));
+        vec->streams[i] = pufferl->torch_streams[i].stream();
+    }
 
 
     // Static breakout - OMP only
@@ -672,7 +672,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     }
     static_vec_reset(vec);
-
+    
     return pufferl;
 }
 
