@@ -22,7 +22,7 @@ pybind11::dict log_environments(pybind11::object pufferl_obj) {
 
 Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::Device device) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    return pufferl.policy->initial_state(batch_size, device);
+    return pufferl.policy_bf16->initial_state(batch_size, device);
 }
 
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
@@ -127,6 +127,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.kernels = get_config(kwargs, "kernels");
     hypers.profile = get_config(kwargs, "profile");
     hypers.use_omp = get_config(kwargs, "use_omp");
+    hypers.bf16 = get_config(kwargs, "bf16");
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
     Dict* vec_kwargs = py_dict_to_c_dict(kwargs["vec_kwargs"].cast<py::dict>());
@@ -232,7 +233,8 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("create_pufferl", &create_pufferl);
     py::class_<PuffeRL, std::unique_ptr<PuffeRL>>(m, "PuffeRL")
-        .def_readwrite("policy", &PuffeRL::policy)
+        .def_readwrite("policy_bf16", &PuffeRL::policy_bf16)
+        .def_readwrite("policy_fp32", &PuffeRL::policy_fp32)
         .def_readwrite("muon", &PuffeRL::muon)
         .def_readwrite("hypers", &PuffeRL::hypers)
         .def_readwrite("rollouts", &PuffeRL::rollouts);

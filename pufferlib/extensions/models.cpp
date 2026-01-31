@@ -201,7 +201,7 @@ class DefaultEncoder : public Encoder {
     }
 
     Tensor forward(Tensor x) override {
-        return linear->forward(x);
+        return linear->forward(x.to(linear->weight.dtype()));
     }
 };
 
@@ -223,8 +223,9 @@ class SnakeEncoder : public Encoder {
     Tensor forward(Tensor x) override {
         // x is [B, input_size] with values 0-7
         int64_t B = x.size(0);
+        auto target_dtype = linear->weight.dtype();
         // One-hot encode: [B, input_size] -> [B, input_size, num_classes]
-        Tensor onehot = torch::one_hot(x.to(torch::kLong), num_classes).to(torch::kFloat32);
+        Tensor onehot = torch::one_hot(x.to(torch::kLong), num_classes).to(target_dtype);
         // Flatten: [B, input_size * num_classes]
         onehot = onehot.view({B, -1});
         return linear->forward(onehot);
@@ -291,12 +292,13 @@ class G2048Encoder : public Encoder {
     Tensor forward(Tensor x) override {
         // x is (B, 16) uint8 tile values
         auto B = x.size(0);
+        auto target_dtype = linear1->weight.dtype();
 
         // value_embed(obs) -> (B, 16, embed_dim)
-        auto value_obs = value_embed->forward(x.to(torch::kLong));
+        auto value_obs = value_embed->forward(x.to(torch::kLong)).to(target_dtype);
 
         // pos_embed.weight expanded to (B, 16, embed_dim)
-        auto pos_obs = pos_embed->weight.unsqueeze(0).expand({B, num_grid_cells, embed_dim});
+        auto pos_obs = pos_embed->weight.unsqueeze(0).expand({B, num_grid_cells, embed_dim}).to(target_dtype);
 
         // grid_obs = (value_obs + pos_obs).flatten(1) -> (B, 48)
         auto grid_obs = (value_obs + pos_obs).flatten(1);
@@ -368,7 +370,7 @@ class NMMO3Encoder : public Encoder {
     Tensor forward(Tensor x) override {
         int64_t B = x.size(0);
         auto device = x.device();
-        auto dtype = x.dtype();
+        auto target_dtype = conv1->weight.dtype();
 
         // Split observations: map (1650), player (47), reward (10)
         Tensor ob_map = x.narrow(1, 0, 11*15*10).view({B, 11, 15, 10});
@@ -382,7 +384,7 @@ class NMMO3Encoder : public Encoder {
         Tensor codes = map_perm + offsets.to(device);
 
         // Create multi-hot buffer and scatter
-        Tensor map_buf = torch::zeros({B, 59, 11, 15}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        Tensor map_buf = torch::zeros({B, 59, 11, 15}, torch::TensorOptions().dtype(target_dtype).device(device));
         map_buf.scatter_(1, codes.to(torch::kInt32), 1.0f);
 
         // Conv layers
@@ -391,11 +393,11 @@ class NMMO3Encoder : public Encoder {
         map_out = map_out.flatten(1);  // (B, 256)
 
         // Player discrete embedding
-        Tensor player_discrete = player_embed->forward(ob_player.to(torch::kInt64));
+        Tensor player_discrete = player_embed->forward(ob_player.to(torch::kInt64)).to(target_dtype);
         player_discrete = player_discrete.flatten(1);  // (B, 1504)
 
         // Concatenate: map_out + player_discrete + player_continuous + reward
-        Tensor obs = torch::cat({map_out, player_discrete, ob_player.to(torch::kFloat32), ob_reward.to(torch::kFloat32)}, 1);
+        Tensor obs = torch::cat({map_out, player_discrete, ob_player.to(target_dtype), ob_reward.to(target_dtype)}, 1);
 
         // Projection with ReLU
         obs = torch::relu(proj->forward(obs));
@@ -523,7 +525,8 @@ class DriveEncoder : public Encoder {
 
     Tensor forward(Tensor x) override {
         int64_t B = x.size(0);
-        x = x.to(torch::kFloat32);
+        auto target_dtype = ego_linear1->weight.dtype();
+        x = x.to(target_dtype);
 
         // Split observations: ego (7), partner (441), road (1400)
         Tensor ego_obs = x.narrow(1, 0, 7);
@@ -652,9 +655,10 @@ public:
 
     Tensor initial_state(int64_t batch_size, torch::Device device) {
         // Layout: {num_layers, batch_size, hidden} - select(0, i) gives contiguous slice
+        auto dtype = this->parameters().empty() ? torch::kFloat32 : this->parameters()[0].scalar_type();
         return torch::zeros(
             {num_layers, batch_size, (int64_t)(hidden_size*expansion_factor)},
-            torch::dtype(torch::kFloat32).device(device)
+            torch::dtype(dtype).device(device)
         );
     }
 
@@ -904,5 +908,25 @@ void sync_fp16_fp32(PolicyLSTM* policy_16, PolicyLSTM* policy_32) {
     auto params_16 = policy_16->parameters();
     for (size_t i = 0; i < params_32.size(); ++i) {
         params_16[i].copy_(params_32[i].to(torch::kFloat32));
+    }
+}
+
+// Sync bf16 working weights from fp32 master weights (for mixed-precision training)
+void sync_policy_weights(PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32) {
+    auto params_fp32 = policy_fp32->parameters();
+    auto params_bf16 = policy_bf16->parameters();
+    for (size_t i = 0; i < params_fp32.size(); ++i) {
+        params_bf16[i].data().copy_(params_fp32[i].data().to(torch::kBFloat16));
+    }
+}
+
+// Copy gradients from bf16 policy to fp32 policy (for optimizer step)
+void copy_gradients_to_fp32(PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32) {
+    auto params_fp32 = policy_fp32->parameters();
+    auto params_bf16 = policy_bf16->parameters();
+    for (size_t i = 0; i < params_fp32.size(); ++i) {
+        if (params_bf16[i].grad().defined()) {
+            params_fp32[i].mutable_grad() = params_bf16[i].grad().to(torch::kFloat32);
+        }
     }
 }

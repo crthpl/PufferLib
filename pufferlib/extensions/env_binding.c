@@ -126,27 +126,47 @@ void static_vec_omp_step(StaticVec* vec) {
 }
 
 // Optional: Initialize all envs at once (for shared state, variable agents per env, etc.)
-// Default implementation creates one env per agent using my_init
+// Default implementation creates envs until total_agents is reached
 #ifndef MY_VEC_INIT
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs) {
+
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int agents_per_buffer = total_agents / num_buffers;
 
-    // Default: one env per agent
+    // Allocate max possible envs (1 agent per env worst case)
     Env* envs = (Env*)calloc(total_agents, sizeof(Env));
-    for (int b = 0; b < num_buffers; b++) {
-        buffer_env_starts[b] = b * agents_per_buffer;
-        buffer_env_counts[b] = agents_per_buffer;
+
+    int num_envs = 0;
+    int agents_created = 0;
+    while (agents_created < total_agents) {
+        srand(num_envs);
+        my_init(&envs[num_envs], env_kwargs);
+        agents_created += envs[num_envs].num_agents;
+        num_envs++;
     }
 
-    for (int i = 0; i < total_agents; i++) {
-        srand(i);
-        my_init(&envs[i], env_kwargs);
+    // Shrink to actual size needed
+    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
+
+    // Fill buffer info by iterating through envs
+    int buf = 0;
+    int buf_agents = 0;
+    buffer_env_starts[0] = 0;
+    buffer_env_counts[0] = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].num_agents;
+        buffer_env_counts[buf]++;
+        if (buf_agents >= agents_per_buffer && buf < num_buffers - 1) {
+            buf++;
+            buffer_env_starts[buf] = i + 1;
+            buffer_env_counts[buf] = 0;
+            buf_agents = 0;
+        }
     }
 
-    *num_envs_out = total_agents;
+    *num_envs_out = num_envs;
     return envs;
 }
 #endif
