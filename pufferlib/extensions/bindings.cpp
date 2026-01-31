@@ -82,22 +82,18 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
     return c_dict;
 }
 
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
+std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind11::dict vec_kwargs, pybind11::dict env_kwargs, pybind11::dict policy_kwargs) {
     HypersT hypers;
     // Layout (total_agents and num_buffers come from vec config)
-    hypers.segments = get_config(kwargs, "segments");
+    hypers.total_agents = get_config(vec_kwargs, "total_agents");
+    hypers.num_buffers = get_config(vec_kwargs, "num_buffers");
     hypers.horizon = get_config(kwargs, "horizon");
-    hypers.total_agents = get_config(kwargs, "total_agents");
-    hypers.num_buffers = get_config(kwargs, "num_buffers");
-    hypers.minibatch_segments = get_config(kwargs, "minibatch_segments");
-    hypers.total_minibatches = get_config(kwargs, "total_minibatches");
-    hypers.accumulate_minibatches = get_config(kwargs, "accumulate_minibatches");
     // Model architecture (num_atns computed from env in C++)
-    hypers.hidden_size = get_config(kwargs, "hidden_size");
-    hypers.expansion_factor = get_config(kwargs, "expansion_factor");
-    hypers.num_layers = get_config(kwargs, "num_layers");
+    hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
+    hypers.expansion_factor = get_config(policy_kwargs, "expansion_factor");
+    hypers.num_layers = get_config(policy_kwargs, "num_layers");
     // Learning rate
-    hypers.lr = get_config(kwargs, "lr");
+    hypers.lr = get_config(kwargs, "learning_rate");
     hypers.min_lr_ratio = get_config(kwargs, "min_lr_ratio");
     hypers.anneal_lr = get_config(kwargs, "anneal_lr");
     // Optimizer
@@ -105,7 +101,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.beta2 = get_config(kwargs, "beta2");
     hypers.eps = get_config(kwargs, "eps");
     // Training
-    hypers.max_epochs = get_config(kwargs, "max_epochs");
+    hypers.minibatch_size = get_config(kwargs, "minibatch_size");
+    hypers.replay_ratio = get_config(kwargs, "replay_ratio");
+    hypers.total_timesteps = get_config(kwargs, "total_timesteps");
     hypers.max_grad_norm = get_config(kwargs, "max_grad_norm");
     // PPO
     hypers.clip_coef = get_config(kwargs, "clip_coef");
@@ -130,11 +128,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs) {
     hypers.bf16 = get_config(kwargs, "bf16");
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
-    Dict* vec_kwargs = py_dict_to_c_dict(kwargs["vec_kwargs"].cast<py::dict>());
-    Dict* env_kwargs = py_dict_to_c_dict(kwargs["env_kwargs"].cast<py::dict>());
+    Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
+    Dict* env_dict = py_dict_to_c_dict(env_kwargs.cast<py::dict>());
 
     pybind11::gil_scoped_release no_gil;
-    return create_pufferl_impl(hypers, env_name, vec_kwargs, env_kwargs);
+    return create_pufferl_impl(hypers, env_name, vec_dict, env_dict);
 }
 
 TORCH_LIBRARY(pufferlib, m) {
@@ -187,16 +185,13 @@ PYBIND11_MODULE(_C, m) {
         .def(py::init<std::vector<torch::optim::OptimizerParamGroup>, torch::optim::MuonOptions>());
 
     py::class_<HypersT>(m, "HypersT")
-        .def_readwrite("segments", &HypersT::segments)
         .def_readwrite("horizon", &HypersT::horizon)
         .def_readwrite("total_agents", &HypersT::total_agents)
         .def_readwrite("num_buffers", &HypersT::num_buffers)
-        .def_readwrite("minibatch_segments", &HypersT::minibatch_segments)
-        .def_readwrite("total_minibatches", &HypersT::total_minibatches)
-        .def_readwrite("accumulate_minibatches", &HypersT::accumulate_minibatches)
         .def_readwrite("num_atns", &HypersT::num_atns)
         .def_readwrite("hidden_size", &HypersT::hidden_size)
         .def_readwrite("expansion_factor", &HypersT::expansion_factor)
+        .def_readwrite("replay_ratio", &HypersT::replay_ratio)
         .def_readwrite("num_layers", &HypersT::num_layers)
         .def_readwrite("lr", &HypersT::lr)
         .def_readwrite("min_lr_ratio", &HypersT::min_lr_ratio)
@@ -204,7 +199,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("beta1", &HypersT::beta1)
         .def_readwrite("beta2", &HypersT::beta2)
         .def_readwrite("eps", &HypersT::eps)
-        .def_readwrite("max_epochs", &HypersT::max_epochs)
+        .def_readwrite("total_timesteps", &HypersT::total_timesteps)
         .def_readwrite("max_grad_norm", &HypersT::max_grad_norm)
         .def_readwrite("clip_coef", &HypersT::clip_coef)
         .def_readwrite("vf_clip_coef", &HypersT::vf_clip_coef)

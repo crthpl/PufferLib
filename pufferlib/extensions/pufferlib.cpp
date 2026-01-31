@@ -195,13 +195,9 @@ RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_at
 
 typedef struct {
     // Layout
-    int segments;
     int horizon;
     int total_agents;
     int num_buffers;
-    int minibatch_segments;
-    int total_minibatches;
-    int accumulate_minibatches;
     // Model architecture
     int num_atns;
     int hidden_size;
@@ -216,7 +212,9 @@ typedef struct {
     float beta2;
     float eps;
     // Training
-    int max_epochs;
+    int minibatch_size;
+    float replay_ratio;
+    long total_timesteps;
     float max_grad_norm;
     // PPO
     float clip_coef;
@@ -358,7 +356,8 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
         )[0];
     } else {
         int num_action_heads = graph.mb_actions.size(-1);
-        int batch = hypers.minibatch_segments * hypers.horizon;
+        int batch = hypers.minibatch_size;
+        int minibatch_segments = batch / hypers.horizon;
 
         // Split logits by action head sizes and compute log probs for each head
         Tensor flat_logits = logits.reshape({batch, -1});
@@ -379,7 +378,7 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
         }
 
         // Stack and reduce - no per-iteration allocations
-        Tensor newlogprob = torch::cat(logprobs_vec, 1).sum(1).reshape({hypers.minibatch_segments, hypers.horizon});
+        Tensor newlogprob = torch::cat(logprobs_vec, 1).sum(1).reshape({minibatch_segments, hypers.horizon});
         Tensor entropy = torch::cat(entropies_vec, 1).sum(1).mean();
 
         // Compute ratio
@@ -606,15 +605,15 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
 
     // Allocate buffers
-    int segments = hypers.segments;
     int horizon = hypers.horizon;
     int total_agents = vec->total_agents;
     int batch = total_agents / hypers.num_buffers;
     int num_buffers = hypers.num_buffers;
-    int minibatch_segments = hypers.minibatch_segments;
 
-    printf("DEBUG: num_envs=%d, total_agents=%d, segments=%d, batch=%d, num_buffers=%d\n",
-        vec->size, total_agents, segments, batch, num_buffers);
+    printf("DEBUG: num_envs=%d, total_agents=%d, batch=%d, num_buffers=%d\n",
+        vec->size, total_agents, batch, num_buffers);
+
+    int minibatch_segments = hypers.minibatch_size / horizon;
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads, hypers.bf16);
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
@@ -754,13 +753,12 @@ void train_impl(PuffeRL& pufferl) {
     rollouts.values = pufferl.rollouts.values.transpose(0, 1).contiguous();
 
     // Inline any of these only used once
-    int total_minibatches = hypers.total_minibatches;
-    int minibatch_segments = hypers.minibatch_segments;
-    int segments = hypers.segments;
+    int minibatch_size = hypers.minibatch_size;
+    int batch_size = hypers.total_agents * hypers.horizon;
+    int minibatch_segments = minibatch_size / hypers.horizon;
     float prio_beta0 = hypers.prio_beta0;
     float prio_alpha = hypers.prio_alpha;
     bool anneal_lr = hypers.anneal_lr;
-    int total_epochs = hypers.max_epochs;
     int current_epoch = pufferl.epoch;
 
     // Accumulators
@@ -779,9 +777,11 @@ void train_impl(PuffeRL& pufferl) {
     // PolicyMinGRU* policy_fp32 = pufferl.policy_fp32;
     torch::optim::Muon* muon = pufferl.muon;
 
+    int total_epochs = hypers.total_timesteps / batch_size;
+
     if (anneal_lr) {
         float lr_min = hypers.min_lr_ratio * hypers.lr;
-        float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, hypers.max_epochs);
+        float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);
         muon->lr.fill_(lr);
     }
 
@@ -813,6 +813,8 @@ void train_impl(PuffeRL& pufferl) {
     auto mb_prio = torch::ones({minibatch_segments, 1}, torch::dtype(torch::kFloat32).device(device));
     */
 
+    int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
+
     for (int mb = 0; mb < total_minibatches; ++mb) {
         advantages.fill_(0.0);
 
@@ -821,7 +823,7 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
-        auto [idx, mb_prio] = compute_prio(advantages, minibatch_segments, segments,
+        auto [idx, mb_prio] = compute_prio(advantages, minibatch_segments, hypers.total_agents,
             prio_alpha, anneal_beta);
         profile_end(hypers.profile);
 

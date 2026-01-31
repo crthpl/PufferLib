@@ -61,108 +61,38 @@ ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 #torch.autograd.set_detect_anomaly(True)
 #torch._dynamo.config.capture_scalar_outputs = True
 
-
 class PuffeRL:
-    def __init__(self, config, logger=None, verbose=True):
-        env_kwargs = config['env_kwargs']
-
-        # total_agents and num_buffers come from vec config
-        total_agents = int(config['total_agents'])
-        num_buffers = int(config['num_buffers'])
-        self.total_agents = total_agents
-        self.agents_per_batch = total_agents
-
+    def __init__(self, config, vec_config, env_config, policy_config, logger=None, verbose=True):
         # Reproducibility
         seed = config['seed']
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Experience
-        if config['batch_size'] == 'auto' and config['bptt_horizon'] == 'auto':
-            raise pufferlib.APIUsageError('Must specify batch_size or bptt_horizon')
-        elif config['batch_size'] == 'auto':
-            config['batch_size'] = total_agents * config['bptt_horizon']
-        elif config['bptt_horizon'] == 'auto':
-            config['bptt_horizon'] = config['batch_size'] // total_agents
-
-        batch_size = config['batch_size']
-        horizon = config['bptt_horizon']
-        segments = batch_size // horizon
-        self.segments = segments
-        if total_agents > segments:
-            raise pufferlib.APIUsageError(
-                f'Total agents {total_agents} <= segments {segments}'
-            )
-
-        device = config['device']
-        '''
-        self.observations = torch.zeros(segments, horizon, *obs_space.shape,
-            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
-            pin_memory=device == 'cuda' and config['cpu_offload'],
-            device='cpu' if config['cpu_offload'] else device)
-        self.actions = torch.zeros(segments, horizon, *atn_space.shape, device=device,
-            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
-        self.values = torch.zeros(segments, horizon, device=device)
-        self.logprobs = torch.zeros(segments, horizon, device=device)
-        self.rewards = torch.zeros(segments, horizon, device=device)
-        self.terminals = torch.zeros(segments, horizon, device=device)
-        self.truncations = torch.zeros(segments, horizon, device=device)
-        self.ratio = torch.ones(segments, horizon, device=device)
-        self.importance = torch.ones(segments, horizon, device=device)
-        self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
-        self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
-        self.free_idx = total_agents
-        '''
- 
-        # Minibatching & gradient accumulation
         minibatch_size = config['minibatch_size']
-        max_minibatch_size = config['max_minibatch_size']
-        self.minibatch_size = min(minibatch_size, max_minibatch_size)
-        self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
-        self.total_minibatches = config['num_minibatches']
-        self.minibatch_segments = self.minibatch_size // horizon 
-        if self.minibatch_segments * horizon != self.minibatch_size:
+        horizon = config['horizon']
+        total_agents = vec_config['total_agents']
+        batch_size = horizon * total_agents
+        self.batch_size = batch_size
+
+        if (minibatch_size % horizon) != 0:
             raise pufferlib.APIUsageError(
-                f'minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {horizon}'
-            )
+                f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}')
+
+        if (minibatch_size > batch_size):
+            raise pufferlib.APIUsageError(f'minibatch_size {minibatch_size} must be >= '
+                f'horizon {horizon} * total_agents {total_agents} ({batch_size})')
 
         # Logging
         self.logger = logger
         if logger is None:
             self.logger = Logger(config)
 
-        epochs = config['total_timesteps'] // config['batch_size']
-        eta_min = config['learning_rate'] * config['min_lr_ratio']
-        
-        self.total_epochs = epochs
-
-        policy_kwargs = config.get('policy_kwargs', {})
-        self.num_layers = int(policy_kwargs.get('num_layers', 4))
-        config['hidden_size'] = int(policy_kwargs.get('hidden_size', 128))
-        config['expansion_factor'] = int(policy_kwargs.get('expansion_factor', 1))
-        config['num_layers'] = self.num_layers
-        config['minibatch_segments'] = self.minibatch_segments
-        config['segments'] = segments
-        config['horizon'] = horizon
-        config['lr'] = config['learning_rate']
-        config['beta1'] = config['adam_beta1']
-        config['beta2'] = config['adam_beta2']
-        config['eps'] = config['adam_eps']
-        config['max_epochs'] = epochs
-        config['total_minibatches'] = self.total_minibatches
-        config['accumulate_minibatches'] = self.accumulate_minibatches
-        self.pufferl_cpp = _C.create_pufferl(config)
-        self.observations = self.pufferl_cpp.rollouts.observations
-        self.actions = self.pufferl_cpp.rollouts.actions
-        self.rewards = self.pufferl_cpp.rollouts.rewards
-        self.terminals = self.pufferl_cpp.rollouts.terminals
-        self.logprobs = self.pufferl_cpp.rollouts.logprobs
-        self.values = self.pufferl_cpp.rollouts.values
+        self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
+        self.rollouts = self.pufferl_cpp.rollouts
 
         # Initializations
         self.config = config
-        #self.vecenv = vecenv
         self.epoch = 0
         self.global_step = 0
         self.last_log_step = 0
@@ -175,12 +105,11 @@ class PuffeRL:
         self.losses = {}
         self.verbose = verbose
 
-        # Dashboard
-        #self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        self.print_dashboard(clear=True)
+        self.policy_fp32 = self.pufferl_cpp.policy_fp32
 
-        #self.compiled_evaluate = torch.compile(_C.compiled_evaluate)
-        #self.eval_forward = torch.compile(self.pufferl_cpp.policy.forward, mode='reduce-overhead')
+        # Dashboard
+        self.model_size = sum(p.numel() for p in self.policy_fp32.parameters() if p.requires_grad)
+        self.print_dashboard(clear=True)
 
     @property
     def uptime(self):
@@ -193,108 +122,40 @@ class PuffeRL:
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
-
     def evaluate(self):
-        profile = self.profile
-        epoch = self.epoch
-        profile('eval', epoch)
-
-        config = self.config
-        device = config['device']
-
+        self.profile('eval', self.epoch)
         state = _C.rollouts(self.pufferl_cpp,)
-
-        '''
-        obs, act, rew, term = _C.env_buffers(self.pufferl_cpp)
-
-        num_buffers = self.config['num_buffers']
-        block_size = int(self.total_agents / num_buffers)
-        with torch.no_grad():
-            for i in range(self.config['bptt_horizon']):
-                buf = i % num_buffers
-                h = int(i / num_buffers)
-                _C.python_vec_recv(self.pufferl_cpp, buf)
-
-                start = int(block_size * buf)
-                obs_batch = obs.narrow(0, start, block_size)
-                state_batch = state.narrow(1, start, block_size)
-                logits, value, state_out = self.eval_forward(obs_batch.cuda(), state_batch)
-                state_batch.copy_(state_out)
-
-                logits = torch.nan_to_num(logits)
-                logprobs = torch.log_softmax(logits, dim=1)
-                action = torch.multinomial(logprobs.exp(), 1, True).squeeze(1).to(torch.int32)
-                logprob = logprobs.gather(1, action.unsqueeze(1)).squeeze(1)
-
-                self.observations.select(1, h).narrow(0, start, block_size).copy_(obs_batch, True)
-                self.actions.select(1, h).narrow(0, start, block_size).copy_(action.to(torch.int64), True)
-                self.logprobs.select(1, h).narrow(0, start, block_size).copy_(logprob.to(torch.float32), True)
-                self.values.select(1, h).narrow(0, start, block_size).copy_(value.flatten().to(torch.float32), True)
-
-                rewards_batch = rew.narrow(0, start, block_size)
-                rewards_clamped = torch.clamp(rewards_batch, -1, 1)
-
-                self.rewards.select(1, h).narrow(0, start, block_size).copy_(rewards_clamped.to(torch.float32), True)
-
-                terminals_batch = term.narrow(0, start, block_size)
-                self.terminals.select(1, h).narrow(0, start, block_size).copy_(terminals_batch.to(torch.float32), True)
-
-                act.narrow(0, start, block_size).copy_(action.to(torch.float32), True)
-
-                torch.cuda.synchronize()
-                _C.python_vec_send(self.pufferl_cpp, buf)
-        '''
-
-        torch.cuda.synchronize()
-        logs = _C.log_environments(self.pufferl_cpp)
-        if logs:
-            for k, v in logs.items():
-                self.stats[k] = [v]
-
-        self.global_step += config['batch_size']
-        profile.end()
-        return self.stats
+        self.profile.end()
+        self.global_step += self.batch_size
 
     def train(self):
-        profile = self.profile
-        epoch = self.epoch
-        profile('train', epoch)
-        config = self.config
-        device = config['device']
-
+        self.profile('train', self.epoch)
         losses = _C.train(self.pufferl_cpp)
-
-        profile('train_misc', epoch)
-        profile.end()
+        self.profile.end()
         logs = None
         self.epoch += 1
-        done_training = self.global_step >= config['total_timesteps']
-        if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
-            logs = self.mean_and_log()
+        done_training = self.global_step >= self.config['total_timesteps']
+        if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.6:
+            torch.cuda.synchronize()
+            logs = _C.log_environments(self.pufferl_cpp)
+            self.stats = logs
+            self.write_logs(logs)
+
             #self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
-            profile.clear()
+            self.profile.clear()
 
-        if self.epoch % config['checkpoint_interval'] == 0 or done_training:
+        if self.epoch % self.config['checkpoint_interval'] == 0 or done_training:
             self.save_checkpoint()
             self.msg = f'Checkpoint saved at update {self.epoch}'
 
         return logs
 
-    def mean_and_log(self):
+    def write_logs(self, logs):
         config = self.config
-        for k in list(self.stats.keys()):
-            v = self.stats[k]
-            try:
-                v = np.mean(v)
-            except:
-                del self.stats[k]
-
-            self.stats[k] = v
-
         device = config['device']
         agent_steps = int(dist_sum(self.global_step, device))
         logs = {
@@ -303,7 +164,7 @@ class PuffeRL:
             'uptime': time.time() - self.start_time,
             'epoch': int(dist_sum(self.epoch, device)),
             #'learning_rate': self.optimizer.param_groups[0]["lr"],
-            **{f'environment/{k}': v for k, v in self.stats.items()},
+            **{f'environment/{k}': v for k, v in logs.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
             **{f'performance/{k}': v['elapsed'] for k, v in self.profile},
             #**{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
@@ -312,7 +173,7 @@ class PuffeRL:
         }
 
         if torch.distributed.is_initialized():
-           if torch.distributed.get_rank() != 0:
+           if torch.distributed.get_rank() == 0:
                self.logger.log(logs, agent_steps)
                return logs
            else:
@@ -348,8 +209,6 @@ class PuffeRL:
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
-
-        #torch.save(self.uncompiled_policy.state_dict(), model_path)
 
         state = {
             #'optimizer_state_dict': self.optimizer.state_dict(),
@@ -406,7 +265,7 @@ class PuffeRL:
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
         s.add_row(f'{c2}Env', f'{b2}{config["env"]}')
-        #s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
+        s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
         s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
         s.add_row(f'{c2}SPS', abbreviate(sps, b2, c2))
         s.add_row(f'{c2}Epoch', f'{b2}{self.epoch}')
@@ -536,7 +395,7 @@ def dist_mean(value, device):
     return dist_sum(value, device) / torch.distributed.get_world_size()
 
 class Profile:
-    def __init__(self, frequency=1):
+    def __init__(self, frequency=30):
         self.reset()
         self.frequency = frequency
         self.stack = []
@@ -555,8 +414,8 @@ class Profile:
         if (epoch + 1) % self.frequency != 0:
             return
 
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         tick = time.time()
         if len(self.stack) != 0 and not nest:
@@ -573,8 +432,8 @@ class Profile:
         profile['elapsed'] += delta * self.frequency
 
     def end(self):
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         end = time.time()
         for i in range(len(self.stack)):
@@ -668,49 +527,6 @@ class Logger:
         with open(self.path, 'w') as f:
             json.dump(self.logs, f)
 
-class NeptuneLogger:
-    def __init__(self, args, load_id=None, mode='async'):
-        import neptune as nept
-        neptune_name = args['neptune_name']
-        neptune_project = args['neptune_project']
-        neptune = nept.init_run(
-            project=f"{neptune_name}/{neptune_project}",
-            capture_hardware_metrics=False,
-            capture_stdout=False,
-            capture_stderr=False,
-            capture_traceback=False,
-            with_id=load_id,
-            mode=mode,
-            tags = [args['tag']] if args['tag'] is not None else [],
-        )
-        self.run_id = neptune._sys_id
-        self.neptune = neptune
-        for k, v in pufferlib.unroll_nested_dict(args):
-            neptune[k].append(v)
-        self.should_upload_model = not args['no_model_upload']
-
-    def init(self, args):
-        pass
-
-    def log_cost(self, cost):
-        pass
-
-    def log(self, logs, step):
-        for k, v in logs.items():
-            self.neptune[k].append(v, step=step)
-
-    def upload_model(self, model_path):
-        self.neptune['model'].track_files(model_path)
-
-    def close(self, model_path):
-        if self.should_upload_model:
-            self.upload_model(model_path)
-        self.neptune.stop()
-
-    def download(self):
-        self.neptune["model"].download(destination='artifacts')
-        return f'artifacts/{self.run_id}.pt'
- 
 class WandbLogger:
     def __init__(self, args, load_id=None, resume='allow'):
         import wandb
@@ -790,7 +606,7 @@ def check(env_name):
     #pufferl_cpp.evaluate()
 
     # You need to determinize the env before checks
-    for i in range(args['train']['bptt_horizon']):
+    for i in range(args['train']['horizon']):
         python_obs = pufferl_python.observations[:, i].float()
         cpp_obs = pufferl_cpp.rollouts.observations[:, i]
         assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.rollouts.observations[:, i]), f'Observation {i} mismatch'
@@ -838,19 +654,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         model.forward_eval = policy.forward_eval
         policy = model.to(local_rank)
 
-    if args['neptune']:
-        logger = NeptuneLogger(args)
     elif args['wandb']:
         logger = WandbLogger(args)
 
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
-    train_config['vec_kwargs'] = args['vec']
-    train_config['env_kwargs'] = args['env']
-    train_config['policy_kwargs'] = args['policy']
-    train_config['total_agents'] = args['vec']['total_agents']
-    train_config['num_buffers'] = args['vec']['num_buffers']
-    pufferl = PuffeRL(train_config, logger, verbose)
+    vec_config = args['vec']
+    env_config = args['env']
+    policy_config = args['policy']
+    pufferl = PuffeRL(train_config, vec_config, env_config, policy_config, logger, verbose)
     pufferl.logger.init(args)
 
     if train_config['profile']:
@@ -861,11 +673,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     while pufferl.global_step < train_config['total_timesteps']:
         if pufferl.uptime > max_cost and max_cost > 0:
             break
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
         logs = pufferl.train()
 
         if logs is not None:
@@ -892,7 +700,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         if i >= 32 and stats:
             break
 
-    logs = pufferl.mean_and_log()
+    torch.cuda.synchronize()
+    logs = _C.log_environments(pufferl.pufferl_cpp)
+    pufferl.stats = logs
+    logs = pufferl.write_logs(logs)
     logs['uptime'] = uptime
     logs['agent_steps'] = agent_steps
     if logs is not None:
@@ -1175,8 +986,8 @@ def paretosweep(args=None, env_name=None):
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
-    if not args['wandb'] and not args['neptune']:
-        raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
+    if not args['wandb']:
+        raise pufferlib.APIUsageError('Sweeps require wandb')
     args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
 
     method = args['sweep'].pop('method')
@@ -1274,9 +1085,7 @@ def load_policy(args, vecenv, env_name=''):
 
     load_id = args['load_id']
     if load_id is not None:
-        if args['neptune']:
-            path = NeptuneLogger(args, load_id, mode='read-only').download()
-        elif args['wandb']:
+        if args['wandb']:
             path = WandbLogger(args, load_id).download()
         else:
             raise pufferlib.APIUsageError('No run id provided for eval')
@@ -1338,7 +1147,7 @@ def make_parser():
     parser.add_argument('--load-model-path', type=str, default=None,
         help='Path to a pretrained checkpoint')
     parser.add_argument('--load-id', type=str,
-        default=None, help='Kickstart/eval from from a finished Wandb/Neptune run')
+        default=None, help='Kickstart/eval from from a finished Wandbrun')
     parser.add_argument('--render-mode', type=str, default='auto',
         choices=['auto', 'human', 'ansi', 'rgb_array', 'raylib', 'None'])
     parser.add_argument('--save-frames', type=int, default=0)
@@ -1348,10 +1157,7 @@ def make_parser():
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
-    parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
-    parser.add_argument('--neptune-name', type=str, default='pufferai')
-    parser.add_argument('--neptune-project', type=str, default='ablations')
-    parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb or neptune')
+    parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--sweep-gpus', type=int, default=-1, help='multigpu sweeps')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
