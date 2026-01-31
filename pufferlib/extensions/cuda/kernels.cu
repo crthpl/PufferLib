@@ -2508,6 +2508,94 @@ void launch_fc_max_backward_float(
     launch_fc_max_backward<float>(grad_x, grad_W, grad_b, grad_out, x, W, argmax_indices, B, N, D_in, D_out, stream);
 }
 
+// bf16 activations, fp32 weights
+__global__ void fc_max_forward_kernel_bf16(
+    at::BFloat16* __restrict__ out,
+    int* __restrict__ argmax_indices,
+    const at::BFloat16* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    int B, int N, int D_in, int D_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_out) return;
+
+    int batch = idx / D_out;
+    int d_out = idx % D_out;
+
+    float bias = b[d_out];
+    float max_val = -INFINITY;
+    int argmax_n = 0;
+
+    for (int n = 0; n < N; n++) {
+        float val = bias;
+        for (int di = 0; di < D_in; di++) {
+            val += float(x[batch * N * D_in + n * D_in + di]) * W[d_out * D_in + di];
+        }
+        if (val > max_val) {
+            max_val = val;
+            argmax_n = n;
+        }
+    }
+
+    out[idx] = at::BFloat16(max_val);
+    argmax_indices[idx] = argmax_n;
+}
+
+void launch_fc_max_forward_bf16(
+    at::BFloat16* out, int* argmax_indices,
+    const at::BFloat16* x, const float* W, const float* b,
+    int B, int N, int D_in, int D_out, cudaStream_t stream
+) {
+    int total = B * D_out;
+    int grid = grid_size(total);
+    fc_max_forward_kernel_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(
+        out, argmax_indices, x, W, b, B, N, D_in, D_out);
+}
+
+// bf16 inputs, fp32 weights and gradients (atomicAdd requires fp32)
+__global__ void fc_max_backward_kernel_bf16(
+    float* __restrict__ grad_x,
+    float* __restrict__ grad_W,
+    float* __restrict__ grad_b,
+    const at::BFloat16* __restrict__ grad_out,
+    const at::BFloat16* __restrict__ x,
+    const float* __restrict__ W,
+    const int* __restrict__ argmax_indices,
+    int B, int N, int D_in, int D_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_out) return;
+
+    int batch = idx / D_out;
+    int d_out = idx % D_out;
+
+    float g_out = float(grad_out[idx]);
+    int argmax_n = argmax_indices[idx];
+
+    atomicAdd(&grad_b[d_out], g_out);
+
+    for (int di = 0; di < D_in; di++) {
+        int x_idx = batch * N * D_in + argmax_n * D_in + di;
+        int w_idx = d_out * D_in + di;
+
+        atomicAdd(&grad_W[w_idx], g_out * float(x[x_idx]));
+        atomicAdd(&grad_x[x_idx], g_out * W[w_idx]);
+    }
+}
+
+void launch_fc_max_backward_bf16(
+    float* grad_x, float* grad_W, float* grad_b,
+    const at::BFloat16* grad_out, const at::BFloat16* x, const float* W,
+    const int* argmax_indices,
+    int B, int N, int D_in, int D_out, cudaStream_t stream
+) {
+    int total = B * D_out;
+    int grid = grid_size(total);
+    fc_max_backward_kernel_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(
+        grad_x, grad_W, grad_b, grad_out, x, W, argmax_indices, B, N, D_in, D_out);
+}
+
 // =============================================================================
 // FCReluFCMax: Fused FC -> ReLU -> FC -> Max kernel for Drive encoder
 // Avoids materializing intermediate buffers (B, N, D_mid) and (B, N, D_out)

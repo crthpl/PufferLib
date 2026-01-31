@@ -82,11 +82,11 @@ typedef struct StaticVec {
     int agents_per_buffer;
     int* buffer_env_starts;
     int* buffer_env_counts;
-    float* observations;
+    void* observations;
     double* actions;
     float* rewards;
     float* terminals;
-    float* gpu_observations;
+    void* gpu_observations;
     double* gpu_actions;
     float* gpu_rewards;
     float* gpu_terminals;
@@ -111,6 +111,7 @@ void static_vec_omp_step(StaticVec* vec);
 
 // Env info
 int get_obs_size(void);
+int get_obs_type(void);
 int get_num_atns(void);
 int* get_act_sizes(void);
 

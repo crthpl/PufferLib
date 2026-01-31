@@ -1626,6 +1626,14 @@ public:
         torch::Tensor W,      // (D_out, D_in)
         torch::Tensor b       // (D_out)
     ) {
+        TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
+        TORCH_CHECK(W.is_cuda(), "W must be on CUDA");
+        TORCH_CHECK(b.is_cuda(), "b must be on CUDA");
+        TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+        TORCH_CHECK(W.is_contiguous(), "W must be contiguous");
+        TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
+
+        auto dtype = x.dtype();
         int B = x.size(0);
         int N = x.size(1);
         int D_in = x.size(2);
@@ -1636,17 +1644,28 @@ public:
 
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "fc_max_forward", [&] {
-            if constexpr (std::is_same_v<scalar_t, float>) {
-                launch_fc_max_forward_float(
-                    out.data_ptr<float>(),
-                    argmax.data_ptr<int>(),
-                    x.data_ptr<float>(),
-                    W.data_ptr<float>(),
-                    b.data_ptr<float>(),
-                    B, N, D_in, D_out, stream);
-            }
-        });
+        if (dtype == torch::kFloat32) {
+            launch_fc_max_forward_float(
+                out.data_ptr<float>(),
+                argmax.data_ptr<int>(),
+                x.data_ptr<float>(),
+                W.data_ptr<float>(),
+                b.data_ptr<float>(),
+                B, N, D_in, D_out, stream);
+        } else if (dtype == torch::kBFloat16) {
+            // W and b are always fp32
+            auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
+            auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
+            launch_fc_max_forward_bf16(
+                out.data_ptr<at::BFloat16>(),
+                argmax.data_ptr<int>(),
+                x.data_ptr<at::BFloat16>(),
+                W_f32.data_ptr<float>(),
+                b_f32.data_ptr<float>(),
+                B, N, D_in, D_out, stream);
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
+        }
 
         ctx->save_for_backward({x, W, argmax});
         ctx->saved_data["B"] = B;
@@ -1665,8 +1684,9 @@ public:
         auto x = saved[0];
         auto W = saved[1];
         auto argmax = saved[2];
-        auto grad_out = grad_outputs[0];
+        auto grad_out = grad_outputs[0].contiguous();
 
+        auto dtype = x.dtype();
         int B = ctx->saved_data["B"].toInt();
         int N = ctx->saved_data["N"].toInt();
         int D_in = ctx->saved_data["D_in"].toInt();
@@ -1678,19 +1698,40 @@ public:
 
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "fc_max_backward", [&] {
-            if constexpr (std::is_same_v<scalar_t, float>) {
-                launch_fc_max_backward_float(
-                    grad_x.data_ptr<float>(),
-                    grad_W.data_ptr<float>(),
-                    grad_b.data_ptr<float>(),
-                    grad_out.data_ptr<float>(),
-                    x.data_ptr<float>(),
-                    W.data_ptr<float>(),
-                    argmax.data_ptr<int>(),
-                    B, N, D_in, D_out, stream);
-            }
-        });
+        if (dtype == torch::kFloat32) {
+            launch_fc_max_backward_float(
+                grad_x.data_ptr<float>(),
+                grad_W.data_ptr<float>(),
+                grad_b.data_ptr<float>(),
+                grad_out.data_ptr<float>(),
+                x.data_ptr<float>(),
+                W.data_ptr<float>(),
+                argmax.data_ptr<int>(),
+                B, N, D_in, D_out, stream);
+        } else if (dtype == torch::kBFloat16) {
+            // Accumulate in fp32 (atomicAdd requires fp32), W is always fp32
+            auto opts_f32 = x.options().dtype(torch::kFloat32);
+            auto grad_x_f32 = torch::zeros({B, N, D_in}, opts_f32);
+            auto grad_W_f32 = torch::zeros({D_out, D_in}, opts_f32);
+            auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
+            auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
+
+            launch_fc_max_backward_bf16(
+                grad_x_f32.data_ptr<float>(),
+                grad_W_f32.data_ptr<float>(),
+                grad_b_f32.data_ptr<float>(),
+                grad_out.data_ptr<at::BFloat16>(),
+                x.data_ptr<at::BFloat16>(),
+                W_f32.data_ptr<float>(),
+                argmax.data_ptr<int>(),
+                B, N, D_in, D_out, stream);
+
+            grad_x = grad_x_f32.to(torch::kBFloat16);
+            grad_W = grad_W_f32;
+            grad_b = grad_b_f32;
+        } else {
+            TORCH_CHECK(false, "Unsupported dtype in backward. Only float32 and bfloat16 supported.");
+        }
 
         return {grad_x, grad_W, grad_b};
     }

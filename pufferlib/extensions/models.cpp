@@ -554,7 +554,7 @@ class DriveEncoder : public Encoder {
         Tensor road_objects = road_obs.view({B, 200, 7});
         Tensor road_continuous = road_objects.narrow(2, 0, 6);
         Tensor road_categorical = road_objects.narrow(2, 6, 1).squeeze(2);
-        Tensor road_onehot = torch::one_hot(road_categorical.to(torch::kInt64), 7).to(torch::kFloat32);
+        Tensor road_onehot = torch::one_hot(road_categorical.to(torch::kInt64), 7).to(x.dtype());
         Tensor road_combined = torch::cat({road_continuous, road_onehot}, 2).contiguous();  // (B, 200, 13)
 
         Tensor road_features;

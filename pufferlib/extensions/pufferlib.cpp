@@ -86,7 +86,9 @@ void clip_grad_norm_(
 
   // Single cat + norm (avoids per-param norm calls)
   Tensor all_grads = torch::cat(flat_grads);
-  Tensor total_norm = all_grads.norm(2);
+  // Getting errors here? See if your net is definint a layeyr and not using it.
+  // TODO: That shouldn't error
+  Tensor total_norm = all_grads.to(torch::kFloat32).norm(2);
 
   // Compute clip coefficient
   Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
@@ -124,7 +126,7 @@ create_environments(int num_buffers, int total_agents, const std::string& env_na
     int obs_size = get_obs_size();
     int num_atns = get_num_atns();
 
-    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, obs_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    env.obs = torch::from_blob(vec->gpu_observations, {total_agents, obs_size}, torch::dtype(to_torch_dtype(get_obs_type())).device(torch::kCUDA));
     env.actions = torch::from_blob(vec->gpu_actions, {total_agents, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     env.rewards = torch::from_blob(vec->gpu_rewards, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     env.terminals = torch::from_blob(vec->gpu_terminals, {total_agents}, torch::dtype(torch::kFloat32).device(torch::kCUDA));

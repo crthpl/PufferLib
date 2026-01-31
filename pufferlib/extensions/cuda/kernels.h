@@ -48,8 +48,10 @@ void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFlo
 void launch_fc_relu_fc_max_forward_bf16(at::BFloat16* out, int* argmax_indices, float* fc1_at_argmax, const at::BFloat16* x, const at::BFloat16* W1, const at::BFloat16* b1, const at::BFloat16* W2, const at::BFloat16* b2, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream);
 void launch_fc_relu_fc_max_backward_bf16(at::BFloat16* grad_x, at::BFloat16* grad_W1, at::BFloat16* grad_b1, at::BFloat16* grad_W2, at::BFloat16* grad_b2, const at::BFloat16* grad_out, const at::BFloat16* x, const at::BFloat16* W1, const at::BFloat16* W2, const int* argmax_indices, const float* fc1_at_argmax, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream);
 
-// FCMax: FC -> Max (no intermediate layer)
+/// FCMax: FC -> Max (no intermediate layer)
 void launch_fc_max_forward_float(float* out, int* argmax_indices, const float* x, const float* W, const float* b, int B, int N, int D_in, int D_out, cudaStream_t stream);
 void launch_fc_max_backward_float(float* grad_x, float* grad_W, float* grad_b, const float* grad_out, const float* x, const float* W, const int* argmax_indices, int B, int N, int D_in, int D_out, cudaStream_t stream);
+void launch_fc_max_forward_bf16(at::BFloat16* out, int* argmax_indices, const at::BFloat16* x, const float* W, const float* b, int B, int N, int D_in, int D_out, cudaStream_t stream);
+void launch_fc_max_backward_bf16(float* grad_x, float* grad_W, float* grad_b, const at::BFloat16* grad_out, const at::BFloat16* x, const float* W, const int* argmax_indices, int B, int N, int D_in, int D_out, cudaStream_t stream);
 
 #endif // PUFFERLIB_KERNELS_H

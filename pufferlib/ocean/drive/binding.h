@@ -10,7 +10,8 @@
 #include "env_binding.h"
 
 // Test version: find first map with 8 agents and fill buffer with copies
-Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int num_maps = (int)dict_get(env_kwargs, "num_maps")->value;
@@ -56,6 +57,12 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
     // Calculate how many envs we need (8 agents per env)
     int envs_per_buffer = agents_per_buffer / 8;
     int total_envs = envs_per_buffer * num_buffers;
+
+    // Fill buffer info
+    for (int b = 0; b < num_buffers; b++) {
+        buffer_env_starts[b] = b * envs_per_buffer;
+        buffer_env_counts[b] = envs_per_buffer;
+    }
 
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
 
