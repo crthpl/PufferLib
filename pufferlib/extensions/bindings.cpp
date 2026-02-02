@@ -257,7 +257,7 @@ PYBIND11_MODULE(_C, m) {
         .def(py::init<int64_t, int64_t>());
     py::class_<DriveEncoder, std::shared_ptr<DriveEncoder>, Encoder>(m, "DriveEncoder")
         .def(py::init<int64_t, int64_t>());
-
+    
     py::class_<PolicyMinGRU, std::shared_ptr<PolicyMinGRU>, torch::nn::Module> cls2(m, "PolicyMinGRU");
     cls2.def(py::init<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>, int64_t, int64_t, int64_t, int64_t, int64_t, bool>());
     cls2.def("forward", &PolicyMinGRU::forward);

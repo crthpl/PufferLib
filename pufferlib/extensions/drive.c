@@ -33,7 +33,7 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
 
         Env temp_env = {0};
         temp_env.map_name = map_file;
-        temp_env.num_agents = 0;
+        temp_env.num_agents = 64;
         init(&temp_env);
 
         int agent_count = temp_env.active_agent_count;
@@ -42,7 +42,7 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
 
         if (agent_count == 8) {
             target_map_id = map_id;
-            printf("Found map %d with 8 active agents and %d total agents\n", map_id, total_agent_count);
+            printf("Found map %d with 8 active agents and %d total agents\n", map_id, agent_count);
             break;
         }
     }
@@ -73,10 +73,9 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->spawn_immunity_timer = spawn_immunity_timer;
-        env->num_agents = 0;
+        env->num_agents = 8;
 
         init(env);
-        env->num_agents = env->active_agent_count;
     }
 
     printf("Created %d envs with %d agents each (%d total agents)\n",

@@ -565,7 +565,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
             dec = std::make_shared<NMMO3Decoder>(hidden_size, act_n);
         } else if (env_name == "puffer_drive") {
-            enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
+            //enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
+            enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
             dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
         } else {
             enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);

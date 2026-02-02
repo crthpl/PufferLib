@@ -965,8 +965,8 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         Entity* agent = &env->entities[agent_idx];
         // Extract action components directly from the multi-discrete action array
         double (*action_array)[2] = (double(*)[2])env->actions;
-        int acceleration_index = action_array[action_idx][0];
-        int steering_index = action_array[action_idx][1];
+        int acceleration_index = (int)action_array[action_idx][0];
+        int steering_index = (int)action_array[action_idx][1];
         float acceleration = ACCELERATION_VALUES[acceleration_index];
         float steering = STEERING_VALUES[steering_index];
 
@@ -1156,6 +1156,7 @@ void c_reset(Drive* env){
         env->entities[agent_idx].reached_goal = 0;
         env->entities[agent_idx].collided_before_goal = 0;
         env->entities[agent_idx].reached_goal_this_episode = 0;
+
         collision_check(env, agent_idx);
     }
     compute_observations(env);
@@ -1196,7 +1197,7 @@ void c_step(Drive* env){
         int agent_idx = env->active_agent_indices[i];
         env->entities[agent_idx].collision_state = 0;
         move_dynamics(env, i, agent_idx);
-        // move_expert(env, env->actions, agent_idx);
+         //move_expert(env, env->actions, agent_idx);
     }
     for(int i = 0; i < env->active_agent_count; i++){
         int agent_idx = env->active_agent_indices[i];
