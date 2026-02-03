@@ -134,10 +134,10 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
         only_include = [p.strip() for p in sweep_config['sweep_only'].split(',')]
 
     for name, param in sweep_config.items():
-        if name in ('method', 'metric', 'goal', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only', 'max_suggestion_cost'):
+        if name in ('method', 'metric', 'goal', 'max_cost', 'downsample', 'use_gpu', 'prune_pareto', 'sweep_only', 'max_suggestion_cost'):
             continue
 
-        assert isinstance(param, dict)
+        assert isinstance(param, dict), f'Found non-dict param {name}'
         if any(isinstance(param[k], dict) for k in param):
             param_spaces[name] = _params_from_puffer_sweep(param, only_include)
             continue

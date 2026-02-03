@@ -58,6 +58,11 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     return losses;
 }
 
+void puf_close(pybind11::object pufferl_obj) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    close_impl(pufferl);
+}
+
 double get_config(py::dict& kwargs, const char* key) {
     if (!kwargs.contains(key)) {
         throw std::runtime_error(std::string("Missing config key: ") + key);
@@ -157,6 +162,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("log_environments", &log_environments);
     m.def("rollouts", &rollouts);
     m.def("train", &train);
+    m.def("close", &puf_close);
     m.def("logcumsumexp_cuda", &logcumsumexp_cuda);
     m.def("policy_forward", &PolicyMinGRU::forward);
     m.def("initial_state", &initial_state);

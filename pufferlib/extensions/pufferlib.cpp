@@ -860,6 +860,10 @@ void train_impl(PuffeRL& pufferl) {
     cudaStreamSynchronize(at::cuda::getCurrentCUDAStream());
 }
 
+void close_impl(PuffeRL& pufferl) {
+    static_vec_close(pufferl.vec);
+}
+
 // Profiler control for nsys --capture-range=cudaProfilerApi
 void profiler_start() {
     cudaDeviceSynchronize();

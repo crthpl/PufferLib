@@ -80,7 +80,7 @@ class PuffeRL:
                 f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}')
 
         if (minibatch_size > batch_size):
-            raise pufferlib.APIUsageError(f'minibatch_size {minibatch_size} must be >= '
+            raise pufferlib.APIUsageError(f'minibatch_size {minibatch_size} must be <= '
                 f'horizon {horizon} * total_agents {total_agents} ({batch_size})')
 
         # Logging
@@ -88,7 +88,14 @@ class PuffeRL:
         if logger is None:
             self.logger = Logger(config)
 
-        self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
+        try: 
+            self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
+        except:
+            print(config)
+            print(vec_config)
+            print(env_config)
+            print(policy_config)
+            raise
         self.rollouts = self.pufferl_cpp.rollouts
 
         # Initializations
@@ -97,7 +104,6 @@ class PuffeRL:
         self.global_step = 0
         self.last_log_step = 0
         self.last_log_time = time.time()
-        self.start_time = time.time()
         self.utilization = Utilization()
         self.profile = Profile()
         self.stats = defaultdict(list)
@@ -109,6 +115,7 @@ class PuffeRL:
 
         # Dashboard
         self.model_size = sum(p.numel() for p in self.policy_fp32.parameters() if p.requires_grad)
+        self.start_time = time.time()
         self.print_dashboard(clear=True)
 
     @property
@@ -183,10 +190,9 @@ class PuffeRL:
         return logs
 
     def close(self):
-        #os._exit(0)
-        return
-        self.vecenv.close()
+        _C.close(self.pufferl_cpp)
         self.utilization.stop()
+        return
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
@@ -669,7 +675,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         _C.profiler_start()
 
     all_logs = []
-    max_cost = args['train'].get('max_cost', -1)
+    max_cost = args['sweep'].get('max_cost', -1)
     while pufferl.global_step < train_config['total_timesteps']:
         if pufferl.uptime > max_cost and max_cost > 0:
             break
@@ -695,14 +701,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     # rollouts within a fixed number of epochs)
     uptime = pufferl.uptime
     agent_steps = pufferl.global_step
+    logs = {}
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
-        stats = pufferl.evaluate()
-        if i >= 32 and stats:
+        pufferl.evaluate()
+        if i == 0 or i % 32 != 0:
+            continue
+
+        torch.cuda.synchronize()
+        logs = _C.log_environments(pufferl.pufferl_cpp)
+        if logs:
             break
 
-    torch.cuda.synchronize()
-    logs = _C.log_environments(pufferl.pufferl_cpp)
-    pufferl.stats = logs
     logs = pufferl.write_logs(logs)
     logs['uptime'] = uptime
     logs['agent_steps'] = agent_steps
@@ -986,8 +995,6 @@ def paretosweep(args=None, env_name=None):
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
-    if not args['wandb']:
-        raise pufferlib.APIUsageError('Sweeps require wandb')
     args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
 
     method = args['sweep'].pop('method')

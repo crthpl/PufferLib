@@ -104,6 +104,7 @@ typedef void (*step_fn)(void* env);
 // Functions implemented by env's static library
 StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* vec_kwargs, Dict* env_kwargs);
 void static_vec_reset(StaticVec* vec);
+void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     void* ctx, net_callback_fn net_callback, thread_init_fn thread_init);
