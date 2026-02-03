@@ -9,6 +9,7 @@
 #include <torch/optim/optimizer.h>
 
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 
@@ -39,6 +40,13 @@ inline torch::ScalarType get_dtype(bool bf16) {
 }
 
 namespace pufferlib {
+
+void print_cuda_mem(const char* label) {
+    cudaDeviceSynchronize();
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    printf("[CUDA MEM %s] used=%.2f MB\n", label, (total_mem - free_mem) / 1e6);
+}
 
 // Advantage computation is in advantage.cpp
 #include "advantage.cpp"
@@ -251,6 +259,8 @@ typedef struct {
     TrainGraph train_buf;
     std::vector<std::vector<at::cuda::CUDAGraph>> fused_rollout_cudagraphs;  // [horizon][num_buffers]
     at::cuda::CUDAGraph train_cudagraph;
+    at::cuda::MempoolId_t train_pool_id;     // Pool ID for releasing graph memory
+    at::cuda::MempoolId_t rollout_pool_id;   // Pool ID for releasing graph memory
     std::vector<at::cuda::CUDAStream> torch_streams;  // PyTorch-managed streams for OMP
     Tensor adv_mean;
     Tensor adv_std;
@@ -633,16 +643,16 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         pufferl->train_cudagraph = at::cuda::CUDAGraph();
 
         auto* p = pufferl.get();
-        auto train_pool = at::cuda::graph_pool_handle();
+        pufferl->train_pool_id = at::cuda::graph_pool_handle();
         capture_graph(&pufferl->train_cudagraph, [p]() {
             train_forward_call(p->train_buf, p->policy_bf16, p->policy_fp32, p->muon,
                 p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
-        }, train_pool);
+        }, pufferl->train_pool_id);
 
         // Fused rollout cudagraphs: [horizon][num_buffers]
         // Each graph does input copy + forward + output copy in one shot
         // Use shared memory pool to reduce memory usage across graphs
-        auto rollout_pool = at::cuda::graph_pool_handle();
+        pufferl->rollout_pool_id = at::cuda::graph_pool_handle();
         pufferl->fused_rollout_cudagraphs.resize(horizon);
         for (int h = 0; h < horizon; ++h) {
             pufferl->fused_rollout_cudagraphs[h].resize(num_buffers);
@@ -650,10 +660,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
                 pufferl->fused_rollout_cudagraphs[h][b] = at::cuda::CUDAGraph();
                 capture_graph(&pufferl->fused_rollout_cudagraphs[h][b], [p, h, b]() {
                     fused_rollout_step(*p, h, b);
-                }, rollout_pool);
+                }, pufferl->rollout_pool_id);
             }
         }
-
     }
 
     // Create PyTorch-managed streams and replace vec->streams with their raw cudaStream_t
@@ -671,7 +680,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     }
     static_vec_reset(vec);
-    
+
     return pufferl;
 }
 
@@ -733,7 +742,6 @@ void rollouts_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
     }
 }
-
 
 void train_impl(PuffeRL& pufferl) {
     // Update to HypersT& p
@@ -860,8 +868,104 @@ void train_impl(PuffeRL& pufferl) {
     cudaStreamSynchronize(at::cuda::getCurrentCUDAStream());
 }
 
+void print_tensor_info(const char* name, const Tensor& t) {
+    if (t.defined() && t.numel() > 0) {
+        size_t bytes = t.numel() * t.element_size();
+        int64_t refcount = t.use_count();
+        printf("  %s: %.2f MB, refcount=%ld, device=%s\n",
+               name, bytes / 1e6, refcount,
+               t.device().str().c_str());
+    }
+}
+
 void close_impl(PuffeRL& pufferl) {
+    cudaDeviceSynchronize();
+    for (size_t i = 0; i < pufferl.buffer_states.size(); i++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "buffer_states[%zu]", i);
+    }
+    // Policy params total
+    size_t policy_bytes = 0;
+    for (const auto& p : pufferl.policy_fp32->parameters()) {
+        policy_bytes += p.numel() * p.element_size();
+    }
+    if (pufferl.hypers.bf16) {
+        size_t bf16_bytes = 0;
+        for (const auto& p : pufferl.policy_bf16->parameters()) {
+            bf16_bytes += p.numel() * p.element_size();
+        }
+    }
+
+    // Reset CUDA graphs first (they hold references to tensor memory)
+    pufferl.train_cudagraph.reset();
+    pufferl.fused_rollout_cudagraphs.clear();
+
+    // Clear optimizer buffers explicitly (policy params are views into weight_buffer)
+    pufferl.muon->weight_buffer = Tensor();
+    pufferl.muon->momentum_buffer = Tensor();
+    pufferl.muon->lr = Tensor();
+    // Clear the param_groups to release parameter references
+    pufferl.muon->param_groups().clear();
+    delete pufferl.muon;
+    pufferl.muon = nullptr;
+
+    // Delete policies - check if bf16 and fp32 are the same pointer
+    if (pufferl.hypers.bf16 && pufferl.policy_bf16 != pufferl.policy_fp32) {
+        delete pufferl.policy_bf16;
+    }
+    delete pufferl.policy_fp32;
+    pufferl.policy_bf16 = nullptr;
+    pufferl.policy_fp32 = nullptr;
+
+    // Clear buffer states (releases CUDA tensors)
+    pufferl.buffer_states.clear();
+
+    // Clear rollout buffers (releases CUDA tensors)
+    pufferl.rollouts.observations = Tensor();
+    pufferl.rollouts.actions = Tensor();
+    pufferl.rollouts.values = Tensor();
+    pufferl.rollouts.logprobs = Tensor();
+    pufferl.rollouts.rewards = Tensor();
+    pufferl.rollouts.terminals = Tensor();
+    pufferl.rollouts.ratio = Tensor();
+    pufferl.rollouts.importance = Tensor();
+
+    // Clear train buffers (releases CUDA tensors)
+    pufferl.train_buf.mb_obs = Tensor();
+    pufferl.train_buf.mb_state = Tensor();
+    pufferl.train_buf.mb_actions = Tensor();
+    pufferl.train_buf.mb_logprobs = Tensor();
+    pufferl.train_buf.mb_advantages = Tensor();
+    pufferl.train_buf.mb_prio = Tensor();
+    pufferl.train_buf.mb_values = Tensor();
+    pufferl.train_buf.mb_returns = Tensor();
+    pufferl.train_buf.mb_ratio = Tensor();
+    pufferl.train_buf.mb_newvalue = Tensor();
+
+    // Clear misc tensors
+    pufferl.adv_mean = Tensor();
+    pufferl.adv_std = Tensor();
+    pufferl.act_sizes = Tensor();
+    pufferl.act_sizes_cpu = Tensor();
+    pufferl.rng_offset = Tensor();
+
+    // Clear env tensors (from_blob wrappers - don't own memory but hold refs)
+    pufferl.env.obs = Tensor();
+    pufferl.env.actions = Tensor();
+    pufferl.env.rewards = Tensor();
+    pufferl.env.terminals = Tensor();
+
+    // Clear torch streams
+    pufferl.torch_streams.clear();
+
+    // Close environment vectorization (frees env GPU buffers)
     static_vec_close(pufferl.vec);
+    pufferl.vec = nullptr;
+
+    // Force CUDA to release cached memory first
+    c10::cuda::CUDACachingAllocator::emptyCache();
+    cudaDeviceSynchronize();
+
 }
 
 // Profiler control for nsys --capture-range=cudaProfilerApi

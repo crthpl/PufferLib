@@ -304,6 +304,11 @@ void static_vec_close(StaticVec* vec) {
     free(vec->buffer_env_starts);
     free(vec->buffer_env_counts);
 
+    cudaDeviceSynchronize();
+    size_t obs_bytes = vec->total_agents * OBS_SIZE * obs_element_size();
+    size_t act_bytes = vec->total_agents * NUM_ATNS * sizeof(double);
+    size_t rew_bytes = vec->total_agents * sizeof(float);
+    size_t term_bytes = vec->total_agents * sizeof(float);
     cudaFree(vec->gpu_observations);
     cudaFree(vec->gpu_actions);
     cudaFree(vec->gpu_rewards);

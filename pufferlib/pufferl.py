@@ -88,14 +88,7 @@ class PuffeRL:
         if logger is None:
             self.logger = Logger(config)
 
-        try: 
-            self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
-        except:
-            print(config)
-            print(vec_config)
-            print(env_config)
-            print(policy_config)
-            raise
+        self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
         self.rollouts = self.pufferl_cpp.rollouts
 
         # Initializations
@@ -190,10 +183,26 @@ class PuffeRL:
         return logs
 
     def close(self):
-        _C.close(self.pufferl_cpp)
         self.utilization.stop()
-        return
         model_path = self.save_checkpoint()
+        # Clear Python references to C++ tensors BEFORE calling C++ close
+        self.rollouts = None
+        self.policy_fp32 = None
+        self.observations = None
+        self.actions = None
+        self.rewards = None
+        self.terminals = None
+
+        torch.cuda.synchronize()
+        _C.close(self.pufferl_cpp)
+        self.pufferl_cpp = None
+
+        # Clear cuBLAS workspaces that accumulate per-stream
+        # This is the only way to check for memleaks. May not
+        # be strictly necessary for normal training.
+        torch.cuda.empty_cache()
+        torch._C._cuda_clearCublasWorkspaces()
+
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
             self.config["env"], f'{run_id}.pt')
@@ -215,6 +224,8 @@ class PuffeRL:
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
+
+        torch.save(dict(self.policy_fp32.named_parameters()), model_path)
 
         state = {
             #'optimizer_state_dict': self.optimizer.state_dict(),
@@ -554,9 +565,11 @@ class WandbLogger:
     def init(self, args):
         pass
         
-
     def log(self, logs, step):
         self.wandb.log(logs, step=step)
+
+    def log_cost(self, cost):
+        pass
 
     def upload_model(self, model_path):
         artifact = self.wandb.Artifact(self.run_id, type='model')
@@ -690,6 +703,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
                 if train_config['profile']:
                     _C.profiler_stop()
                 model_path = pufferl.close()
+                pufferl.logger.log_cost(uptime)
                 pufferl.logger.close(model_path)
                 return all_logs
 
@@ -704,13 +718,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     logs = {}
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
         pufferl.evaluate()
-        if i == 0 or i % 32 != 0:
-            continue
+        #if i == 0 or i % 32 != 0:
+        #    continue
 
-        torch.cuda.synchronize()
-        logs = _C.log_environments(pufferl.pufferl_cpp)
-        if logs:
-            break
+    # TODO: Some envs like pong need more eval (this out of loop)
+    torch.cuda.synchronize()
+    logs = _C.log_environments(pufferl.pufferl_cpp)
+    #if logs:
+    #    break
 
     logs = pufferl.write_logs(logs)
     logs['uptime'] = uptime
@@ -720,7 +735,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
-    #pufferl.logger.log_cost(uptime)
+    pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path)
     return all_logs
 
@@ -1224,6 +1239,7 @@ def main():
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
     if mode == 'train':
+        train(env_name=env_name)
         train(env_name=env_name)
     elif mode == 'eval':
         eval(env_name=env_name)
