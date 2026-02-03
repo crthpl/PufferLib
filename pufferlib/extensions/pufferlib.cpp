@@ -340,7 +340,8 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
 }
 
 void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32,
-        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std, Tensor& act_sizes_cpu, bool kernels) {
+        torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std,
+        Tensor& act_sizes_cpu, Tensor& act_sizes, bool kernels) {
     auto [logits, newvalue] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
 
     Tensor loss;
@@ -359,6 +360,7 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
             mb_adv_var,  // variance, not std - kernel does sqrtf to avoid second kernel launch here
             graph.mb_ratio,
             graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)}),
+            act_sizes,  // CUDA int32 tensor for MultiDiscrete support
             hypers.clip_coef,
             hypers.vf_clip_coef,
             hypers.vf_coef,
@@ -646,7 +648,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         pufferl->train_pool_id = at::cuda::graph_pool_handle();
         capture_graph(&pufferl->train_cudagraph, [p]() {
             train_forward_call(p->train_buf, p->policy_bf16, p->policy_fp32, p->muon,
-                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->hypers.kernels);
+                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->act_sizes, p->hypers.kernels);
         }, pufferl->train_pool_id);
 
         // Fused rollout cudagraphs: [horizon][num_buffers]
@@ -845,7 +847,7 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_cudagraph.replay();
         } else {
             train_forward_call(graph, pufferl.policy_bf16, pufferl.policy_fp32, pufferl.muon,
-                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, hypers.kernels);
+                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, pufferl.act_sizes, hypers.kernels);
         }
         profile_end(hypers.profile);
 

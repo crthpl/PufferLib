@@ -1240,7 +1240,6 @@ def main():
     env_name = sys.argv.pop(1)
     if mode == 'train':
         train(env_name=env_name)
-        train(env_name=env_name)
     elif mode == 'eval':
         eval(env_name=env_name)
     elif mode == 'sweep':
