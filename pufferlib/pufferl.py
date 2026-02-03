@@ -718,14 +718,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     logs = {}
     for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
         pufferl.evaluate()
-        #if i == 0 or i % 32 != 0:
-        #    continue
+        if i == 0 or i % 32 != 0:
+            continue
 
-    # TODO: Some envs like pong need more eval (this out of loop)
-    torch.cuda.synchronize()
-    logs = _C.log_environments(pufferl.pufferl_cpp)
-    #if logs:
-    #    break
+        torch.cuda.synchronize()
+        logs = _C.log_environments(pufferl.pufferl_cpp)
+        pufferl.stats = logs
+
+        if logs:
+            break
 
     logs = pufferl.write_logs(logs)
     logs['uptime'] = uptime
