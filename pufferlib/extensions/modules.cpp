@@ -964,9 +964,9 @@ class PPOFusedLossOptimizedFunction : public torch::autograd::Function<PPOFusedL
 public:
     static torch::autograd::tensor_list forward(
         torch::autograd::AutogradContext* ctx,
-        torch::Tensor logits,           // (N, T, A)
+        torch::Tensor logits,           // (N, T, A_total) where A_total = sum(act_sizes)
         torch::Tensor values_pred,      // (N, T, 1) or (N, T)
-        torch::Tensor actions,          // (N, T)
+        torch::Tensor actions,          // (N, T, num_atns) for MultiDiscrete
         torch::Tensor old_logprobs,     // (N, T)
         torch::Tensor advantages,       // (N, T)
         torch::Tensor prio,             // (N, 1) — importance weights
@@ -976,12 +976,15 @@ public:
         torch::Tensor adv_var,          // (1) - variance, kernel computes sqrt
         torch::Tensor ratio_out,        // (N, T) - output for ratio
         torch::Tensor newvalue_out,     // (N, T) - output for newvalue
+        torch::Tensor act_sizes,        // (num_atns,) int32 CUDA tensor - size of each action head
         double clip_coef,
         double vf_clip_coef,
         double vf_coef,
         double ent_coef
     ) {
         TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
+        TORCH_CHECK(act_sizes.is_cuda(), "act_sizes must be on CUDA");
+        TORCH_CHECK(act_sizes.dtype() == torch::kInt32, "act_sizes must be int32");
         auto dtype = logits.dtype();
         TORCH_CHECK(dtype == torch::kFloat32 || dtype == torch::kBFloat16,
                     "Only float32 and bfloat16 supported");
@@ -989,7 +992,11 @@ public:
         auto device = logits.device();
         auto N = logits.size(0);
         auto T = logits.size(1);
-        auto A = logits.size(2);
+        auto A_total = logits.size(2);
+        auto num_atns = act_sizes.size(0);
+
+        // Reshape actions from (N, T, num_atns) to (N*T, num_atns) for kernel
+        auto actions_flat = actions.reshape({N * T, num_atns}).contiguous();
 
         auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
@@ -1016,7 +1023,7 @@ public:
                 newvalue_out.data_ptr<float>(),
                 logits.data_ptr<float>(),
                 values_pred.data_ptr<float>(),
-                actions.data_ptr<int64_t>(),
+                actions_flat.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<float>(),
                 advantages.data_ptr<float>(),
                 prio.data_ptr<float>(),
@@ -1024,11 +1031,13 @@ public:
                 returns.data_ptr<float>(),
                 adv_mean.data_ptr<float>(),
                 adv_var.data_ptr<float>(),
+                act_sizes.data_ptr<int>(),
+                static_cast<int>(num_atns),
                 static_cast<float>(clip_coef),
                 static_cast<float>(vf_clip_coef),
                 static_cast<float>(vf_coef),
                 static_cast<float>(ent_coef),
-                T, A, N,
+                T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
                 stream
@@ -1041,7 +1050,7 @@ public:
                 newvalue_out.data_ptr<at::BFloat16>(),
                 logits.data_ptr<at::BFloat16>(),
                 values_pred.data_ptr<at::BFloat16>(),
-                actions.data_ptr<int64_t>(),
+                actions_flat.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
                 advantages.data_ptr<float>(), // keep in fp32 for precision and training stability
                 prio.data_ptr<at::BFloat16>(),
@@ -1049,11 +1058,13 @@ public:
                 returns.data_ptr<at::BFloat16>(),
                 adv_mean.data_ptr<float>(), // fp32 training and precision
                 adv_var.data_ptr<float>(),  // fp32 training and precision
+                act_sizes.data_ptr<int>(),
+                static_cast<int>(num_atns),
                 static_cast<float>(clip_coef),
                 static_cast<float>(vf_clip_coef),
                 static_cast<float>(vf_coef),
                 static_cast<float>(ent_coef),
-                T, A, N,
+                T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
                 stream
@@ -1065,8 +1076,9 @@ public:
         ctx->saved_data["vf_coef"] = vf_coef;
         ctx->saved_data["ent_coef"] = ent_coef;
 
-        ctx->save_for_backward({logits, values_pred, actions, old_logprobs, advantages,
-                                prio, values, returns, adv_mean, adv_var});
+        // Save act_sizes and flattened actions for backward
+        ctx->save_for_backward({logits, values_pred, actions_flat, old_logprobs, advantages,
+                                prio, values, returns, adv_mean, adv_var, act_sizes});
 
         return {loss_output};
     }
@@ -1077,7 +1089,7 @@ public:
         auto saved = ctx->get_saved_variables();
         auto logits = saved[0].contiguous();
         auto values_pred = saved[1].contiguous();
-        auto actions = saved[2].contiguous();
+        auto actions_flat = saved[2].contiguous();  // already (N*T, num_atns) from forward
         auto old_logprobs = saved[3].contiguous();
         auto advantages = saved[4].contiguous();
         auto prio = saved[5].contiguous();
@@ -1085,11 +1097,13 @@ public:
         auto returns = saved[7].contiguous();
         auto adv_mean = saved[8].contiguous();
         auto adv_var = saved[9].contiguous();
+        auto act_sizes = saved[10];  // already on CUDA and contiguous
 
         auto dtype = logits.dtype();
         auto N = logits.size(0);
         auto T = logits.size(1);
-        auto A = logits.size(2);
+        auto A_total = logits.size(2);
+        auto num_atns = act_sizes.size(0);
 
         float clip_coef = ctx->saved_data["clip_coef"].to<double>();
         float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
@@ -1119,7 +1133,7 @@ public:
                 grad_loss.data_ptr<float>(),
                 logits.data_ptr<float>(),
                 values_pred.data_ptr<float>(),
-                actions.data_ptr<int64_t>(),
+                actions_flat.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<float>(),
                 advantages.data_ptr<float>(),
                 prio.data_ptr<float>(),
@@ -1127,9 +1141,11 @@ public:
                 returns.data_ptr<float>(),
                 adv_mean.data_ptr<float>(),
                 adv_var.data_ptr<float>(),
+                act_sizes.data_ptr<int>(),
+                static_cast<int>(num_atns),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
-                T, A, N,
+                T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
                 stream
@@ -1141,7 +1157,7 @@ public:
                 grad_loss.data_ptr<float>(),
                 logits.data_ptr<at::BFloat16>(),
                 values_pred.data_ptr<at::BFloat16>(),
-                actions.data_ptr<int64_t>(),
+                actions_flat.data_ptr<int64_t>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
                 advantages.data_ptr<float>(), // keep in fp32
                 prio.data_ptr<at::BFloat16>(),
@@ -1149,9 +1165,11 @@ public:
                 returns.data_ptr<at::BFloat16>(),
                 adv_mean.data_ptr<float>(),
                 adv_var.data_ptr<float>(),
+                act_sizes.data_ptr<int>(),
+                static_cast<int>(num_atns),
                 clip_coef, vf_clip_coef,
                 vf_coef, ent_coef,
-                T, A, N,
+                T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
                 stream
@@ -1164,6 +1182,7 @@ public:
             {}, {}, {}, {}, {}, {},  // actions, old_logprobs, advantages, prio, values, returns
             {}, {},                   // adv_mean, adv_std
             {}, {},                   // ratio_out, newvalue_out (no grad needed)
+            {},                       // act_sizes (no grad needed)
             {}, {}, {}, {}           // clip_coef, vf_clip_coef, vf_coef, ent_coef
         };
     }
@@ -1182,6 +1201,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     torch::Tensor adv_var,  // variance, kernel does sqrt
     torch::Tensor ratio_out,
     torch::Tensor newvalue_out,
+    torch::Tensor act_sizes,  // (num_atns,) int32 CUDA tensor - size of each action head
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -1189,7 +1209,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
 ) {
     return PPOFusedLossOptimizedFunction::apply(logits, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, adv_mean,
-        adv_var, ratio_out, newvalue_out, clip_coef, vf_clip_coef, vf_coef, ent_coef);
+        adv_var, ratio_out, newvalue_out, act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
 // Reference implementation for mingru_gate (inference path)

@@ -1464,6 +1464,10 @@ void launch_logcumsumexp_backward(
         fprintf(stderr, "Backward kernel error: %s\n", cudaGetErrorString(err));
 }
 
+// Maximum number of action heads supported for MultiDiscrete
+// Using register arrays to avoid dynamic allocation
+#define MAX_ATN_HEADS 16
+
 template<typename T>
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
@@ -1480,12 +1484,14 @@ __global__ void ppo_loss_forward_kernel_optimized(
     const T* __restrict__ returns,
     const float* __restrict__ adv_mean,
     const float* __restrict__ adv_var,
+    const int* __restrict__ act_sizes,  // NEW: array of action head sizes
+    int num_atns,                        // NEW: number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A,
+    int A_total,                         // renamed: sum of all action sizes
     int N,
     int logits_stride_n,
     int logits_stride_t,
@@ -1505,39 +1511,61 @@ __global__ void ppo_loss_forward_kernel_optimized(
 
     int logits_base = n * logits_stride_n + t * logits_stride_t;
     int values_idx = n * values_stride_n + t * values_stride_t;
-    int act = actions[nt];
 
-    float max_logit = -INFINITY;
-    float sum = 0.0f;
-    float act_logit = 0.0f;
+    // Loop over action heads for MultiDiscrete support
+    int logits_offset = 0;
+    float total_log_prob = 0.0f;
+    float total_entropy = 0.0f;
 
-    for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_base + a * logits_stride_a]);
+    for (int h = 0; h < num_atns; ++h) {
+        int A = act_sizes[h];  // size of this action head
+        int act = static_cast<int>(actions[nt * num_atns + h]);  // action for this head
 
-        // cache the action's logit
-        if (a == act) {
-            act_logit = l;
+        // Find max for numerical stability and cache action's logit
+        float max_logit = -INFINITY;
+        float sum = 0.0f;
+        float act_logit = 0.0f;
+
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+
+            if (a == act) {
+                act_logit = l;
+            }
+
+            if (l > max_logit) {
+                sum *= __expf(max_logit - l);
+                max_logit = l;
+            }
+            sum += __expf(l - max_logit);
         }
 
-        // rescale
-        if (l > max_logit) {
-            sum *= __expf(max_logit - l);
-            max_logit = l;
+        float logsumexp = max_logit + __logf(sum);
+
+        // Compute entropy for this head
+        float head_entropy = 0.0f;
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+            float logp = l - logsumexp;
+            float p = __expf(logp);
+            head_entropy -= p * logp;
         }
-        sum += __expf(l - max_logit);
+
+        // Log prob for this head
+        float head_logp = act_logit - logsumexp;
+
+        // Accumulate across heads
+        total_log_prob += head_logp;
+        total_entropy += head_entropy;
+
+        // Advance to next action head
+        logits_offset += A;
     }
 
-    float logsumexp = max_logit + __logf(sum);
+    // Use accumulated values for the rest of computation
+    float new_logp = total_log_prob;
+    float entropy = total_entropy;
 
-    float entropy = 0.0f;
-    for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_base + a * logits_stride_a]);
-        float logp = l - logsumexp;
-        float p = __expf(logp);
-        entropy -= p * logp;
-    }
-
-    float new_logp = act_logit - logsumexp;
     float old_logp = float(old_logprobs[nt]);
     float adv = float(advantages[nt]);
     float w = float(prio[n]);
@@ -1601,12 +1629,14 @@ __global__ void ppo_loss_backward_kernel_optimized(
     const T* __restrict__ returns,
     const float* __restrict__ adv_mean,
     const float* __restrict__ adv_var,
+    const int* __restrict__ act_sizes,  // NEW: array of action head sizes
+    int num_atns,                        // NEW: number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A,
+    int A_total,                         // renamed: sum of all action sizes
     int N,
     int logits_stride_n,
     int logits_stride_t,
@@ -1625,7 +1655,6 @@ __global__ void ppo_loss_backward_kernel_optimized(
 
     int logits_base = n * logits_stride_n + t * logits_stride_t;
     int values_idx = n * values_stride_n + t * values_stride_t;
-    int act = actions[nt];
 
     float old_logp = float(old_logprobs[nt]);
     float adv = float(advantages[nt]);
@@ -1634,46 +1663,70 @@ __global__ void ppo_loss_backward_kernel_optimized(
     float ret = float(returns[nt]);
     float val_pred = float(values_pred[values_idx]);
 
-    float max_logit = -INFINITY;
-    float sum = 0.0f;
-    float act_logit = 0.0f;
+    // First pass: compute per-head logsumexp and entropy, accumulate total log prob
+    // Store per-head values for gradient computation (use register arrays)
+    float head_logsumexp[MAX_ATN_HEADS];
+    float head_entropy[MAX_ATN_HEADS];
+    int head_act[MAX_ATN_HEADS];
 
-    for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_base + a * logits_stride_a]);
-        if (a == act) act_logit = l;
+    int logits_offset = 0;
+    float total_log_prob = 0.0f;
 
-        if (l > max_logit) {
-            sum *= __expf(max_logit - l);
-            max_logit = l;
+    for (int h = 0; h < num_atns; ++h) {
+        int A = act_sizes[h];
+        int act = static_cast<int>(actions[nt * num_atns + h]);
+        head_act[h] = act;
+
+        // Compute logsumexp for this head
+        float max_logit = -INFINITY;
+        float sum = 0.0f;
+        float act_logit = 0.0f;
+
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+            if (a == act) act_logit = l;
+
+            if (l > max_logit) {
+                sum *= __expf(max_logit - l);
+                max_logit = l;
+            }
+            sum += __expf(l - max_logit);
         }
-        sum += __expf(l - max_logit);
-    }
-    float logsumexp = max_logit + __logf(sum);
+        float logsumexp = max_logit + __logf(sum);
+        head_logsumexp[h] = logsumexp;
 
-    float entropy = 0.0f;
-    for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_base + a * logits_stride_a]);
-        float logp = l - logsumexp;
-        float p = __expf(logp);
-        entropy -= p * logp;
+        // Compute entropy for this head
+        float ent = 0.0f;
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+            float logp = l - logsumexp;
+            float p = __expf(logp);
+            ent -= p * logp;
+        }
+        head_entropy[h] = ent;
+
+        // Accumulate total log prob
+        total_log_prob += act_logit - logsumexp;
+
+        logits_offset += A;
     }
 
-    // recompute values that were saved in forward
-    float new_logp = act_logit - logsumexp;
+    // Compute ratio and policy gradient
+    float new_logp = total_log_prob;
     float ratio = __expf(new_logp - old_logp);
     float v_error = val_pred - val;
     float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
 
-    // normalize advantage
+    // Normalize advantage
     float adv_std = sqrtf(float(adv_var[0]));
     float adv_normalized = (adv - float(adv_mean[0])) / (adv_std + 1e-8f);
 
-    // loss gradient scaling
+    // Loss gradient scaling
     float dL = grad_loss[0] * inv_NT;
     float d_pg_loss = dL;
     float d_entropy_term = dL * (-ent_coef);
 
-    // gradient wrt value function prediction
+    // Gradient wrt value function prediction
     float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
     float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
     bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
@@ -1688,7 +1741,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
     }
     grad_values_pred[values_idx] = dL * vf_coef * d_val_pred;
 
-    // policy loss gradient
+    // Policy loss gradient
     float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
     float pg_loss1 = -w * adv_normalized * ratio;
     float pg_loss2 = -w * adv_normalized * ratio_clipped;
@@ -1699,18 +1752,34 @@ __global__ void ppo_loss_backward_kernel_optimized(
             d_ratio = 0.0f;
         }
     }
+    // d_new_logp flows to each head's log prob equally since total = sum of head log probs
     float d_new_logp = d_ratio * ratio;
 
-    for (int a = 0; a < A; a++) {
-        float l = float(logits[logits_base + a * logits_stride_a]);
-        float logp = l - logsumexp;
-        float p = __expf(logp);
+    // Second pass: compute gradients per head
+    logits_offset = 0;
+    for (int h = 0; h < num_atns; ++h) {
+        int A = act_sizes[h];
+        int act = head_act[h];
+        float logsumexp = head_logsumexp[h];
+        float ent = head_entropy[h];
 
-        float d_logit = (a == act) ? d_new_logp : 0.0f;
-        d_logit -= p * d_new_logp;
+        for (int a = 0; a < A; ++a) {
+            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+            float logp = l - logsumexp;
+            float p = __expf(logp);
 
-        d_logit += d_entropy_term * p * (-entropy - logp);
-        grad_logits[logits_base + a * logits_stride_a] = d_logit;
+            // Policy gradient: d/dlogits[a] of head_logp = delta(a,act) - p
+            float d_logit = (a == act) ? d_new_logp : 0.0f;
+            d_logit -= p * d_new_logp;
+
+            // Entropy gradient: d/dlogits[a] of head_entropy = p * (-entropy - logp)
+            // Each head's entropy contributes independently to total entropy
+            d_logit += d_entropy_term * p * (-ent - logp);
+
+            grad_logits[logits_base + (logits_offset + a) * logits_stride_a] = d_logit;
+        }
+
+        logits_offset += A;
     }
 }
 
@@ -1730,12 +1799,14 @@ inline void launch_ppo_loss_forward_optimized(
     const T* returns,
     const float* adv_mean, // keep fp32
     const float* adv_var, // keep fp32
+    const int* act_sizes,  // NEW: array of action head sizes
+    int num_atns,          // NEW: number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A,
+    int A_total,           // renamed from A
     int N,
     int logits_stride_n,
     int logits_stride_t,
@@ -1746,7 +1817,7 @@ inline void launch_ppo_loss_forward_optimized(
 ) {
     int total = N * T_seq;
     int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    cudaMemsetAsync(loss_output, 0, sizeof(T), stream);
+    cudaMemsetAsync(loss_output, 0, sizeof(float), stream);
     ppo_loss_forward_kernel_optimized<T><<<grid, PPO_THREADS, 0, stream>>>(
         loss_output,
         saved_for_backward,
@@ -1762,12 +1833,14 @@ inline void launch_ppo_loss_forward_optimized(
         returns,
         adv_mean,
         adv_var,
+        act_sizes,
+        num_atns,
         clip_coef,
         vf_clip_coef,
         vf_coef,
         ent_coef,
         T_seq,
-        A,
+        A_total,
         N,
         logits_stride_n,
         logits_stride_t,
@@ -1797,12 +1870,14 @@ void launch_ppo_loss_backward_optimized(
     const T* returns,
     const float* adv_mean,
     const float* adv_var,
+    const int* act_sizes,    // NEW: array of action head sizes
+    int num_atns,            // NEW: number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A,
+    int A_total,             // renamed from A
     int N,
     int logits_stride_n,
     int logits_stride_t,
@@ -1828,12 +1903,14 @@ void launch_ppo_loss_backward_optimized(
         returns,
         adv_mean,
         adv_var,
+        act_sizes,
+        num_atns,
         clip_coef,
         vf_clip_coef,
         vf_coef,
         ent_coef,
         T_seq,
-        A,
+        A_total,
         N,
         logits_stride_n,
         logits_stride_t,
@@ -2923,18 +3000,18 @@ void launch_fc_relu_fc_max_backward_bf16(at::BFloat16* grad_x, at::BFloat16* gra
     launch_fc_relu_fc_max_backward<at::BFloat16>(grad_x, grad_W1, grad_b1, grad_W2, grad_b2, grad_out, x, W1, W2, argmax_indices, fc1_at_argmax, B, N, D_in, D_mid, D_out, stream);
 }
 
-void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
-void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
 
-void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
-void launch_ppo_loss_backward_optimized_bf16(float* grad_logits, float* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_backward_optimized_bf16(float* grad_logits, float* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
 }
 
 #endif // PUFFERLIB_KERNELS_CU
