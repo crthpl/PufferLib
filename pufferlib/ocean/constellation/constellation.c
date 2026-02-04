@@ -651,8 +651,8 @@ void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
             py = screen_pos.y;
         } else {
             // TODO: Check margins
-            px = args.left_margin + (xi - x_min) / dx * (args.width - args.left_margin);
-            py = args.height - args.bottom_margin - (yi - y_min) / dy * (args.height - args.bottom_margin);
+            px = args.left_margin + (xi - x_min) / dx * (args.width - args.left_margin - args.right_margin);
+            py = args.height - args.bottom_margin - (yi - y_min) / dy * (args.height - args.top_margin - args.bottom_margin);
         }
 
         float cmap = points[i].c;
