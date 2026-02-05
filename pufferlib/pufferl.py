@@ -520,38 +520,11 @@ def downsample(data_list, num_points):
     return downsampled.tolist() + [last]
 
 class Logger:
-    def __init__(self, args):
+    def __init__(self, args, load_id=None, resume='allow'):
+        train_args = args['train']
+
         self.run_id = str(int(1000*time.time()))
-        root = os.path.join(args['data_dir'], 'logs', args['env'])
-        if not os.path.exists(root):
-            os.makedirs(root)
-
-        self.path = os.path.join(root, self.run_id + '.json')
-        self.logs = {'data': []}
-        for k, v in pufferlib.unroll_nested_dict(args):
-            self.logs[k] = v
-
-    # Temp hack to log full config
-    def init(self, args):
-        for k, v in pufferlib.unroll_nested_dict(args):
-            self.logs[k] = v
-
-    def log(self, logs, step):
-        self.logs['data'].append(logs)
-
-    def log_cost(self, cost):
-        self.logs['cost'] = cost
-
-    def close(self, model_path, early_stop):
-        self.logs['early_stop'] = early_stop
-        import json
-        with open(self.path, 'w') as f:
-            json.dump(self.logs, f)
-
-class WandbLogger:
-    def __init__(self, args, train_args, load_id=None, resume='allow'):
-        self.run_id = str(int(1000*time.time()))
-        root = os.path.join(train_args['data_dir'], 'logs', train_args['env'])
+        root = os.path.join(train_args['data_dir'], 'logs', args['env_name'])
         if not os.path.exists(root):
             os.makedirs(root)
 
@@ -560,35 +533,38 @@ class WandbLogger:
         for k, v in pufferlib.unroll_nested_dict(train_args):
             self.logs[k] = v
 
+        self.wandb = None
+        if args['wandb']:
+            import wandb
+            wandb.init(
+                id=load_id or wandb.util.generate_id(),
+                project=args['wandb_project'],
+                group=args['wandb_group'],
+                allow_val_change=True,
+                save_code=False,
+                resume=resume,
+                config=args,
+                tags = [args['tag']] if args['tag'] is not None else [],
+                settings=wandb.Settings(console="off"),  # stop sending dashboard to wandb
+            )
+            self.wandb = wandb
+            self.run_id = wandb.run.id
+            self.should_upload_model = not args['no_model_upload']
 
-        import wandb
-        wandb.init(
-            id=load_id or wandb.util.generate_id(),
-            project=args['wandb_project'],
-            group=args['wandb_group'],
-            allow_val_change=True,
-            save_code=False,
-            resume=resume,
-            config=args,
-            tags = [args['tag']] if args['tag'] is not None else [],
-            settings=wandb.Settings(console="off"),  # stop sending dashboard to wandb
-        )
-        self.wandb = wandb
-        self.run_id = wandb.run.id
-        self.should_upload_model = not args['no_model_upload']
-
-    def init(self, args):
-        for k, v in pufferlib.unroll_nested_dict(args):
-            self.logs[k] = v
-        
+       
     def log(self, logs, step):
         self.logs['data'].append(logs)
-        self.wandb.log(logs, step=step)
+
+        if self.wandb:
+            self.wandb.log(logs, step=step)
 
     def log_cost(self, cost):
         self.logs['cost'] = cost
 
     def upload_model(self, model_path):
+        if not self.wandb:
+            return
+
         artifact = self.wandb.Artifact(self.run_id, type='model')
         artifact.add_file(model_path)
         self.wandb.run.log_artifact(artifact)
@@ -599,12 +575,15 @@ class WandbLogger:
         with open(self.path, 'w') as f:
             json.dump(self.logs, f)
 
-        #if self.should_upload_model:
-        #    self.upload_model(model_path)
+        if not self.wandb:
+            return
+        if self.should_upload_model:
+            self.upload_model(model_path)
         self.wandb.run.summary['early_stop'] = early_stop
         self.wandb.finish()
 
     def download(self):
+        assert self.wandb, 'No wandb run'
         artifact = self.wandb.use_artifact(f'{self.run_id}:latest')
         data_dir = artifact.download()
         model_file = max(os.listdir(data_dir))
@@ -699,14 +678,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
 
-    if args['wandb']:
-        logger = WandbLogger(args, train_config)
+    logger = Logger(args)
 
     vec_config = args['vec']
     env_config = args['env']
     policy_config = args['policy']
     pufferl = PuffeRL(train_config, vec_config, env_config, policy_config, logger, verbose)
-    pufferl.logger.init(args)
 
     if train_config['profile']:
         _C.profiler_start()
