@@ -187,6 +187,7 @@ def compute_tsne():
             data[env]['tsne2'] = np.random.rand(sz).tolist()
 
         row += sz
+        print(f'Env {env} has {sz} points')
 
     json.dump(data, open('all_cache.json', 'w'))
 

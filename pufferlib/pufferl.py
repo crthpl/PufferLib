@@ -80,8 +80,11 @@ class PuffeRL:
                 f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}')
 
         if (minibatch_size > batch_size):
-            raise pufferlib.APIUsageError(f'minibatch_size {minibatch_size} must be <= '
-                f'horizon {horizon} * total_agents {total_agents} ({batch_size})')
+            minibatch_size = batch_size
+            print(f'WARNING: minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}. Reducing it for you.')
+
+            #raise pufferlib.APIUsageError(f'minibatch_size {minibatch_size} must be <= '
+            #    f'horizon {horizon} * total_agents {total_agents} ({batch_size})')
 
         # Logging
         self.logger = logger
@@ -139,7 +142,7 @@ class PuffeRL:
             torch.cuda.synchronize()
             logs = _C.log_environments(self.pufferl_cpp)
             self.stats = logs
-            self.write_logs(logs)
+            logs = self.write_logs(logs)
 
             #self.losses = losses
             self.print_dashboard()
@@ -161,7 +164,7 @@ class PuffeRL:
         logs = {
             'SPS': dist_sum(self.sps, device),
             'agent_steps': agent_steps,
-            'uptime': time.time() - self.start_time,
+            'uptime': self.uptime,
             'epoch': int(dist_sum(self.epoch, device)),
             #'learning_rate': self.optimizer.param_groups[0]["lr"],
             **{f'environment/{k}': v for k, v in logs.items()},
@@ -539,13 +542,25 @@ class Logger:
     def log_cost(self, cost):
         self.logs['cost'] = cost
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.logs['early_stop'] = early_stop
         import json
         with open(self.path, 'w') as f:
             json.dump(self.logs, f)
 
 class WandbLogger:
-    def __init__(self, args, load_id=None, resume='allow'):
+    def __init__(self, args, train_args, load_id=None, resume='allow'):
+        self.run_id = str(int(1000*time.time()))
+        root = os.path.join(train_args['data_dir'], 'logs', train_args['env'])
+        if not os.path.exists(root):
+            os.makedirs(root)
+
+        self.path = os.path.join(root, self.run_id + '.json')
+        self.logs = {'data': []}
+        for k, v in pufferlib.unroll_nested_dict(train_args):
+            self.logs[k] = v
+
+
         import wandb
         wandb.init(
             id=load_id or wandb.util.generate_id(),
@@ -563,22 +578,30 @@ class WandbLogger:
         self.should_upload_model = not args['no_model_upload']
 
     def init(self, args):
-        pass
+        for k, v in pufferlib.unroll_nested_dict(args):
+            self.logs[k] = v
         
     def log(self, logs, step):
+        self.logs['data'].append(logs)
         self.wandb.log(logs, step=step)
 
     def log_cost(self, cost):
-        pass
+        self.logs['cost'] = cost
 
     def upload_model(self, model_path):
         artifact = self.wandb.Artifact(self.run_id, type='model')
         artifact.add_file(model_path)
         self.wandb.run.log_artifact(artifact)
 
-    def close(self, model_path):
+    def close(self, model_path, early_stop):
+        self.logs['early_stop'] = early_stop
+        import json
+        with open(self.path, 'w') as f:
+            json.dump(self.logs, f)
+
         #if self.should_upload_model:
         #    self.upload_model(model_path)
+        self.wandb.run.summary['early_stop'] = early_stop
         self.wandb.finish()
 
     def download(self):
@@ -642,7 +665,7 @@ def check(env_name):
 
     print('Check passed')
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
+def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, early_stop_fn=None):
     args = args or load_config(env_name)
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
@@ -673,11 +696,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         model.forward_eval = policy.forward_eval
         policy = model.to(local_rank)
 
-    elif args['wandb']:
-        logger = WandbLogger(args)
-
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
+
+    if args['wandb']:
+        logger = WandbLogger(args, train_config)
+
     vec_config = args['vec']
     env_config = args['env']
     policy_config = args['policy']
@@ -687,25 +711,35 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     if train_config['profile']:
         _C.profiler_start()
 
+    # Sweep needs data for early stopped runs, so send data when steps > 100M
+    logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
     all_logs = []
-    max_cost = args['sweep'].get('max_cost', -1)
+
     while pufferl.global_step < train_config['total_timesteps']:
-        if pufferl.uptime > max_cost and max_cost > 0:
-            break
         pufferl.evaluate()
         logs = pufferl.train()
 
-        if logs is not None:
-            if pufferl.global_step > 0.20*train_config['total_timesteps']:
-                all_logs.append(logs)
+        if logs is None:
+            continue
 
-            if should_stop_early is not None and should_stop_early(logs):
-                if train_config['profile']:
-                    _C.profiler_stop()
-                model_path = pufferl.close()
-                pufferl.logger.log_cost(uptime)
-                pufferl.logger.close(model_path)
-                return all_logs
+        should_stop_early = False
+        if early_stop_fn is not None:
+            should_stop_early = early_stop_fn(logs)
+
+            # This is hacky, but need to see if threshold looks reasonable
+            if 'early_stop_threshold' in logs:
+                pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
+
+        if pufferl.global_step > logging_threshold:
+            all_logs.append(logs)
+
+        if should_stop_early:
+            if train_config['profile']:
+                _C.profiler_stop()
+            model_path = pufferl.close()
+            pufferl.logger.log_cost(pufferl.uptime)
+            pufferl.logger.close(model_path, early_stop=True)
+            return all_logs
 
     if train_config['profile']:
         _C.profiler_stop()
@@ -728,16 +762,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
         if logs:
             break
 
-    logs = pufferl.write_logs(logs)
     logs['uptime'] = uptime
     logs['agent_steps'] = agent_steps
+    logs = pufferl.write_logs(logs)
+
     if logs is not None:
         all_logs.append(logs)
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.log_cost(uptime)
-    pufferl.logger.close(model_path)
+    pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
 def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
@@ -1022,6 +1057,31 @@ def sweep(args=None, env_name=None):
     sweep = sweep_cls(args['sweep'])
     points_per_run = args['sweep']['downsample']
     target_key = f'environment/{args["sweep"]["metric"]}'
+    running_target_buffer = deque(maxlen=30)
+
+    def stop_if_perf_below(logs):
+        if stop_if_loss_nan(logs):
+            logs['is_loss_nan'] = True
+            return True
+
+        if method != 'Protein':
+            return False
+
+        if ('uptime' in logs and target_key in logs):
+            metric_val, cost = logs[target_key], logs['uptime']
+            running_target_buffer.append(metric_val)
+            target_running_mean = np.mean(running_target_buffer)
+            
+            # If metric distribution is percentile, threshold is also logit transformed
+            threshold = sweep.get_early_stop_threshold(cost)
+            print(f'Threshold: {threshold} at cost {cost}')
+            logs['early_stop_threshold'] = max(threshold, -5)  # clipping for visualization
+
+            if sweep.should_stop(max(target_running_mean, metric_val), cost):
+                logs['is_loss_nan'] = False
+                return True
+        return False
+
     for i in range(args['max_runs']):
         seed = time.time_ns() & 0xFFFFFFFF
         random.seed(seed)
@@ -1032,7 +1092,7 @@ def sweep(args=None, env_name=None):
         if i > 0:
             sweep.suggest(args)
 
-        all_logs = train(env_name, args=args, should_stop_early=stop_if_loss_nan)
+        all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
         all_logs = [e for e in all_logs if target_key in e]
 
         if not all_logs:
@@ -1042,10 +1102,11 @@ def sweep(args=None, env_name=None):
         total_timesteps = args['train']['total_timesteps']
 
         scores = downsample([log[target_key] for log in all_logs], points_per_run)
-        costs = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+        costs = downsample([log['uptime'] for log in all_logs], points_per_run)
         timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
 
-        if len(timesteps) > 0 and timesteps[-1] < 0.7 * total_timesteps:  # 0.7 is arbitrary
+        is_final_loss_nan = all_logs[-1].get('is_loss_nan', False)
+        if is_final_loss_nan:
             s = scores.pop()
             c = costs.pop()
             args['train']['total_timesteps'] = timesteps.pop()
