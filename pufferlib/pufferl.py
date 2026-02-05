@@ -19,6 +19,8 @@ import importlib
 import configparser
 from threading import Thread
 from collections import defaultdict, deque
+import multiprocessing as mp
+from copy import deepcopy
 
 import numpy as np
 import psutil
@@ -88,9 +90,6 @@ class PuffeRL:
 
         # Logging
         self.logger = logger
-        if logger is None:
-            self.logger = Logger(config)
-
         self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
         self.rollouts = self.pufferl_cpp.rollouts
 
@@ -158,14 +157,17 @@ class PuffeRL:
         return logs
 
     def write_logs(self, logs):
+        if not self.logger:
+            return
+
         config = self.config
         device = config['device']
-        agent_steps = int(dist_sum(self.global_step, device))
+        agent_steps = int(self.global_step * config['gpus'])
         logs = {
-            'SPS': dist_sum(self.sps, device),
-            'agent_steps': agent_steps,
+            'SPS': int(self.sps * config['gpus']),
+            'agent_steps': int(agent_steps * config['gpus']),
             'uptime': self.uptime,
-            'epoch': int(dist_sum(self.epoch, device)),
+            'epoch': int(self.epoch * config['gpus']),
             #'learning_rate': self.optimizer.param_groups[0]["lr"],
             **{f'environment/{k}': v for k, v in logs.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
@@ -174,13 +176,6 @@ class PuffeRL:
             #**{f'losses/{k}': dist_mean(v, device) for k, v in self.losses.items()},
             #**{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
         }
-
-        if torch.distributed.is_initialized():
-           if torch.distributed.get_rank() == 0:
-               self.logger.log(logs, agent_steps)
-               return logs
-           else:
-               return None
 
         self.logger.log(logs, agent_steps)
         return logs
@@ -206,6 +201,9 @@ class PuffeRL:
         torch.cuda.empty_cache()
         torch._C._cuda_clearCublasWorkspaces()
 
+        if not self.logger:
+            return
+
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
             self.config["env"], f'{run_id}.pt')
@@ -213,10 +211,9 @@ class PuffeRL:
         return path
 
     def save_checkpoint(self):
-        if torch.distributed.is_initialized():
-           if torch.distributed.get_rank() != 0:
-               return
- 
+        if not self.logger:
+            return
+
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
             self.config["env"], run_id)
@@ -249,8 +246,8 @@ class PuffeRL:
             return
 
         config = self.config
-        sps = dist_sum(self.sps, config['device'])
-        agent_steps = dist_sum(self.global_step, config['device'])
+        sps = self.sps * config['gpus']
+        agent_steps = self.global_step * config['gpus']
         if torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
                return
@@ -280,7 +277,7 @@ class PuffeRL:
         s = Table(box=None, expand=True)
         remaining = f'{b2}A hair past a freckle{c2}'
         if sps != 0:
-            remaining = duration((config['total_timesteps'] - agent_steps)/sps, b2, c2)
+            remaining = duration((config['total_timesteps']*config['gpus'] - agent_steps)/sps, b2, c2)
 
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
@@ -399,20 +396,6 @@ def duration(seconds, b2, c2):
 def fmt_perf(name, color, delta_ref, prof, b2, c2):
     percent = 0 if delta_ref == 0 else int(100*prof['buffer']/delta_ref - 1e-5)
     return f'{color}{name}', duration(prof['elapsed'], b2, c2), f'{b2}{percent:2d}{c2}%'
-
-def dist_sum(value, device):
-    if not torch.distributed.is_initialized():
-        return value
-
-    tensor = torch.tensor(value, device=device)
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-    return tensor.item()
-
-def dist_mean(value, device):
-    if not torch.distributed.is_initialized():
-        return value
-
-    return dist_sum(value, device) / torch.distributed.get_world_size()
 
 class Profile:
     def __init__(self, frequency=30):
@@ -644,41 +627,16 @@ def check(env_name):
 
     print('Check passed')
 
-def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, early_stop_fn=None):
+def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
+    """Worker function for multi-GPU training. Runs on each GPU."""
+
+    if args:
+        torch.cuda.set_device(args['train']['rank'])
+
     args = args or load_config(env_name)
-
-    # Assume TorchRun DDP is used if LOCAL_RANK is set
-    if 'LOCAL_RANK' in os.environ:
-        world_size = int(os.environ.get('WORLD_SIZE', 1))
-        print("World size", world_size)
-        master_addr = os.environ.get('MASTER_ADDR', 'localhost')
-        master_port = os.environ.get('MASTER_PORT', '29500')
-        local_rank = int(os.environ["LOCAL_RANK"])
-        print(f"rank: {local_rank}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
-        torch.cuda.set_device(local_rank)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-
-    #vecenv = vecenv or load_env(env_name, args)
-    #policy = policy or load_policy(args, vecenv, env_name)
-
-    if 'LOCAL_RANK' in os.environ:
-        args['train']['device'] = torch.cuda.current_device()
-        torch.distributed.init_process_group(backend='nccl', world_size=world_size)
-        policy = policy.to(local_rank)
-        model = torch.nn.parallel.DistributedDataParallel(
-            policy, device_ids=[local_rank], output_device=local_rank
-        )
-        if hasattr(policy, 'lstm'):
-            #model.lstm = policy.lstm
-            model.hidden_size = policy.hidden_size
-
-        model.forward_eval = policy.forward_eval
-        policy = model.to(local_rank)
 
     train_config = dict(**args['train'])
     train_config['env_name'] = args['env_name']
-
-    logger = Logger(args)
 
     vec_config = args['vec']
     env_config = args['env']
@@ -721,6 +679,58 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     if train_config['profile']:
         _C.profiler_stop()
 
+    pufferl.print_dashboard()
+
+    if not logger:
+        model_path = pufferl.close()
+
+    return pufferl
+
+
+def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
+    args = load_config(env_name)
+    num_gpus = args['train']['gpus']
+
+    nccl_id_path = f'/tmp/puffer_nccl_{os.getpid()}'
+    if os.path.exists(nccl_id_path):
+        os.remove(nccl_id_path)
+
+    # Set shared config
+    args['train']['world_size'] = num_gpus
+    args['train']['nccl_id_path'] = nccl_id_path
+
+    args['train']['total_timesteps'] /= num_gpus
+    args['train']['minibatch_size'] /= num_gpus
+    args['vec']['total_agents'] /= num_gpus
+    args['vec']['num_threads'] /= num_gpus
+
+    # Spawn workers for ranks 1..N-1
+    ctx = mp.get_context('spawn')
+    procs = []
+    for rank in range(1, num_gpus):
+        worker_args = deepcopy(args)
+        worker_args['train']['rank'] = rank
+        p = ctx.Process(target=_train_rank, args=(env_name, worker_args, None, False, early_stop_fn))
+        p.start()
+        procs.append(p)
+
+    # Run rank 0 on main process
+    torch.cuda.set_device(0)
+
+    args['train']['rank'] = 0
+
+    if logger is None:
+        logger = Logger(args)
+
+    pufferl = _train_rank(env_name, args=args, logger=logger, verbose=True)
+
+    for p in procs:
+        p.join()
+
+    if os.path.exists(nccl_id_path):
+        os.remove(nccl_id_path)
+
+
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest
     # rollouts within a fixed number of epochs)
@@ -743,14 +753,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     logs['agent_steps'] = agent_steps
     logs = pufferl.write_logs(logs)
 
-    if logs is not None:
-        all_logs.append(logs)
-
     pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path, early_stop=False)
-    return all_logs
+
 
 def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
     args = args or load_config(env_name)
@@ -1147,7 +1154,7 @@ def load_policy(args, vecenv, env_name=''):
     load_id = args['load_id']
     if load_id is not None:
         if args['wandb']:
-            path = WandbLogger(args, load_id).download()
+            path = Logger(args, load_id).download()
         else:
             raise pufferlib.APIUsageError('No run id provided for eval')
 

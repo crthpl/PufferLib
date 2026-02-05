@@ -12,9 +12,11 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
+#include <nccl.h>
 
 #include <atomic>
 #include <dlfcn.h>
+#include <unistd.h>
 #include "muon.h"
 
 #include <ATen/cuda/CUDAGraph.h>
@@ -245,6 +247,12 @@ typedef struct {
     bool profile;
     bool use_omp;
     bool bf16;  // bfloat16 mixed precision training
+    // Multi-GPU
+    int rank;
+    int world_size;
+    std::string nccl_id_path;
+    // Threading
+    int num_threads;
 } HypersT;
 
 typedef struct {
@@ -252,6 +260,7 @@ typedef struct {
     PolicyMinGRU* policy_fp32;  // Master weights (fp32) - used for optimizer
     StaticVec* vec;
     torch::optim::Muon* muon;
+    ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
     RolloutBuf rollouts;
@@ -521,11 +530,38 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs) {
     auto pufferl = std::make_unique<pufferlib::PuffeRL>();
     pufferl->hypers = hypers;
+    pufferl->nccl_comm = nullptr;
 
-    // Seeding
-    torch::manual_seed(42);
-    torch::cuda::manual_seed(42);
-    pufferl->rng_seed = 42;
+    // Multi-GPU: initialize NCCL (device already set by Python)
+    if (hypers.world_size > 1) {
+        ncclUniqueId nccl_id;
+        if (hypers.rank == 0) {
+            ncclGetUniqueId(&nccl_id);
+            FILE* f = fopen(hypers.nccl_id_path.c_str(), "wb");
+            fwrite(&nccl_id, sizeof(nccl_id), 1, f);
+            fclose(f);
+        }
+        // Wait for rank 0 to write the ID file
+        while (access(hypers.nccl_id_path.c_str(), F_OK) != 0) {
+            usleep(10000);  // 10ms
+        }
+        if (hypers.rank != 0) {
+            // Small delay to ensure file is fully written
+            usleep(50000);
+            FILE* f = fopen(hypers.nccl_id_path.c_str(), "rb");
+            fread(&nccl_id, sizeof(nccl_id), 1, f);
+            fclose(f);
+        }
+
+        ncclCommInitRank(&pufferl->nccl_comm, hypers.world_size, nccl_id, hypers.rank);
+        printf("Rank %d/%d: NCCL initialized\n", hypers.rank, hypers.world_size);
+    }
+
+    // Seeding (vary by rank for different random exploration)
+    int seed = 42 + hypers.rank;
+    torch::manual_seed(seed);
+    torch::cuda::manual_seed(seed);
+    pufferl->rng_seed = seed;
     pufferl->rng_offset = torch::zeros({1}, torch::dtype(torch::kInt64).device(torch::kCUDA));
 
     // Enable cuDNN benchmarking
@@ -613,6 +649,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     pufferl->muon = new torch::optim::Muon(policy_fp32->parameters(),
         torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
     pufferl->muon->init_contiguous_weights();
+    pufferl->muon->nccl_comm = pufferl->nccl_comm;
+    pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weight_buffer.numel());
 
 
@@ -676,9 +714,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
 
     // Static breakout - OMP only
-    int num_threads = 16;
     if (hypers.use_omp) {
-        create_static_threads(vec, num_threads, horizon, pufferl.get(), net_callback_wrapper, thread_init_wrapper);
+        create_static_threads(vec, hypers.num_threads, horizon, pufferl.get(), net_callback_wrapper, thread_init_wrapper);
 
     }
     static_vec_reset(vec);
@@ -963,6 +1000,12 @@ void close_impl(PuffeRL& pufferl) {
     // Close environment vectorization (frees env GPU buffers)
     static_vec_close(pufferl.vec);
     pufferl.vec = nullptr;
+
+    // Cleanup NCCL
+    if (pufferl.nccl_comm != nullptr) {
+        ncclCommDestroy(pufferl.nccl_comm);
+        pufferl.nccl_comm = nullptr;
+    }
 
     // Force CUDA to release cached memory first
     c10::cuda::CUDACachingAllocator::emptyCache();

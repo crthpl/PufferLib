@@ -92,6 +92,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
     // Layout (total_agents and num_buffers come from vec config)
     hypers.total_agents = get_config(vec_kwargs, "total_agents");
     hypers.num_buffers = get_config(vec_kwargs, "num_buffers");
+    hypers.num_threads = get_config(vec_kwargs, "num_threads");
     hypers.horizon = get_config(kwargs, "horizon");
     // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
@@ -131,6 +132,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
     hypers.profile = get_config(kwargs, "profile");
     hypers.use_omp = get_config(kwargs, "use_omp");
     hypers.bf16 = get_config(kwargs, "bf16");
+    // Multi-GPU
+    hypers.rank = get_config(kwargs, "rank");
+    hypers.world_size = get_config(kwargs, "world_size");
+    hypers.nccl_id_path = kwargs["nccl_id_path"].cast<std::string>();
 
     std::string env_name = kwargs["env_name"].cast<std::string>();
     Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
@@ -220,7 +225,10 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("use_rnn", &HypersT::use_rnn)
         .def_readwrite("cudagraphs", &HypersT::cudagraphs)
         .def_readwrite("kernels", &HypersT::kernels)
-        .def_readwrite("profile", &HypersT::profile);
+        .def_readwrite("profile", &HypersT::profile)
+        .def_readwrite("rank", &HypersT::rank)
+        .def_readwrite("world_size", &HypersT::world_size)
+        .def_readwrite("nccl_id_path", &HypersT::nccl_id_path);
 
     py::class_<RolloutBuf>(m, "RolloutBuf")
         .def_readwrite("observations", &RolloutBuf::observations)
