@@ -1474,9 +1474,10 @@ __global__ void ppo_loss_forward_kernel_optimized(
     double* __restrict__ saved_for_backward,
     T* __restrict__ ratio_out,
     T* __restrict__ newvalue_out,
-    const T* __restrict__ logits,
+    const T* __restrict__ logits,       // For continuous: mean
+    const T* __restrict__ logstd,       // For continuous: log standard deviation (nullptr for discrete)
     const T* __restrict__ values_pred,
-    const int64_t* __restrict__ actions,
+    const double* __restrict__ actions, // float64 for both continuous and discrete
     const T* __restrict__ old_logprobs,
     const float* __restrict__ advantages,
     const T* __restrict__ prio,
@@ -1497,7 +1498,8 @@ __global__ void ppo_loss_forward_kernel_optimized(
     int logits_stride_t,
     int logits_stride_a,
     int values_stride_n,
-    int values_stride_t
+    int values_stride_t,
+    bool is_continuous
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = N * T_seq;
@@ -1512,54 +1514,80 @@ __global__ void ppo_loss_forward_kernel_optimized(
     int logits_base = n * logits_stride_n + t * logits_stride_t;
     int values_idx = n * values_stride_n + t * values_stride_t;
 
-    // Loop over action heads for MultiDiscrete support
-    int logits_offset = 0;
     float total_log_prob = 0.0f;
     float total_entropy = 0.0f;
 
-    for (int h = 0; h < num_atns; ++h) {
-        int A = act_sizes[h];  // size of this action head
-        int act = static_cast<int>(actions[nt * num_atns + h]);  // action for this head
+    if (is_continuous) {
+        // Continuous actions: Normal distribution
+        // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
+        // Differential entropy = 0.5 * (1 + log(2*pi)) + log_std
+        constexpr float LOG_2PI = 1.8378770664093453f;
+        constexpr float HALF_LOG_2PI = 0.9189385332046727f;
+        constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;  // 0.5 * (1 + log(2*pi))
 
-        // Find max for numerical stability and cache action's logit
-        float max_logit = -INFINITY;
-        float sum = 0.0f;
-        float act_logit = 0.0f;
+        for (int h = 0; h < num_atns; ++h) {
+            float mean = float(logits[logits_base + h * logits_stride_a]);
+            float log_std = float(logstd[logits_base + h * logits_stride_a]);
+            float std = __expf(log_std);
+            float action = float(actions[nt * num_atns + h]);
 
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+            float normalized = (action - mean) / std;
+            float log_prob = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
+            // Differential entropy for Normal: 0.5 + 0.5*log(2*pi) + log_std
+            float entropy = HALF_1_PLUS_LOG_2PI + log_std;
 
-            if (a == act) {
-                act_logit = l;
+            total_log_prob += log_prob;
+            total_entropy += entropy;
+        }
+    } else {
+        // Discrete actions: Categorical distribution
+        // Loop over action heads for MultiDiscrete support
+        int logits_offset = 0;
+
+        for (int h = 0; h < num_atns; ++h) {
+            int A = act_sizes[h];  // size of this action head
+            int act = static_cast<int>(actions[nt * num_atns + h]);  // action for this head
+
+            // Find max for numerical stability and cache action's logit
+            float max_logit = -INFINITY;
+            float sum = 0.0f;
+            float act_logit = 0.0f;
+
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+
+                if (a == act) {
+                    act_logit = l;
+                }
+
+                if (l > max_logit) {
+                    sum *= __expf(max_logit - l);
+                    max_logit = l;
+                }
+                sum += __expf(l - max_logit);
             }
 
-            if (l > max_logit) {
-                sum *= __expf(max_logit - l);
-                max_logit = l;
+            float logsumexp = max_logit + __logf(sum);
+
+            // Compute entropy for this head
+            float head_entropy = 0.0f;
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+                float logp = l - logsumexp;
+                float p = __expf(logp);
+                head_entropy -= p * logp;
             }
-            sum += __expf(l - max_logit);
+
+            // Log prob for this head
+            float head_logp = act_logit - logsumexp;
+
+            // Accumulate across heads
+            total_log_prob += head_logp;
+            total_entropy += head_entropy;
+
+            // Advance to next action head
+            logits_offset += A;
         }
-
-        float logsumexp = max_logit + __logf(sum);
-
-        // Compute entropy for this head
-        float head_entropy = 0.0f;
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-            float logp = l - logsumexp;
-            float p = __expf(logp);
-            head_entropy -= p * logp;
-        }
-
-        // Log prob for this head
-        float head_logp = act_logit - logsumexp;
-
-        // Accumulate across heads
-        total_log_prob += head_logp;
-        total_entropy += head_entropy;
-
-        // Advance to next action head
-        logits_offset += A;
     }
 
     // Use accumulated values for the rest of computation
@@ -1616,12 +1644,14 @@ __global__ void ppo_loss_forward_kernel_optimized(
 
 template<typename T>
 __global__ void ppo_loss_backward_kernel_optimized(
-    float* __restrict__ grad_logits,
+    float* __restrict__ grad_logits,    // For continuous: grad_mean
+    float* __restrict__ grad_logstd,    // For continuous: grad_logstd (nullptr for discrete)
     float* __restrict__ grad_values_pred,
     const float* __restrict__ grad_loss,
-    const T* __restrict__ logits,
+    const T* __restrict__ logits,       // For continuous: mean
+    const T* __restrict__ logstd,       // For continuous: log standard deviation (nullptr for discrete)
     const T* __restrict__ values_pred,
-    const int64_t* __restrict__ actions,
+    const double* __restrict__ actions, // float64 for both continuous and discrete
     const T* __restrict__ old_logprobs,
     const float* __restrict__ advantages,
     const T* __restrict__ prio,
@@ -1642,7 +1672,8 @@ __global__ void ppo_loss_backward_kernel_optimized(
     int logits_stride_t,
     int logits_stride_a,
     int values_stride_n,
-    int values_stride_t
+    int values_stride_t,
+    bool is_continuous
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = N * T_seq;
@@ -1663,63 +1694,9 @@ __global__ void ppo_loss_backward_kernel_optimized(
     float ret = float(returns[nt]);
     float val_pred = float(values_pred[values_idx]);
 
-    // First pass: compute per-head logsumexp and entropy, accumulate total log prob
-    // Store per-head values for gradient computation (use register arrays)
-    float head_logsumexp[MAX_ATN_HEADS];
-    float head_entropy[MAX_ATN_HEADS];
-    int head_act[MAX_ATN_HEADS];
-
-    int logits_offset = 0;
-    float total_log_prob = 0.0f;
-
-    for (int h = 0; h < num_atns; ++h) {
-        int A = act_sizes[h];
-        int act = static_cast<int>(actions[nt * num_atns + h]);
-        head_act[h] = act;
-
-        // Compute logsumexp for this head
-        float max_logit = -INFINITY;
-        float sum = 0.0f;
-        float act_logit = 0.0f;
-
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-            if (a == act) act_logit = l;
-
-            if (l > max_logit) {
-                sum *= __expf(max_logit - l);
-                max_logit = l;
-            }
-            sum += __expf(l - max_logit);
-        }
-        float logsumexp = max_logit + __logf(sum);
-        head_logsumexp[h] = logsumexp;
-
-        // Compute entropy for this head
-        float ent = 0.0f;
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-            float logp = l - logsumexp;
-            float p = __expf(logp);
-            ent -= p * logp;
-        }
-        head_entropy[h] = ent;
-
-        // Accumulate total log prob
-        total_log_prob += act_logit - logsumexp;
-
-        logits_offset += A;
-    }
-
-    // Compute ratio and policy gradient
-    float new_logp = total_log_prob;
-    float ratio = __expf(new_logp - old_logp);
-    float v_error = val_pred - val;
-    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
-
     // Normalize advantage
-    float adv_std = sqrtf(float(adv_var[0]));
-    float adv_normalized = (adv - float(adv_mean[0])) / (adv_std + 1e-8f);
+    float adv_std_val = sqrtf(float(adv_var[0]));
+    float adv_normalized = (adv - float(adv_mean[0])) / (adv_std_val + 1e-8f);
 
     // Loss gradient scaling
     float dL = grad_loss[0] * inv_NT;
@@ -1727,6 +1704,8 @@ __global__ void ppo_loss_backward_kernel_optimized(
     float d_entropy_term = dL * (-ent_coef);
 
     // Gradient wrt value function prediction
+    float v_error = val_pred - val;
+    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
     float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
     float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
     bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
@@ -1741,45 +1720,159 @@ __global__ void ppo_loss_backward_kernel_optimized(
     }
     grad_values_pred[values_idx] = dL * vf_coef * d_val_pred;
 
-    // Policy loss gradient
-    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-    float pg_loss1 = -w * adv_normalized * ratio;
-    float pg_loss2 = -w * adv_normalized * ratio_clipped;
+    if (is_continuous) {
+        // Continuous: compute total log prob first for ratio
+        constexpr float HALF_LOG_2PI = 0.9189385332046727f;
+        float total_log_prob = 0.0f;
 
-    float d_ratio = -w * adv_normalized * d_pg_loss;
-    if (pg_loss2 > pg_loss1) {
-        if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
-            d_ratio = 0.0f;
-        }
-    }
-    // d_new_logp flows to each head's log prob equally since total = sum of head log probs
-    float d_new_logp = d_ratio * ratio;
+        for (int h = 0; h < num_atns; ++h) {
+            float mean = float(logits[logits_base + h * logits_stride_a]);
+            float log_std = float(logstd[logits_base + h * logits_stride_a]);
+            float std = __expf(log_std);
+            float action = float(actions[nt * num_atns + h]);
 
-    // Second pass: compute gradients per head
-    logits_offset = 0;
-    for (int h = 0; h < num_atns; ++h) {
-        int A = act_sizes[h];
-        int act = head_act[h];
-        float logsumexp = head_logsumexp[h];
-        float ent = head_entropy[h];
-
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-            float logp = l - logsumexp;
-            float p = __expf(logp);
-
-            // Policy gradient: d/dlogits[a] of head_logp = delta(a,act) - p
-            float d_logit = (a == act) ? d_new_logp : 0.0f;
-            d_logit -= p * d_new_logp;
-
-            // Entropy gradient: d/dlogits[a] of head_entropy = p * (-entropy - logp)
-            // Each head's entropy contributes independently to total entropy
-            d_logit += d_entropy_term * p * (-ent - logp);
-
-            grad_logits[logits_base + (logits_offset + a) * logits_stride_a] = d_logit;
+            float normalized = (action - mean) / std;
+            float log_prob = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
+            total_log_prob += log_prob;
         }
 
-        logits_offset += A;
+        float new_logp = total_log_prob;
+        float ratio = __expf(new_logp - old_logp);
+
+        // Policy loss gradient
+        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+        float pg_loss1 = -w * adv_normalized * ratio;
+        float pg_loss2 = -w * adv_normalized * ratio_clipped;
+
+        float d_ratio = -w * adv_normalized * d_pg_loss;
+        if (pg_loss2 > pg_loss1) {
+            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
+                d_ratio = 0.0f;
+            }
+        }
+        float d_new_logp = d_ratio * ratio;
+
+        // Compute gradients for continuous actions
+        // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log_std
+        // d_log_prob/d_mean = (action - mean) / var
+        // d_log_prob/d_log_std = (action - mean)^2 / var - 1
+        // entropy = 0.5 + 0.5*log(2*pi) + log_std
+        // d_entropy/d_log_std = 1
+
+        for (int h = 0; h < num_atns; ++h) {
+            float mean = float(logits[logits_base + h * logits_stride_a]);
+            float log_std = float(logstd[logits_base + h * logits_stride_a]);
+            float std = __expf(log_std);
+            float var = std * std;
+            float action = float(actions[nt * num_atns + h]);
+
+            float diff = action - mean;
+
+            // Gradient wrt mean: d_log_prob/d_mean = (action - mean) / var
+            float d_mean = d_new_logp * diff / var;
+            grad_logits[logits_base + h * logits_stride_a] = d_mean;
+
+            // Gradient wrt log_std:
+            // d_log_prob/d_log_std = (action - mean)^2 / var - 1
+            // d_entropy/d_log_std = 1
+            // Total: d_new_logp * ((diff^2/var) - 1) + d_entropy_term * 1
+            float d_log_std = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
+            grad_logstd[logits_base + h * logits_stride_a] = d_log_std;
+        }
+    } else {
+        // Discrete: original implementation
+        // First pass: compute per-head logsumexp and entropy, accumulate total log prob
+        // Store per-head values for gradient computation (use register arrays)
+        float head_logsumexp[MAX_ATN_HEADS];
+        float head_entropy[MAX_ATN_HEADS];
+        int head_act[MAX_ATN_HEADS];
+
+        int logits_offset = 0;
+        float total_log_prob = 0.0f;
+
+        for (int h = 0; h < num_atns; ++h) {
+            int A = act_sizes[h];
+            int act = static_cast<int>(actions[nt * num_atns + h]);
+            head_act[h] = act;
+
+            // Compute logsumexp for this head
+            float max_logit = -INFINITY;
+            float sum = 0.0f;
+            float act_logit = 0.0f;
+
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+                if (a == act) act_logit = l;
+
+                if (l > max_logit) {
+                    sum *= __expf(max_logit - l);
+                    max_logit = l;
+                }
+                sum += __expf(l - max_logit);
+            }
+            float logsumexp = max_logit + __logf(sum);
+            head_logsumexp[h] = logsumexp;
+
+            // Compute entropy for this head
+            float ent = 0.0f;
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+                float logp = l - logsumexp;
+                float p = __expf(logp);
+                ent -= p * logp;
+            }
+            head_entropy[h] = ent;
+
+            // Accumulate total log prob
+            total_log_prob += act_logit - logsumexp;
+
+            logits_offset += A;
+        }
+
+        // Compute ratio and policy gradient
+        float new_logp = total_log_prob;
+        float ratio = __expf(new_logp - old_logp);
+
+        // Policy loss gradient
+        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+        float pg_loss1 = -w * adv_normalized * ratio;
+        float pg_loss2 = -w * adv_normalized * ratio_clipped;
+
+        float d_ratio = -w * adv_normalized * d_pg_loss;
+        if (pg_loss2 > pg_loss1) {
+            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
+                d_ratio = 0.0f;
+            }
+        }
+        // d_new_logp flows to each head's log prob equally since total = sum of head log probs
+        float d_new_logp = d_ratio * ratio;
+
+        // Second pass: compute gradients per head
+        logits_offset = 0;
+        for (int h = 0; h < num_atns; ++h) {
+            int A = act_sizes[h];
+            int act = head_act[h];
+            float logsumexp = head_logsumexp[h];
+            float ent = head_entropy[h];
+
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+                float logp = l - logsumexp;
+                float p = __expf(logp);
+
+                // Policy gradient: d/dlogits[a] of head_logp = delta(a,act) - p
+                float d_logit = (a == act) ? d_new_logp : 0.0f;
+                d_logit -= p * d_new_logp;
+
+                // Entropy gradient: d/dlogits[a] of head_entropy = p * (-entropy - logp)
+                // Each head's entropy contributes independently to total entropy
+                d_logit += d_entropy_term * p * (-ent - logp);
+
+                grad_logits[logits_base + (logits_offset + a) * logits_stride_a] = d_logit;
+            }
+
+            logits_offset += A;
+        }
     }
 }
 
@@ -1789,30 +1882,32 @@ inline void launch_ppo_loss_forward_optimized(
     double* saved_for_backward,
     T* ratio_out,
     T* newvalue_out,
-    const T* logits,
+    const T* logits,          // For continuous: mean
+    const T* logstd,          // For continuous: log std (nullptr for discrete)
     const T* values_pred,
-    const int64_t* actions,
+    const double* actions,    // float64 for both continuous and discrete
     const T* old_logprobs,
     const float* advantages,  // always fp32 for precision
     const T* prio,
     const T* values,
     const T* returns,
-    const float* adv_mean, // keep fp32
-    const float* adv_var, // keep fp32
-    const int* act_sizes,  // NEW: array of action head sizes
-    int num_atns,          // NEW: number of action heads
+    const float* adv_mean,    // keep fp32
+    const float* adv_var,     // keep fp32
+    const int* act_sizes,     // array of action head sizes
+    int num_atns,             // number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A_total,           // renamed from A
+    int A_total,              // renamed from A
     int N,
     int logits_stride_n,
     int logits_stride_t,
     int logits_stride_a,
     int values_stride_n,
     int values_stride_t,
+    bool is_continuous,
     cudaStream_t stream
 ) {
     int total = N * T_seq;
@@ -1824,6 +1919,7 @@ inline void launch_ppo_loss_forward_optimized(
         ratio_out,
         newvalue_out,
         logits,
+        logstd,
         values_pred,
         actions,
         old_logprobs,
@@ -1846,7 +1942,8 @@ inline void launch_ppo_loss_forward_optimized(
         logits_stride_t,
         logits_stride_a,
         values_stride_n,
-        values_stride_t
+        values_stride_t,
+        is_continuous
     );
 
     cudaError_t err = cudaGetLastError();
@@ -1857,12 +1954,14 @@ inline void launch_ppo_loss_forward_optimized(
 
 template<typename T>
 void launch_ppo_loss_backward_optimized(
-    float* grad_logits,
+    float* grad_logits,       // For continuous: grad_mean
+    float* grad_logstd,       // For continuous: grad_logstd (nullptr for discrete)
     float* grad_values_pred,
     const float* grad_loss,
-    const T* logits,
-    const T* values_pred,    // added: need to read val_pred directly
-    const int64_t* actions,
+    const T* logits,          // For continuous: mean
+    const T* logstd,          // For continuous: log std (nullptr for discrete)
+    const T* values_pred,     // added: need to read val_pred directly
+    const double* actions,    // float64 for both continuous and discrete
     const T* old_logprobs,
     const float* advantages,
     const T* prio,
@@ -1870,20 +1969,21 @@ void launch_ppo_loss_backward_optimized(
     const T* returns,
     const float* adv_mean,
     const float* adv_var,
-    const int* act_sizes,    // NEW: array of action head sizes
-    int num_atns,            // NEW: number of action heads
+    const int* act_sizes,     // array of action head sizes
+    int num_atns,             // number of action heads
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A_total,             // renamed from A
+    int A_total,              // renamed from A
     int N,
     int logits_stride_n,
     int logits_stride_t,
     int logits_stride_a,
     int values_stride_n,
     int values_stride_t,
+    bool is_continuous,
     cudaStream_t stream
 ) {
     int total = N * T_seq;
@@ -1891,9 +1991,11 @@ void launch_ppo_loss_backward_optimized(
 
     ppo_loss_backward_kernel_optimized<T><<<grid, PPO_THREADS, 0, stream>>>(
         grad_logits,
+        grad_logstd,
         grad_values_pred,
         grad_loss,
         logits,
+        logstd,
         values_pred,
         actions,
         old_logprobs,
@@ -1916,7 +2018,8 @@ void launch_ppo_loss_backward_optimized(
         logits_stride_t,
         logits_stride_a,
         values_stride_n,
-        values_stride_t
+        values_stride_t,
+        is_continuous
     );
 
     cudaError_t err = cudaGetLastError();
@@ -2318,26 +2421,30 @@ void launch_ppo_loss_backward(
 // to avoid .contiguous() kernel launches.
 // ============================================================================
 
-// Single kernel that handles: nan_to_num, log_softmax, multinomial sampling, logprob gather, value copy
-// Input: logits (B, sum(act_sizes)) with row stride logits_stride, value (B, 1) with row stride value_stride, seed for RNG
+// Single kernel that handles both discrete and continuous action sampling
+// Discrete: nan_to_num, log_softmax, multinomial sampling, logprob gather, value copy
+// Continuous: sample from Normal(mean, exp(logstd)), compute log_prob, value copy
+// Input: logits (B, num_atns) for continuous or (B, sum(act_sizes)) for discrete
+//        logstd (B, num_atns) for continuous, nullptr for discrete
 // Output: actions (B, num_atns) as float64, logprobs (B,), value_out (B,)
 // NOTE: offset is read from a pointer (not passed by value) so it works correctly with CUDA graphs.
-// The offset tensor is incremented with a CUDA op after this kernel, so each graph replay gets a new offset.
-// Supports MultiDiscrete via act_sizes array - loops over action heads and sums logprobs.
 template<typename T>
 __global__ void sample_logits_kernel(
-    double* __restrict__ actions,         // (B, num_atns) output - sampled action indices as float64
-    T* __restrict__ logprobs,             // (B,) output - sum of log probs across action heads
+    double* __restrict__ actions,         // (B, num_atns) output - sampled actions as float64
+    T* __restrict__ logprobs,             // (B,) output - sum of log probs across action dims
     T* __restrict__ value_out,            // (B,) output - copied value (flattened)
-    const T* __restrict__ logits,         // (B, sum(act_sizes)) input - raw logits (may be non-contiguous)
+    const T* __restrict__ logits,         // (B, num_atns or sum(act_sizes)) input - mean for continuous, logits for discrete
+    const T* __restrict__ logstd,         // (B, num_atns) input - log std for continuous, nullptr for discrete
     const T* __restrict__ value,          // (B, 1) input - value from fused output (may be non-contiguous)
     const int* __restrict__ act_sizes,    // (num_atns,) input - size of each action head
     uint64_t seed,                        // RNG seed
     const int64_t* __restrict__ offset_ptr, // RNG offset pointer (read at execution time for CUDA graph support)
-    int num_atns,                         // number of action heads
+    int num_atns,                         // number of action heads/dimensions
     int B,                                // batch size
     int logits_stride,                    // stride between rows (for non-contiguous logits from fused output)
-    int value_stride                      // stride between rows (for non-contiguous value from fused output)
+    int logstd_stride,                    // stride between rows for logstd (may be 0 for broadcast)
+    int value_stride,                     // stride between rows (for non-contiguous value from fused output)
+    bool is_continuous                    // true for continuous actions, false for discrete
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B) return;
@@ -2350,65 +2457,87 @@ __global__ void sample_logits_kernel(
     curand_init(seed, idx, offset, &state);
 
     int logits_base = idx * logits_stride;
-    int logits_offset = 0;  // offset within row for current action head
     float total_log_prob = 0.0f;
 
-    // Loop over action heads
-    for (int h = 0; h < num_atns; ++h) {
-        int A = act_sizes[h];  // size of this action head
+    if (is_continuous) {
+        // Continuous action sampling from Normal(mean, exp(logstd))
+        constexpr float LOG_2PI = 1.8378770664093453f;  // log(2*pi)
+        int logstd_base = idx * logstd_stride;  // separate stride for logstd (may be 0 for broadcast)
 
-        // Step 1: Find max for numerical stability (with nan_to_num)
-        float max_val = -INFINITY;
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + logits_offset + a]);
-            // nan_to_num: replace nan with 0
-            if (isnan(l)) l = 0.0f;
-            // clamp inf/-inf (pytorch defaults: neginf=-3.4028e+38, posinf=3.4028e+38)
-            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-            max_val = fmaxf(max_val, l);
+        for (int h = 0; h < num_atns; ++h) {
+            float mean = float(logits[logits_base + h]);
+            float log_std = float(logstd[logstd_base + h]);
+            float std = expf(log_std);
+
+            // Sample from N(0,1) and transform: action = mean + std * noise
+            float noise = curand_normal(&state);
+            float action = mean + std * noise;
+
+            // Log probability: -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
+            float normalized = (action - mean) / std;
+            float log_prob = -0.5f * normalized * normalized - 0.5f * LOG_2PI - log_std;
+
+            actions[idx * num_atns + h] = double(action);
+            total_log_prob += log_prob;
         }
+    } else {
+        // Discrete action sampling (original multinomial logic)
+        int logits_offset = 0;  // offset within row for current action head
 
-        // Step 2: Compute logsumexp for log_softmax denominator
-        float sum_exp = 0.0f;
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + logits_offset + a]);
-            if (isnan(l)) l = 0.0f;
-            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-            sum_exp += expf(l - max_val);
-        }
-        float logsumexp = max_val + logf(sum_exp);
+        for (int h = 0; h < num_atns; ++h) {
+            int A = act_sizes[h];  // size of this action head
 
-        // Step 3: Generate random value for this action head
-        float rand_val = curand_uniform(&state);
-
-        // Step 4: Multinomial sampling using inverse CDF
-        float cumsum = 0.0f;
-        int sampled_action = A - 1;  // default to last action
-
-        for (int a = 0; a < A; ++a) {
-            float l = float(logits[logits_base + logits_offset + a]);
-            if (isnan(l)) l = 0.0f;
-            if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-            float prob = expf(l - logsumexp);
-            cumsum += prob;
-            if (rand_val < cumsum) {
-                sampled_action = a;
-                break;
+            // Step 1: Find max for numerical stability (with nan_to_num)
+            float max_val = -INFINITY;
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + logits_offset + a]);
+                if (isnan(l)) l = 0.0f;
+                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                max_val = fmaxf(max_val, l);
             }
+
+            // Step 2: Compute logsumexp for log_softmax denominator
+            float sum_exp = 0.0f;
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + logits_offset + a]);
+                if (isnan(l)) l = 0.0f;
+                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                sum_exp += expf(l - max_val);
+            }
+            float logsumexp = max_val + logf(sum_exp);
+
+            // Step 3: Generate random value for this action head
+            float rand_val = curand_uniform(&state);
+
+            // Step 4: Multinomial sampling using inverse CDF
+            float cumsum = 0.0f;
+            int sampled_action = A - 1;  // default to last action
+
+            for (int a = 0; a < A; ++a) {
+                float l = float(logits[logits_base + logits_offset + a]);
+                if (isnan(l)) l = 0.0f;
+                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                float prob = expf(l - logsumexp);
+                cumsum += prob;
+                if (rand_val < cumsum) {
+                    sampled_action = a;
+                    break;
+                }
+            }
+
+            // Step 5: Gather log probability of sampled action
+            float sampled_logit = float(logits[logits_base + logits_offset + sampled_action]);
+            if (isnan(sampled_logit)) sampled_logit = 0.0f;
+            if (isinf(sampled_logit)) sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
+            float log_prob = sampled_logit - logsumexp;
+
+            // Write action for this head
+            actions[idx * num_atns + h] = double(sampled_action);
+            total_log_prob += log_prob;
+
+            // Advance to next action head
+            logits_offset += A;
         }
-
-        // Step 5: Gather log probability of sampled action
-        float sampled_logit = float(logits[logits_base + logits_offset + sampled_action]);
-        if (isnan(sampled_logit)) sampled_logit = 0.0f;
-        if (isinf(sampled_logit)) sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
-        float log_prob = sampled_logit - logsumexp;
-
-        // Write action for this head
-        actions[idx * num_atns + h] = double(sampled_action);
-        total_log_prob += log_prob;
-
-        // Advance to next action head
-        logits_offset += A;
     }
 
     // Write summed log probability (log of joint probability)
@@ -2429,14 +2558,17 @@ void launch_sample_logits(
     T* logprobs,
     T* value_out,
     const T* logits,
+    const T* logstd,  // nullptr for discrete
     const T* value,
     const int* act_sizes,
     uint64_t seed,
-    const int64_t* offset_ptr,  // pointer to offset tensor (read at execution time for CUDA graphs)
+    const int64_t* offset_ptr,
     int num_atns,
     int B,
-    int logits_stride,  // stride between rows (for non-contiguous logits from fused output)
-    int value_stride,   // stride between rows (for non-contiguous value from fused output)
+    int logits_stride,
+    int logstd_stride,
+    int value_stride,
+    bool is_continuous,
     cudaStream_t stream
 ) {
     int grid = grid_size(B);
@@ -2445,6 +2577,7 @@ void launch_sample_logits(
         logprobs,
         value_out,
         logits,
+        logstd,
         value,
         act_sizes,
         seed,
@@ -2452,7 +2585,9 @@ void launch_sample_logits(
         num_atns,
         B,
         logits_stride,
-        value_stride
+        logstd_stride,
+        value_stride,
+        is_continuous
     );
 
     cudaError_t err = cudaGetLastError();
@@ -2932,8 +3067,8 @@ void launch_ppo_loss_forward_float(float* loss_output, double* saved_for_backwar
 void launch_ppo_loss_backward_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward<float>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
-void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
-    launch_sample_logits<float>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
+void launch_sample_logits_float(double* actions, float* logprobs, float* value_out, const float* logits, const float* logstd, const float* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int logstd_stride, int value_stride, bool is_continuous, cudaStream_t stream) {
+    launch_sample_logits<float>(actions, logprobs, value_out, logits, logstd, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, logstd_stride, value_stride, is_continuous, stream);
 }
 void launch_fc_relu_fc_max_forward_float(float* out, int* argmax_indices, float* fc1_at_argmax, const float* x, const float* W1, const float* b1, const float* W2, const float* b2, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
     launch_fc_relu_fc_max_forward<float>(out, argmax_indices, fc1_at_argmax, x, W1, b1, W2, b2, B, N, D_in, D_mid, D_out, stream);
@@ -2990,8 +3125,8 @@ void launch_ppo_loss_forward_bf16(float* loss_output, double* saved_for_backward
 void launch_ppo_loss_backward_bf16(at::BFloat16* grad_logits, at::BFloat16* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const int64_t* actions, const at::BFloat16* old_logprobs, const at::BFloat16* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const double* saved_for_backward, const float* adv_mean, const float* adv_std, double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef, int T_seq, int A, int N, cudaStream_t stream) {
     launch_ppo_loss_backward<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, actions, old_logprobs, advantages, prio, values, returns, saved_for_backward, adv_mean, adv_std, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A, N, stream);
 }
-void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int value_stride, cudaStream_t stream) {
-    launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, value_stride, stream);
+void launch_sample_logits_bf16(double* actions, at::BFloat16* logprobs, at::BFloat16* value_out, const at::BFloat16* logits, const at::BFloat16* logstd, const at::BFloat16* value, const int* act_sizes, uint64_t seed, const int64_t* offset_ptr, int num_atns, int B, int logits_stride, int logstd_stride, int value_stride, bool is_continuous, cudaStream_t stream) {
+    launch_sample_logits<at::BFloat16>(actions, logprobs, value_out, logits, logstd, value, act_sizes, seed, offset_ptr, num_atns, B, logits_stride, logstd_stride, value_stride, is_continuous, stream);
 }
 void launch_fc_relu_fc_max_forward_bf16(at::BFloat16* out, int* argmax_indices, float* fc1_at_argmax, const at::BFloat16* x, const at::BFloat16* W1, const at::BFloat16* b1, const at::BFloat16* W2, const at::BFloat16* b2, int B, int N, int D_in, int D_mid, int D_out, cudaStream_t stream) {
     launch_fc_relu_fc_max_forward<at::BFloat16>(out, argmax_indices, fc1_at_argmax, x, W1, b1, W2, b2, B, N, D_in, D_mid, D_out, stream);
@@ -3000,18 +3135,18 @@ void launch_fc_relu_fc_max_backward_bf16(at::BFloat16* grad_x, at::BFloat16* gra
     launch_fc_relu_fc_max_backward<at::BFloat16>(grad_x, grad_W1, grad_b1, grad_W2, grad_b2, grad_out, x, W1, W2, argmax_indices, fc1_at_argmax, B, N, D_in, D_mid, D_out, stream);
 }
 
-void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_forward_optimized_float(float* loss_output, double* saved_for_backward, float* ratio_out, float* newvalue_out, const float* logits, const float* logstd, const float* values_pred, const double* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, bool is_continuous, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<float>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, logstd, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, is_continuous, stream);
 }
-void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_values_pred, const float* grad_loss, const float* logits, const float* values_pred, const int64_t* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_backward_optimized<float>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_backward_optimized_float(float* grad_logits, float* grad_logstd, float* grad_values_pred, const float* grad_loss, const float* logits, const float* logstd, const float* values_pred, const double* actions, const float* old_logprobs, const float* advantages, const float* prio, const float* values, const float* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, bool is_continuous, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<float>(grad_logits, grad_logstd, grad_values_pred, grad_loss, logits, logstd, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, is_continuous, stream);
 }
 
-void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_forward_optimized_bf16(float* loss_output, double* saved_for_backward, at::BFloat16* ratio_out, at::BFloat16* newvalue_out, const at::BFloat16* logits, const at::BFloat16* logstd, const at::BFloat16* values_pred, const double* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, bool is_continuous, cudaStream_t stream) {
+    launch_ppo_loss_forward_optimized<at::BFloat16>(loss_output, saved_for_backward, ratio_out, newvalue_out, logits, logstd, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, is_continuous, stream);
 }
-void launch_ppo_loss_backward_optimized_bf16(float* grad_logits, float* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* values_pred, const int64_t* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, cudaStream_t stream) {
-    launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_values_pred, grad_loss, logits, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, stream);
+void launch_ppo_loss_backward_optimized_bf16(float* grad_logits, float* grad_logstd, float* grad_values_pred, const float* grad_loss, const at::BFloat16* logits, const at::BFloat16* logstd, const at::BFloat16* values_pred, const double* actions, const at::BFloat16* old_logprobs, const float* advantages, const at::BFloat16* prio, const at::BFloat16* values, const at::BFloat16* returns, const float* adv_mean, const float* adv_var, const int* act_sizes, int num_atns, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef, int T_seq, int A_total, int N, int logits_stride_n, int logits_stride_t, int logits_stride_a, int values_stride_n, int values_stride_t, bool is_continuous, cudaStream_t stream) {
+    launch_ppo_loss_backward_optimized<at::BFloat16>(grad_logits, grad_logstd, grad_values_pred, grad_loss, logits, logstd, values_pred, actions, old_logprobs, advantages, prio, values, returns, adv_mean, adv_var, act_sizes, num_atns, clip_coef, vf_clip_coef, vf_coef, ent_coef, T_seq, A_total, N, logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, is_continuous, stream);
 }
 
 #endif // PUFFERLIB_KERNELS_CU

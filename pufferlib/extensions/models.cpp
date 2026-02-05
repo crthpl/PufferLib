@@ -9,7 +9,10 @@ struct Encoder : public torch::nn::Module {
 };
 
 struct Decoder : public torch::nn::Module {
-    virtual std::tuple<Tensor, Tensor> forward(Tensor hidden) = 0;
+    // Returns (logits_or_mean, value, logstd)
+    // For discrete: logstd is empty tensor
+    // For continuous: logstd is the learnable log standard deviation
+    virtual std::tuple<Tensor, Tensor, Tensor> forward(Tensor hidden) = 0;
 };
 
 struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
@@ -235,22 +238,38 @@ class SnakeEncoder : public Encoder {
 class DefaultDecoder : public Decoder {
     public:
         torch::nn::Linear linear{nullptr};
+        Tensor logstd{nullptr};  // For continuous actions only
         int hidden_size;
-        int output_size;
+        int output_size;  // For discrete: sum(act_sizes). For continuous: num_atns.
+        bool is_continuous;
 
-    DefaultDecoder(int64_t hidden_size, int64_t output_size)
-        : hidden_size(hidden_size), output_size(output_size) {
+    DefaultDecoder(int64_t hidden_size, int64_t output_size, bool is_continuous = false)
+        : hidden_size(hidden_size), output_size(output_size), is_continuous(is_continuous) {
 
+        // Fused linear: outputs [logits/mean, value] for contiguous memory access
         linear = register_module("linear", torch::nn::Linear(
             torch::nn::LinearOptions(hidden_size, output_size+1).bias(false)));
         torch::nn::init::orthogonal_(linear->weight, 0.01);
+
+        // For continuous: learnable logstd parameter initialized to zeros
+        if (is_continuous) {
+            logstd = register_parameter("logstd", torch::zeros({1, output_size}));
+        }
     }
 
-    std::tuple<Tensor, Tensor> forward(Tensor hidden) override {
+    std::tuple<Tensor, Tensor, Tensor> forward(Tensor hidden) override {
         Tensor output = linear->forward(hidden);
-        Tensor logits = output.narrow(1, 0, output_size);
-        Tensor value = output.narrow(1, output_size, 1);
-        return {logits, value.squeeze(1)};
+        Tensor logits_or_mean = output.narrow(-1, 0, output_size);
+        Tensor value = output.narrow(-1, output_size, 1);
+
+        if (is_continuous) {
+            // Expand logstd to match batch dimensions of mean
+            Tensor logstd_expanded = logstd.expand_as(logits_or_mean);
+            return {logits_or_mean, value.squeeze(-1), logstd_expanded};
+        } else {
+            // Return empty tensor for logstd in discrete case
+            return {logits_or_mean, value.squeeze(-1), Tensor()};
+        }
     }
 };
 
@@ -424,12 +443,12 @@ class NMMO3Decoder : public Decoder {
         torch::nn::init::constant_(linear->bias, 0.0);
     }
 
-    std::tuple<Tensor, Tensor> forward(Tensor hidden) override {
+    std::tuple<Tensor, Tensor, Tensor> forward(Tensor hidden) override {
         Tensor x = layer_norm->forward(hidden);
         Tensor output = linear->forward(x);
         Tensor logits = output.narrow(-1, 0, output_size);
         Tensor value = output.narrow(-1, output_size, 1);
-        return {logits, value.squeeze(-1)};
+        return {logits, value.squeeze(-1), Tensor()};
     }
 };
 
@@ -607,7 +626,7 @@ class G2048Decoder : public Decoder {
         torch::nn::init::orthogonal_(val_linear2->weight, 1.0);
     }
 
-    std::tuple<Tensor, Tensor> forward(Tensor hidden) override {
+    std::tuple<Tensor, Tensor, Tensor> forward(Tensor hidden) override {
         // Policy head
         Tensor logits = torch::gelu(dec_linear1->forward(hidden));
         logits = dec_linear2->forward(logits);
@@ -621,7 +640,7 @@ class G2048Decoder : public Decoder {
         logits = output.narrow(1, 0, output_size);
         value = output.narrow(1, output_size, 1);
 
-        return {logits, value.squeeze(1)};
+        return {logits, value.squeeze(1), Tensor()};
     }
 };
 
@@ -662,7 +681,7 @@ public:
         );
     }
 
-    std::tuple<Tensor, Tensor, Tensor> forward(
+    std::tuple<Tensor, Tensor, Tensor, Tensor> forward(
         Tensor observations, Tensor state) {
         int64_t B = observations.size(0);
 
@@ -692,16 +711,17 @@ public:
         hidden = hidden.squeeze(1);
         state = state.squeeze(2);
 
-        std::tuple<Tensor, Tensor> out = decoder->forward(hidden);
+        std::tuple<Tensor, Tensor, Tensor> out = decoder->forward(hidden);
         Tensor logits = std::get<0>(out);
         Tensor values = std::get<1>(out);
+        Tensor logstd = std::get<2>(out);
         //auto logits = decoder->forward(hidden);
         //auto values = value->forward(hidden);
 
-        return {logits, values, state};
+        return {logits, values, state, logstd};
     }
 
-    std::tuple<Tensor, Tensor> forward_train(
+    std::tuple<Tensor, Tensor, Tensor> forward_train(
         Tensor observations, Tensor state) {
 
         Tensor x = observations;
@@ -740,17 +760,22 @@ public:
 
         Tensor flat_hidden = hidden.reshape({-1, hidden_size});
 
-        std::tuple<Tensor, Tensor> out = decoder->forward(flat_hidden);
+        std::tuple<Tensor, Tensor, Tensor> out = decoder->forward(flat_hidden);
         Tensor logits = std::get<0>(out);
         Tensor values = std::get<1>(out);
+        Tensor logstd = std::get<2>(out);
 
         //auto logits = decoder->forward(flat_hidden);
         //auto values = value->forward(flat_hidden);
 
         logits = logits.reshape({B, TT, num_atns});
         values = values.reshape({B, TT, 1});
+        // logstd: if defined, reshape to (B, TT, num_atns) for continuous
+        if (logstd.defined()) {
+            logstd = logstd.reshape({B, TT, num_atns});
+        }
 
-        return {logits, values};
+        return {logits, values, logstd};
     }
 };
 

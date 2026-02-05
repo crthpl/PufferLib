@@ -169,7 +169,7 @@ TrainGraph create_train_graph(int minibatch_segments, int horizon, int input_siz
     g.mb_state = torch::zeros({num_layers, minibatch_segments, 1, hidden_size * expansion_factor}, options);
     g.mb_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
     g.mb_ratio = torch::zeros({minibatch_segments, horizon}, options);
-    g.mb_actions = torch::zeros({minibatch_segments, horizon, num_atns}, options).to(torch::kInt64);
+    g.mb_actions = torch::zeros({minibatch_segments, horizon, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
     g.mb_logprobs = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_advantages = torch::zeros({minibatch_segments, horizon}, options.dtype(torch::kFloat32));  // always fp32 for precision
     g.mb_prio = torch::zeros({minibatch_segments, 1}, options);
@@ -262,6 +262,7 @@ typedef struct {
     torch::optim::Muon* muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
+    bool is_continuous;  // True if all action dimensions are continuous (size==1)
     std::vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
     RolloutBuf rollouts;
     EnvBuf env;
@@ -300,7 +301,7 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     Tensor& state = pufferl.buffer_states[buf];
 
     // Run policy forward using bf16 working weights
-    auto [logits, value, state_out] = pufferl.policy_bf16->forward(obs_slice, state);
+    auto [logits, value, state_out, logstd] = pufferl.policy_bf16->forward(obs_slice, state);
 
     // Get output slices in rollouts storage
     Tensor actions_out = pufferl.rollouts.actions.select(0, h).narrow(0, buf*block_size, block_size);
@@ -309,27 +310,46 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
 
     // Sample actions and write directly to rollouts
     if (hypers.kernels) {
-        sample_logits(logits, value, actions_out, logprobs_out,
+        // Kernel handles both continuous (logstd defined) and discrete
+        sample_logits(logits, logstd, value, actions_out, logprobs_out,
             values_out, pufferl.act_sizes, pufferl.rng_seed, pufferl.rng_offset);
     } else {
-        int num_action_heads = actions_out.size(1);
-        logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+        if (pufferl.is_continuous) {
+            // Continuous: logits is mean, logstd is log standard deviation
+            Tensor mean = logits;
+            Tensor std = logstd.exp();
+            // Sample: action = mean + std * N(0,1)
+            Tensor noise = torch::randn_like(mean);
+            Tensor actions = mean + std * noise;
+            // Log probability: sum of log_prob for each action dimension
+            // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
+            Tensor log_prob = -0.5 * ((actions - mean) / std).pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
+            Tensor total_log_prob = log_prob.sum(1);
 
-        auto split_logits = torch::split(logits, c10::IntArrayRef(pufferl.act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
-        std::vector<Tensor> actions_vec;
-        std::vector<Tensor> logprobs_vec;
+            actions_out.copy_(actions.to(torch::kFloat64), false);
+            logprobs_out.copy_(total_log_prob, false);
+            values_out.copy_(value.flatten(), false);
+        } else {
+            // Discrete: multinomial sampling
+            int num_action_heads = actions_out.size(1);
+            logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
 
-        for (int i = 0; i < num_action_heads; i++) {
-            Tensor head_logits = split_logits[i];
-            Tensor log_probs = torch::log_softmax(head_logits, 1);
-            Tensor action = at::multinomial(log_probs.exp(), 1, true);
-            Tensor logprob = log_probs.gather(1, action);
-            actions_vec.push_back(action);
-            logprobs_vec.push_back(logprob);
+            auto split_logits = torch::split(logits, c10::IntArrayRef(pufferl.act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+            std::vector<Tensor> actions_vec;
+            std::vector<Tensor> logprobs_vec;
+
+            for (int i = 0; i < num_action_heads; i++) {
+                Tensor head_logits = split_logits[i];
+                Tensor log_probs = torch::log_softmax(head_logits, 1);
+                Tensor action = at::multinomial(log_probs.exp(), 1, true);
+                Tensor logprob = log_probs.gather(1, action);
+                actions_vec.push_back(action);
+                logprobs_vec.push_back(logprob);
+            }
+            actions_out.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
+            logprobs_out.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
+            values_out.copy_(value.flatten(), false);
         }
-        actions_out.copy_(torch::cat(actions_vec, 1).to(torch::kFloat64), false);
-        logprobs_out.copy_(torch::cat(logprobs_vec, 1).sum(1), false);
-        values_out.copy_(value.flatten(), false);
     }
 
     // Update state
@@ -350,14 +370,18 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
 
 void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32,
         torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std,
-        Tensor& act_sizes_cpu, Tensor& act_sizes, bool kernels) {
-    auto [logits, newvalue] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
+        Tensor& act_sizes_cpu, Tensor& act_sizes, bool kernels, bool is_continuous) {
+    auto [logits, newvalue, logstd] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
+
+    // Convert undefined tensor to empty CUDA tensor (autograd requires device)
+    Tensor logstd_safe = logstd.defined() ? logstd : torch::empty({0}, logits.options());
 
     Tensor loss;
     if (kernels) {
         auto [mb_adv_var, mb_adv_mean] = torch::var_mean(graph.mb_advantages);  // single kernel launch
         loss = fused_ppo_loss_optimized(
             logits,
+            logstd_safe,  // For continuous: log std; empty CUDA tensor for discrete
             newvalue,
             graph.mb_actions,
             graph.mb_logprobs,
@@ -380,27 +404,52 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
         int batch = hypers.minibatch_size;
         int minibatch_segments = batch / hypers.horizon;
 
-        // Split logits by action head sizes and compute log probs for each head
-        Tensor flat_logits = logits.reshape({batch, -1});
-        flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
-        auto split_logits = torch::split(flat_logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+        Tensor newlogprob;
+        Tensor entropy;
 
-        std::vector<Tensor> logprobs_vec;
-        std::vector<Tensor> entropies_vec;
+        if (is_continuous) {
+            TORCH_CHECK(logstd.defined() && logstd.numel() > 0,
+                "logstd must be defined for continuous actions");
+            // Continuous: Normal distribution log probability
+            // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
+            Tensor mean = logits.reshape({batch, -1});
+            Tensor log_std = logstd.reshape({batch, -1});
+            Tensor std = log_std.exp();
+            Tensor actions = graph.mb_actions.reshape({batch, -1}).to(mean.dtype());
 
-        for (int h = 0; h < num_action_heads; h++) {
-            Tensor head_logits = split_logits[h];
-            Tensor log_probs = torch::log_softmax(head_logits, 1);
-            Tensor probs = log_probs.exp();
-            Tensor head_actions = graph.mb_actions.select(-1, h).reshape({batch}).to(torch::kInt64);
-            Tensor logprob = log_probs.gather(1, head_actions.unsqueeze(1));
-            logprobs_vec.push_back(logprob);
-            entropies_vec.push_back(-(probs * log_probs).sum(1, true));
+            Tensor normalized = (actions - mean) / std;
+            Tensor log_prob = -0.5 * normalized.pow(2) - 0.5 * std::log(2 * M_PI) - log_std;
+            newlogprob = log_prob.sum(1).reshape({minibatch_segments, hypers.horizon});
+
+            // Differential entropy for Normal: 0.5 * (1 + log(2*pi)) + log_std
+            // = 0.5 + 0.5*log(2*pi) + log_std per dimension
+            constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;
+            entropy = (HALF_1_PLUS_LOG_2PI + log_std).sum(1).mean();
+
+        } else {
+            // Discrete: Categorical distribution
+            // Split logits by action head sizes and compute log probs for each head
+            Tensor flat_logits = logits.reshape({batch, -1});
+            flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
+            auto split_logits = torch::split(flat_logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+
+            std::vector<Tensor> logprobs_vec;
+            std::vector<Tensor> entropies_vec;
+
+            for (int h = 0; h < num_action_heads; h++) {
+                Tensor head_logits = split_logits[h];
+                Tensor log_probs = torch::log_softmax(head_logits, 1);
+                Tensor probs = log_probs.exp();
+                Tensor head_actions = graph.mb_actions.select(-1, h).reshape({batch}).to(torch::kInt64);
+                Tensor logprob = log_probs.gather(1, head_actions.unsqueeze(1));
+                logprobs_vec.push_back(logprob);
+                entropies_vec.push_back(-(probs * log_probs).sum(1, true));
+            }
+
+            // Stack and reduce - no per-iteration allocations
+            newlogprob = torch::cat(logprobs_vec, 1).sum(1).reshape({minibatch_segments, hypers.horizon});
+            entropy = torch::cat(entropies_vec, 1).sum(1).mean();
         }
-
-        // Stack and reduce - no per-iteration allocations
-        Tensor newlogprob = torch::cat(logprobs_vec, 1).sum(1).reshape({minibatch_segments, hypers.horizon});
-        Tensor entropy = torch::cat(entropies_vec, 1).sum(1).mean();
 
         // Compute ratio
         Tensor logratio = newlogprob - graph.mb_logprobs;
@@ -431,7 +480,7 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
 
     // computes gradients on bf16 weights (or fp32 if not using bf16)
     loss.backward();
-    
+
     // copy gradients from bf16 to fp32, then optimizer step on fp32 master weights
     if (hypers.bf16) {
         copy_gradients_to_fp32(policy_bf16, policy_fp32);
@@ -591,6 +640,33 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     pufferl->act_sizes = act_sizes;
     pufferl->act_sizes_cpu = act_sizes.cpu().to(torch::kInt64).contiguous();
 
+    // Determine if action space is continuous or discrete
+    // Continuous: all action dimensions have size 1
+    // Discrete: all action dimensions have size > 1
+    // Mixed: not supported (assert)
+    {
+        int* act_sizes_ptr = get_act_sizes();
+        int num_continuous = 0;
+        int num_discrete = 0;
+        for (int i = 0; i < num_action_heads; i++) {
+            if (act_sizes_ptr[i] == 1) {
+                num_continuous++;
+            } else {
+                num_discrete++;
+            }
+        }
+        TORCH_CHECK(num_continuous == 0 || num_discrete == 0,
+            "Mixed continuous/discrete action spaces not supported. "
+            "All action dimensions must be either continuous (size==1) or discrete (size>1). "
+            "Got ", num_continuous, " continuous and ", num_discrete, " discrete.");
+        pufferl->is_continuous = (num_continuous > 0);
+        if (pufferl->is_continuous) {
+            printf("Detected continuous action space with %d dimensions\n", num_action_heads);
+        } else {
+            printf("Detected discrete action space with %d heads\n", num_action_heads);
+        }
+    }
+
     int input_size = pufferl->env.obs.size(1);
     int hidden_size = hypers.hidden_size;
     int expansion_factor = hypers.expansion_factor;
@@ -598,26 +674,28 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     bool kernels = hypers.kernels;
 
     // Create encoder/decoder based on env_name
-    // Decoder output size is act_n (sum of all action space sizes)
+    // Decoder output size: discrete = act_n (sum of action sizes), continuous = num_action_heads
     // We need two sets for mixed-precision: fp32 (master) and bf16 (working)
+    bool is_continuous = pufferl->is_continuous;
+    int decoder_output_size = is_continuous ? num_action_heads : act_n;
     auto create_encoder_decoder = [&]() -> std::pair<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>> {
         std::shared_ptr<Encoder> enc;
         std::shared_ptr<Decoder> dec;
         if (env_name == "puffer_snake") {
             enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
         } else if (env_name == "puffer_g2048") {
             enc = std::make_shared<G2048Encoder>(input_size, hidden_size);
-            dec = std::make_shared<G2048Decoder>(hidden_size, act_n);
+            dec = std::make_shared<G2048Decoder>(hidden_size, decoder_output_size);
         } else if (env_name == "puffer_nmmo3") {
             enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
-            dec = std::make_shared<NMMO3Decoder>(hidden_size, act_n);
+            dec = std::make_shared<NMMO3Decoder>(hidden_size, decoder_output_size);
         } else if (env_name == "puffer_drive") {
             enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
         } else {
             enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, act_n);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
         }
         return {enc, dec};
     };
@@ -686,7 +764,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         pufferl->train_pool_id = at::cuda::graph_pool_handle();
         capture_graph(&pufferl->train_cudagraph, [p]() {
             train_forward_call(p->train_buf, p->policy_bf16, p->policy_fp32, p->muon,
-                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->act_sizes, p->hypers.kernels);
+                p->hypers, p->adv_mean, p->adv_std, p->act_sizes_cpu, p->act_sizes, p->hypers.kernels, p->is_continuous);
         }, pufferl->train_pool_id);
 
         // Fused rollout cudagraphs: [horizon][num_buffers]
@@ -884,7 +962,7 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_cudagraph.replay();
         } else {
             train_forward_call(graph, pufferl.policy_bf16, pufferl.policy_fp32, pufferl.muon,
-                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, pufferl.act_sizes, hypers.kernels);
+                hypers, pufferl.adv_mean, pufferl.adv_std, pufferl.act_sizes_cpu, pufferl.act_sizes, hypers.kernels, pufferl.is_continuous);
         }
         profile_end(hypers.profile);
 

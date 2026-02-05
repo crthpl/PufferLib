@@ -70,8 +70,8 @@ FLAGS=(
     -I./$BOX2D_NAME/include
     -I./$BOX2D_NAME/src
     -I./pufferlib/extensions
-    "$SRC_DIR/cJSON.c" "$SRC_DIR/$ENV.c" -o "$ENV"
-    #"$SRC_DIR/$ENV.c" -o "$ENV"
+    #"$SRC_DIR/cJSON.c" "$SRC_DIR/$ENV.c" -o "$ENV"
+    "$SRC_DIR/$ENV.c" -o "$ENV"
     $LINK_ARCHIVES
     -lGL
     -lm

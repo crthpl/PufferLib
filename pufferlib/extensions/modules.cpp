@@ -964,9 +964,10 @@ class PPOFusedLossOptimizedFunction : public torch::autograd::Function<PPOFusedL
 public:
     static torch::autograd::tensor_list forward(
         torch::autograd::AutogradContext* ctx,
-        torch::Tensor logits,           // (N, T, A_total) where A_total = sum(act_sizes)
+        torch::Tensor logits,           // (N, T, A_total) where A_total = sum(act_sizes); for continuous: mean
+        torch::Tensor logstd,           // (N, T, num_atns) for continuous; empty tensor for discrete
         torch::Tensor values_pred,      // (N, T, 1) or (N, T)
-        torch::Tensor actions,          // (N, T, num_atns) for MultiDiscrete
+        torch::Tensor actions,          // (N, T, num_atns) - float64 for both continuous and discrete
         torch::Tensor old_logprobs,     // (N, T)
         torch::Tensor advantages,       // (N, T)
         torch::Tensor prio,             // (N, 1) — importance weights
@@ -988,6 +989,11 @@ public:
         auto dtype = logits.dtype();
         TORCH_CHECK(dtype == torch::kFloat32 || dtype == torch::kBFloat16,
                     "Only float32 and bfloat16 supported");
+
+        bool is_continuous = logstd.defined() && logstd.numel() > 0;
+
+        // Create empty CUDA tensor for logstd if discrete (undefined tensors can't be saved)
+        auto logstd_to_save = is_continuous ? logstd : torch::empty({0}, logits.options());
 
         auto device = logits.device();
         auto N = logits.size(0);
@@ -1022,8 +1028,9 @@ public:
                 ratio_out.data_ptr<float>(),
                 newvalue_out.data_ptr<float>(),
                 logits.data_ptr<float>(),
+                is_continuous ? logstd.data_ptr<float>() : nullptr,
                 values_pred.data_ptr<float>(),
-                actions_flat.data_ptr<int64_t>(),
+                actions_flat.data_ptr<double>(),
                 old_logprobs.data_ptr<float>(),
                 advantages.data_ptr<float>(),
                 prio.data_ptr<float>(),
@@ -1040,6 +1047,7 @@ public:
                 T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
+                is_continuous,
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
@@ -1049,8 +1057,9 @@ public:
                 ratio_out.data_ptr<at::BFloat16>(),
                 newvalue_out.data_ptr<at::BFloat16>(),
                 logits.data_ptr<at::BFloat16>(),
+                is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
                 values_pred.data_ptr<at::BFloat16>(),
-                actions_flat.data_ptr<int64_t>(),
+                actions_flat.data_ptr<double>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
                 advantages.data_ptr<float>(), // keep in fp32 for precision and training stability
                 prio.data_ptr<at::BFloat16>(),
@@ -1067,6 +1076,7 @@ public:
                 T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
+                is_continuous,
                 stream
             );
         }
@@ -1075,9 +1085,10 @@ public:
         ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
         ctx->saved_data["vf_coef"] = vf_coef;
         ctx->saved_data["ent_coef"] = ent_coef;
+        ctx->saved_data["is_continuous"] = is_continuous;
 
-        // Save act_sizes and flattened actions for backward
-        ctx->save_for_backward({logits, values_pred, actions_flat, old_logprobs, advantages,
+        // Save tensors for backward - use logstd_to_save (empty CUDA tensor for discrete)
+        ctx->save_for_backward({logits, logstd_to_save, values_pred, actions_flat, old_logprobs, advantages,
                                 prio, values, returns, adv_mean, adv_var, act_sizes});
 
         return {loss_output};
@@ -1088,16 +1099,17 @@ public:
     ) {
         auto saved = ctx->get_saved_variables();
         auto logits = saved[0].contiguous();
-        auto values_pred = saved[1].contiguous();
-        auto actions_flat = saved[2].contiguous();  // already (N*T, num_atns) from forward
-        auto old_logprobs = saved[3].contiguous();
-        auto advantages = saved[4].contiguous();
-        auto prio = saved[5].contiguous();
-        auto values = saved[6].contiguous();
-        auto returns = saved[7].contiguous();
-        auto adv_mean = saved[8].contiguous();
-        auto adv_var = saved[9].contiguous();
-        auto act_sizes = saved[10];  // already on CUDA and contiguous
+        auto logstd = saved[1];  // may be empty for discrete
+        auto values_pred = saved[2].contiguous();
+        auto actions_flat = saved[3].contiguous();  // already (N*T, num_atns) from forward
+        auto old_logprobs = saved[4].contiguous();
+        auto advantages = saved[5].contiguous();
+        auto prio = saved[6].contiguous();
+        auto values = saved[7].contiguous();
+        auto returns = saved[8].contiguous();
+        auto adv_mean = saved[9].contiguous();
+        auto adv_var = saved[10].contiguous();
+        auto act_sizes = saved[11];  // already on CUDA and contiguous
 
         auto dtype = logits.dtype();
         auto N = logits.size(0);
@@ -1109,12 +1121,19 @@ public:
         float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
         float vf_coef = ctx->saved_data["vf_coef"].to<double>();
         float ent_coef = ctx->saved_data["ent_coef"].to<double>();
+        bool is_continuous = ctx->saved_data["is_continuous"].to<bool>();
 
         auto grad_loss = grad_outputs[0].to(torch::kFloat32).contiguous();
 
         // keep gradients in fp32 for precision / training stability issues
         auto grad_logits = torch::empty(logits.sizes(), logits.options().dtype(torch::kFloat32));
         auto grad_values_pred = torch::empty(values_pred.sizes(), values_pred.options().dtype(torch::kFloat32));
+        // For continuous: grad_logstd has same shape as logstd
+        torch::Tensor grad_logstd;
+        if (is_continuous) {
+            logstd = logstd.contiguous();
+            grad_logstd = torch::empty(logstd.sizes(), logstd.options().dtype(torch::kFloat32));
+        }
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // need strides
@@ -1129,11 +1148,13 @@ public:
         if (dtype == torch::kFloat32) {
             launch_ppo_loss_backward_optimized_float(
                 grad_logits.data_ptr<float>(),
+                is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
                 grad_values_pred.data_ptr<float>(),
                 grad_loss.data_ptr<float>(),
                 logits.data_ptr<float>(),
+                is_continuous ? logstd.data_ptr<float>() : nullptr,
                 values_pred.data_ptr<float>(),
-                actions_flat.data_ptr<int64_t>(),
+                actions_flat.data_ptr<double>(),
                 old_logprobs.data_ptr<float>(),
                 advantages.data_ptr<float>(),
                 prio.data_ptr<float>(),
@@ -1148,16 +1169,19 @@ public:
                 T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
+                is_continuous,
                 stream
             );
         } else if (dtype == torch::kBFloat16) {
             launch_ppo_loss_backward_optimized_bf16(
                 grad_logits.data_ptr<float>(),
+                is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
                 grad_values_pred.data_ptr<float>(),
                 grad_loss.data_ptr<float>(),
                 logits.data_ptr<at::BFloat16>(),
+                is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
                 values_pred.data_ptr<at::BFloat16>(),
-                actions_flat.data_ptr<int64_t>(),
+                actions_flat.data_ptr<double>(),
                 old_logprobs.data_ptr<at::BFloat16>(),
                 advantages.data_ptr<float>(), // keep in fp32
                 prio.data_ptr<at::BFloat16>(),
@@ -1172,12 +1196,14 @@ public:
                 T, A_total, N,
                 logits_stride_n, logits_stride_t, logits_stride_a,
                 values_stride_n, values_stride_t,
+                is_continuous,
                 stream
             );
         }
 
         return {
             grad_logits,
+            is_continuous ? grad_logstd : torch::Tensor(),  // grad_logstd
             grad_values_pred,
             {}, {}, {}, {}, {}, {},  // actions, old_logprobs, advantages, prio, values, returns
             {}, {},                   // adv_mean, adv_std
@@ -1189,7 +1215,8 @@ public:
 };
 
 torch::autograd::tensor_list fused_ppo_loss_optimized(
-    torch::Tensor logits,
+    torch::Tensor logits,           // For continuous: mean
+    torch::Tensor logstd,           // For continuous: log std; empty tensor for discrete
     torch::Tensor values_pred,
     torch::Tensor actions,
     torch::Tensor old_logprobs,
@@ -1207,7 +1234,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     float vf_coef,
     float ent_coef
 ) {
-    return PPOFusedLossOptimizedFunction::apply(logits, values_pred, actions,
+    return PPOFusedLossOptimizedFunction::apply(logits, logstd, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, adv_mean,
         adv_var, ratio_out, newvalue_out, act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
@@ -1331,25 +1358,27 @@ torch::Tensor fused_ppo_loss_cpp(
     return pg_loss + vf_coef * v_loss - ent_coef * entropy;
 }
 
-// Fused sample_logits: nan_to_num + log_softmax + multinomial + gather + value copy
+// Fused sample_logits: handles both discrete and continuous action sampling
+// For discrete: nan_to_num + log_softmax + multinomial + gather + value copy
+// For continuous: sample from Normal(mean, exp(logstd)) + compute log_prob
 // Writes directly to pre-allocated output tensors to avoid copy overhead
-// logits: (B, A) - raw logits (may be non-contiguous in dim 0)
+//
+// logits: (B, A) - For discrete: raw logits. For continuous: mean values.
+// logstd: Tensor or empty - For continuous: log standard deviation. Empty for discrete.
 // value: (B, 1) or (B,) - value from fused output (may be non-contiguous)
-// actions_out: (B,) float64 - output actions
-// logprobs_out: (B,) same dtype as logits - output log probabilities
+// actions_out: (B, num_atns) float64 - output actions
+// logprobs_out: (B,) same dtype as logits - output log probabilities (sum over action dims)
 // value_out: (B,) same dtype as logits - output value (flattened copy)
+// act_sizes: (num_atns,) int32 - size of each action head (all 1s for continuous)
 // seed: RNG seed
 // offset: RNG offset tensor (int64, read at kernel execution time for CUDA graph support)
 //
 // NOTE: Unlike other kernels, this supports non-contiguous logits/value input via stride.
-// This is specifically for fused logit+value decoder output where the decoder outputs
-// (B, V+A) and logits is a view [:, V:] with stride (V+A, 1) instead of (A, 1).
-// Using stride avoids .contiguous() kernel launches.
-//
 // NOTE: offset is a tensor (not scalar) so that CUDA graphs read the current value at
 // replay time. Increment offset with a CUDA tensor op after calling this function.
 void sample_logits(
     torch::Tensor logits,
+    torch::Tensor logstd,  // Empty tensor for discrete, defined for continuous
     torch::Tensor value,
     torch::Tensor actions_out,
     torch::Tensor logprobs_out,
@@ -1359,7 +1388,7 @@ void sample_logits(
     torch::Tensor offset
 ) {
     TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
-    TORCH_CHECK(logits.dim() == 2, "logits must be 2D (B, sum(act_sizes))");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D (B, num_atns or sum(act_sizes))");
     TORCH_CHECK(logits.stride(1) == 1, "logits must be contiguous in last dim");
     TORCH_CHECK(actions_out.is_contiguous(), "actions_out must be contiguous");
     TORCH_CHECK(logprobs_out.is_contiguous(), "logprobs_out must be contiguous");
@@ -1370,10 +1399,14 @@ void sample_logits(
     TORCH_CHECK(act_sizes.dtype() == torch::kInt32, "act_sizes must be int32");
     TORCH_CHECK(act_sizes.is_cuda(), "act_sizes must be on CUDA");
 
+    bool is_continuous = logstd.defined() && logstd.numel() > 0;
+
     auto dtype = logits.dtype();
     auto B = logits.size(0);
     auto num_atns = act_sizes.size(0);
     auto logits_stride = logits.stride(0);  // row stride (may be > sum(act_sizes) for fused output)
+    // logstd may have different stride (e.g., 0 for broadcast from [1, num_atns] expanded to [B, num_atns])
+    auto logstd_stride = is_continuous ? logstd.stride(0) : 0;
     // value may be (B, 1) or (B,) - stride(0) works for both (gives stride between elements)
     auto value_stride = value.stride(0);
 
@@ -1385,6 +1418,7 @@ void sample_logits(
             logprobs_out.data_ptr<float>(),
             value_out.data_ptr<float>(),
             logits.data_ptr<float>(),
+            is_continuous ? logstd.data_ptr<float>() : nullptr,
             value.data_ptr<float>(),
             act_sizes.data_ptr<int>(),
             seed,
@@ -1392,7 +1426,9 @@ void sample_logits(
             static_cast<int>(num_atns),
             static_cast<int>(B),
             static_cast<int>(logits_stride),
+            static_cast<int>(logstd_stride),
             static_cast<int>(value_stride),
+            is_continuous,
             stream
         );
     } else if (dtype == torch::kBFloat16) {
@@ -1401,6 +1437,7 @@ void sample_logits(
             logprobs_out.data_ptr<at::BFloat16>(),
             value_out.data_ptr<at::BFloat16>(),
             logits.data_ptr<at::BFloat16>(),
+            is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
             value.data_ptr<at::BFloat16>(),
             act_sizes.data_ptr<int>(),
             seed,
@@ -1408,7 +1445,9 @@ void sample_logits(
             static_cast<int>(num_atns),
             static_cast<int>(B),
             static_cast<int>(logits_stride),
+            static_cast<int>(logstd_stride),
             static_cast<int>(value_stride),
+            is_continuous,
             stream
         );
     } else {

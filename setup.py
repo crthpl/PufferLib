@@ -314,6 +314,7 @@ def create_static_env_build_class(env_name):
             static_lib = f'pufferlib/extensions/libstatic_{env_name}.a'
             static_obj = f'pufferlib/extensions/libstatic_{env_name}.o'
 
+            # -g?
             clang_cmd = [
                 'clang', '-c', '-O2', '-DNDEBUG',
                 '-I.', '-Ipufferlib/extensions', f'-Ipufferlib/ocean/{env_name}',
