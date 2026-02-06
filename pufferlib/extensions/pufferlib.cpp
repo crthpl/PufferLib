@@ -684,9 +684,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         if (env_name == "puffer_snake") {
             enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
             dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-        } else if (env_name == "puffer_g2048") {
-            enc = std::make_shared<G2048Encoder>(input_size, hidden_size);
-            dec = std::make_shared<G2048Decoder>(hidden_size, decoder_output_size);
+        } else if (env_name == "falsepuffer_g2048") {
+            enc = std::make_shared<SimpleG2048Encoder>(input_size, hidden_size);
+            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
+
         } else if (env_name == "puffer_nmmo3") {
             enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
             dec = std::make_shared<NMMO3Decoder>(hidden_size, decoder_output_size);

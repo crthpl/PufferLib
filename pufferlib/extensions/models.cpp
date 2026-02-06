@@ -330,6 +330,47 @@ class G2048Encoder : public Encoder {
     }
 };
 
+class SimpleG2048Encoder : public Encoder {
+    public:
+        torch::nn::Embedding value_embed{nullptr};
+        torch::nn::Embedding pos_embed{nullptr};
+        torch::nn::Linear linear1{nullptr};
+        int input_size;
+        int hidden_size;
+        static constexpr int embed_dim = 3;  // ceil(33^0.25) = 3
+        static constexpr int num_grid_cells = 16;
+        static constexpr int num_obs = num_grid_cells * embed_dim;  // 48
+
+    SimpleG2048Encoder(int64_t input_size, int64_t hidden_size)
+        : input_size(input_size), hidden_size(hidden_size) {
+        // Embeddings for tile values and positions
+        value_embed = register_module("value_embed", torch::nn::Embedding(18, embed_dim));
+        pos_embed = register_module("pos_embed", torch::nn::Embedding(num_grid_cells, embed_dim));
+
+        linear1 = register_module("linear1", torch::nn::Linear(
+            torch::nn::LinearOptions(num_obs, hidden_size).bias(false)));
+        torch::nn::init::orthogonal_(linear1->weight, std::sqrt(2.0));
+    }
+
+    Tensor forward(Tensor x) override {
+        // x is (B, 16) uint8 tile values
+        auto B = x.size(0);
+        auto target_dtype = linear1->weight.dtype();
+
+        // value_embed(obs) -> (B, 16, embed_dim)
+        auto value_obs = value_embed->forward(x.to(torch::kLong)).to(target_dtype);
+
+        // pos_embed.weight expanded to (B, 16, embed_dim)
+        auto pos_obs = pos_embed->weight.unsqueeze(0).expand({B, num_grid_cells, embed_dim}).to(target_dtype);
+
+        // grid_obs = (value_obs + pos_obs).flatten(1) -> (B, 48)
+        auto grid_obs = (value_obs + pos_obs).flatten(1);
+
+        return linear1->forward(grid_obs);
+    }
+};
+
+
 // NMMO3 encoder: Conv2d map processing + embedding for player discrete + projection
 class NMMO3Encoder : public Encoder {
     public:

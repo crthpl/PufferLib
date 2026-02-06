@@ -674,7 +674,7 @@ def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=No
             model_path = pufferl.close()
             pufferl.logger.log_cost(pufferl.uptime)
             pufferl.logger.close(model_path, early_stop=True)
-            return all_logs
+            return pufferl, all_logs
 
     if train_config['profile']:
         _C.profiler_stop()
@@ -684,11 +684,13 @@ def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=No
     if not logger:
         model_path = pufferl.close()
 
-    return pufferl
+    return pufferl, all_logs
 
 
 def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
-    args = load_config(env_name)
+    if args is None:
+        args = load_config(env_name)
+
     num_gpus = args['train']['gpus']
 
     nccl_id_path = f'/tmp/puffer_nccl_{os.getpid()}'
@@ -722,7 +724,7 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     if logger is None:
         logger = Logger(args)
 
-    pufferl = _train_rank(env_name, args=args, logger=logger, verbose=True)
+    pufferl, all_logs = _train_rank(env_name, args=args, logger=logger, verbose=True)
 
     for p in procs:
         p.join()
@@ -753,10 +755,13 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     logs['agent_steps'] = agent_steps
     logs = pufferl.write_logs(logs)
 
+    all_logs.append(logs)
+
     pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.log_cost(uptime)
     pufferl.logger.close(model_path, early_stop=False)
+    return all_logs
 
 
 def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
