@@ -32,55 +32,6 @@ struct ShareableLSTMCell : public torch::nn::LSTMCellImpl {
     }
 };
 
-class RMSNorm : public torch::nn::Module {
-private:
-    int64_t dim;
-    Tensor weight{nullptr};
-
-public:
-    RMSNorm(int64_t dim)
-        : dim(dim) {
-
-        weight = register_parameter("weight", torch::ones(dim));
-    }
-
-    Tensor forward(Tensor x) {
-        int ndim = x.dim();
-        TORCH_CHECK(x.size(ndim - 1) == dim, "Last dimension must match expected size");
-        double eps = 1.19e-07;
-        //return torch::nn::functional::normalize(
-        //    x, torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(-1)) * weight;
-        Tensor rms = (x.pow(2).mean(-1, true) + eps).rsqrt();
-        return x * rms * weight;
-        //auto mean_sq = (x*x).mean(ndim - 1, true);
-        //return weight * x/mean_sq.sqrt();
-    }
-};
-
-class DyT : public torch::nn::Module {
-    private:
-        int64_t dim;
-        Tensor alpha{nullptr};
-        Tensor weight{nullptr};
-        Tensor bias{nullptr};
-
-    public:
-        DyT(int64_t dim)
-            : dim(dim) {
-
-            alpha = register_parameter("alpha", 0.5*torch::ones({dim}));
-            weight = register_parameter("weight", torch::ones({dim}));
-            bias = register_parameter("bias", torch::zeros({dim}));
-        }
-
-        Tensor forward(Tensor x) {
-            x = torch::tanh(alpha*x);
-            x = x*weight + bias;
-            return x;
-        }
-};
-
-
 class MinGRULayer : public torch::nn::Module {
 public:
     int64_t dim;
@@ -90,8 +41,6 @@ public:
     //Tensor to_hidden_and_gate_bf16{nullptr};
     torch::nn::Linear to_out{nullptr};
     //Tensor rmsnorm_weight{nullptr};
-    //RMSNorm rmsnorm{nullptr};
-    std::shared_ptr<RMSNorm> norm{nullptr};
     //std::shared_ptr<DyT> dyt{nullptr};
     MinGRULayer(int64_t dim, int64_t expansion_factor = 1., bool kernels = true)
         : dim(dim), expansion_factor(expansion_factor), kernels(kernels) {
@@ -110,7 +59,6 @@ public:
         //        torch::nn::Linear(torch::nn::LinearOptions(dim*expansion_factor, dim).bias(false)));
         //torch::nn::init::orthogonal_(to_out->weight);
 
-        norm = register_module("norm", std::make_shared<RMSNorm>(dim));
         //dyt = register_module("dyt", std::make_shared<DyT>(dim));
 
         //rmsnorm_weight = register_parameter("rmsnorm_weight", torch::ones({dim}));

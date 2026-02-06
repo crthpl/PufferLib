@@ -37,9 +37,8 @@ import pufferlib.vector
 import pufferlib.pytorch
 try:
     from pufferlib import _C
-    from pufferlib import fake_tensors
 except ImportError:
-    raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
+    raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
 
 import rich
 import rich.traceback
@@ -349,29 +348,6 @@ class PuffeRL:
 
         print('\033[0;0H' + capture.get())
 
-def compute_puff_advantage(values, rewards, terminals,
-        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
-    '''CUDA kernel for puffer advantage with automatic CPU fallback. You need
-    nvcc (in cuda-dev-tools or in a cuda-dev docker base) for PufferLib to
-    compile the fast version.'''
-
-    device = values.device
-    if not ADVANTAGE_CUDA:
-        values = values.cpu()
-        rewards = rewards.cpu()
-        terminals = terminals.cpu()
-        ratio = ratio.cpu()
-        advantages = advantages.cpu()
-
-    torch.ops.pufferlib.compute_puff_advantage(values, rewards, terminals,
-        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
-
-    if not ADVANTAGE_CUDA:
-        return advantages.to(device)
-
-    return advantages
-
-
 def abbreviate(num, b2, c2):
     if num < 1e3:
         return f'{b2}{num}{c2}'
@@ -572,61 +548,6 @@ class Logger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def check(env_name):
-    torch.set_printoptions(precision=16)
-
-    args = load_config(env_name)
-    args['train']['optimizer'] = 'adam'
-
-    vecenv = load_env(env_name, args)
-
-    torch.manual_seed(args['train']['seed'])
-    policy = load_policy(args, vecenv, env_name)
-
-    import pufferlib.python_pufferl
-    train_config = dict(**args['train'])
-    train_config['env_name'] = args['env_name']
-    train_config['vec_kwargs'] = args['vec']
-    train_config['env_kwargs'] = args['env']
-    train_config['total_agents'] = args['vec']['total_agents']
-    train_config['num_buffers'] = args['vec']['num_buffers']
-    pufferl_python = pufferlib.python_pufferl.PuffeRL(train_config, vecenv, policy, verbose=False)
-
-    pufferl_cpp = PuffeRL(train_config, verbose=False)
-
-    python_params = dict(policy.named_parameters())
-    for k, v in pufferl_cpp.pufferl_cpp.policy.named_parameters():
-        v_python = python_params[k].data
-        assert torch.allclose(v, v_python)
-
-    torch.manual_seed(args['train']['seed'])
-    pufferl_python.evaluate()
-    #pufferl_python.train()
-    #pufferl_python.evaluate()
-
-    torch.manual_seed(args['train']['seed'])
-    pufferl_cpp.evaluate()
-    #pufferl_cpp.train()
-    #pufferl_cpp.evaluate()
-
-    # You need to determinize the env before checks
-    for i in range(args['train']['horizon']):
-        python_obs = pufferl_python.observations[:, i].float()
-        cpp_obs = pufferl_cpp.rollouts.observations[:, i]
-        assert torch.allclose(pufferl_python.observations[:, i].float(), pufferl_cpp.rollouts.observations[:, i]), f'Observation {i} mismatch'
-        assert torch.allclose(pufferl_python.actions[:, i], pufferl_cpp.rollouts.actions[:, i].long()), f'Action {i} mismatch'
-        assert torch.allclose(pufferl_python.rewards[:, i], pufferl_cpp.rollouts.rewards[:, i]), f'Reward {i} mismatch'
-        assert torch.allclose(pufferl_python.terminals[:, i], pufferl_cpp.rollouts.terminals[:, i]), f'Terminal {i} mismatch'
-        assert torch.allclose(pufferl_python.logprobs[:, i], pufferl_cpp.rollouts.logprobs[:, i], atol=1e-5), f'Logprob {i} mismatch'
-        assert torch.allclose(pufferl_python.values[:, i], pufferl_cpp.rollouts.values[:, i], atol=1e-4), f'Value {i} mismatch'
-
-    python_params = dict(policy.named_parameters())
-    for k, v in pufferl_cpp.pufferl_cpp.policy.named_parameters():
-        v_python = python_params[k].data
-        assert torch.allclose(v, v_python, atol=1e-5)
-
-    print('Check passed')
-
 def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     """Worker function for multi-GPU training. Runs on each GPU."""
 
@@ -763,42 +684,6 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
-
-def sps(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True, should_stop_early=None):
-    args = args or load_config(env_name)
-    train_config = dict(**args['train'])#, env=env_name)
-    train_config['env_name'] = args['env_name']
-    train_config['vec_kwargs'] = args['vec']
-    train_config['env_kwargs'] = args['env']
-    train_config['total_agents'] = args['vec']['total_agents']
-    train_config['num_buffers'] = args['vec']['num_buffers']
-    pufferl = PuffeRL(train_config, logger, verbose)
-    # Warmup
-    for _ in range(3):
-        _C.batched_forward(
-            pufferl.pufferl_cpp,
-            pufferl.observations,
-            pufferl.total_minibatches,
-            pufferl.minibatch_segments,
-        )
-
-    N = 100
-    torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(N):
-        _C.batched_forward(
-            pufferl.pufferl_cpp,
-            pufferl.observations,
-            pufferl.total_minibatches,
-            pufferl.minibatch_segments,
-        )
-    torch.cuda.synchronize()
-    end = time.time()
-    dt = end - start
-    sps = pufferl.config['batch_size']*N/dt
-    print(f'SPS: {sps/1e6:.1f}M')
-
-
 def eval(env_name, args=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
     backend = args['vec']['backend']
@@ -854,9 +739,6 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
-
-def stop_if_loss_nan(logs):
-    return any("losses/" in k and np.isnan(v) for k, v in logs.items())
 
 def _sweep_worker(env_name, q_host, q_worker, device):
     while True:
@@ -1049,7 +931,7 @@ def sweep(args=None, env_name=None):
     running_target_buffer = deque(maxlen=30)
 
     def stop_if_perf_below(logs):
-        if stop_if_loss_nan(logs):
+        if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
             logs['is_loss_nan'] = True
             return True
 
@@ -1124,14 +1006,6 @@ def export(args=None, env_name=None, vecenv=None, policy=None):
     weights.tofile(path)
     print(f'Saved {len(weights)} weights to {path}')
 
-def autotune(args=None, env_name=None, vecenv=None, policy=None):
-    package = args['package']
-    module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
-    env_module = importlib.import_module(module_name)
-    env_name = args['env_name']
-    make_env = env_module.env_creator(env_name)
-    pufferlib.vector.autotune(make_env, batch_size=args['train']['env_batch_size'])
- 
 def load_env(env_name, args):
     package = args['package']
     module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
@@ -1195,22 +1069,6 @@ def load_config(env_name, parser=None):
             if env_name in p['base']['env_name'].split(): break
         else:
             raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
-
-    return process_config(p, parser=parser)
-
-def load_config_file(file_path, fill_in_default=True, parser=None):
-    if not os.path.exists(file_path):
-        raise pufferlib.APIUsageError('No config file found')
-
-    config_paths = [file_path]
-
-    if fill_in_default:
-        puffer_dir = os.path.dirname(os.path.realpath(__file__))
-        # Process the puffer defaults first
-        config_paths.insert(0, os.path.join(puffer_dir, 'config/default.ini'))
-
-    p = configparser.ConfigParser()
-    p.read(config_paths)
 
     return process_config(p, parser=parser)
 
@@ -1299,14 +1157,8 @@ def main():
         multisweep(env_name=env_name)
     elif mode == 'paretosweep':
         paretosweep(env_name=env_name)
-    elif mode == 'autotune':
-        autotune(env_name=env_name)
     elif mode == 'export':
         export(env_name=env_name)
-    elif mode == 'check':
-        check(env_name=env_name)
-    elif mode == 'sps':
-        sps(env_name=env_name)
     else:
         raise pufferlib.APIUsageError(err)
 
