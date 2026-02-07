@@ -37,29 +37,17 @@ std::vector<torch::Tensor> mingru_gate(
     auto next_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (dtype == torch::kFloat32) {
-        launch_mingru_gate_inference_float(
-            out.data_ptr<float>(),
-            next_state.data_ptr<float>(),
-            combined.data_ptr<float>(),
-            state.data_ptr<float>(),
-            static_cast<int>(H),
-            static_cast<int>(B),
-            stream
-        );
-    } else if (dtype == torch::kBFloat16) {
-        launch_mingru_gate_inference_bf16(
-            out.data_ptr<at::BFloat16>(),
-            next_state.data_ptr<at::BFloat16>(),
-            combined.data_ptr<at::BFloat16>(),
-            state.data_ptr<at::BFloat16>(),
-            static_cast<int>(H),
-            static_cast<int>(B),
-            stream
-        );
-    } else {
-        TORCH_CHECK(false, "Unsupported dtype. Supported dtypes are float32 and bfloat16");
-    }
+    int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+    launch_mingru_gate_inference(
+        out.data_ptr(),
+        next_state.data_ptr(),
+        combined.data_ptr(),
+        state.data_ptr(),
+        static_cast<int>(H),
+        static_cast<int>(B),
+        stream,
+        dtype_flag
+    );
     return {out, next_state};
 }
 
@@ -99,37 +87,21 @@ public:
         auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_fused_scan_forward_checkpointed_float(
-                out.data_ptr<float>(),
-                next_state.data_ptr<float>(),
-                a_star.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
-                log_values_buf.data_ptr<float>(),
-                combined.data_ptr<float>(),
-                state.data_ptr<float>(),
-                static_cast<int>(T),
-                static_cast<int>(H),
-                static_cast<int>(B),
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_fused_scan_forward_checkpointed_bf16(
-                out.data_ptr<at::BFloat16>(),
-                next_state.data_ptr<at::BFloat16>(),
-                a_star.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
-                log_values_buf.data_ptr<float>(),
-                combined.data_ptr<at::BFloat16>(),
-                state.data_ptr<at::BFloat16>(),
-                static_cast<int>(T),
-                static_cast<int>(H),
-                static_cast<int>(B),
-                stream
-            );
-        } else {
-            TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_fused_scan_forward_checkpointed(
+            out.data_ptr(),
+            next_state.data_ptr(),
+            a_star.data_ptr<float>(),
+            s_vals.data_ptr<float>(),
+            log_values_buf.data_ptr<float>(),
+            combined.data_ptr(),
+            state.data_ptr(),
+            static_cast<int>(T),
+            static_cast<int>(H),
+            static_cast<int>(B),
+            stream,
+            dtype_flag
+        );
 
         // Save all tensors for backward (ensures proper cleanup after backward)
         ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
@@ -163,41 +135,23 @@ public:
         auto grad_state = torch::empty_like(state);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_fused_scan_backward_checkpointed_float(
-                grad_combined.data_ptr<float>(),
-                grad_state.data_ptr<float>(),
-                grad_out.data_ptr<float>(),
-                grad_next_state.data_ptr<float>(),
-                combined.data_ptr<float>(),
-                state.data_ptr<float>(),
-                a_star_buf.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
-                log_values_buf.data_ptr<float>(),
-                static_cast<int>(T),
-                static_cast<int>(H),
-                static_cast<int>(B),
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_fused_scan_backward_checkpointed_bf16(
-                grad_combined.data_ptr<at::BFloat16>(),
-                grad_state.data_ptr<at::BFloat16>(),
-                grad_out.data_ptr<at::BFloat16>(),
-                grad_next_state.data_ptr<at::BFloat16>(),
-                combined.data_ptr<at::BFloat16>(),
-                state.data_ptr<at::BFloat16>(),
-                a_star_buf.data_ptr<float>(),
-                s_vals.data_ptr<float>(),
-                log_values_buf.data_ptr<float>(),
-                static_cast<int>(T),
-                static_cast<int>(H),
-                static_cast<int>(B),
-                stream
-            );
-        } else {
-            TORCH_CHECK(false, "Unsupported dtype");
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_fused_scan_backward_checkpointed(
+            grad_combined.data_ptr(),
+            grad_state.data_ptr(),
+            grad_out.data_ptr(),
+            grad_next_state.data_ptr(),
+            combined.data_ptr(),
+            state.data_ptr(),
+            a_star_buf.data_ptr<float>(),
+            s_vals.data_ptr<float>(),
+            log_values_buf.data_ptr<float>(),
+            static_cast<int>(T),
+            static_cast<int>(H),
+            static_cast<int>(B),
+            stream,
+            dtype_flag
+        );
 
         return {grad_combined, grad_state};
     }
@@ -229,25 +183,15 @@ public:
         auto s_buf = torch::empty({B, T, H}, options_double);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_logcumsumexp_forward_float(
-                out.data_ptr<float>(),
-                s_buf.data_ptr<double>(),
-                x.data_ptr<float>(),
-                (int)T, (int)H, (int)B,
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_logcumsumexp_forward_bf16(
-                out.data_ptr<at::BFloat16>(),
-                s_buf.data_ptr<double>(),
-                x.data_ptr<at::BFloat16>(),
-                (int)T, (int)H, (int)B,
-                stream
-            );
-        } else {
-            TORCH_CHECK(false, "Only float32 and bfloat16 supported");
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_logcumsumexp_forward(
+            out.data_ptr(),
+            s_buf.data_ptr<double>(),
+            x.data_ptr(),
+            (int)T, (int)H, (int)B,
+            stream,
+            dtype_flag
+        );
 
         ctx->save_for_backward({x, out, s_buf});
         return {out};
@@ -267,27 +211,16 @@ public:
         auto grad_x = torch::empty_like(x);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_logcumsumexp_backward_float(
-                grad_x.data_ptr<float>(),
-                grad_out.data_ptr<float>(),
-                x.data_ptr<float>(),
-                s_buf.data_ptr<double>(),
-                (int)T, (int)H, (int)B,
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_logcumsumexp_backward_bf16(
-                grad_x.data_ptr<at::BFloat16>(),
-                grad_out.data_ptr<at::BFloat16>(),
-                x.data_ptr<at::BFloat16>(),
-                s_buf.data_ptr<double>(),
-                (int)T, (int)H, (int)B,
-                stream
-            );
-        } else {
-            TORCH_CHECK(false, "Unsupported dtype in backward");
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_logcumsumexp_backward(
+            grad_x.data_ptr(),
+            grad_out.data_ptr(),
+            x.data_ptr(),
+            s_buf.data_ptr<double>(),
+            (int)T, (int)H, (int)B,
+            stream,
+            dtype_flag
+        );
 
         return {grad_x};
     }
@@ -359,65 +292,36 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        if (dtype == torch::kFloat32) {
-            launch_ppo_loss_forward_optimized_float(
-                loss_output.data_ptr<float>(),
-                saved_for_backward.data_ptr<double>(),
-                ratio_out.data_ptr<float>(),
-                newvalue_out.data_ptr<float>(),
-                logits.data_ptr<float>(),
-                is_continuous ? logstd.data_ptr<float>() : nullptr,
-                values_pred.data_ptr<float>(),
-                actions_flat.data_ptr<double>(),
-                old_logprobs.data_ptr<float>(),
-                advantages.data_ptr<float>(),
-                prio.data_ptr<float>(),
-                values.data_ptr<float>(),
-                returns.data_ptr<float>(),
-                adv_mean.data_ptr<float>(),
-                adv_var.data_ptr<float>(),
-                act_sizes.data_ptr<int>(),
-                static_cast<int>(num_atns),
-                static_cast<float>(clip_coef),
-                static_cast<float>(vf_clip_coef),
-                static_cast<float>(vf_coef),
-                static_cast<float>(ent_coef),
-                T, A_total, N,
-                logits_stride_n, logits_stride_t, logits_stride_a,
-                values_stride_n, values_stride_t,
-                is_continuous,
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_ppo_loss_forward_optimized_bf16(
-                loss_output.data_ptr<float>(),
-                saved_for_backward.data_ptr<double>(),
-                ratio_out.data_ptr<at::BFloat16>(),
-                newvalue_out.data_ptr<at::BFloat16>(),
-                logits.data_ptr<at::BFloat16>(),
-                is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
-                values_pred.data_ptr<at::BFloat16>(),
-                actions_flat.data_ptr<double>(),
-                old_logprobs.data_ptr<at::BFloat16>(),
-                advantages.data_ptr<float>(), // keep in fp32 for precision and training stability
-                prio.data_ptr<at::BFloat16>(),
-                values.data_ptr<at::BFloat16>(),
-                returns.data_ptr<at::BFloat16>(),
-                adv_mean.data_ptr<float>(), // fp32 training and precision
-                adv_var.data_ptr<float>(),  // fp32 training and precision
-                act_sizes.data_ptr<int>(),
-                static_cast<int>(num_atns),
-                static_cast<float>(clip_coef),
-                static_cast<float>(vf_clip_coef),
-                static_cast<float>(vf_coef),
-                static_cast<float>(ent_coef),
-                T, A_total, N,
-                logits_stride_n, logits_stride_t, logits_stride_a,
-                values_stride_n, values_stride_t,
-                is_continuous,
-                stream
-            );
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_ppo_loss_forward_optimized(
+            loss_output.data_ptr<float>(),
+            saved_for_backward.data_ptr<double>(),
+            ratio_out.data_ptr(),
+            newvalue_out.data_ptr(),
+            logits.data_ptr(),
+            is_continuous ? logstd.data_ptr() : nullptr,
+            values_pred.data_ptr(),
+            actions_flat.data_ptr<double>(),
+            old_logprobs.data_ptr(),
+            advantages.data_ptr<float>(),
+            prio.data_ptr(),
+            values.data_ptr(),
+            returns.data_ptr(),
+            adv_mean.data_ptr<float>(),
+            adv_var.data_ptr<float>(),
+            act_sizes.data_ptr<int>(),
+            static_cast<int>(num_atns),
+            static_cast<float>(clip_coef),
+            static_cast<float>(vf_clip_coef),
+            static_cast<float>(vf_coef),
+            static_cast<float>(ent_coef),
+            T, A_total, N,
+            logits_stride_n, logits_stride_t, logits_stride_a,
+            values_stride_n, values_stride_t,
+            is_continuous,
+            stream,
+            dtype_flag
+        );
 
         ctx->saved_data["clip_coef"] = clip_coef;
         ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
@@ -483,61 +387,34 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        if (dtype == torch::kFloat32) {
-            launch_ppo_loss_backward_optimized_float(
-                grad_logits.data_ptr<float>(),
-                is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
-                grad_values_pred.data_ptr<float>(),
-                grad_loss.data_ptr<float>(),
-                logits.data_ptr<float>(),
-                is_continuous ? logstd.data_ptr<float>() : nullptr,
-                values_pred.data_ptr<float>(),
-                actions_flat.data_ptr<double>(),
-                old_logprobs.data_ptr<float>(),
-                advantages.data_ptr<float>(),
-                prio.data_ptr<float>(),
-                values.data_ptr<float>(),
-                returns.data_ptr<float>(),
-                adv_mean.data_ptr<float>(),
-                adv_var.data_ptr<float>(),
-                act_sizes.data_ptr<int>(),
-                static_cast<int>(num_atns),
-                clip_coef, vf_clip_coef,
-                vf_coef, ent_coef,
-                T, A_total, N,
-                logits_stride_n, logits_stride_t, logits_stride_a,
-                values_stride_n, values_stride_t,
-                is_continuous,
-                stream
-            );
-        } else if (dtype == torch::kBFloat16) {
-            launch_ppo_loss_backward_optimized_bf16(
-                grad_logits.data_ptr<float>(),
-                is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
-                grad_values_pred.data_ptr<float>(),
-                grad_loss.data_ptr<float>(),
-                logits.data_ptr<at::BFloat16>(),
-                is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
-                values_pred.data_ptr<at::BFloat16>(),
-                actions_flat.data_ptr<double>(),
-                old_logprobs.data_ptr<at::BFloat16>(),
-                advantages.data_ptr<float>(), // keep in fp32
-                prio.data_ptr<at::BFloat16>(),
-                values.data_ptr<at::BFloat16>(),
-                returns.data_ptr<at::BFloat16>(),
-                adv_mean.data_ptr<float>(),
-                adv_var.data_ptr<float>(),
-                act_sizes.data_ptr<int>(),
-                static_cast<int>(num_atns),
-                clip_coef, vf_clip_coef,
-                vf_coef, ent_coef,
-                T, A_total, N,
-                logits_stride_n, logits_stride_t, logits_stride_a,
-                values_stride_n, values_stride_t,
-                is_continuous,
-                stream
-            );
-        }
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_ppo_loss_backward_optimized(
+            grad_logits.data_ptr<float>(),
+            is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
+            grad_values_pred.data_ptr<float>(),
+            grad_loss.data_ptr<float>(),
+            logits.data_ptr(),
+            is_continuous ? logstd.data_ptr() : nullptr,
+            values_pred.data_ptr(),
+            actions_flat.data_ptr<double>(),
+            old_logprobs.data_ptr(),
+            advantages.data_ptr<float>(),
+            prio.data_ptr(),
+            values.data_ptr(),
+            returns.data_ptr(),
+            adv_mean.data_ptr<float>(),
+            adv_var.data_ptr<float>(),
+            act_sizes.data_ptr<int>(),
+            static_cast<int>(num_atns),
+            clip_coef, vf_clip_coef,
+            vf_coef, ent_coef,
+            T, A_total, N,
+            logits_stride_n, logits_stride_t, logits_stride_a,
+            values_stride_n, values_stride_t,
+            is_continuous,
+            stream,
+            dtype_flag
+        );
 
         return {
             grad_logits,
@@ -750,47 +627,26 @@ void sample_logits(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (dtype == torch::kFloat32) {
-        launch_sample_logits_float(
-            actions_out.data_ptr<double>(),
-            logprobs_out.data_ptr<float>(),
-            value_out.data_ptr<float>(),
-            logits.data_ptr<float>(),
-            is_continuous ? logstd.data_ptr<float>() : nullptr,
-            value.data_ptr<float>(),
-            act_sizes.data_ptr<int>(),
-            seed,
-            offset.data_ptr<int64_t>(),
-            static_cast<int>(num_atns),
-            static_cast<int>(B),
-            static_cast<int>(logits_stride),
-            static_cast<int>(logstd_stride),
-            static_cast<int>(value_stride),
-            is_continuous,
-            stream
-        );
-    } else if (dtype == torch::kBFloat16) {
-        launch_sample_logits_bf16(
-            actions_out.data_ptr<double>(),
-            logprobs_out.data_ptr<at::BFloat16>(),
-            value_out.data_ptr<at::BFloat16>(),
-            logits.data_ptr<at::BFloat16>(),
-            is_continuous ? logstd.data_ptr<at::BFloat16>() : nullptr,
-            value.data_ptr<at::BFloat16>(),
-            act_sizes.data_ptr<int>(),
-            seed,
-            offset.data_ptr<int64_t>(),
-            static_cast<int>(num_atns),
-            static_cast<int>(B),
-            static_cast<int>(logits_stride),
-            static_cast<int>(logstd_stride),
-            static_cast<int>(value_stride),
-            is_continuous,
-            stream
-        );
-    } else {
-        TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
-    }
+    int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+    launch_sample_logits(
+        actions_out.data_ptr<double>(),
+        logprobs_out.data_ptr(),
+        value_out.data_ptr(),
+        logits.data_ptr(),
+        is_continuous ? logstd.data_ptr() : nullptr,
+        value.data_ptr(),
+        act_sizes.data_ptr<int>(),
+        seed,
+        offset.data_ptr<int64_t>(),
+        static_cast<int>(num_atns),
+        static_cast<int>(B),
+        static_cast<int>(logits_stride),
+        static_cast<int>(logstd_stride),
+        static_cast<int>(value_stride),
+        is_continuous,
+        stream,
+        dtype_flag
+    );
 }
 
 // Reference implementation for sample_logits (for correctness testing)
@@ -861,28 +717,16 @@ public:
 
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_fc_max_forward_float(
-                out.data_ptr<float>(),
-                argmax.data_ptr<int>(),
-                x.data_ptr<float>(),
-                W.data_ptr<float>(),
-                b.data_ptr<float>(),
-                B, N, D_in, D_out, stream);
-        } else if (dtype == torch::kBFloat16) {
-            // W and b are always fp32
-            auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
-            auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
-            launch_fc_max_forward_bf16(
-                out.data_ptr<at::BFloat16>(),
-                argmax.data_ptr<int>(),
-                x.data_ptr<at::BFloat16>(),
-                W_f32.data_ptr<float>(),
-                b_f32.data_ptr<float>(),
-                B, N, D_in, D_out, stream);
-        } else {
-            TORCH_CHECK(false, "Unsupported dtype. Only float32 and bfloat16 supported.");
-        }
+        auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
+        auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_fc_max_forward(
+            out.data_ptr(),
+            argmax.data_ptr<int>(),
+            x.data_ptr(),
+            W_f32.data_ptr<float>(),
+            b_f32.data_ptr<float>(),
+            B, N, D_in, D_out, stream, dtype_flag);
 
         ctx->save_for_backward({x, W, argmax});
         ctx->saved_data["B"] = B;
@@ -909,48 +753,28 @@ public:
         int D_in = ctx->saved_data["D_in"].toInt();
         int D_out = ctx->saved_data["D_out"].toInt();
 
-        auto grad_x = torch::zeros_like(x);
-        auto grad_W = torch::zeros_like(W);
-        auto grad_b = torch::zeros({D_out}, x.options());
-
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        if (dtype == torch::kFloat32) {
-            launch_fc_max_backward_float(
-                grad_x.data_ptr<float>(),
-                grad_W.data_ptr<float>(),
-                grad_b.data_ptr<float>(),
-                grad_out.data_ptr<float>(),
-                x.data_ptr<float>(),
-                W.data_ptr<float>(),
-                argmax.data_ptr<int>(),
-                B, N, D_in, D_out, stream);
-        } else if (dtype == torch::kBFloat16) {
-            // Accumulate in fp32 (atomicAdd requires fp32), W is always fp32
-            auto opts_f32 = x.options().dtype(torch::kFloat32);
-            auto grad_x_f32 = torch::zeros({B, N, D_in}, opts_f32);
-            auto grad_W_f32 = torch::zeros({D_out, D_in}, opts_f32);
-            auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
-            auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
+        // Accumulate in fp32 (atomicAdd requires fp32), W is always fp32
+        auto opts_f32 = x.options().dtype(torch::kFloat32);
+        auto grad_x_f32 = torch::zeros({B, N, D_in}, opts_f32);
+        auto grad_W_f32 = torch::zeros({D_out, D_in}, opts_f32);
+        auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
+        auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
 
-            launch_fc_max_backward_bf16(
-                grad_x_f32.data_ptr<float>(),
-                grad_W_f32.data_ptr<float>(),
-                grad_b_f32.data_ptr<float>(),
-                grad_out.data_ptr<at::BFloat16>(),
-                x.data_ptr<at::BFloat16>(),
-                W_f32.data_ptr<float>(),
-                argmax.data_ptr<int>(),
-                B, N, D_in, D_out, stream);
+        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
+        launch_fc_max_backward(
+            grad_x_f32.data_ptr<float>(),
+            grad_W_f32.data_ptr<float>(),
+            grad_b_f32.data_ptr<float>(),
+            grad_out.data_ptr(),
+            x.data_ptr(),
+            W_f32.data_ptr<float>(),
+            argmax.data_ptr<int>(),
+            B, N, D_in, D_out, stream, dtype_flag);
 
-            grad_x = grad_x_f32.to(torch::kBFloat16);
-            grad_W = grad_W_f32;
-            grad_b = grad_b_f32;
-        } else {
-            TORCH_CHECK(false, "Unsupported dtype in backward. Only float32 and bfloat16 supported.");
-        }
-
-        return {grad_x, grad_W, grad_b};
+        auto grad_x = (dtype == torch::kBFloat16) ? grad_x_f32.to(torch::kBFloat16) : grad_x_f32;
+        return {grad_x, grad_W_f32, grad_b_f32};
     }
 };
 
