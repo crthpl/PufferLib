@@ -130,7 +130,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
     hypers.kernels = get_config(kwargs, "kernels");
     hypers.profile = get_config(kwargs, "profile");
     hypers.use_omp = get_config(kwargs, "use_omp");
-    hypers.bf16 = get_config(kwargs, "bf16");
     // Multi-GPU
     hypers.rank = get_config(kwargs, "rank");
     hypers.world_size = get_config(kwargs, "world_size");

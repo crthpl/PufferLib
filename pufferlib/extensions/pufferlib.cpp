@@ -1,35 +1,20 @@
-//TODO:clamped
-//5.6% cat overhead from grad clip. Preallocate?
-//11% seqwise overhead from fused scan
-//30% elemwise form random ops
-//5% on log_coeffs_and_values
-
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch/optim/optimizer.h>
-
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <nccl.h>
-
-#include <atomic>
-#include <dlfcn.h>
 #include <unistd.h>
-#include "muon.h"
-
+#include <vector>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAContext.h>
-
 #include <nvtx3/nvToolsExt.h>
 
-#include <functional>
-#include <iostream>
-#include <vector>
-
+#include "muon.h"
 #include "env_binding.h"
+#include "modules.h"
 
 using std::tuple;
 using std::vector;
@@ -38,13 +23,14 @@ namespace nn = torch::nn;
 
 typedef torch::Tensor Tensor;
 
-// CUDA kernel wrappers (implemented in modules.cu, compiled separately by nvcc)
-#include "modules.h"
-
-// get dtype based on bf16 flag
-inline torch::ScalarType get_dtype(bool bf16) {
-    return bf16 ? torch::kBFloat16 : torch::kFloat32;
-}
+// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
+#ifdef PRECISION_FLOAT
+constexpr bool USE_BF16 = false;
+constexpr torch::ScalarType PRECISION_DTYPE = torch::kFloat32;
+#else
+constexpr bool USE_BF16 = true;
+constexpr torch::ScalarType PRECISION_DTYPE = torch::kBFloat16;
+#endif
 
 namespace pufferlib {
 
@@ -54,20 +40,8 @@ auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
 auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
 auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
 
-void print_cuda_mem(const char* label) {
-    cudaDeviceSynchronize();
-    size_t free_mem, total_mem;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    printf("[CUDA MEM %s] used=%.2f MB\n", label, (total_mem - free_mem) / 1e6);
-}
-
-// Advantage computation is in advantage.cpp
 #include "advantage.cpp"
-
-// Model classes are in models.cpp
 #include "models.cpp"
-
-// Environment-specific encoder/decoder models are in ocean.cpp
 #include "ocean.cpp"
 
 torch::Dtype to_torch_dtype(int dtype) {
@@ -85,52 +59,6 @@ torch::Dtype to_torch_dtype(int dtype) {
         assert(false && "to_torch_dtype failed to convert dtype");
     }
     return torch::kFloat32;
-}
-
-// Fast clip_grad_norm_ for contiguous weights
-// Cats all grads for one-shot norm computation, then scales each grad
-void clip_grad_norm_(
-    const vector<Tensor>& parameters,
-    double max_norm
-    ) {
-  // Collect flattened grads
-  vector<Tensor> flat_grads;
-  flat_grads.reserve(parameters.size());
-
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      flat_grads.push_back(grad.flatten());
-    }
-  }
-
-  if (flat_grads.empty()) {
-    return;
-  }
-
-  // Single cat + norm (avoids per-param norm calls)
-  Tensor all_grads = torch::cat(flat_grads);
-  // Getting errors here? See if your net is definint a layeyr and not using it.
-  // TODO: That shouldn't error
-  Tensor total_norm = all_grads.to(torch::kFloat32).norm(2);
-
-  // Compute clip coefficient
-  Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
-
-  // Scale each grad in-place
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      grad.mul_(clip_coef);
-    }
-  }
-}
-
-float cosine_annealing(float lr_base, float lr_min, int t, int T) {
-    if (T == 0) return lr_base;  // avoid division by zero
-    float ratio = (float)t / (float)T;
-    ratio = std::max(0.0f, std::min(1.0f, ratio));  // clamp to [0, 1]
-    return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
 typedef struct {
@@ -174,20 +102,20 @@ typedef struct {
 } TrainGraph;
 
 TrainGraph create_train_graph(int mb_segments, int horizon, int input_size,
-        int num_layers, int hidden_size, int num_atns, bool bf16) {
-    TrainGraph g;
-    auto opts = torch::dtype(get_dtype(bf16)).device(torch::kCUDA);
-    g.mb_obs = torch::zeros({mb_segments, horizon, input_size}, opts);
-    g.mb_state = torch::zeros({num_layers, mb_segments, 1, hidden_size}, opts);
-    g.mb_newvalue = torch::zeros({mb_segments, horizon, 1}, opts);
-    g.mb_ratio = torch::zeros({mb_segments, horizon}, opts);
-    g.mb_actions = torch::zeros({mb_segments, horizon, num_atns}, cuda_f64);
-    g.mb_logprobs = torch::zeros({mb_segments, horizon}, opts);
-    g.mb_advantages = torch::zeros({mb_segments, horizon}, cuda_f32);  // always fp32 for precision
-    g.mb_prio = torch::zeros({mb_segments, 1}, opts);
-    g.mb_values = torch::zeros({mb_segments, horizon}, opts);
-    g.mb_returns = torch::zeros({mb_segments, horizon}, opts);
-    return g;
+        int num_layers, int hidden_size, int num_atns) {
+    auto opts = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
+    return {
+        .mb_obs = torch::zeros({mb_segments, horizon, input_size}, opts),
+        .mb_state = torch::zeros({num_layers, mb_segments, 1, hidden_size}, opts),
+        .mb_actions = torch::zeros({mb_segments, horizon, num_atns}, cuda_f64),
+        .mb_logprobs = torch::zeros({mb_segments, horizon}, opts),
+        .mb_advantages = torch::zeros({mb_segments, horizon}, cuda_f32),  // always fp32 for precision
+        .mb_prio = torch::zeros({mb_segments, 1}, opts),
+        .mb_values = torch::zeros({mb_segments, horizon}, opts),
+        .mb_returns = torch::zeros({mb_segments, horizon}, opts),
+        .mb_ratio = torch::zeros({mb_segments, horizon}, opts),
+        .mb_newvalue = torch::zeros({mb_segments, horizon, 1}, opts),
+    };
 }
 
 typedef struct {
@@ -201,18 +129,18 @@ typedef struct {
     Tensor importance;
 } RolloutBuf;
 
-RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_atns, bool bf16) {
-    RolloutBuf r;
-    auto opts = torch::dtype(get_dtype(bf16)).device(torch::kCUDA);
-    r.observations = torch::zeros({horizon, segments, input_size}, opts);
-    r.actions = torch::zeros({horizon, segments, num_atns}, cuda_f64);
-    r.values = torch::zeros({horizon, segments}, opts);
-    r.logprobs = torch::zeros({horizon, segments}, opts);
-    r.rewards = torch::zeros({horizon, segments}, opts);
-    r.terminals = torch::zeros({horizon, segments}, opts);
-    r.ratio = torch::zeros({horizon, segments}, opts);
-    r.importance = torch::zeros({horizon, segments}, opts);
-    return r;
+RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_atns) {
+    auto opts = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
+    return {
+        .observations = torch::zeros({horizon, segments, input_size}, opts),
+        .actions = torch::zeros({horizon, segments, num_atns}, cuda_f64),
+        .values = torch::zeros({horizon, segments}, opts),
+        .logprobs = torch::zeros({horizon, segments}, opts),
+        .rewards = torch::zeros({horizon, segments}, opts),
+        .terminals = torch::zeros({horizon, segments}, opts),
+        .ratio = torch::zeros({horizon, segments}, opts),
+        .importance = torch::zeros({horizon, segments}, opts),
+    };
 }
 
 typedef struct {
@@ -253,11 +181,10 @@ typedef struct {
     float prio_beta0;
     // Flags
     bool use_rnn;
-    bool cudagraphs;
+    int cudagraphs;  // epoch at which to capture graph, -1 to disable
     bool kernels;
     bool profile;
     bool use_omp;
-    bool bf16;  // bfloat16 mixed precision training
     // Multi-GPU
     int rank;
     int world_size;
@@ -283,13 +210,12 @@ typedef struct {
     at::cuda::MempoolId_t train_pool_id;     // Pool ID for releasing graph memory
     at::cuda::MempoolId_t rollout_pool_id;   // Pool ID for releasing graph memory
     vector<at::cuda::CUDAStream> torch_streams;  // PyTorch-managed streams for OMP
-    Tensor adv_mean;
-    Tensor adv_std;
     Tensor act_sizes;      // CUDA int32 tensor of action head sizes for MultiDiscrete
     Tensor act_sizes_cpu;  // CPU int64 tensor (pre-computed to avoid alloc during graph replay)
     int epoch;
     int train_warmup;
     bool rollout_captured;
+    bool train_captured;
     uint64_t rng_seed;
     Tensor rng_offset;  // CUDA tensor so increment is graphable
 } PuffeRL;
@@ -309,7 +235,6 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
  * 6. Scalars get captured by value. They cannot change between calls.
  */
 
-constexpr int CAPTURE_WARMUP = 10;
 
 // ============================================================================
 // Rollout and train section functions
@@ -342,16 +267,15 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     HypersT& hypers = pufferl->hypers;
 
     profile_begin("fused_rollout", hypers.profile);
-    if (hypers.cudagraphs && pufferl->rollout_captured) {
+    if (pufferl->rollout_captured) {
         pufferl->fused_rollout_cudagraphs[t][buf].replay();
     } else {
-        bool capturing = hypers.cudagraphs && pufferl->epoch == CAPTURE_WARMUP;
+        bool capturing = pufferl->epoch == hypers.cudagraphs;
         auto saved_stream = at::cuda::getCurrentCUDAStream();
         auto cap_stream = capturing ? at::cuda::getStreamFromPool() : saved_stream;
         if (capturing) {
             at::cuda::setCurrentCUDAStream(cap_stream);
-            pufferl->fused_rollout_cudagraphs[t][buf].capture_begin(
-                pufferl->rollout_pool_id);
+            pufferl->fused_rollout_cudagraphs[t][buf].capture_begin(pufferl->rollout_pool_id);
         }
 
         int total_agents = pufferl->vec->total_agents;
@@ -471,17 +395,9 @@ void train_impl(PuffeRL& pufferl) {
     Tensor advantages = torch::zeros_like(rollouts.values, torch::kFloat32);  // fp32 precision
 
     compute_advantage(rollouts, advantages, hypers);
-    pufferl.adv_mean.copy_(advantages.mean().detach());
-    pufferl.adv_std.copy_(advantages.std().detach());
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    auto dtype = get_dtype(hypers.bf16);
     Tensor mb_state = torch::zeros(
         {hypers.num_layers, minibatch_segments, 1, (int64_t)hypers.hidden_size},
-        torch::dtype(dtype).device(rollouts.values.device())
+        torch::dtype(PRECISION_DTYPE).device(rollouts.values.device())
     );
 
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
@@ -506,31 +422,29 @@ void train_impl(PuffeRL& pufferl) {
 
         // Inlined train_select_and_copy
         profile_begin("train_select_and_copy", hypers.profile);
-        {
-            Tensor mb_obs = rollouts.observations.index_select(0, idx);
-            Tensor mb_actions = rollouts.actions.index_select(0, idx);
-            Tensor mb_logprobs = rollouts.logprobs.index_select(0, idx);
-            Tensor mb_values = rollouts.values.index_select(0, idx);
-            Tensor mb_advantages = advantages.index_select(0, idx);
-            Tensor mb_returns = mb_advantages + mb_values;
+        Tensor mb_obs = rollouts.observations.index_select(0, idx);
+        Tensor mb_actions = rollouts.actions.index_select(0, idx);
+        Tensor mb_logprobs = rollouts.logprobs.index_select(0, idx);
+        Tensor mb_values = rollouts.values.index_select(0, idx);
+        Tensor mb_advantages = advantages.index_select(0, idx);
+        Tensor mb_returns = mb_advantages + mb_values;
 
-            mb_state.zero_();
-            graph.mb_obs.copy_(mb_obs, false);
-            graph.mb_state.copy_(mb_state, false);
-            graph.mb_actions.copy_(mb_actions, false);
-            graph.mb_logprobs.copy_(mb_logprobs, false);
-            graph.mb_advantages.copy_(mb_advantages, false);
-            graph.mb_prio.copy_(mb_prio, false);
-            graph.mb_values.copy_(mb_values, false);
-            graph.mb_returns.copy_(mb_returns, false);
-        }
+        mb_state.zero_();
+        graph.mb_obs.copy_(mb_obs, false);
+        graph.mb_state.copy_(mb_state, false);
+        graph.mb_actions.copy_(mb_actions, false);
+        graph.mb_logprobs.copy_(mb_logprobs, false);
+        graph.mb_advantages.copy_(mb_advantages, false);
+        graph.mb_prio.copy_(mb_prio, false);
+        graph.mb_values.copy_(mb_values, false);
+        graph.mb_returns.copy_(mb_returns, false);
         profile_end(hypers.profile);
 
         profile_begin("train_forward_graph", hypers.profile);
-        if (hypers.cudagraphs && pufferl.train_warmup > CAPTURE_WARMUP) {
+        if (pufferl.train_captured) {
             pufferl.train_cudagraph.replay();
         } else {
-            bool capturing = hypers.cudagraphs && pufferl.train_warmup == CAPTURE_WARMUP;
+            bool capturing = pufferl.train_warmup == hypers.cudagraphs;
             auto saved_stream = at::cuda::getCurrentCUDAStream();
             auto cap_stream = capturing ? at::cuda::getStreamFromPool() : saved_stream;
             if (capturing) {
@@ -551,13 +465,13 @@ void train_impl(PuffeRL& pufferl) {
 
             loss.backward();
 
-            if (hypers.bf16) {
+            if (USE_BF16) {
                 copy_gradients_to_fp32(pufferl.policy_bf16, pufferl.policy_fp32);
             }
             clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
             pufferl.muon->step();
             pufferl.muon->zero_grad();
-            if (hypers.bf16) {
+            if (USE_BF16) {
                 pufferl.policy_bf16->zero_grad();
                 sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
             }
@@ -567,14 +481,15 @@ void train_impl(PuffeRL& pufferl) {
                 cap_stream.synchronize();
                 cudaDeviceSynchronize();
                 at::cuda::setCurrentCUDAStream(saved_stream);
+                pufferl.train_captured = true;
             }
-            if (hypers.cudagraphs) pufferl.train_warmup++;
+            pufferl.train_warmup++;
         }
         profile_end(hypers.profile);
 
         // Update global ratio and values in-place (matches Python)
-        pufferl.rollouts.ratio.index_copy_(1, idx, graph.mb_ratio.detach().squeeze(-1).to(dtype).transpose(0, 1));
-        pufferl.rollouts.values.index_copy_(1, idx, graph.mb_newvalue.detach().squeeze(-1).to(dtype).transpose(0, 1));
+        pufferl.rollouts.ratio.index_copy_(1, idx, graph.mb_ratio.detach().squeeze(-1).to(PRECISION_DTYPE).transpose(0, 1));
+        pufferl.rollouts.values.index_copy_(1, idx, graph.mb_newvalue.detach().squeeze(-1).to(PRECISION_DTYPE).transpose(0, 1));
 
     }
     pufferl.epoch += 1;
@@ -620,6 +535,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     }
 
     // Seeding (vary by rank for different random exploration)
+    // CC: Base seed should come from train config
     int seed = 42 + hypers.rank;
     torch::manual_seed(seed);
     torch::cuda::manual_seed(seed);
@@ -657,27 +573,25 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // Continuous: all action dimensions have size 1
     // Discrete: all action dimensions have size > 1
     // Mixed: not supported (assert)
-    {
-        int* act_sizes_ptr = get_act_sizes();
-        int num_continuous = 0;
-        int num_discrete = 0;
-        for (int i = 0; i < num_action_heads; i++) {
-            if (act_sizes_ptr[i] == 1) {
-                num_continuous++;
-            } else {
-                num_discrete++;
-            }
-        }
-        TORCH_CHECK(num_continuous == 0 || num_discrete == 0,
-            "Mixed continuous/discrete action spaces not supported. "
-            "All action dimensions must be either continuous (size==1) or discrete (size>1). "
-            "Got ", num_continuous, " continuous and ", num_discrete, " discrete.");
-        pufferl->is_continuous = (num_continuous > 0);
-        if (pufferl->is_continuous) {
-            printf("Detected continuous action space with %d dimensions\n", num_action_heads);
+    int* act_sizes_ptr = get_act_sizes();
+    int num_continuous = 0;
+    int num_discrete = 0;
+    for (int i = 0; i < num_action_heads; i++) {
+        if (act_sizes_ptr[i] == 1) {
+            num_continuous++;
         } else {
-            printf("Detected discrete action space with %d heads\n", num_action_heads);
+            num_discrete++;
         }
+    }
+    TORCH_CHECK(num_continuous == 0 || num_discrete == 0,
+        "Mixed continuous/discrete action spaces not supported. "
+        "All action dimensions must be either continuous (size==1) or discrete (size>1). "
+        "Got ", num_continuous, " continuous and ", num_discrete, " discrete.");
+    pufferl->is_continuous = (num_continuous > 0);
+    if (pufferl->is_continuous) {
+        printf("Detected continuous action space with %d dimensions\n", num_action_heads);
+    } else {
+        printf("Detected discrete action space with %d heads\n", num_action_heads);
     }
 
     int input_size = pufferl->env.obs.size(1);
@@ -685,50 +599,26 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     int num_layers = hypers.num_layers;
     bool kernels = hypers.kernels;
 
-    // Create encoder/decoder based on env_name
     // Decoder output size: discrete = act_n (sum of action sizes), continuous = num_action_heads
-    // We need two sets for mixed-precision: fp32 (master) and bf16 (working)
     bool is_continuous = pufferl->is_continuous;
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
-    // TODO: Move conditional policy selection into ocean.cpp
-    auto create_policy = [&]() -> Policy* {
-        shared_ptr<Encoder> enc;
-        shared_ptr<Decoder> dec;
-        if (env_name == "puffer_snake") {
-            enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-        } else if (env_name == "falsepuffer_g2048") {
-            enc = std::make_shared<SimpleG2048Encoder>(input_size, hidden_size);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-        } else if (env_name == "puffer_nmmo3") {
-            enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
-            dec = std::make_shared<NMMO3Decoder>(hidden_size, decoder_output_size);
-        } else if (env_name == "puffer_drive") {
-            enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-        } else {
-            enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
-            dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-        }
-        auto rnn = std::make_shared<MinGRU>(hidden_size, num_layers, kernels);
-        return new Policy(enc, dec, rnn, input_size, act_n, hidden_size);
-    };
 
     // Create fp32 master policy (for optimizer - precise gradient accumulation)
-    Policy* policy_fp32 = create_policy();
+    Policy* policy_fp32 = create_policy(env_name, input_size, hidden_size,
+        decoder_output_size, num_layers, act_n, is_continuous, kernels);
     policy_fp32->to(torch::kCUDA);
     policy_fp32->to(torch::kFloat32);
     pufferl->policy_fp32 = policy_fp32;
 
-    if (hypers.bf16) {
+    if (USE_BF16) {
         // create bf16 working policy (for fwd/bwd)
-        Policy* policy_bf16 = create_policy();
+        Policy* policy_bf16 = create_policy(env_name, input_size, hidden_size,
+            decoder_output_size, num_layers, act_n, is_continuous, kernels);
         policy_bf16->to(torch::kCUDA);
         policy_bf16->to(torch::kBFloat16);
         pufferl->policy_bf16 = policy_bf16;
         sync_policy_weights(policy_bf16, policy_fp32); // initial sync
     } else {
-        // just use same policy for both
         pufferl->policy_bf16 = policy_fp32;
     }
 
@@ -755,13 +645,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     int minibatch_segments = hypers.minibatch_size / horizon;
 
-    pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads, hypers.bf16);
+    pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
-        num_layers, hidden_size, num_action_heads, hypers.bf16);
-
-    // always fp32 since advantages are computed in fp32
-    pufferl->adv_mean = torch::zeros({1}, cuda_f32);
-    pufferl->adv_std = torch::ones({1}, cuda_f32);
+        num_layers, hidden_size, num_action_heads);
 
     // Per-buffer states: each is {num_layers, block_size, hidden} for contiguous access
     pufferl->buffer_states.resize(num_buffers);
@@ -769,7 +655,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         pufferl->buffer_states[i] = pufferl->policy_bf16->initial_state(batch, torch::kCUDA);
     }
 
-    if (hypers.cudagraphs) {
+    if (hypers.cudagraphs >= 0) {
         pufferl->train_cudagraph = at::cuda::CUDAGraph();
         pufferl->train_pool_id = at::cuda::graph_pool_handle();
         pufferl->train_warmup = 0;
@@ -800,12 +686,12 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
         // Init-time warmup + capture BEFORE creating streams/threads.
         // No per-buffer streams exist yet = no cross-stream deps baked into graphs.
-        for (pufferl->epoch = 0; pufferl->epoch <= CAPTURE_WARMUP; pufferl->epoch++) {
+        for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
             rollouts_impl(*pufferl);
         }
         pufferl->rollout_captured = true;
 
-        for (int i = 0; i <= CAPTURE_WARMUP; i++) {
+        for (int i = 0; i <= hypers.cudagraphs; i++) {
             train_impl(*pufferl);
         }
 
@@ -822,11 +708,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         } else {
             pufferl->muon->momentum_buffer = Tensor();
         }
-        if (hypers.bf16) {
+        if (USE_BF16) {
             sync_policy_weights(pufferl->policy_bf16, pufferl->policy_fp32);
         }
         pufferl->muon->zero_grad();
-        if (hypers.bf16) {
+        if (USE_BF16) {
             pufferl->policy_bf16->zero_grad();
         }
         } // end NoGradGuard
@@ -849,16 +735,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     return pufferl;
 }
 
-void print_tensor_info(const char* name, const Tensor& t) {
-    if (t.defined() && t.numel() > 0) {
-        size_t bytes = t.numel() * t.element_size();
-        int64_t refcount = t.use_count();
-        printf("  %s: %.2f MB, refcount=%ld, device=%s\n",
-               name, bytes / 1e6, refcount,
-               t.device().str().c_str());
-    }
-}
-
 void close_impl(PuffeRL& pufferl) {
     cudaDeviceSynchronize();
     for (size_t i = 0; i < pufferl.buffer_states.size(); i++) {
@@ -870,7 +746,7 @@ void close_impl(PuffeRL& pufferl) {
     for (const auto& p : pufferl.policy_fp32->parameters()) {
         policy_bytes += p.numel() * p.element_size();
     }
-    if (pufferl.hypers.bf16) {
+    if (USE_BF16) {
         size_t bf16_bytes = 0;
         for (const auto& p : pufferl.policy_bf16->parameters()) {
             bf16_bytes += p.numel() * p.element_size();
@@ -890,8 +766,7 @@ void close_impl(PuffeRL& pufferl) {
     delete pufferl.muon;
     pufferl.muon = nullptr;
 
-    // Delete policies - check if bf16 and fp32 are the same pointer
-    if (pufferl.hypers.bf16 && pufferl.policy_bf16 != pufferl.policy_fp32) {
+    if (USE_BF16) {
         delete pufferl.policy_bf16;
     }
     delete pufferl.policy_fp32;
@@ -924,8 +799,6 @@ void close_impl(PuffeRL& pufferl) {
     pufferl.train_buf.mb_newvalue = Tensor();
 
     // Clear misc tensors
-    pufferl.adv_mean = Tensor();
-    pufferl.adv_std = Tensor();
     pufferl.act_sizes = Tensor();
     pufferl.act_sizes_cpu = Tensor();
     pufferl.rng_offset = Tensor();

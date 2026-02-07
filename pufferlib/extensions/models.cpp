@@ -550,6 +550,7 @@ Tensor compute_train_loss(Logits& logits, Tensor newvalue,
         bool is_continuous, bool kernels) {
     if (kernels) {
         Tensor logstd_safe = logits.logstd.defined() ? logits.logstd : torch::empty({0}, logits.mean.options());
+        // TODO: Try using global (epoch-level) adv mean/std instead of per-minibatch
         auto [adv_var, adv_mean] = torch::var_mean(advantages);
         return fused_ppo_loss_optimized(
             logits.mean, logstd_safe, newvalue,
@@ -582,6 +583,50 @@ Tensor compute_train_loss(Logits& logits, Tensor newvalue,
             newvalue, values, returns, result[1],
             clip_coef, vf_clip_coef, vf_coef, ent_coef);
     }
+}
+
+// Fast clip_grad_norm_ for contiguous weights
+// Cats all grads for one-shot norm computation, then scales each grad
+void clip_grad_norm_(
+    const vector<Tensor>& parameters,
+    double max_norm
+    ) {
+  // Collect flattened grads
+  vector<Tensor> flat_grads;
+  flat_grads.reserve(parameters.size());
+
+  for (const auto& param : parameters) {
+    auto& grad = param.grad();
+    if (grad.defined()) {
+      flat_grads.push_back(grad.flatten());
+    }
+  }
+
+  if (flat_grads.empty()) {
+    return;
+  }
+
+  // Single cat + norm (avoids per-param norm calls)
+  Tensor all_grads = torch::cat(flat_grads);
+  Tensor total_norm = all_grads.to(torch::kFloat32).norm(2);
+
+  // Compute clip coefficient
+  Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
+
+  // Scale each grad in-place
+  for (const auto& param : parameters) {
+    auto& grad = param.grad();
+    if (grad.defined()) {
+      grad.mul_(clip_coef);
+    }
+  }
+}
+
+float cosine_annealing(float lr_base, float lr_min, int t, int T) {
+    if (T == 0) return lr_base;  // avoid division by zero
+    float ratio = (float)t / (float)T;
+    ratio = std::max(0.0f, std::min(1.0f, ratio));  // clamp to [0, 1]
+    return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
 // Reference implementation for testing
