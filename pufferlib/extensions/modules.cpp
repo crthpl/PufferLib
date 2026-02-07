@@ -29,7 +29,6 @@ std::vector<torch::Tensor> mingru_gate(
     TORCH_CHECK(state.size(0) == combined.size(0), "batch size must match");
     TORCH_CHECK(state.is_contiguous() && combined.is_contiguous(), "must be contiguous");
 
-    auto dtype = state.dtype();
     auto B = state.size(0);
     auto H = state.size(2);
 
@@ -37,16 +36,14 @@ std::vector<torch::Tensor> mingru_gate(
     auto next_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
     launch_mingru_gate_inference(
-        out.data_ptr(),
-        next_state.data_ptr(),
-        combined.data_ptr(),
-        state.data_ptr(),
+        (precision_t*)out.data_ptr(),
+        (precision_t*)next_state.data_ptr(),
+        (const precision_t*)combined.data_ptr(),
+        (const precision_t*)state.data_ptr(),
         static_cast<int>(H),
         static_cast<int>(B),
-        stream,
-        dtype_flag
+        stream
     );
     return {out, next_state};
 }
@@ -70,7 +67,6 @@ public:
         TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
                     "All tensors must be contiguous");
 
-        auto dtype = combined.dtype();
         auto device = combined.device();
         auto B = combined.size(0);
         auto T = combined.size(1);
@@ -87,20 +83,18 @@ public:
         auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_fused_scan_forward_checkpointed(
-            out.data_ptr(),
-            next_state.data_ptr(),
+            (precision_t*)out.data_ptr(),
+            (precision_t*)next_state.data_ptr(),
             a_star.data_ptr<float>(),
             s_vals.data_ptr<float>(),
             log_values_buf.data_ptr<float>(),
-            combined.data_ptr(),
-            state.data_ptr(),
+            (const precision_t*)combined.data_ptr(),
+            (const precision_t*)state.data_ptr(),
             static_cast<int>(T),
             static_cast<int>(H),
             static_cast<int>(B),
-            stream,
-            dtype_flag
+            stream
         );
 
         // Save all tensors for backward (ensures proper cleanup after backward)
@@ -126,7 +120,6 @@ public:
         auto grad_next_state = grad_outputs[1];
         TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
 
-        auto dtype = combined.dtype();
         auto B = combined.size(0);
         auto T = combined.size(1);
         auto H = state.size(2);
@@ -135,22 +128,20 @@ public:
         auto grad_state = torch::empty_like(state);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_fused_scan_backward_checkpointed(
-            grad_combined.data_ptr(),
-            grad_state.data_ptr(),
-            grad_out.data_ptr(),
-            grad_next_state.data_ptr(),
-            combined.data_ptr(),
-            state.data_ptr(),
+            (precision_t*)grad_combined.data_ptr(),
+            (precision_t*)grad_state.data_ptr(),
+            (const precision_t*)grad_out.data_ptr(),
+            (const precision_t*)grad_next_state.data_ptr(),
+            (const precision_t*)combined.data_ptr(),
+            (const precision_t*)state.data_ptr(),
             a_star_buf.data_ptr<float>(),
             s_vals.data_ptr<float>(),
             log_values_buf.data_ptr<float>(),
             static_cast<int>(T),
             static_cast<int>(H),
             static_cast<int>(B),
-            stream,
-            dtype_flag
+            stream
         );
 
         return {grad_combined, grad_state};
@@ -173,7 +164,6 @@ public:
         torch::Tensor x  // (B, T, H)
     ) {
         TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
-        auto dtype = x.dtype();
         auto device = x.device();
         auto B = x.size(0), T = x.size(1), H = x.size(2);
 
@@ -183,14 +173,12 @@ public:
         auto s_buf = torch::empty({B, T, H}, options_double);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_logcumsumexp_forward(
-            out.data_ptr(),
+            (precision_t*)out.data_ptr(),
             s_buf.data_ptr<double>(),
-            x.data_ptr(),
+            (const precision_t*)x.data_ptr(),
             (int)T, (int)H, (int)B,
-            stream,
-            dtype_flag
+            stream
         );
 
         ctx->save_for_backward({x, out, s_buf});
@@ -205,21 +193,18 @@ public:
         auto s_buf = saved[2];  // s_buf was from torch::empty, already contiguous
 
         auto grad_out = grad_outputs[0].contiguous();  // incoming grad might not be contiguous
-        auto dtype = x.dtype();
         auto B = x.size(0), T = x.size(1), H = x.size(2);
 
         auto grad_x = torch::empty_like(x);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_logcumsumexp_backward(
-            grad_x.data_ptr(),
-            grad_out.data_ptr(),
-            x.data_ptr(),
+            (precision_t*)grad_x.data_ptr(),
+            (const precision_t*)grad_out.data_ptr(),
+            (const precision_t*)x.data_ptr(),
             s_buf.data_ptr<double>(),
             (int)T, (int)H, (int)B,
-            stream,
-            dtype_flag
+            stream
         );
 
         return {grad_x};
@@ -292,21 +277,20 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_ppo_loss_forward_optimized(
             loss_output.data_ptr<float>(),
             saved_for_backward.data_ptr<double>(),
-            ratio_out.data_ptr(),
-            newvalue_out.data_ptr(),
-            logits.data_ptr(),
-            is_continuous ? logstd.data_ptr() : nullptr,
-            values_pred.data_ptr(),
+            (precision_t*)ratio_out.data_ptr(),
+            (precision_t*)newvalue_out.data_ptr(),
+            (const precision_t*)logits.data_ptr(),
+            is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
+            (const precision_t*)values_pred.data_ptr(),
             actions_flat.data_ptr<double>(),
-            old_logprobs.data_ptr(),
+            (const precision_t*)old_logprobs.data_ptr(),
             advantages.data_ptr<float>(),
-            prio.data_ptr(),
-            values.data_ptr(),
-            returns.data_ptr(),
+            (const precision_t*)prio.data_ptr(),
+            (const precision_t*)values.data_ptr(),
+            (const precision_t*)returns.data_ptr(),
             adv_mean.data_ptr<float>(),
             adv_var.data_ptr<float>(),
             act_sizes.data_ptr<int>(),
@@ -319,8 +303,7 @@ public:
             logits_stride_n, logits_stride_t, logits_stride_a,
             values_stride_n, values_stride_t,
             is_continuous,
-            stream,
-            dtype_flag
+            stream
         );
 
         ctx->saved_data["clip_coef"] = clip_coef;
@@ -353,7 +336,6 @@ public:
         auto adv_var = saved[10].contiguous();
         auto act_sizes = saved[11];  // already on CUDA and contiguous
 
-        auto dtype = logits.dtype();
         auto N = logits.size(0);
         auto T = logits.size(1);
         auto A_total = logits.size(2);
@@ -387,21 +369,20 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_ppo_loss_backward_optimized(
             grad_logits.data_ptr<float>(),
             is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
             grad_values_pred.data_ptr<float>(),
             grad_loss.data_ptr<float>(),
-            logits.data_ptr(),
-            is_continuous ? logstd.data_ptr() : nullptr,
-            values_pred.data_ptr(),
+            (const precision_t*)logits.data_ptr(),
+            is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
+            (const precision_t*)values_pred.data_ptr(),
             actions_flat.data_ptr<double>(),
-            old_logprobs.data_ptr(),
+            (const precision_t*)old_logprobs.data_ptr(),
             advantages.data_ptr<float>(),
-            prio.data_ptr(),
-            values.data_ptr(),
-            returns.data_ptr(),
+            (const precision_t*)prio.data_ptr(),
+            (const precision_t*)values.data_ptr(),
+            (const precision_t*)returns.data_ptr(),
             adv_mean.data_ptr<float>(),
             adv_var.data_ptr<float>(),
             act_sizes.data_ptr<int>(),
@@ -412,8 +393,7 @@ public:
             logits_stride_n, logits_stride_t, logits_stride_a,
             values_stride_n, values_stride_t,
             is_continuous,
-            stream,
-            dtype_flag
+            stream
         );
 
         return {
@@ -616,7 +596,6 @@ void sample_logits(
 
     bool is_continuous = logstd.defined() && logstd.numel() > 0;
 
-    auto dtype = logits.dtype();
     auto B = logits.size(0);
     auto num_atns = act_sizes.size(0);
     auto logits_stride = logits.stride(0);  // row stride (may be > sum(act_sizes) for fused output)
@@ -627,14 +606,13 @@ void sample_logits(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
     launch_sample_logits(
         actions_out.data_ptr<double>(),
-        logprobs_out.data_ptr(),
-        value_out.data_ptr(),
-        logits.data_ptr(),
-        is_continuous ? logstd.data_ptr() : nullptr,
-        value.data_ptr(),
+        (precision_t*)logprobs_out.data_ptr(),
+        (precision_t*)value_out.data_ptr(),
+        (const precision_t*)logits.data_ptr(),
+        is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
+        (const precision_t*)value.data_ptr(),
         act_sizes.data_ptr<int>(),
         seed,
         offset.data_ptr<int64_t>(),
@@ -644,8 +622,7 @@ void sample_logits(
         static_cast<int>(logstd_stride),
         static_cast<int>(value_stride),
         is_continuous,
-        stream,
-        dtype_flag
+        stream
     );
 }
 
@@ -706,7 +683,6 @@ public:
         TORCH_CHECK(W.is_contiguous(), "W must be contiguous");
         TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
 
-        auto dtype = x.dtype();
         int B = x.size(0);
         int N = x.size(1);
         int D_in = x.size(2);
@@ -719,14 +695,13 @@ public:
 
         auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
         auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_fc_max_forward(
-            out.data_ptr(),
+            (precision_t*)out.data_ptr(),
             argmax.data_ptr<int>(),
-            x.data_ptr(),
+            (const precision_t*)x.data_ptr(),
             W_f32.data_ptr<float>(),
             b_f32.data_ptr<float>(),
-            B, N, D_in, D_out, stream, dtype_flag);
+            B, N, D_in, D_out, stream);
 
         ctx->save_for_backward({x, W, argmax});
         ctx->saved_data["B"] = B;
@@ -762,16 +737,15 @@ public:
         auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
         auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
 
-        int dtype_flag = (dtype == torch::kFloat32) ? DTYPE_FLOAT : DTYPE_BF16;
         launch_fc_max_backward(
             grad_x_f32.data_ptr<float>(),
             grad_W_f32.data_ptr<float>(),
             grad_b_f32.data_ptr<float>(),
-            grad_out.data_ptr(),
-            x.data_ptr(),
+            (const precision_t*)grad_out.data_ptr(),
+            (const precision_t*)x.data_ptr(),
             W_f32.data_ptr<float>(),
             argmax.data_ptr<int>(),
-            B, N, D_in, D_out, stream, dtype_flag);
+            B, N, D_in, D_out, stream);
 
         auto grad_x = (dtype == torch::kBFloat16) ? grad_x_f32.to(torch::kBFloat16) : grad_x_f32;
         return {grad_x, grad_W_f32, grad_b_f32};
