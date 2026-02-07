@@ -56,6 +56,9 @@ void print_cuda_mem(const char* label) {
 // Model classes are in models.cpp
 #include "models.cpp"
 
+// Environment-specific encoder/decoder models are in ocean.cpp
+#include "ocean.cpp"
+
 torch::Dtype to_torch_dtype(int dtype) {
     if (dtype == FLOAT) {
         return torch::kFloat32;
@@ -161,12 +164,12 @@ typedef struct {
 } TrainGraph;
 
 TrainGraph create_train_graph(int minibatch_segments, int horizon, int input_size,
-        int num_layers, int hidden_size, int expansion_factor, int num_atns, bool bf16) {
+        int num_layers, int hidden_size, int num_atns, bool bf16) {
     TrainGraph g;
     auto dtype = get_dtype(bf16);
     auto options = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
     g.mb_obs = torch::zeros({minibatch_segments, horizon, input_size}, options);
-    g.mb_state = torch::zeros({num_layers, minibatch_segments, 1, hidden_size * expansion_factor}, options);
+    g.mb_state = torch::zeros({num_layers, minibatch_segments, 1, hidden_size}, options);
     g.mb_newvalue = torch::zeros({minibatch_segments, horizon, 1}, options);
     g.mb_ratio = torch::zeros({minibatch_segments, horizon}, options);
     g.mb_actions = torch::zeros({minibatch_segments, horizon, num_atns}, torch::dtype(torch::kFloat64).device(torch::kCUDA));
@@ -211,7 +214,6 @@ typedef struct {
     // Model architecture
     int num_atns;
     int hidden_size;
-    int expansion_factor;
     int num_layers;
     // Learning rate
     float lr;
@@ -256,8 +258,8 @@ typedef struct {
 } HypersT;
 
 typedef struct {
-    PolicyMinGRU* policy_bf16;  // Working weights (bf16) - used for forward/backward
-    PolicyMinGRU* policy_fp32;  // Master weights (fp32) - used for optimizer
+    Policy* policy_bf16;  // Working weights (bf16) - used for forward/backward
+    Policy* policy_fp32;  // Master weights (fp32) - used for optimizer
     StaticVec* vec;
     torch::optim::Muon* muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
@@ -301,7 +303,7 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     Tensor& state = pufferl.buffer_states[buf];
 
     // Run policy forward using bf16 working weights
-    auto [logits, value, state_out, logstd] = pufferl.policy_bf16->forward(obs_slice, state);
+    auto [logits, value, state_out] = pufferl.policy_bf16->forward(obs_slice, state);
 
     // Get output slices in rollouts storage
     Tensor actions_out = pufferl.rollouts.actions.select(0, h).narrow(0, buf*block_size, block_size);
@@ -310,20 +312,19 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
 
     // Sample actions and write directly to rollouts
     if (hypers.kernels) {
-        // Kernel handles both continuous (logstd defined) and discrete
-        sample_logits(logits, logstd, value, actions_out, logprobs_out,
+        Tensor logstd = logits.logstd.defined() ? logits.logstd : Tensor();
+        sample_logits(logits.mean, logstd, value, actions_out, logprobs_out,
             values_out, pufferl.act_sizes, pufferl.rng_seed, pufferl.rng_offset);
     } else {
         if (pufferl.is_continuous) {
-            // Continuous: logits is mean, logstd is log standard deviation
-            Tensor mean = logits;
-            Tensor std = logstd.exp();
+            Tensor mean = logits.mean;
+            Tensor std = logits.logstd.exp();
             // Sample: action = mean + std * N(0,1)
             Tensor noise = torch::randn_like(mean);
             Tensor actions = mean + std * noise;
             // Log probability: sum of log_prob for each action dimension
             // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
-            Tensor log_prob = -0.5 * ((actions - mean) / std).pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
+            Tensor log_prob = -0.5 * ((actions - mean) / std).pow(2) - 0.5 * std::log(2 * M_PI) - logits.logstd;
             Tensor total_log_prob = log_prob.sum(1);
 
             actions_out.copy_(actions.to(torch::kFloat64), false);
@@ -332,9 +333,9 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
         } else {
             // Discrete: multinomial sampling
             int num_action_heads = actions_out.size(1);
-            logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+            Tensor mean = torch::nan_to_num(logits.mean, 1e-8, 1e-8, 1e-8);
 
-            auto split_logits = torch::split(logits, c10::IntArrayRef(pufferl.act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
+            auto split_logits = torch::split(mean, c10::IntArrayRef(pufferl.act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
             std::vector<Tensor> actions_vec;
             std::vector<Tensor> logprobs_vec;
 
@@ -368,19 +369,19 @@ void fused_rollout_step(PuffeRL& pufferl, int h, int buf) {
     pufferl.env.actions.narrow(0, buf*block_size, block_size).copy_(actions_out, true);
 }
 
-void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinGRU* policy_fp32,
+void train_forward_call(TrainGraph& graph, Policy* policy_bf16, Policy* policy_fp32,
         torch::optim::Muon* muon, HypersT& hypers, Tensor& adv_mean, Tensor& adv_std,
         Tensor& act_sizes_cpu, Tensor& act_sizes, bool kernels, bool is_continuous) {
-    auto [logits, newvalue, logstd] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
+    auto [logits, newvalue] = policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
 
     // Convert undefined tensor to empty CUDA tensor (autograd requires device)
-    Tensor logstd_safe = logstd.defined() ? logstd : torch::empty({0}, logits.options());
+    Tensor logstd_safe = logits.logstd.defined() ? logits.logstd : torch::empty({0}, logits.mean.options());
 
     Tensor loss;
     if (kernels) {
         auto [mb_adv_var, mb_adv_mean] = torch::var_mean(graph.mb_advantages);  // single kernel launch
         loss = fused_ppo_loss_optimized(
-            logits,
+            logits.mean,
             logstd_safe,  // For continuous: log std; empty CUDA tensor for discrete
             newvalue,
             graph.mb_actions,
@@ -408,12 +409,12 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
         Tensor entropy;
 
         if (is_continuous) {
-            TORCH_CHECK(logstd.defined() && logstd.numel() > 0,
+            TORCH_CHECK(logits.logstd.defined() && logits.logstd.numel() > 0,
                 "logstd must be defined for continuous actions");
             // Continuous: Normal distribution log probability
             // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
-            Tensor mean = logits.reshape({batch, -1});
-            Tensor log_std = logstd.reshape({batch, -1});
+            Tensor mean = logits.mean.reshape({batch, -1});
+            Tensor log_std = logits.logstd.reshape({batch, -1});
             Tensor std = log_std.exp();
             Tensor actions = graph.mb_actions.reshape({batch, -1}).to(mean.dtype());
 
@@ -429,7 +430,7 @@ void train_forward_call(TrainGraph& graph, PolicyMinGRU* policy_bf16, PolicyMinG
         } else {
             // Discrete: Categorical distribution
             // Split logits by action head sizes and compute log probs for each head
-            Tensor flat_logits = logits.reshape({batch, -1});
+            Tensor flat_logits = logits.mean.reshape({batch, -1});
             flat_logits = torch::nan_to_num(flat_logits, 1e-8, 1e-8, 1e-8);
             auto split_logits = torch::split(flat_logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_action_heads), 1);
 
@@ -669,7 +670,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     int input_size = pufferl->env.obs.size(1);
     int hidden_size = hypers.hidden_size;
-    int expansion_factor = hypers.expansion_factor;
     int num_layers = hypers.num_layers;
     bool kernels = hypers.kernels;
 
@@ -678,7 +678,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // We need two sets for mixed-precision: fp32 (master) and bf16 (working)
     bool is_continuous = pufferl->is_continuous;
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
-    auto create_encoder_decoder = [&]() -> std::pair<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>> {
+    auto create_policy = [&]() -> Policy* {
         std::shared_ptr<Encoder> enc;
         std::shared_ptr<Decoder> dec;
         if (env_name == "puffer_snake") {
@@ -687,7 +687,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         } else if (env_name == "falsepuffer_g2048") {
             enc = std::make_shared<SimpleG2048Encoder>(input_size, hidden_size);
             dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-
         } else if (env_name == "puffer_nmmo3") {
             enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
             dec = std::make_shared<NMMO3Decoder>(hidden_size, decoder_output_size);
@@ -698,20 +697,19 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
             dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
         }
-        return {enc, dec};
+        auto rnn = std::make_shared<MinGRU>(hidden_size, num_layers, kernels);
+        return new Policy(enc, dec, rnn, input_size, act_n, hidden_size);
     };
 
     // Create fp32 master policy (for optimizer - precise gradient accumulation)
-    auto [enc_fp32, dec_fp32] = create_encoder_decoder();
-    PolicyMinGRU* policy_fp32 = new PolicyMinGRU(enc_fp32, dec_fp32, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
+    Policy* policy_fp32 = create_policy();
     policy_fp32->to(torch::kCUDA);
     policy_fp32->to(torch::kFloat32);
     pufferl->policy_fp32 = policy_fp32;
 
     if (hypers.bf16) {
         // create bf16 working policy (for fwd/bwd)
-        auto [enc_bf16, dec_bf16] = create_encoder_decoder();
-        PolicyMinGRU* policy_bf16 = new PolicyMinGRU(enc_bf16, dec_bf16, input_size, act_n, hidden_size, expansion_factor, num_layers, kernels);
+        Policy* policy_bf16 = create_policy();
         policy_bf16->to(torch::kCUDA);
         policy_bf16->to(torch::kBFloat16);
         pufferl->policy_bf16 = policy_bf16;
@@ -746,7 +744,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads, hypers.bf16);
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
-        policy_fp32->num_layers, policy_fp32->hidden_size, policy_fp32->expansion_factor, num_action_heads, hypers.bf16);
+        num_layers, hidden_size, num_action_heads, hypers.bf16);
 
     // always fp32 since advantages are computed in fp32
     pufferl->adv_mean = torch::zeros({1}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
@@ -899,8 +897,8 @@ void train_impl(PuffeRL& pufferl) {
     Tensor clipfrac_sum = torch::zeros({}, scalar_opts);
     Tensor importance_sum = torch::zeros({}, scalar_opts);
 
-    PolicyMinGRU* policy_bf16 = pufferl.policy_bf16;
-    // PolicyMinGRU* policy_fp32 = pufferl.policy_fp32;
+    Policy* policy_bf16 = pufferl.policy_bf16;
+    // Policy* policy_fp32 = pufferl.policy_fp32;
     torch::optim::Muon* muon = pufferl.muon;
 
     int total_epochs = hypers.total_timesteps / batch_size;
@@ -929,7 +927,7 @@ void train_impl(PuffeRL& pufferl) {
 
     auto dtype = get_dtype(hypers.bf16);
     Tensor mb_state = torch::zeros(
-        {policy_bf16->num_layers, minibatch_segments, 1, (int64_t)(policy_bf16->hidden_size*policy_bf16->expansion_factor)},
+        {hypers.num_layers, minibatch_segments, 1, (int64_t)hypers.hidden_size},
         torch::dtype(dtype).device(rollouts.values.device())
     );
 

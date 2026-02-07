@@ -12,11 +12,11 @@
 #include <stdlib.h>
 
 // Fused: chunk + mingru_gate + sigmoid(proj) * out
-// combined is (B, 1, 3*H) = [hidden, gate, proj]
-// state is (B, 1, H)
+// combined is (B, 3*H) = [hidden, gate, proj]
+// state is (B, H)
 // returns {out, next_state} where:
-//   out (B, 1, H) = sigmoid(proj) * mingru_out
-//   next_state (B, 1, H) = mingru_out (for recurrence)
+//   out (B, H) = sigmoid(proj) * mingru_out
+//   next_state (B, H) = mingru_out (for recurrence)
 std::vector<torch::Tensor> mingru_gate(
     torch::Tensor state,
     torch::Tensor combined
@@ -24,13 +24,13 @@ std::vector<torch::Tensor> mingru_gate(
     TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
     TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
     TORCH_CHECK(state.dtype() == combined.dtype(), "dtypes must match");
-    TORCH_CHECK(state.dim() == 3 && combined.dim() == 3, "must be 3D tensors");
-    TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
+    TORCH_CHECK(state.dim() == 2 && combined.dim() == 2, "must be 2D tensors");
+    TORCH_CHECK(combined.size(1) == 3 * state.size(1), "combined must be 3*H");
     TORCH_CHECK(state.size(0) == combined.size(0), "batch size must match");
     TORCH_CHECK(state.is_contiguous() && combined.is_contiguous(), "must be contiguous");
 
     int B = static_cast<int>(state.size(0));
-    int H = static_cast<int>(state.size(2));
+    int H = static_cast<int>(state.size(1));
 
     auto out = torch::empty_like(state);
     auto next_state = torch::empty_like(state);
@@ -424,125 +424,6 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
         adv_var, ratio_out, newvalue_out, act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
-// Reference implementation for mingru_gate (inference path)
-// Takes combined (B, 1, 3*H) = [hidden, gate, proj] and state (B, 1, H)
-// Returns {out, next_state} where:
-//   out = sigmoid(proj) * mingru_out
-//   next_state = mingru_out (for recurrence)
-std::vector<torch::Tensor> mingru_gate_cpp(torch::Tensor state, torch::Tensor combined) {
-    auto chunks = combined.chunk(3, 2);
-    auto hidden = chunks[0];
-    auto gate = chunks[1];
-    auto proj = chunks[2];
-
-    auto h = torch::where(hidden >= 0, hidden + 0.5, hidden.sigmoid());
-    auto g = gate.sigmoid();
-    auto mingru_out = torch::lerp(state, h, g);
-    auto out = torch::sigmoid(proj) * mingru_out;
-    return {out, mingru_out};
-}
-
-torch::autograd::tensor_list log_coeffs_and_values_cpp(torch::Tensor gate, torch::Tensor hidden) {
-    auto log_coeffs = -torch::nn::functional::softplus(gate);
-    auto log_z = -torch::nn::functional::softplus(-gate);
-    auto log_tilde_h = torch::where(hidden >= 0,
-        (torch::nn::functional::relu(hidden) + 0.5).log(),
-        -torch::nn::functional::softplus(-hidden));
-    auto log_values = log_z + log_tilde_h;
-    return {log_coeffs, log_values};
-}
-
-torch::Tensor logcumsumexp_cpp(torch::Tensor x) {
-    return x.exp().cumsum(1).log();
-}
-
-// Reference implementation for fused_scan (training path)
-// Takes combined (B, T, 3*H) = [hidden, gate, proj] and state (B, 1, H)
-// Returns {out, next_state} where:
-//   out (B, T, H) = sigmoid(proj) * scan_result
-//   next_state (B, 1, H) = raw scan_result at T (for recurrence)
-std::vector<torch::Tensor> fused_scan_cpp(torch::Tensor combined, torch::Tensor state) {
-    auto seq_len = combined.size(1);
-
-    // Split combined into hidden, gate, proj
-    auto chunks = combined.chunk(3, 2);
-    auto hidden = chunks[0];
-    auto gate = chunks[1];
-    auto proj = chunks[2];
-
-    // Compute log_coeffs and log_values
-    auto log_coeffs = -torch::nn::functional::softplus(gate);
-    auto log_z = -torch::nn::functional::softplus(-gate);
-    auto log_tilde_h = torch::where(hidden >= 0,
-        (torch::nn::functional::relu(hidden) + 0.5).log(),
-        -torch::nn::functional::softplus(-hidden));
-    auto log_values = log_z + log_tilde_h;
-
-    // Cat state and pad for scan
-    log_values = torch::cat({state.log(), log_values}, 1);
-    log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
-
-    // Heinsen associative scan
-    auto a_star = log_coeffs.cumsum(1);
-    auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
-    auto log_h = a_star + log_h0_plus_b_star;
-    auto scan_result = log_h.exp();
-
-    // Extract output and next_state
-    scan_result = scan_result.narrow(1, scan_result.size(1) - seq_len, seq_len);
-    auto next_state = scan_result.narrow(1, scan_result.size(1) - 1, 1);
-
-    // Apply sigmoid(proj) * scan_result for output
-    auto out = torch::sigmoid(proj) * scan_result;
-
-    return {out, next_state};
-}
-
-torch::Tensor fused_ppo_loss_cpp(
-    torch::Tensor logits,
-    torch::Tensor newvalue,
-    torch::Tensor actions,
-    torch::Tensor old_logprobs,
-    torch::Tensor advantages,
-    torch::Tensor prio,
-    torch::Tensor values,
-    torch::Tensor returns,
-    torch::Tensor adv_mean,
-    torch::Tensor adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef
-) {
-    auto segments = logits.size(0);
-    auto horizon = logits.size(1);
-
-    auto flat_logits = logits.reshape({-1, logits.size(-1)});
-    auto flat_actions = actions.reshape({-1});
-    auto logprobs_new = torch::log_softmax(flat_logits, 1);
-
-    auto probs_new = logprobs_new.exp();
-    auto entropy = -(probs_new * logprobs_new).sum(1).mean();
-
-    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-    auto newlogprob = newlogprob_flat.reshape({segments, horizon});
-    auto logratio = newlogprob - old_logprobs;
-    auto ratio_new = logratio.exp();
-
-    auto adv_normalized = prio.unsqueeze(1) * (advantages - adv_mean) / (adv_std + 1e-8);
-    auto pg_loss1 = -adv_normalized * ratio_new;
-    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
-    auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
-
-    auto nv = newvalue.view(returns.sizes());
-    auto v_clipped = values + torch::clamp(nv - values, -vf_clip_coef, vf_clip_coef);
-    auto v_loss_unclipped = (nv - returns).pow(2);
-    auto v_loss_clipped = (v_clipped - returns).pow(2);
-    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
-
-    return pg_loss + vf_coef * v_loss - ent_coef * entropy;
-}
-
 // Fused sample_logits: handles both discrete and continuous action sampling
 // For discrete: nan_to_num + log_softmax + multinomial + gather + value copy
 // For continuous: sample from Normal(mean, exp(logstd)) + compute log_prob
@@ -606,44 +487,6 @@ void sample_logits(
         offset.data_ptr<int64_t>(),
         num_atns, B, logits_stride, logstd_stride, value_stride,
         is_continuous);
-}
-
-// Reference implementation for sample_logits (for correctness testing)
-std::vector<torch::Tensor> sample_logits_cpp(
-    torch::Tensor logits
-) {
-    // nan_to_num
-    auto clean_logits = torch::nan_to_num(logits);
-
-    // log_softmax
-    auto log_probs = torch::log_softmax(clean_logits, 1);
-
-    // multinomial sampling
-    auto probs = log_probs.exp();
-    auto actions = torch::multinomial(probs, 1, /*replacement=*/false).squeeze(1);
-
-    // gather logprobs
-    auto sampled_logprobs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1);
-
-    return {actions, sampled_logprobs};
-}
-
-// Reference implementation for testing
-torch::Tensor fc_relu_fc_max_cpp(
-    torch::Tensor x,      // (B, N, D_in)
-    torch::Tensor W1,     // (D_mid, D_in)
-    torch::Tensor b1,     // (D_mid)
-    torch::Tensor W2,     // (D_out, D_mid)
-    torch::Tensor b2      // (D_out)
-) {
-    // FC1: x @ W1.T + b1 -> (B, N, D_mid)
-    auto fc1 = torch::addmm(b1, x.flatten(0, 1), W1.t()).view({x.size(0), x.size(1), -1});
-    // ReLU
-    auto relu_out = torch::relu(fc1);
-    // FC2: relu_out @ W2.T + b2 -> (B, N, D_out)
-    auto fc2 = torch::addmm(b2, relu_out.flatten(0, 1), W2.t()).view({x.size(0), x.size(1), -1});
-    // Max over N dimension
-    return std::get<0>(fc2.max(1));
 }
 
 // =============================================================================
@@ -737,14 +580,6 @@ public:
 // Named entrypoint: fc_max(x, W, b) -> out
 torch::Tensor fc_max(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
     return FCMaxFunction::apply(x, W, b)[0];
-}
-
-// Reference implementation for testing
-torch::Tensor fc_max_cpp(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
-    // FC: x @ W.T + b -> (B, N, D_out)
-    auto fc = torch::addmm(b, x.flatten(0, 1), W.t()).view({x.size(0), x.size(1), -1});
-    // Max over N dimension
-    return std::get<0>(fc.max(1));
 }
 
 #endif // PUFFERLIB_MODULES_CU

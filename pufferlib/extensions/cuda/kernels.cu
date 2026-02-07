@@ -52,13 +52,13 @@ inline int seq_size(int N) {
 // Fused kernel: chunk + mingru_gate + sigmoid(proj) * out
 // combined is (B, 1, 3*H) containing [hidden, gate, proj] concatenated on last dim
 // state is (B, 1, H)
-// out is (B, 1, H) = sigmoid(proj) * mingru_out (final output)
-// next_state is (B, 1, H) = mingru_out (recurrent state, without proj)
+// out is (B, H) = sigmoid(proj) * mingru_out (final output)
+// next_state is (B, H) = mingru_out (recurrent state, without proj)
 __global__ void mingru_gate_inference_kernel(
     precision_t* out,
     precision_t* next_state,
-    const precision_t* combined,    // (B, 1, 3*H) = [hidden, gate, proj]
-    const precision_t* state_in,    // (B, 1, H)
+    const precision_t* combined,    // (B, 3*H) = [hidden, gate, proj]
+    const precision_t* state_in,    // (B, H)
     int H,
     int B
 ) {
@@ -88,7 +88,6 @@ __global__ void mingru_gate_inference_kernel(
     float proj_sigmoid = sigmoid(proj);
     out[idx] = from_float(proj_sigmoid * mingru_out);
 }
-
 
 
 __device__ __forceinline__ double logcumsumexp_forward(double x, double acc) {
