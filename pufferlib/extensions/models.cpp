@@ -138,10 +138,8 @@ struct RNN : public nn::Module {
     virtual Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) = 0;
 };
 
-class MinGRU : public RNN {
-public:
-    int hidden;
-    int num_layers;
+struct MinGRU : public RNN {
+    int hidden, num_layers;
     bool kernels;
     vector<nn::Linear> layers;
 
@@ -196,8 +194,7 @@ public:
     }
 };
 
-class Policy : public nn::Module {
-public:
+struct Policy : public nn::Module {
     int input, hidden, num_atns;
     shared_ptr<Encoder> encoder{nullptr};
     shared_ptr<Decoder> decoder{nullptr};
@@ -448,69 +445,143 @@ Tensor logcumsumexp_cpp(Tensor x) {
     return x.exp().cumsum(1).log();
 }
 
-Tensor fused_ppo_loss_cpp(
-    Tensor logits,
-    Tensor newvalue,
-    Tensor actions,
-    Tensor old_logprobs,
-    Tensor advantages,
-    Tensor prio,
-    Tensor values,
-    Tensor returns,
-    Tensor adv_mean,
-    Tensor adv_std,
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef
-) {
-    auto segments = logits.size(0);
-    auto horizon = logits.size(1);
+// Sample from multi-head discrete distribution
+// Returns {actions (B, heads), total_logprob (B,)}
+vector<Tensor> sample_discrete_cpp(Tensor logits, Tensor act_sizes_cpu, int num_heads) {
+    logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+    auto split = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_heads), 1);
+    vector<Tensor> actions_vec, logprobs_vec;
+    for (int i = 0; i < num_heads; i++) {
+        auto log_probs = torch::log_softmax(split[i], 1);
+        auto action = at::multinomial(log_probs.exp(), 1, true);
+        actions_vec.push_back(action);
+        logprobs_vec.push_back(log_probs.gather(1, action));
+    }
+    return {torch::cat(actions_vec, 1), torch::cat(logprobs_vec, 1).sum(1)};
+}
 
-    auto flat_logits = logits.reshape({-1, logits.size(-1)});
-    auto flat_actions = actions.reshape({-1});
-    auto logprobs_new = torch::log_softmax(flat_logits, 1);
+// Sample from continuous Normal distribution
+// Returns {actions (B, D), total_logprob (B,)}
+vector<Tensor> sample_continuous_cpp(Tensor mean, Tensor logstd) {
+    auto std = logstd.exp();
+    auto actions = mean + std * torch::randn_like(mean);
+    auto log_prob = -0.5 * ((actions - mean) / std).pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
+    return {actions, log_prob.sum(1)};
+}
 
-    auto probs_new = logprobs_new.exp();
-    auto entropy = -(probs_new * logprobs_new).sum(1).mean();
+// Compute logprob + entropy for multi-head discrete actions
+// Returns {logprob (batch,), entropy scalar}
+vector<Tensor> discrete_logprob_entropy_cpp(Tensor logits, Tensor actions, Tensor act_sizes_cpu, int num_heads) {
+    logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
+    auto split = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_heads), 1);
+    int batch = logits.size(0);
+    vector<Tensor> logprobs_vec, entropies_vec;
+    for (int h = 0; h < num_heads; h++) {
+        auto log_probs = torch::log_softmax(split[h], 1);
+        auto probs = log_probs.exp();
+        auto head_actions = actions.select(-1, h).reshape({batch}).to(torch::kInt64);
+        logprobs_vec.push_back(log_probs.gather(1, head_actions.unsqueeze(1)));
+        entropies_vec.push_back(-(probs * log_probs).sum(1, true));
+    }
+    auto logprob = torch::cat(logprobs_vec, 1).sum(1);
+    auto entropy = torch::cat(entropies_vec, 1).sum(1).mean();
+    return {logprob, entropy};
+}
 
-    auto newlogprob_flat = logprobs_new.gather(1, flat_actions.unsqueeze(1)).squeeze(1);
-    auto newlogprob = newlogprob_flat.reshape({segments, horizon});
-    auto logratio = newlogprob - old_logprobs;
-    auto ratio_new = logratio.exp();
+// Compute logprob + entropy for continuous Normal actions
+// Returns {logprob (batch,), entropy scalar}
+vector<Tensor> continuous_logprob_entropy_cpp(Tensor mean, Tensor logstd, Tensor actions) {
+    auto std = logstd.exp();
+    auto normalized = (actions.to(mean.dtype()) - mean) / std;
+    auto log_prob = -0.5 * normalized.pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
+    auto logprob = log_prob.sum(1);
+    constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;
+    auto entropy = (HALF_1_PLUS_LOG_2PI + logstd).sum(1).mean();
+    return {logprob, entropy};
+}
 
-    auto adv_normalized = prio.unsqueeze(1) * (advantages - adv_mean) / (adv_std + 1e-8);
-    auto pg_loss1 = -adv_normalized * ratio_new;
-    auto pg_loss2 = -adv_normalized * torch::clamp(ratio_new, 1.0 - clip_coef, 1.0 + clip_coef);
+// PPO clipped loss with clipped value loss
+Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
+        Tensor newvalue, Tensor values, Tensor returns, Tensor entropy,
+        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) {
+    auto adv_normalized = prio * (advantages - advantages.mean()) / (advantages.std() + 1e-8);
+    auto pg_loss1 = -adv_normalized * ratio;
+    auto pg_loss2 = -adv_normalized * torch::clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef);
     auto pg_loss = torch::max(pg_loss1, pg_loss2).mean();
 
-    auto nv = newvalue.view(returns.sizes());
-    auto v_clipped = values + torch::clamp(nv - values, -vf_clip_coef, vf_clip_coef);
-    auto v_loss_unclipped = (nv - returns).pow(2);
-    auto v_loss_clipped = (v_clipped - returns).pow(2);
-    auto v_loss = 0.5 * torch::max(v_loss_unclipped, v_loss_clipped).mean();
+    newvalue = newvalue.view(returns.sizes());
+    auto v_clipped = values + torch::clamp(newvalue - values, -vf_clip_coef, vf_clip_coef);
+    auto v_loss = 0.5 * torch::max((newvalue - returns).pow(2), (v_clipped - returns).pow(2)).mean();
 
     return pg_loss + vf_coef * v_loss - ent_coef * entropy;
 }
 
-// Reference implementation for sample_logits (for correctness testing)
-vector<Tensor> sample_logits_cpp(
-    Tensor logits
-) {
-    // nan_to_num
-    auto clean_logits = torch::nan_to_num(logits);
+// Dispatch: sample actions using kernel or cpp path, write to output buffers
+void sample_actions(Logits& logits, Tensor value,
+        Tensor actions_out, Tensor logprobs_out, Tensor values_out,
+        Tensor act_sizes, Tensor act_sizes_cpu,
+        bool is_continuous, bool kernels, uint64_t rng_seed, Tensor rng_offset) {
+    if (kernels) {
+        Tensor logstd = logits.logstd.defined() ? logits.logstd : Tensor();
+        sample_logits(logits.mean, logstd, value, actions_out, logprobs_out,
+            values_out, act_sizes, rng_seed, rng_offset);
+    } else {
+        vector<Tensor> result;
+        if (is_continuous) {
+            result = sample_continuous_cpp(logits.mean, logits.logstd);
+        } else {
+            result = sample_discrete_cpp(logits.mean, act_sizes_cpu, actions_out.size(1));
+        }
+        actions_out.copy_(result[0].to(torch::kFloat64), false);
+        logprobs_out.copy_(result[1], false);
+        values_out.copy_(value.flatten(), false);
+    }
+}
 
-    // log_softmax
-    auto log_probs = torch::log_softmax(clean_logits, 1);
+// Dispatch: compute PPO loss using kernel or cpp path
+// Writes ratio and newvalue to output buffers as side effect
+Tensor compute_train_loss(Logits& logits, Tensor newvalue,
+        Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio,
+        Tensor values, Tensor returns,
+        Tensor ratio_out, Tensor newvalue_out,
+        Tensor act_sizes, Tensor act_sizes_cpu,
+        int minibatch_size, int horizon,
+        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        bool is_continuous, bool kernels) {
+    if (kernels) {
+        Tensor logstd_safe = logits.logstd.defined() ? logits.logstd : torch::empty({0}, logits.mean.options());
+        auto [adv_var, adv_mean] = torch::var_mean(advantages);
+        return fused_ppo_loss_optimized(
+            logits.mean, logstd_safe, newvalue,
+            actions, old_logprobs, advantages, prio, values, returns,
+            adv_mean, adv_var,  // variance, not std - kernel does sqrtf
+            ratio_out, newvalue_out,
+            act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef
+        )[0];
+    } else {
+        int num_heads = actions.size(-1);
+        int batch = minibatch_size;
+        int segments = batch / horizon;
 
-    // multinomial sampling
-    auto probs = log_probs.exp();
-    auto actions = torch::multinomial(probs, 1, /*replacement=*/false).squeeze(1);
+        vector<Tensor> result;
+        if (is_continuous) {
+            TORCH_CHECK(logits.logstd.defined() && logits.logstd.numel() > 0,
+                "logstd must be defined for continuous actions");
+            result = continuous_logprob_entropy_cpp(
+                logits.mean.reshape({batch, -1}), logits.logstd.reshape({batch, -1}),
+                actions.reshape({batch, -1}));
+        } else {
+            result = discrete_logprob_entropy_cpp(
+                logits.mean.reshape({batch, -1}), actions, act_sizes_cpu, num_heads);
+        }
+        Tensor ratio = (result[0].reshape({segments, horizon}) - old_logprobs).exp();
+        ratio_out.copy_(ratio, false);
+        newvalue_out.copy_(newvalue, false);
 
-    // gather logprobs
-    auto sampled_logprobs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1);
-
-    return {actions, sampled_logprobs};
+        return ppo_loss_cpp(ratio, advantages, prio,
+            newvalue, values, returns, result[1],
+            clip_coef, vf_clip_coef, vf_coef, ent_coef);
+    }
 }
 
 // Reference implementation for testing

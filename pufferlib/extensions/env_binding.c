@@ -142,6 +142,14 @@ void static_vec_omp_step(StaticVec* vec) {
     }
 }
 
+void static_vec_seq_step(StaticVec* vec) {
+    StaticThreading* threading = vec->threading;
+    for (int buf = 0; buf < vec->buffers; buf++) {
+        atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
+        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
+    }
+}
+
 // Optional: Initialize all envs at once (for shared state, variable agents per env, etc.)
 // Default implementation creates envs until total_agents is reached
 #ifndef MY_VEC_INIT
