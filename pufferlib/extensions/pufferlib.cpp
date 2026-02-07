@@ -33,8 +33,8 @@
 
 typedef torch::Tensor Tensor;
 
-// CUDA kernel wrappers
-#include "modules.cpp"
+// CUDA kernel wrappers (implemented in modules.cu, compiled separately by nvcc)
+#include "modules.h"
 
 // get dtype based on bf16 flag
 inline torch::ScalarType get_dtype(bool bf16) {

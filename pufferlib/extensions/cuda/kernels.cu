@@ -2,18 +2,24 @@
 #define PUFFERLIB_KERNELS_CU
 
 /* Kernels must launch on the current torch stream to be traced by cudagraphs.
- * Launch functions take cudaStream_t as parameter - callers (modules.cu) should
- * pass at::cuda::getCurrentCUDAStream() when using with torch.
+ * This file is included by modules.cu which calls kernels directly with <<<>>>.
+ * Callers should use at::cuda::getCurrentCUDAStream() when using with torch.
  */
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "ops.cuh"
 #include <curand_kernel.h>
-#include "kernels.h"
 
 #include <cstdio>
 #include <cstdint>
+
+// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
+#ifdef PRECISION_FLOAT
+typedef float precision_t;
+#else
+typedef __nv_bfloat16 precision_t;
+#endif
 
 #define PPO_THREADS 256
 
@@ -33,7 +39,7 @@ inline int seq_size(int N) {
     return (N + SEQ_SIZE - 1) / SEQ_SIZE;
 }
 
-// Compile-time precision conversion macros (precision_t typedef is in kernels.h)
+// Compile-time precision conversion macros
 #ifdef PRECISION_FLOAT
 #define to_float(x) (x)
 #define from_float(x) (x)
@@ -83,13 +89,7 @@ __global__ void mingru_gate_inference_kernel(
     out[idx] = from_float(proj_sigmoid * mingru_out);
 }
 
-void launch_mingru_gate_inference(precision_t* out, precision_t* next_state, const precision_t* combined,
-  const precision_t* state_in, int H, int B, cudaStream_t stream) {
-  int N = B * H;
-  int grid = grid_size(N);
-  mingru_gate_inference_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
-      out, next_state, combined, state_in, H, B);
-}
+
 
 __device__ __forceinline__ double logcumsumexp_forward(double x, double acc) {
     if (acc == -INFINITY) {
@@ -341,20 +341,7 @@ __global__ void fused_scan_backward_kernel_checkpointed(
     grad_state[state_idx] = from_float(grad_z_0 / to_float(state[state_idx]));
 }
 
-void launch_fused_scan_forward_checkpointed(precision_t* out, precision_t* next_state, float* a_star, float* s_vals, float* log_values_buf, const precision_t* combined, const precision_t* state, int T_seq, int H, int B, cudaStream_t stream) {
-    int total = B * H;
-    int grid = grid_size(total);
-    fused_scan_forward_kernel_checkpointed<<<grid, BLOCK_SIZE, 0, stream>>>(
-        out, next_state, a_star, s_vals, log_values_buf, combined, state, T_seq, H, B);
-}
 
-void launch_fused_scan_backward_checkpointed(precision_t* grad_combined, precision_t* grad_state, const precision_t* grad_out, const precision_t* grad_next_state, const precision_t* combined, const precision_t* state, const float* a_star_buf, const float* s_buf, const float* log_values_buf, int T_seq, int H, int B, cudaStream_t stream) {
-    int total = B * H;
-    int grid = grid_size(total);
-    fused_scan_backward_kernel_checkpointed<<<grid, BLOCK_SIZE, 0, stream>>>(
-        grad_combined, grad_state, grad_out, grad_next_state,
-        combined, state, a_star_buf, s_buf, log_values_buf, T_seq, H, B);
-}
 
 // This exactly matches pytorch in double, but not in float
 __global__ void logcumsumexp_forward_kernel(
@@ -413,17 +400,7 @@ __global__ void logcumsumexp_backward_kernel(
     }
 }
 
-void launch_logcumsumexp_forward(precision_t* out, double* s_buf, const precision_t* x, int T_total, int H, int B, cudaStream_t stream) {
-    int total = B * H;
-    int grid = grid_size(total);
-    logcumsumexp_forward_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(out, s_buf, x, T_total, H, B);
-}
 
-void launch_logcumsumexp_backward(precision_t* grad_x, const precision_t* grad_out, const precision_t* x, const double* s_buf, int T_total, int H, int B, cudaStream_t stream) {
-    int total = B * H;
-    int grid = grid_size(total);
-    logcumsumexp_backward_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(grad_x, grad_out, x, s_buf, T_total, H, B);
-}
 
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
@@ -831,71 +808,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
     }
 }
 
-void launch_ppo_loss_forward_optimized(
-    float* loss_output, double* saved_for_backward,
-    precision_t* ratio_out, precision_t* newvalue_out,
-    const precision_t* logits, const precision_t* logstd, const precision_t* values_pred,
-    const double* actions, const precision_t* old_logprobs,
-    const float* advantages, const precision_t* prio,
-    const precision_t* values, const precision_t* returns,
-    const float* adv_mean, const float* adv_var,
-    const int* act_sizes, int num_atns,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    int T_seq, int A_total, int N,
-    int logits_stride_n, int logits_stride_t, int logits_stride_a,
-    int values_stride_n, int values_stride_t,
-    bool is_continuous, cudaStream_t stream
-) {
-    int total = N * T_seq;
-    int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    cudaMemsetAsync(loss_output, 0, sizeof(float), stream);
-    ppo_loss_forward_kernel_optimized<<<grid, PPO_THREADS, 0, stream>>>(
-        loss_output, saved_for_backward,
-        ratio_out, newvalue_out,
-        logits, logstd, values_pred,
-        actions, old_logprobs,
-        advantages, prio,
-        values, returns,
-        adv_mean, adv_var,
-        act_sizes, num_atns,
-        clip_coef, vf_clip_coef, vf_coef, ent_coef,
-        T_seq, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-}
 
-void launch_ppo_loss_backward_optimized(
-    float* grad_logits, float* grad_logstd, float* grad_values_pred,
-    const float* grad_loss,
-    const precision_t* logits, const precision_t* logstd, const precision_t* values_pred,
-    const double* actions, const precision_t* old_logprobs,
-    const float* advantages, const precision_t* prio,
-    const precision_t* values, const precision_t* returns,
-    const float* adv_mean, const float* adv_var,
-    const int* act_sizes, int num_atns,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    int T_seq, int A_total, int N,
-    int logits_stride_n, int logits_stride_t, int logits_stride_a,
-    int values_stride_n, int values_stride_t,
-    bool is_continuous, cudaStream_t stream
-) {
-    int total = N * T_seq;
-    int grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    ppo_loss_backward_kernel_optimized<<<grid, PPO_THREADS, 0, stream>>>(
-        grad_logits, grad_logstd, grad_values_pred, grad_loss,
-        logits, logstd, values_pred,
-        actions, old_logprobs,
-        advantages, prio,
-        values, returns,
-        adv_mean, adv_var,
-        act_sizes, num_atns,
-        clip_coef, vf_clip_coef, vf_coef, ent_coef,
-        T_seq, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-}
 
 // ============================================================================
 // Fused sample_logits kernel: nan_to_num + log_softmax + multinomial + gather + value copy
@@ -1038,21 +951,7 @@ __global__ void sample_logits_kernel(
     }
 }
 
-void launch_sample_logits(
-    double* actions, precision_t* logprobs, precision_t* value_out,
-    const precision_t* logits, const precision_t* logstd, const precision_t* value,
-    const int* act_sizes, uint64_t seed, const int64_t* offset_ptr,
-    int num_atns, int B, int logits_stride, int logstd_stride, int value_stride,
-    bool is_continuous, cudaStream_t stream
-) {
-    int grid = grid_size(B);
-    sample_logits_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
-        actions, logprobs, value_out,
-        logits, logstd, value,
-        act_sizes, seed, offset_ptr,
-        num_atns, B, logits_stride, logstd_stride, value_stride,
-        is_continuous);
-}
+
 
 // =============================================================================
 // FCMax: Fused FC -> Max kernel
@@ -1134,16 +1033,6 @@ __global__ void fc_max_backward_kernel(
     }
 }
 
-void launch_fc_max_forward(precision_t* out, int* argmax_indices, const precision_t* x, const float* W, const float* b, int B, int N, int D_in, int D_out, cudaStream_t stream) {
-    int total = B * D_out;
-    int grid = grid_size(total);
-    fc_max_forward_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(out, argmax_indices, x, W, b, B, N, D_in, D_out);
-}
 
-void launch_fc_max_backward(float* grad_x, float* grad_W, float* grad_b, const precision_t* grad_out, const precision_t* x, const float* W, const int* argmax_indices, int B, int N, int D_in, int D_out, cudaStream_t stream) {
-    int total = B * D_out;
-    int grid = grid_size(total);
-    fc_max_backward_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(grad_x, grad_W, grad_b, grad_out, x, W, argmax_indices, B, N, D_in, D_out);
-}
 
 #endif // PUFFERLIB_KERNELS_CU

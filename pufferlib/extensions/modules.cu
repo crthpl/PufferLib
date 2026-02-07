@@ -1,12 +1,12 @@
-#ifndef PUFFERLIB_MODULES_CPP
-#define PUFFERLIB_MODULES_CPP
+#ifndef PUFFERLIB_MODULES_CU
+#define PUFFERLIB_MODULES_CU
 
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
-#include "cuda/kernels.h"
+#include "cuda/kernels.cu"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,22 +29,19 @@ std::vector<torch::Tensor> mingru_gate(
     TORCH_CHECK(state.size(0) == combined.size(0), "batch size must match");
     TORCH_CHECK(state.is_contiguous() && combined.is_contiguous(), "must be contiguous");
 
-    auto B = state.size(0);
-    auto H = state.size(2);
+    int B = static_cast<int>(state.size(0));
+    int H = static_cast<int>(state.size(2));
 
     auto out = torch::empty_like(state);
     auto next_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    launch_mingru_gate_inference(
+    mingru_gate_inference_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)out.data_ptr(),
         (precision_t*)next_state.data_ptr(),
         (const precision_t*)combined.data_ptr(),
         (const precision_t*)state.data_ptr(),
-        static_cast<int>(H),
-        static_cast<int>(B),
-        stream
-    );
+        H, B);
     return {out, next_state};
 }
 
@@ -68,9 +65,9 @@ public:
                     "All tensors must be contiguous");
 
         auto device = combined.device();
-        auto B = combined.size(0);
-        auto T = combined.size(1);
-        auto H = state.size(2);
+        int B = static_cast<int>(combined.size(0));
+        int T = static_cast<int>(combined.size(1));
+        int H = static_cast<int>(state.size(2));
         auto T_buf = T + 1;
 
         auto out = torch::empty({B, T, H}, state.options());
@@ -83,7 +80,7 @@ public:
         auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        launch_fused_scan_forward_checkpointed(
+        fused_scan_forward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)out.data_ptr(),
             (precision_t*)next_state.data_ptr(),
             a_star.data_ptr<float>(),
@@ -91,11 +88,7 @@ public:
             log_values_buf.data_ptr<float>(),
             (const precision_t*)combined.data_ptr(),
             (const precision_t*)state.data_ptr(),
-            static_cast<int>(T),
-            static_cast<int>(H),
-            static_cast<int>(B),
-            stream
-        );
+            T, H, B);
 
         // Save all tensors for backward (ensures proper cleanup after backward)
         ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
@@ -120,15 +113,15 @@ public:
         auto grad_next_state = grad_outputs[1];
         TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
 
-        auto B = combined.size(0);
-        auto T = combined.size(1);
-        auto H = state.size(2);
+        int B = static_cast<int>(combined.size(0));
+        int T = static_cast<int>(combined.size(1));
+        int H = static_cast<int>(state.size(2));
 
         auto grad_combined = torch::empty_like(combined);
         auto grad_state = torch::empty_like(state);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        launch_fused_scan_backward_checkpointed(
+        fused_scan_backward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)grad_combined.data_ptr(),
             (precision_t*)grad_state.data_ptr(),
             (const precision_t*)grad_out.data_ptr(),
@@ -138,11 +131,7 @@ public:
             a_star_buf.data_ptr<float>(),
             s_vals.data_ptr<float>(),
             log_values_buf.data_ptr<float>(),
-            static_cast<int>(T),
-            static_cast<int>(H),
-            static_cast<int>(B),
-            stream
-        );
+            T, H, B);
 
         return {grad_combined, grad_state};
     }
@@ -165,7 +154,9 @@ public:
     ) {
         TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
         auto device = x.device();
-        auto B = x.size(0), T = x.size(1), H = x.size(2);
+        int B = static_cast<int>(x.size(0));
+        int T = static_cast<int>(x.size(1));
+        int H = static_cast<int>(x.size(2));
 
         auto out = torch::empty({B, T, H}, x.options());
         //auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
@@ -173,13 +164,11 @@ public:
         auto s_buf = torch::empty({B, T, H}, options_double);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        launch_logcumsumexp_forward(
+        logcumsumexp_forward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)out.data_ptr(),
             s_buf.data_ptr<double>(),
             (const precision_t*)x.data_ptr(),
-            (int)T, (int)H, (int)B,
-            stream
-        );
+            T, H, B);
 
         ctx->save_for_backward({x, out, s_buf});
         return {out};
@@ -193,19 +182,19 @@ public:
         auto s_buf = saved[2];  // s_buf was from torch::empty, already contiguous
 
         auto grad_out = grad_outputs[0].contiguous();  // incoming grad might not be contiguous
-        auto B = x.size(0), T = x.size(1), H = x.size(2);
+        int B = static_cast<int>(x.size(0));
+        int T = static_cast<int>(x.size(1));
+        int H = static_cast<int>(x.size(2));
 
         auto grad_x = torch::empty_like(x);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        launch_logcumsumexp_backward(
+        logcumsumexp_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)grad_x.data_ptr(),
             (const precision_t*)grad_out.data_ptr(),
             (const precision_t*)x.data_ptr(),
             s_buf.data_ptr<double>(),
-            (int)T, (int)H, (int)B,
-            stream
-        );
+            T, H, B);
 
         return {grad_x};
     }
@@ -252,10 +241,10 @@ public:
         auto logstd_to_save = is_continuous ? logstd : torch::empty({0}, logits.options());
 
         auto device = logits.device();
-        auto N = logits.size(0);
-        auto T = logits.size(1);
-        auto A_total = logits.size(2);
-        auto num_atns = act_sizes.size(0);
+        int N = static_cast<int>(logits.size(0));
+        int T = static_cast<int>(logits.size(1));
+        int A_total = static_cast<int>(logits.size(2));
+        int num_atns = static_cast<int>(act_sizes.size(0));
 
         // Reshape actions from (N, T, num_atns) to (N*T, num_atns) for kernel
         auto actions_flat = actions.reshape({N * T, num_atns}).contiguous();
@@ -277,7 +266,10 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        launch_ppo_loss_forward_optimized(
+        int total = N * T;
+        int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+        cudaMemsetAsync(loss_output.data_ptr<float>(), 0, sizeof(float), stream);
+        ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             loss_output.data_ptr<float>(),
             saved_for_backward.data_ptr<double>(),
             (precision_t*)ratio_out.data_ptr(),
@@ -294,7 +286,7 @@ public:
             adv_mean.data_ptr<float>(),
             adv_var.data_ptr<float>(),
             act_sizes.data_ptr<int>(),
-            static_cast<int>(num_atns),
+            num_atns,
             static_cast<float>(clip_coef),
             static_cast<float>(vf_clip_coef),
             static_cast<float>(vf_coef),
@@ -302,9 +294,7 @@ public:
             T, A_total, N,
             logits_stride_n, logits_stride_t, logits_stride_a,
             values_stride_n, values_stride_t,
-            is_continuous,
-            stream
-        );
+            is_continuous);
 
         ctx->saved_data["clip_coef"] = clip_coef;
         ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
@@ -336,10 +326,10 @@ public:
         auto adv_var = saved[10].contiguous();
         auto act_sizes = saved[11];  // already on CUDA and contiguous
 
-        auto N = logits.size(0);
-        auto T = logits.size(1);
-        auto A_total = logits.size(2);
-        auto num_atns = act_sizes.size(0);
+        int N = static_cast<int>(logits.size(0));
+        int T = static_cast<int>(logits.size(1));
+        int A_total = static_cast<int>(logits.size(2));
+        int num_atns = static_cast<int>(act_sizes.size(0));
 
         float clip_coef = ctx->saved_data["clip_coef"].to<double>();
         float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
@@ -369,7 +359,9 @@ public:
         int values_stride_n = values_strides[0];
         int values_stride_t = values_strides[1];
 
-        launch_ppo_loss_backward_optimized(
+        int total = N * T;
+        int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+        ppo_loss_backward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             grad_logits.data_ptr<float>(),
             is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
             grad_values_pred.data_ptr<float>(),
@@ -386,15 +378,13 @@ public:
             adv_mean.data_ptr<float>(),
             adv_var.data_ptr<float>(),
             act_sizes.data_ptr<int>(),
-            static_cast<int>(num_atns),
+            num_atns,
             clip_coef, vf_clip_coef,
             vf_coef, ent_coef,
             T, A_total, N,
             logits_stride_n, logits_stride_t, logits_stride_a,
             values_stride_n, values_stride_t,
-            is_continuous,
-            stream
-        );
+            is_continuous);
 
         return {
             grad_logits,
@@ -596,17 +586,15 @@ void sample_logits(
 
     bool is_continuous = logstd.defined() && logstd.numel() > 0;
 
-    auto B = logits.size(0);
-    auto num_atns = act_sizes.size(0);
-    auto logits_stride = logits.stride(0);  // row stride (may be > sum(act_sizes) for fused output)
-    // logstd may have different stride (e.g., 0 for broadcast from [1, num_atns] expanded to [B, num_atns])
-    auto logstd_stride = is_continuous ? logstd.stride(0) : 0;
-    // value may be (B, 1) or (B,) - stride(0) works for both (gives stride between elements)
-    auto value_stride = value.stride(0);
+    int B = static_cast<int>(logits.size(0));
+    int num_atns = static_cast<int>(act_sizes.size(0));
+    int logits_stride = static_cast<int>(logits.stride(0));
+    int logstd_stride = is_continuous ? static_cast<int>(logstd.stride(0)) : 0;
+    int value_stride = static_cast<int>(value.stride(0));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    launch_sample_logits(
+    sample_logits_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
         actions_out.data_ptr<double>(),
         (precision_t*)logprobs_out.data_ptr(),
         (precision_t*)value_out.data_ptr(),
@@ -616,14 +604,8 @@ void sample_logits(
         act_sizes.data_ptr<int>(),
         seed,
         offset.data_ptr<int64_t>(),
-        static_cast<int>(num_atns),
-        static_cast<int>(B),
-        static_cast<int>(logits_stride),
-        static_cast<int>(logstd_stride),
-        static_cast<int>(value_stride),
-        is_continuous,
-        stream
-    );
+        num_atns, B, logits_stride, logstd_stride, value_stride,
+        is_continuous);
 }
 
 // Reference implementation for sample_logits (for correctness testing)
@@ -695,13 +677,13 @@ public:
 
         auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
         auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
-        launch_fc_max_forward(
+        fc_max_forward_kernel<<<grid_size(B * D_out), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)out.data_ptr(),
             argmax.data_ptr<int>(),
             (const precision_t*)x.data_ptr(),
             W_f32.data_ptr<float>(),
             b_f32.data_ptr<float>(),
-            B, N, D_in, D_out, stream);
+            B, N, D_in, D_out);
 
         ctx->save_for_backward({x, W, argmax});
         ctx->saved_data["B"] = B;
@@ -737,7 +719,7 @@ public:
         auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
         auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
 
-        launch_fc_max_backward(
+        fc_max_backward_kernel<<<grid_size(B * D_out), BLOCK_SIZE, 0, stream>>>(
             grad_x_f32.data_ptr<float>(),
             grad_W_f32.data_ptr<float>(),
             grad_b_f32.data_ptr<float>(),
@@ -745,7 +727,7 @@ public:
             (const precision_t*)x.data_ptr(),
             W_f32.data_ptr<float>(),
             argmax.data_ptr<int>(),
-            B, N, D_in, D_out, stream);
+            B, N, D_in, D_out);
 
         auto grad_x = (dtype == torch::kBFloat16) ? grad_x_f32.to(torch::kBFloat16) : grad_x_f32;
         return {grad_x, grad_W_f32, grad_b_f32};
@@ -765,4 +747,4 @@ torch::Tensor fc_max_cpp(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
     return std::get<0>(fc.max(1));
 }
 
-#endif // PUFFERLIB_MODULES_CPP
+#endif // PUFFERLIB_MODULES_CU
