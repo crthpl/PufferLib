@@ -14,7 +14,7 @@
 static float offset_x = -6.5f;
 static float offset_z = 12.5f;
 
-static Vector3 scene_pos = (Vector3){-7.5, -2.5, 61.5};
+static Vector3 scene_pos = (Vector3){-6.5, -2.5, 60.5};
 
 // Required struct. Only use floats!
 typedef struct {
@@ -38,7 +38,10 @@ typedef struct {
     float y;
     float dest_x;
     float dest_y;
-} Agent;
+    int size;
+    int height;
+    Color color;
+} Entity;
 
 typedef struct {
     float x;
@@ -50,7 +53,7 @@ typedef struct {
 typedef struct {
     Log log; // Required field. Env binding code uses this to aggregate logs
     Client* client;
-    Agent* agents;
+    Entity* entities;
     Goal* goals;
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
     double* actions; // Required. double* for discrete/multidiscrete, float* for box
@@ -59,6 +62,7 @@ typedef struct {
     int width;
     int height;
     int num_agents;
+    int num_npcs;
 } Scape;
 
 Vector3 to_world(Vector2 pos) {
@@ -83,19 +87,81 @@ float clampf(float x, float min, float max) {
 }
 
 void move_agent(Scape* env) {
-    float dx = env->agents[0].dest_x - env->agents[0].x;
-    float dy = env->agents[0].dest_y - env->agents[0].y;
-    env->agents[0].x += clampf(dx, -2, 2);
-    env->agents[0].y += clampf(dy, -2, 2);
+    float dx = env->entities[0].dest_x - env->entities[0].x;
+    float dy = env->entities[0].dest_y - env->entities[0].y;
+    env->entities[0].x += clampf(dx, -2, 2);
+    env->entities[0].y += clampf(dy, -2, 2);
 }
 
+bool overlaps(Entity* a, Entity* b) {
+  return a->x < b->x + b->size && b->x < a->x + a->size
+    && a->y > b->y - b->size && b->y > a->y - a->size;
+}
+
+void move_npc(Scape* env, int idx) {
+    Entity* player = &env->entities[0];
+    Entity* npc = &env->entities[idx];
+    float x = npc->x;
+    float y = npc->y;
+
+    bool collide_x = false;
+    bool collide_y = false;
+
+    int dst_x = npc->x - clampf(x - npc->dest_x, -1, 1);
+    int dst_y = npc->y - clampf(y - npc->dest_y, -1, 1);
+
+    npc->x = dst_x;
+    npc->y = dst_y;
+    if (overlaps(npc, player)) {
+        collide_y = true;
+    }
+    npc->x = x;
+    npc->y = y;
+
+    npc->y = dst_y;
+    for (int i=1; i<env->num_npcs + env->num_agents; i++) {
+        Entity* other = &env->entities[i];
+        if (npc == other) {
+            continue;
+        }
+        if (overlaps(npc, other)) {
+            env->entities[idx].y = y;
+            collide_y = true;
+            break;
+        }
+    }
+    npc->y = y;
+
+    npc->x = dst_x;
+    for (int i=1; i<env->num_npcs + env->num_agents; i++) {
+        Entity* other = &env->entities[i];
+        if (npc == other) {
+            continue;
+        }
+        if (overlaps(npc, other)) {
+            env->entities[idx].x = x;
+            collide_x = true;
+            break;
+        }
+    }
+    npc->x = x;
+
+    if (!collide_x) {
+        npc->x = dst_x;
+    }
+    if (!collide_y) {
+        npc->y = dst_y;
+    }
+}
 
 /* Recommended to have an init function of some kind if you allocate 
  * extra memory. This should be freed by c_close. Don't forget to call
  * this in binding.c!
  */
 void init(Scape* env) {
-    env->agents = calloc(env->num_agents, sizeof(Agent));
+    env->num_agents = 1;
+    env->num_npcs = 6;
+    env->entities = calloc(env->num_agents + env->num_npcs, sizeof(Entity));
 }
 
 /* Recommended to have an observation function of some kind because
@@ -108,20 +174,77 @@ void compute_observations(Scape* env) {
 
 // Required function
 void c_reset(Scape* env) {
-    env->agents[0].x = 28;
-    env->agents[0].dest_x = 28;
-    env->agents[0].y = 17;
-    env->agents[0].dest_y = 17;
+    env->entities[0].x = 28;
+    env->entities[0].dest_x = 28;
+    env->entities[0].y = 17;
+    env->entities[0].dest_y = 17;
+    env->entities[0].size = 1;
+    env->entities[0].height = 2;
+    env->entities[0].color = WHITE;
+
+    // South pillar
+    env->entities[1].x = 21;
+    env->entities[1].dest_x = 21;
+    env->entities[1].y = 37;
+    env->entities[1].dest_y = 37;
+    env->entities[1].size = 3;
+    env->entities[1].height = 3;
+    env->entities[1].color = YELLOW;
+
+    // West pillar
+    env->entities[2].x = 11;
+    env->entities[2].dest_x = 11;
+    env->entities[2].y = 23;
+    env->entities[2].dest_y = 23;
+    env->entities[2].size = 3;
+    env->entities[2].height = 3;
+    env->entities[2].color = YELLOW;
+
+    // North pillar
+    env->entities[3].x = 28;
+    env->entities[3].dest_x = 28;
+    env->entities[3].y = 21;
+    env->entities[3].dest_y = 21;
+    env->entities[3].size = 3;
+    env->entities[3].height = 3;
+    env->entities[3].color = YELLOW;
+
+    // Test enemy
+    env->entities[4].x = 12;
+    env->entities[4].y = 19;
+    env->entities[4].size = 4;
+    env->entities[4].height = 2;
+    env->entities[4].color = RED;
+
+    env->entities[5].x = 26;
+    env->entities[5].y = 42;
+    env->entities[5].size = 4;
+    env->entities[5].height = 2;
+    env->entities[5].color = BLUE;
+
+    env->entities[6].x = 14;
+    env->entities[6].y = 25;
+    env->entities[6].size = 3;
+    env->entities[6].height = 2;
+    env->entities[6].color = GREEN;
+
     compute_observations(env);
 }
 
 // Required function
 void c_step(Scape* env) {
-    for (int i=0; i<env->num_agents; i++) {
-        env->rewards[i] = 0;
-        Agent* agent = &env->agents[i];
-    }
     move_agent(env);
+
+    // Set npc target to player pos
+    for (int i=4; i<env->num_agents + env->num_npcs; i++) {
+        Entity* npc = &env->entities[i];
+        npc->dest_x = env->entities[0].x;
+        npc->dest_y = env->entities[0].y;
+    }
+
+    for (int i=env->num_agents; i<env->num_agents + env->num_npcs; i++) {
+        move_npc(env, i);
+    }
     compute_observations(env);
 }
 
@@ -298,12 +421,16 @@ void c_render(Scape* env) {
 
     //Vector2 spawn = (Vector2){28.0f, 17.0f};
     //Vector3 player_pos = to_world(spawn);
-    Vector3 player_pos = (Vector3){env->agents[0].x, 0, env->agents[0].y};
+    Vector3 player_pos = (Vector3){env->entities[0].x, 0, env->entities[0].y};
     DrawCube(player_pos, 1.0f, 1.0f, 1.0f, RED);
 
-    DrawCube((Vector3){21, 0, 37}, 3, 6, 3, BLUE);
-    DrawCube((Vector3){11, 0, 23}, 3, 6, 3, GREEN);
-    DrawCube((Vector3){28, 0, 21}, 3, 6, 3, RED);
+    for (int i=0; i<env->num_agents + env->num_npcs; i++) {
+        Entity* entity = &env->entities[i];
+        float entity_x = entity->x + entity->size/2.0f - 0.5f;
+        float entity_y = entity->y - entity->size/2.0f + 0.5f;
+        Vector3 entity_pos = (Vector3){entity_x, 0, entity_y};
+        DrawCube(entity_pos, entity->size, 2*entity->height, entity->size, entity->color);
+    }
 
     // Draw axes
     DrawLine3D((Vector3){0, 0, 0}, (Vector3){50, 0, 0}, RED);
@@ -316,16 +443,12 @@ void c_render(Scape* env) {
     draw_tile(client, hovered_tile);
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        env->agents[0].dest_x = hovered_tile.x;
-        env->agents[0].dest_y = hovered_tile.y;
+        env->entities[0].dest_x = hovered_tile.x;
+        env->entities[0].dest_y = hovered_tile.y;
     }
 
     DrawText(TextFormat("scene_pos.x: %f scene_pos.z: %f", scene_pos.x, scene_pos.z), 10, 30, 20, RAYWHITE);
     DrawText(TextFormat("offset_x: %f offset_z: %f", offset_x, offset_z), 10, 10, 20, RAYWHITE);
-
-    for (int i=0; i<env->num_agents; i++) {
-        Agent* agent = &env->agents[i];
-    }
 
     EndDrawing();
 }
@@ -333,8 +456,7 @@ void c_render(Scape* env) {
 // Required function. Should clean up anything you allocated
 // Do not free env->observations, actions, rewards, terminals
 void c_close(Scape* env) {
-    free(env->agents);
-    free(env->goals);
+    free(env->entities);
     if (env->client != NULL) {
         Client* client = env->client;
         UnloadTexture(client->puffer);
