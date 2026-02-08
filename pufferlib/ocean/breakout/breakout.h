@@ -79,6 +79,7 @@ typedef struct Breakout {
     int frameskip;
     unsigned char hit_brick;
     int continuous;
+    unsigned int rng;
 } Breakout;
 
 typedef struct CollisionInfo CollisionInfo;

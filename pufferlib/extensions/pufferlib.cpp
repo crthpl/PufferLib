@@ -1,3 +1,12 @@
+/* Checklist for avoiding diabolical capture bugs:
+ * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
+ * 2. Make sure input/output buffer pointers don't change
+ * 3. Make sure to restore the original stream after tracing
+ * 4. All custom kernels need to use the default torch stream
+ * 5. Make sure you are using the torch stream fns, not the c10 ones.
+ * 6. Scalars get captured by value. They cannot change between calls.
+ */
+
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch/optim/optimizer.h>
@@ -225,15 +234,6 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
     static_vec_log(pufferl.vec, out);
     return out;
 }
-
-/* Checklist for avoiding diabolical capture bugs:
- * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
- * 2. Make sure input/output buffer pointers don't change
- * 3. Make sure to restore the original stream after tracing
- * 4. All custom kernels need to use the default torch stream
- * 5. Make sure you are using the torch stream fns, not the c10 ones.
- * 6. Scalars get captured by value. They cannot change between calls.
- */
 
 
 // ============================================================================

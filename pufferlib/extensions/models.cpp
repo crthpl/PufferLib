@@ -577,7 +577,7 @@ Tensor compute_train_loss(Logits& logits, Tensor newvalue,
         }
         Tensor ratio = (result[0].reshape({segments, horizon}) - old_logprobs).exp();
         ratio_out.copy_(ratio, false);
-        newvalue_out.copy_(newvalue, false);
+        newvalue_out.copy_(newvalue.squeeze(-1), false);
 
         return ppo_loss_cpp(ratio, advantages, prio,
             newvalue, values, returns, result[1],
