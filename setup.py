@@ -230,7 +230,7 @@ if not NO_OCEAN:
             c_ext.extra_link_args.extend(['-L/usr/local/lib', '-llammps'])
 
 
-class ProfilerV2BuildExt(build_ext):
+class ProfilerBuildExt(build_ext):
     user_options = build_ext.user_options + [
         ('no-torch', None, 'Build profiler without torch support'),
         ('env=', None, 'Static env to link (e.g., breakout, drive)'),
@@ -252,7 +252,7 @@ class ProfilerV2BuildExt(build_ext):
         import torch.utils.cpp_extension as cpp_ext
 
         src = 'profiling/main.cu'
-        out = 'profile_v2'
+        out = 'profile'
 
         nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
         arch = '-arch=sm_89'
@@ -260,7 +260,7 @@ class ProfilerV2BuildExt(build_ext):
         cmd = [nvcc, '-O3', arch, '-I.', src, '-o', out]
 
         if not self.no_torch:
-            out = 'profile_v2_torch'
+            out = 'profile_torch'
             lib_paths = cpp_ext.library_paths()
             nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
 
@@ -293,7 +293,7 @@ class ProfilerV2BuildExt(build_ext):
             cmd += ['-lomp5']
             cmd += ['pufferlib/extensions/muon.cpp', src, '-o', out]
 
-        print(f'Building profiler v2: {" ".join(cmd)}')
+        print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)
         print(f'Built: {out}')
 
@@ -302,7 +302,7 @@ cmdclass = {
     "build_ext": BuildExt,
     "build_torch": TorchBuildExt,
     "build_c": CBuildExt,
-    "build_profiler_v2": ProfilerV2BuildExt,
+    "build_profiler": ProfilerBuildExt,
 }
 
 # Static env builds: clang-compiled env + gcc/nvcc torch extension

@@ -6,11 +6,11 @@
 #   all    - Run both (default)
 
 MODE=${1:-all}
-BIN="./profile_v2_torch"
+BIN="./profile_torch"
 
 if [[ ! -x "$BIN" ]]; then
     echo "Error: $BIN not found. Build with:"
-    echo "  python setup.py build_profiler_v2"
+    echo "  python setup.py build_profiler"
     exit 1
 fi
 
@@ -35,7 +35,7 @@ run_nsys() {
         -o nprof-v2-"$name" \
         "$BIN" "$name" 2>&1 | grep -v "^Generating\|^Processing"
 
-    nsys stats --report cuda_gpu_kern_sum:base --force-export=true nprof-v2-"$name".nsys-rep 2>/dev/null | tail -n +4
+    nsys stats --report cuda_gpu_kern_sum:base --force-export=true nprof-"$name".nsys-rep 2>/dev/null | tail -n +4
     echo ""
 }
 
