@@ -113,7 +113,8 @@ FCMaxArgsTorch* create_fcmaxargs_torch(FCMaxArgs* raw) {
     args->D_out = raw->D_out;
 
     auto prec_opts = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
-    // x and grad_out are precision_t; W and b are always float32
+    // Keep x and grad_out in native precision — kernel casts to precision_t*
+    // W and b are always float32 (kernel reads them as float directly)
     args->x = torch::from_blob(raw->x, {raw->B, raw->N, raw->D_in}, prec_opts).clone().requires_grad_(true);
     args->W = torch::from_blob(raw->W, {raw->D_out, raw->D_in}, cuda_f32).clone().requires_grad_(true);
     args->b = torch::from_blob(raw->b, {raw->D_out}, cuda_f32).clone().requires_grad_(true);
@@ -131,37 +132,43 @@ void run_fcmax_backward_torch(FCMaxArgsTorch* args) {
     if (args->x.grad().defined()) args->x.grad().zero_();
     if (args->W.grad().defined()) args->W.grad().zero_();
     if (args->b.grad().defined()) args->b.grad().zero_();
-    args->out.backward(args->grad_out, /*retain_graph=*/true);
+    args->out.backward(args->grad_out.to(args->out.dtype()), /*retain_graph=*/true);
 }
 
 void run_fcmax_forward_cpp(FCMaxArgsTorch* args) {
     torch::NoGradGuard no_grad;
-    fc_max_cpp(args->x, args->W, args->b);
+    // fc_max_cpp uses addmm which requires matching dtypes — upcast x to float32
+    fc_max_cpp(args->x.to(torch::kFloat32), args->W, args->b);
 }
 
 void test_fcmax_correct(FCMaxArgsTorch* args) {
+    // Kernel path: x in native precision (kernel casts to precision_t*)
     auto x_fused = args->x.detach().clone().requires_grad_(true);
     auto W_fused = args->W.detach().clone().requires_grad_(true);
     auto b_fused = args->b.detach().clone().requires_grad_(true);
     auto fused_out = fc_max(x_fused, W_fused, b_fused);
 
-    auto x_ref = args->x.detach().clone().requires_grad_(true);
+    // Cpp path: x in float32 (addmm requires matching dtypes)
+    auto x_ref = args->x.detach().to(torch::kFloat32).requires_grad_(true);
     auto W_ref = args->W.detach().clone().requires_grad_(true);
     auto b_ref = args->b.detach().clone().requires_grad_(true);
     auto ref_out = fc_max_cpp(x_ref, W_ref, b_ref);
 
-    float rtol = 1e-3f, atol = 1e-4f;
-    bool out_match = torch::allclose(fused_out, ref_out, rtol, atol);
-    float out_max_diff = (fused_out - ref_out).abs().max().item<float>();
+    float rtol = USE_BF16 ? 5e-2f : 1e-3f;
+    float atol = USE_BF16 ? 1e-2f : 1e-4f;
+    bool out_match = torch::allclose(fused_out.to(torch::kFloat32), ref_out, rtol, atol);
+    float out_max_diff = (fused_out.to(torch::kFloat32) - ref_out).abs().max().item<float>();
 
     printf("  forward correctness: out=%s(%.2e)\n",
            out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff);
 
-    fused_out.backward(args->grad_out);
-    ref_out.backward(args->grad_out);
+    auto grad_fused = args->grad_out.to(fused_out.dtype());
+    auto grad_ref = args->grad_out.to(torch::kFloat32);
+    fused_out.backward(grad_fused);
+    ref_out.backward(grad_ref);
 
-    bool grad_x_match = torch::allclose(x_fused.grad(), x_ref.grad(), rtol, atol);
-    float grad_x_max_diff = (x_fused.grad() - x_ref.grad()).abs().max().item<float>();
+    bool grad_x_match = torch::allclose(x_fused.grad().to(torch::kFloat32), x_ref.grad(), rtol, atol);
+    float grad_x_max_diff = (x_fused.grad().to(torch::kFloat32) - x_ref.grad()).abs().max().item<float>();
     bool grad_W_match = torch::allclose(W_fused.grad(), W_ref.grad(), rtol, atol);
     float grad_W_max_diff = (W_fused.grad() - W_ref.grad()).abs().max().item<float>();
 

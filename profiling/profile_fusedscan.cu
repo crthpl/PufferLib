@@ -127,10 +127,11 @@ FusedScanArgsTorch* create_fusedscanargs_torch(FusedScanArgs* raw) {
     args->T = raw->T;
     args->H = raw->H;
     auto opts = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
-    args->combined = torch::from_blob(raw->combined, {raw->B, raw->T, 3 * raw->H}, opts).clone().to(torch::kFloat32).requires_grad_(true);
-    args->state = torch::from_blob(raw->state, {raw->B, 1, raw->H}, opts).clone().to(torch::kFloat32).requires_grad_(true);
-    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts).clone().to(torch::kFloat32);
-    args->grad_next_state = torch::from_blob(raw->grad_next_state, {raw->B, 1, raw->H}, opts).clone().to(torch::kFloat32);
+    // Keep in native precision — kernel wrappers cast to precision_t*
+    args->combined = torch::from_blob(raw->combined, {raw->B, raw->T, 3 * raw->H}, opts).clone().requires_grad_(true);
+    args->state = torch::from_blob(raw->state, {raw->B, 1, raw->H}, opts).clone().requires_grad_(true);
+    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts).clone();
+    args->grad_next_state = torch::from_blob(raw->grad_next_state, {raw->B, 1, raw->H}, opts).clone();
     return args;
 }
 
@@ -154,40 +155,51 @@ void run_fusedscan_forward_cpp(FusedScanArgsTorch* args) {
 }
 
 void test_fusedscan_correct(FusedScanArgsTorch* args) {
-    auto combined_ref = args->combined.detach().clone().requires_grad_(true);
-    auto state_ref = args->state.detach().clone().requires_grad_(true);
-    combined_ref.retain_grad();
-    state_ref.retain_grad();
-    auto ref_outputs = fused_scan_checkpointed(combined_ref, state_ref);
-    auto ref_out = ref_outputs[0];
-    auto ref_next_state = ref_outputs[1];
+    // Kernel path: native precision (bf16 or f32) — kernel casts to precision_t*
+    auto combined_k = args->combined.detach().clone().requires_grad_(true);
+    auto state_k = args->state.detach().clone().requires_grad_(true);
+    combined_k.retain_grad();
+    state_k.retain_grad();
+    auto k_outputs = fused_scan_checkpointed(combined_k, state_k);
+    auto k_out = k_outputs[0];
+    auto k_next_state = k_outputs[1];
 
-    auto cpp_outputs = fused_scan_cpp(args->combined.detach(), args->state.detach());
-    auto cpp_out = cpp_outputs[0];
-    auto cpp_next_state = cpp_outputs[1];
+    // Cpp path: float32 for higher-precision reference
+    auto combined_c = args->combined.detach().to(torch::kFloat32);
+    auto state_c = args->state.detach().to(torch::kFloat32);
+    auto c_outputs = fused_scan_cpp(combined_c, state_c);
+    auto c_out = c_outputs[0];
+    auto c_next_state = c_outputs[1];
 
-    float rtol = 1e-3f, atol = 3e-4f;
-    bool out_match = torch::allclose(ref_out, cpp_out, rtol, atol);
-    float out_max_diff = (ref_out - cpp_out).abs().max().item<float>();
-    bool ns_match = torch::allclose(ref_next_state, cpp_next_state, rtol, atol);
-    float ns_max_diff = (ref_next_state - cpp_next_state).abs().max().item<float>();
+    // bf16 accumulates error over 64 sequential timesteps — needs wider tolerance
+    float rtol = USE_BF16 ? 1e-1f : 1e-3f;
+    float atol = USE_BF16 ? 5e-2f : 2e-4f;
+    bool out_match = torch::allclose(k_out.to(torch::kFloat32), c_out, rtol, atol);
+    float out_max_diff = (k_out.to(torch::kFloat32) - c_out).abs().max().item<float>();
+    bool ns_match = torch::allclose(k_next_state.to(torch::kFloat32), c_next_state, rtol, atol);
+    float ns_max_diff = (k_next_state.to(torch::kFloat32) - c_next_state).abs().max().item<float>();
     printf("  forward correctness: out=%s(%.2e) next_state=%s(%.2e)\n",
            out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff,
            ns_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", ns_max_diff);
 
-    torch::autograd::backward({ref_out, ref_next_state}, {args->grad_out, args->grad_next_state});
-    auto grad_combined_ref = combined_ref.grad().clone();
-    auto grad_state_ref = state_ref.grad().clone();
+    // Backward: kernel path (native precision)
+    auto grad_out_k = args->grad_out.to(k_out.dtype());
+    auto grad_ns_k = args->grad_next_state.to(k_next_state.dtype());
+    torch::autograd::backward({k_out, k_next_state}, {grad_out_k, grad_ns_k});
+    auto grad_combined_k = combined_k.grad().clone();
+    auto grad_state_k = state_k.grad().clone();
 
-    auto combined_cpp = args->combined.detach().clone().requires_grad_(true);
-    auto state_cpp = args->state.detach().clone().requires_grad_(true);
-    auto cpp_out2 = fused_scan_cpp(combined_cpp, state_cpp);
-    torch::autograd::backward({cpp_out2[0], cpp_out2[1]}, {args->grad_out, args->grad_next_state});
+    // Backward: cpp path in float32
+    auto combined_c2 = args->combined.detach().to(torch::kFloat32).requires_grad_(true);
+    auto state_c2 = args->state.detach().to(torch::kFloat32).requires_grad_(true);
+    auto c_out2 = fused_scan_cpp(combined_c2, state_c2);
+    torch::autograd::backward({c_out2[0], c_out2[1]},
+        {args->grad_out.to(torch::kFloat32), args->grad_next_state.to(torch::kFloat32)});
 
-    bool gc_match = torch::allclose(grad_combined_ref, combined_cpp.grad(), rtol, atol);
-    float gc_diff = (grad_combined_ref - combined_cpp.grad()).abs().max().item<float>();
-    bool gs_match = torch::allclose(grad_state_ref, state_cpp.grad(), rtol, atol);
-    float gs_diff = (grad_state_ref - state_cpp.grad()).abs().max().item<float>();
+    bool gc_match = torch::allclose(grad_combined_k.to(torch::kFloat32), combined_c2.grad(), rtol, atol);
+    float gc_diff = (grad_combined_k.to(torch::kFloat32) - combined_c2.grad()).abs().max().item<float>();
+    bool gs_match = torch::allclose(grad_state_k.to(torch::kFloat32), state_c2.grad(), rtol, atol);
+    float gs_diff = (grad_state_k.to(torch::kFloat32) - state_c2.grad()).abs().max().item<float>();
     printf("  backward correctness: grad_combined=%s(%.2e) grad_state=%s(%.2e)\n",
            gc_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", gc_diff,
            gs_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", gs_diff);

@@ -92,19 +92,24 @@ void run_mingrugate_forward_cpp(MingruGateArgsTorch* args) {
 }
 
 void test_mingrugate_correct(MingruGateArgsTorch* args) {
+    // Kernel path: native precision (kernel internally computes in float32)
     auto kernel_outputs = mingru_gate(args->state, args->combined);
     auto kernel_out = kernel_outputs[0];
     auto kernel_next_state = kernel_outputs[1];
 
-    auto cpp_outputs = mingru_gate_cpp(args->state, args->combined);
+    // Cpp path: float32 for accurate reference
+    auto cpp_outputs = mingru_gate_cpp(
+        args->state.to(torch::kFloat32),
+        args->combined.to(torch::kFloat32));
     auto cpp_out = cpp_outputs[0];
     auto cpp_next_state = cpp_outputs[1];
 
-    float rtol = 1e-3f, atol = 1e-4f;
-    bool out_match = torch::allclose(kernel_out.to(torch::kFloat32), cpp_out.to(torch::kFloat32), rtol, atol);
-    float out_max_diff = (kernel_out.to(torch::kFloat32) - cpp_out.to(torch::kFloat32)).abs().max().item<float>();
-    bool next_state_match = torch::allclose(kernel_next_state.to(torch::kFloat32), cpp_next_state.to(torch::kFloat32), rtol, atol);
-    float next_state_max_diff = (kernel_next_state.to(torch::kFloat32) - cpp_next_state.to(torch::kFloat32)).abs().max().item<float>();
+    float rtol = USE_BF16 ? 5e-2f : 1e-3f;
+    float atol = USE_BF16 ? 1e-2f : 1e-4f;
+    bool out_match = torch::allclose(kernel_out.to(torch::kFloat32), cpp_out, rtol, atol);
+    float out_max_diff = (kernel_out.to(torch::kFloat32) - cpp_out).abs().max().item<float>();
+    bool next_state_match = torch::allclose(kernel_next_state.to(torch::kFloat32), cpp_next_state, rtol, atol);
+    float next_state_max_diff = (kernel_next_state.to(torch::kFloat32) - cpp_next_state).abs().max().item<float>();
 
     printf("  correctness: out=%s(%.2e) next_state=%s(%.2e)\n",
            out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff,

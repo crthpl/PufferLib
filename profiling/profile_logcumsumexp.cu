@@ -75,8 +75,9 @@ LogcumsumexpArgsTorch* create_logcumsumexpargs_torch(LogcumsumexpArgs* raw) {
     LogcumsumexpArgsTorch* args = new LogcumsumexpArgsTorch();
     args->N = raw->N;
     auto opts = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
-    args->x = torch::from_blob(raw->x, {raw->B, raw->T, raw->H}, opts).clone().to(torch::kFloat32).requires_grad_(true);
-    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts).clone().to(torch::kFloat32);
+    // Keep in native precision — kernel wrappers cast to precision_t*
+    args->x = torch::from_blob(raw->x, {raw->B, raw->T, raw->H}, opts).clone().requires_grad_(true);
+    args->grad_out = torch::from_blob(raw->grad_out, {raw->B, raw->T, raw->H}, opts).clone();
     return args;
 }
 
@@ -96,24 +97,31 @@ void run_logcumsumexp_forward_cpp(LogcumsumexpArgsTorch* args) {
 }
 
 void test_logcumsumexp_correct(LogcumsumexpArgsTorch* args) {
+    // Kernel path: native precision (bf16 or f32) — kernel casts to precision_t*
     auto x_k = args->x.detach().clone().requires_grad_(true);
     auto out_k = logcumsumexp_cuda(x_k);
 
-    auto x_c = args->x.detach().clone().requires_grad_(true);
+    // Cpp path: float32 for higher-precision reference
+    auto x_c = args->x.detach().to(torch::kFloat32).requires_grad_(true);
     auto out_c = logcumsumexp_cpp(x_c);
 
-    float rtol = 1e-3f, atol = 1e-4f;
-    float out_max_diff = (out_k - out_c).abs().max().item<float>();
-    bool out_match = torch::allclose(out_k, out_c, rtol, atol);
+    float rtol = USE_BF16 ? 5e-2f : 1e-3f;
+    float atol = USE_BF16 ? 1e-2f : 1e-4f;
+    float out_max_diff = (out_k.to(torch::kFloat32) - out_c).abs().max().item<float>();
+    bool out_match = torch::allclose(out_k.to(torch::kFloat32), out_c, rtol, atol);
     printf("  forward correctness: %s(%.2e)\n",
            out_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", out_max_diff);
 
-    auto grad = args->grad_out.detach().clone();
-    out_k.backward(grad, /*retain_graph=*/false);
-    out_c.backward(grad, /*retain_graph=*/false);
+    // Backward: kernel in native precision
+    auto grad_k = args->grad_out.to(x_k.dtype());
+    out_k.backward(grad_k, /*retain_graph=*/false);
 
-    float grad_max_diff = (x_k.grad() - x_c.grad()).abs().max().item<float>();
-    bool grad_match = torch::allclose(x_k.grad(), x_c.grad(), rtol, atol);
+    // Backward: cpp in float32
+    auto grad_c = args->grad_out.to(torch::kFloat32);
+    out_c.backward(grad_c, /*retain_graph=*/false);
+
+    float grad_max_diff = (x_k.grad().to(torch::kFloat32) - x_c.grad()).abs().max().item<float>();
+    bool grad_match = torch::allclose(x_k.grad().to(torch::kFloat32), x_c.grad(), rtol, atol);
     printf("  backward correctness: %s(%.2e)\n",
            grad_match ? "\033[32mok\033[0m" : "\033[31mFAIL\033[0m", grad_max_diff);
 }
