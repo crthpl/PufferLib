@@ -89,6 +89,7 @@ static void* static_omp_threadmanager(void* arg) {
 
     Env* envs = (Env*)vec->envs;
 
+    printf("Num workers: %d\n", num_workers);
     while (true) {
         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
             if (atomic_load(&threading->shutdown)) {
@@ -107,9 +108,15 @@ static void* static_omp_threadmanager(void* arg) {
                 cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);
 
-            #pragma omp parallel for schedule(static) num_threads(num_workers)
-            for (int i = env_start; i < env_start + env_count; i++) {
-                c_step(&envs[i]);
+            if (num_workers > 1) {
+                #pragma omp parallel for schedule(static) num_threads(num_workers)
+                for (int i = env_start; i < env_start + env_count; i++) {
+                    c_step(&envs[i]);
+                }
+            } else {
+                for (int i = env_start; i < env_start + env_count; i++) {
+                    c_step(&envs[i]);
+                }
             }
 
             cudaMemcpyAsync(
