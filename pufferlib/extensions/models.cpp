@@ -1,11 +1,26 @@
 // models.cpp - MinGRU, LSTM, and related model classes for pufferlib
-// Separated from pufferlib.cpp for cleaner organization
-// NOTE: This file is included directly into pufferlib.cpp inside namespace pufferlib
+// Included by pufferlib.cpp and profile_kernels.cu inside namespace pufferlib
 
 using std::tuple;
 using std::vector;
 using std::shared_ptr;
 namespace nn = torch::nn;
+typedef torch::Tensor Tensor;
+
+// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
+#ifdef PRECISION_FLOAT
+constexpr bool USE_BF16 = false;
+constexpr torch::ScalarType PRECISION_DTYPE = torch::kFloat32;
+#else
+constexpr bool USE_BF16 = true;
+constexpr torch::ScalarType PRECISION_DTYPE = torch::kBFloat16;
+#endif
+
+// Common tensor options
+auto cuda_f32 = torch::dtype(torch::kFloat32).device(torch::kCUDA);
+auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
+auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
+auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
 
 // Raw struct bundling decoder outputs: mean (logits for discrete) + logstd
 struct Logits {

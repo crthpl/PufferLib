@@ -234,12 +234,14 @@ class ProfilerBuildExt(build_ext):
     user_options = build_ext.user_options + [
         ('no-torch', None, 'Build profiler without torch support'),
         ('env=', None, 'Static env to link (e.g., breakout, drive)'),
+        ('precision=', None, 'Precision: float or bf16 (default: float)'),
     ]
 
     def initialize_options(self):
         super().initialize_options()
         self.no_torch = False
         self.env = None
+        self.precision = 'float'
 
     def finalize_options(self):
         super().finalize_options()
@@ -261,7 +263,19 @@ class ProfilerBuildExt(build_ext):
             out = 'profile_kernels_torch'
             lib_paths = cpp_ext.library_paths()
             nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
-            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-I.', f'-I./{RAYLIB_NAME}/include', '-Ipufferlib/extensions']
+            # Link static env (required)
+            if not self.env:
+                raise RuntimeError('--env is required. Usage: python setup.py build_profiler --env=breakout')
+            static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
+            if not os.path.exists(static_lib):
+                raise RuntimeError(f'Static library not found: {static_lib}\n'
+                                   f'Build it first with: python setup.py build_{self.env}')
+
+            precision_flag = '-DPRECISION_FLOAT' if self.precision == 'float' else ''
+            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', f'-DENV_NAME={self.env}', '-DUSE_STATIC_ENV',
+                   '-I.', f'-I./{RAYLIB_NAME}/include', '-Ipufferlib/extensions']
+            if precision_flag:
+                cmd.append(precision_flag)
             cmd += ['-I' + sysconfig.get_path('include')]
             cmd += ['-I' + p for p in cpp_ext.include_paths()]
             cmd += ['-L' + p for p in lib_paths]
@@ -269,16 +283,8 @@ class ProfilerBuildExt(build_ext):
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
             cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl']
-
-            # Add static env if specified
-            if self.env:
-                static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
-                if not os.path.exists(static_lib):
-                    raise RuntimeError(f'Static library not found: {static_lib}\n'
-                                       f'Build it first with: python setup.py build_{self.env}')
-                cmd += ['-DUSE_STATIC_ENV', static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL', '-lomp5']
-
-            cmd += ['pufferlib/extensions/muon.cpp', 'pufferlib/extensions/cuda/advantage.cu', src, '-o', out]
+            cmd += [static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL', '-lomp5']
+            cmd += ['pufferlib/extensions/ini.c', src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)

@@ -25,32 +25,10 @@
 #include "env_binding.h"
 #include "modules.h"
 
-using std::tuple;
-using std::vector;
-using std::shared_ptr;
-namespace nn = torch::nn;
-
-typedef torch::Tensor Tensor;
-
-// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
-#ifdef PRECISION_FLOAT
-constexpr bool USE_BF16 = false;
-constexpr torch::ScalarType PRECISION_DTYPE = torch::kFloat32;
-#else
-constexpr bool USE_BF16 = true;
-constexpr torch::ScalarType PRECISION_DTYPE = torch::kBFloat16;
-#endif
-
 namespace pufferlib {
 
-// Common tensor options
-auto cuda_f32 = torch::dtype(torch::kFloat32).device(torch::kCUDA);
-auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
-auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
-auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
-
-#include "advantage.cpp"
 #include "models.cpp"
+#include "advantage.cpp"
 #include "ocean.cpp"
 
 torch::Dtype to_torch_dtype(int dtype) {
