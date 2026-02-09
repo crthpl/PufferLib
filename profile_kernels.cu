@@ -1857,13 +1857,16 @@ void profile_envspeed(int total_agents, int num_buffers, int num_threads, int ho
 #endif  // USE_STATIC_ENV
 
 void print_usage(const char* prog) {
-    printf("Usage: %s <profile>\n", prog);
+    printf("Usage: %s <profile> [options]\n", prog);
     printf("  kernels        - Individual kernel profiling (no nsys needed)\n");
 #ifdef USE_TORCH
     printf("  forwardcall    - Inference forward pass\n");
 #endif
 #ifdef USE_STATIC_ENV
     printf("  envspeed       - Environment step throughput (static linked)\n");
+    printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
+    printf("    --threads N  - Number of threads (default: 16)\n");
+    printf("    --horizon N  - Horizon length (default: %d)\n", T);
 #endif
     printf("  all            - Run all profiles\n");
 }
@@ -1875,6 +1878,17 @@ int main(int argc, char** argv) {
     }
 
     const char* profile = argv[1];
+
+    // Parse optional CLI args for envspeed
+    int buffers = BUF;
+    int threads = 16;
+    int horizon = T;
+    for (int i = 2; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--buffers") == 0) buffers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--threads") == 0) threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--horizon") == 0) horizon = atoi(argv[++i]);
+    }
+
     warmup_gpu();
 
     // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
@@ -1900,7 +1914,7 @@ int main(int argc, char** argv) {
 
 #ifdef USE_STATIC_ENV
     if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
-        profile_envspeed(BUF*BR, BUF, 16, T);
+        profile_envspeed(buffers * BR, buffers, threads, horizon);
     }
 #endif
 

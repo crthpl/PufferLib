@@ -13,6 +13,7 @@ typedef struct {
     double* actions;
     float* rewards;
     float* terminals;
+    int num_agents;
     int bandwidth;
     int compute;
 } Benchmark;

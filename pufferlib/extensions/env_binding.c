@@ -4,6 +4,7 @@
 #include <omp.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdbool.h>
 
 #include "env_binding.h"
 #include "binding.h"
