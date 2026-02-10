@@ -149,13 +149,57 @@ void select_and_copy_impl(RolloutCopyArgs* args, const Tensor& idx, const Tensor
 // Phase runners (for individual profile_kernel calls)
 // ============================================================================
 
-// Phase 1: compute_advantage — calls puff_advantage CUDA kernel
-void run_compute_advantage(RolloutCopyArgs* args) {
+// Helper: run an advantage dispatch function with args unpacked
+typedef void (*adv_dispatch_fn)(Tensor, Tensor, Tensor, Tensor, Tensor,
+                                double, double, double, double);
+
+void run_advantage_impl(RolloutCopyArgs* args, adv_dispatch_fn fn) {
     args->advantages.fill_(0.0);
-    compute_puff_advantage_cuda(
-        args->values, args->rewards, args->terminals, args->ratio,
-        args->advantages, args->gamma, args->gae_lambda,
-        args->rho_clip, args->c_clip);
+    fn(args->values, args->rewards, args->terminals, args->ratio,
+       args->advantages, args->gamma, args->gae_lambda,
+       args->rho_clip, args->c_clip);
+}
+
+// Phase 1: compute_advantage — vectorized CUDA kernel (production)
+void run_compute_advantage(RolloutCopyArgs* args) {
+    run_advantage_impl(args, compute_puff_advantage_cuda);
+}
+
+// Phase 1 (scalar baseline): scalar-only CUDA kernel (for benchmarking)
+void run_compute_advantage_scalar(RolloutCopyArgs* args) {
+    run_advantage_impl(args, compute_puff_advantage_cuda_scalar);
+}
+
+// Phase 1 (PyTorch reference): GAE in pure PyTorch ops
+// Sequential loop over time, but vectorized across all rows per timestep
+void run_compute_advantage_torch(RolloutCopyArgs* args) {
+    auto& vals = args->values;
+    auto& rews = args->rewards;
+    auto& terms = args->terminals;
+    auto& ratio = args->ratio;
+    auto& advantages = args->advantages;
+    float gamma = args->gamma;
+    float gae_lambda = args->gae_lambda;
+    float rho_clip = args->rho_clip;
+    float c_clip = args->c_clip;
+    int T = args->horizon;
+
+    advantages.zero_();
+    auto lastgaelam = torch::zeros({args->num_segments}, cuda_f32);
+
+    for (int t = T - 2; t >= 0; t--) {
+        auto nextnonterminal = 1.0f - terms.select(1, t + 1).to(torch::kFloat32);
+        auto imp = ratio.select(1, t).to(torch::kFloat32);
+        auto rho_t = imp.clamp_max(rho_clip);
+        auto c_t = imp.clamp_max(c_clip);
+        auto next_val = vals.select(1, t + 1).to(torch::kFloat32);
+        auto cur_val = vals.select(1, t).to(torch::kFloat32);
+        auto next_rew = rews.select(1, t + 1).to(torch::kFloat32);
+
+        auto delta = rho_t * (next_rew + gamma * next_val * nextnonterminal - cur_val);
+        lastgaelam = delta + gamma * gae_lambda * c_t * lastgaelam * nextnonterminal;
+        advantages.select(1, t).copy_(lastgaelam);
+    }
 }
 
 // Phase 2: compute_prio — priority-weighted sampling (all PyTorch ops)
@@ -184,6 +228,47 @@ void run_full_rolloutcopy(RolloutCopyArgs* args) {
 }
 
 // ============================================================================
+// Correctness check: vectorized vs scalar (must match exactly)
+// ============================================================================
+
+void test_advantage_correct(RolloutCopyArgs* args) {
+    int S = args->num_segments;
+    int T = args->horizon;
+
+    // Run vectorized kernel
+    auto adv_vec = torch::zeros({S, T}, cuda_f32);
+    compute_puff_advantage_cuda(
+        args->values, args->rewards, args->terminals, args->ratio,
+        adv_vec, args->gamma, args->gae_lambda, args->rho_clip, args->c_clip);
+
+    // Run scalar kernel
+    auto adv_scalar = torch::zeros({S, T}, cuda_f32);
+    compute_puff_advantage_cuda_scalar(
+        args->values, args->rewards, args->terminals, args->ratio,
+        adv_scalar, args->gamma, args->gae_lambda, args->rho_clip, args->c_clip);
+
+    cudaDeviceSynchronize();
+
+    // Compare: should be bit-identical (same float arithmetic, just different load pattern)
+    float max_diff = (adv_vec - adv_scalar).abs().max().item<float>();
+    const char* status = (max_diff < 1e-6f) ? "PASS" : "FAIL";
+    printf("  correctness (vec vs scalar): %s (max_diff=%.2e)\n", status, max_diff);
+
+    // Also compare against PyTorch reference (may have small fp differences)
+    auto saved_adv = args->advantages;
+    args->advantages = torch::zeros({S, T}, cuda_f32);
+    run_compute_advantage_torch(args);
+    auto adv_torch = args->advantages;
+    args->advantages = saved_adv;
+    cudaDeviceSynchronize();
+
+    float max_diff_torch = (adv_vec - adv_torch).abs().max().item<float>();
+    float atol = USE_BF16 ? 5e-2f : 1e-5f;  // bf16 inputs lose precision in .to() conversions
+    const char* torch_status = (max_diff_torch < atol) ? "PASS" : "FAIL";
+    printf("  correctness (vec vs torch):  %s (max_diff=%.2e)\n", torch_status, max_diff_torch);
+}
+
+// ============================================================================
 // Profile function
 // ============================================================================
 
@@ -199,10 +284,28 @@ void profile_rolloutcopy(int num_segments, int horizon, int minibatch_segs,
     auto* args = create_rolloutcopyargs(num_segments, horizon, minibatch_segs,
                                          input_size, num_atns, num_layers, hidden);
 
-    // --- Individual phase timing ---
+    // === Advantage Kernel Comparison ===
+    printf("--- Advantage Kernel Comparison (S=%d, T=%d) ---\n", num_segments, horizon);
+
+    float adv_vec_ms = profile_kernel((kernel_fn)run_compute_advantage, args, "advantage_vectorized");
+    print_timing("advantage (vectorized)", adv_vec_ms, num_segments);
+
+    float adv_scalar_ms = profile_kernel((kernel_fn)run_compute_advantage_scalar, args, "advantage_scalar");
+    print_timing("advantage (scalar)", adv_scalar_ms, num_segments);
+
+    float adv_torch_ms = profile_kernel((kernel_fn)run_compute_advantage_torch, args, "advantage_torch");
+    print_timing("advantage (torch)", adv_torch_ms, num_segments);
+
+    printf("  vectorized vs scalar:  %.2fx\n", adv_scalar_ms / adv_vec_ms);
+    printf("  vectorized vs torch:   %.2fx\n", adv_torch_ms / adv_vec_ms);
+
+    test_advantage_correct(args);
+    printf("\n");
+
+    // === Per-Phase Timing (rollout copy pipeline) ===
     printf("--- Per-Phase Timing ---\n");
 
-    float adv_ms = profile_kernel((kernel_fn)run_compute_advantage, args, "compute_advantage");
+    float adv_ms = adv_vec_ms;
     print_timing("compute_advantage", adv_ms, num_segments);
 
     // Ensure advantages are populated for prio/select phases
