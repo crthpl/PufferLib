@@ -325,7 +325,7 @@ void profile_trainforward(int N, int T_seq, int input_size, int hidden, int act_
     bool use_kernels = true;
 
     // ----- Full forward + loss (no backward) -----
-    printf("--- Forward + Loss (no backward) ---\n");
+    printf("--- Forward + Loss (no backward, no autograd) ---\n");
     TrainArgs* args_fwd = create_trainargs(N, T_seq, input_size, hidden, act_n, num_layers, use_kernels);
     float fwd_ms = profile_kernel((kernel_fn)run_train_forward, args_fwd, "trainforward");
     print_timing("forward+loss (kernel)", fwd_ms, N * T_seq);
@@ -443,7 +443,7 @@ void profile_trainstep(int N, int T_seq, int input_size, int hidden, int act_n, 
     }
 
     // ----- Instrumented breakdown (CUDA events at phase boundaries) -----
-    printf("\n--- Training Step Breakdown (instrumented) ---\n");
+    printf("\n--- Training Step Breakdown (instrumented, includes autograd overhead) ---\n");
     {
         TrainArgs* args_bd = create_trainargs(N, T_seq, input_size, hidden, act_n, num_layers, use_kernels);
         auto t = profile_step_instrumented(args_bd);
