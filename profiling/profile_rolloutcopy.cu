@@ -32,6 +32,10 @@ typedef struct {
     Tensor mb_values;
     Tensor mb_returns;
 
+    // Pre-computed prio results (for isolated select+copy profiling)
+    Tensor cached_idx;
+    Tensor cached_mb_prio;
+
     // Config
     int num_segments;     // S = total_agents (full rollout rows)
     int horizon;          // T = sequence length
@@ -102,7 +106,47 @@ void free_rolloutcopyargs(RolloutCopyArgs* args) {
 }
 
 // ============================================================================
-// Phase runners (mirror train_impl per-minibatch loop)
+// Shared helpers (single source of truth for prio + select logic)
+// ============================================================================
+
+struct PrioResult {
+    Tensor idx;
+    Tensor mb_prio;
+};
+
+// Priority-weighted sampling: advantages -> probabilities -> multinomial -> importance weights
+PrioResult compute_prio_impl(RolloutCopyArgs* args) {
+    Tensor adv = args->advantages.abs().sum(1);
+    Tensor prio_weights = adv.pow(args->prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+    Tensor prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6);
+    Tensor idx = at::multinomial(prio_probs, args->minibatch_segs, true);
+    Tensor mb_prio = torch::pow(
+        args->total_agents * prio_probs.index_select(0, idx).unsqueeze(1),
+        -args->anneal_beta);
+    return {idx, mb_prio};
+}
+
+// index_select sampled segments + copy_ into graph buffers
+void select_and_copy_impl(RolloutCopyArgs* args, const Tensor& idx, const Tensor& mb_prio) {
+    Tensor mb_obs = args->observations.index_select(0, idx);
+    Tensor mb_actions = args->actions.index_select(0, idx);
+    Tensor mb_logprobs = args->logprobs.index_select(0, idx);
+    Tensor mb_values = args->values.index_select(0, idx);
+    Tensor mb_advantages = args->advantages.index_select(0, idx);
+    Tensor mb_returns = mb_advantages + mb_values;
+
+    args->mb_state.zero_();
+    args->mb_obs.copy_(mb_obs, false);
+    args->mb_actions.copy_(mb_actions, false);
+    args->mb_logprobs.copy_(mb_logprobs, false);
+    args->mb_advantages.copy_(mb_advantages, false);
+    args->mb_prio.copy_(mb_prio, false);
+    args->mb_values.copy_(mb_values, false);
+    args->mb_returns.copy_(mb_returns, false);
+}
+
+// ============================================================================
+// Phase runners (for individual profile_kernel calls)
 // ============================================================================
 
 // Phase 1: compute_advantage — calls puff_advantage CUDA kernel
@@ -116,41 +160,12 @@ void run_compute_advantage(RolloutCopyArgs* args) {
 
 // Phase 2: compute_prio — priority-weighted sampling (all PyTorch ops)
 void run_compute_prio(RolloutCopyArgs* args) {
-    Tensor adv = args->advantages.abs().sum(1);
-    Tensor prio_weights = adv.pow(args->prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-    Tensor prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6);
-    Tensor idx = at::multinomial(prio_probs, args->minibatch_segs, true);
-    Tensor mb_prio = torch::pow(
-        args->total_agents * prio_probs.index_select(0, idx).unsqueeze(1),
-        -args->anneal_beta);
+    compute_prio_impl(args);
 }
 
-// Phase 3: train_select_and_copy — index_select + copy_ into graph buffers
+// Phase 3: train_select_and_copy — pure select+copy using cached prio results
 void run_select_and_copy(RolloutCopyArgs* args) {
-    // Recompute idx (multinomial is stochastic, needs recompute each call)
-    Tensor adv = args->advantages.abs().sum(1);
-    Tensor prio_weights = adv.pow(args->prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-    Tensor prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6);
-    Tensor idx = at::multinomial(prio_probs, args->minibatch_segs, true);
-    Tensor mb_prio = torch::pow(
-        args->total_agents * prio_probs.index_select(0, idx).unsqueeze(1),
-        -args->anneal_beta);
-
-    Tensor mb_obs = args->observations.index_select(0, idx);
-    Tensor mb_actions = args->actions.index_select(0, idx);
-    Tensor mb_logprobs = args->logprobs.index_select(0, idx);
-    Tensor mb_values = args->values.index_select(0, idx);
-    Tensor mb_advantages = args->advantages.index_select(0, idx);
-    Tensor mb_returns = mb_advantages + mb_values;
-
-    args->mb_state.zero_();
-    args->mb_obs.copy_(mb_obs, false);
-    args->mb_actions.copy_(mb_actions, false);
-    args->mb_logprobs.copy_(mb_logprobs, false);
-    args->mb_advantages.copy_(mb_advantages, false);
-    args->mb_prio.copy_(mb_prio, false);
-    args->mb_values.copy_(mb_values, false);
-    args->mb_returns.copy_(mb_returns, false);
+    select_and_copy_impl(args, args->cached_idx, args->cached_mb_prio);
 }
 
 // Full rollout copy: advantage + prio + select_and_copy (one minibatch iteration)
@@ -159,33 +174,12 @@ void run_full_rolloutcopy(RolloutCopyArgs* args) {
     run_compute_advantage(args);
     nvtxRangePop();
 
-    // Recompute idx inline (matches train_impl flow)
     nvtxRangePushA("compute_prio");
-    Tensor adv = args->advantages.abs().sum(1);
-    Tensor prio_weights = adv.pow(args->prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-    Tensor prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6);
-    Tensor idx = at::multinomial(prio_probs, args->minibatch_segs, true);
-    Tensor mb_prio = torch::pow(
-        args->total_agents * prio_probs.index_select(0, idx).unsqueeze(1),
-        -args->anneal_beta);
+    auto [idx, mb_prio] = compute_prio_impl(args);
     nvtxRangePop();
 
     nvtxRangePushA("train_select_and_copy");
-    Tensor mb_obs = args->observations.index_select(0, idx);
-    Tensor mb_actions = args->actions.index_select(0, idx);
-    Tensor mb_logprobs = args->logprobs.index_select(0, idx);
-    Tensor mb_values = args->values.index_select(0, idx);
-    Tensor mb_advantages = args->advantages.index_select(0, idx);
-    Tensor mb_returns = mb_advantages + mb_values;
-
-    args->mb_state.zero_();
-    args->mb_obs.copy_(mb_obs, false);
-    args->mb_actions.copy_(mb_actions, false);
-    args->mb_logprobs.copy_(mb_logprobs, false);
-    args->mb_advantages.copy_(mb_advantages, false);
-    args->mb_prio.copy_(mb_prio, false);
-    args->mb_values.copy_(mb_values, false);
-    args->mb_returns.copy_(mb_returns, false);
+    select_and_copy_impl(args, idx, mb_prio);
     nvtxRangePop();
 }
 
@@ -217,15 +211,23 @@ void profile_rolloutcopy(int num_segments, int horizon, int minibatch_segs,
     float prio_ms = profile_kernel((kernel_fn)run_compute_prio, args, "compute_prio");
     print_timing("compute_prio", prio_ms, num_segments);
 
+    // Pre-compute prio results so Phase 3 measures pure select+copy
+    auto [cached_idx, cached_mb_prio] = compute_prio_impl(args);
+    args->cached_idx = cached_idx;
+    args->cached_mb_prio = cached_mb_prio;
+
     float copy_ms = profile_kernel((kernel_fn)run_select_and_copy, args, "train_select_and_copy");
     print_timing("train_select_and_copy", copy_ms, minibatch_segs);
     printf("\n");
 
-    // --- Full rollout copy (all 3 phases) ---
+    // --- Full rollout copy (all 3 phases, fresh args) ---
     printf("--- Full Rollout Copy (one minibatch iteration) ---\n");
 
-    float full_ms = profile_kernel((kernel_fn)run_full_rolloutcopy, args, "rolloutcopy_full");
+    auto* full_args = create_rolloutcopyargs(num_segments, horizon, minibatch_segs,
+                                         input_size, num_atns, num_layers, hidden);
+    float full_ms = profile_kernel((kernel_fn)run_full_rolloutcopy, full_args, "rolloutcopy_full");
     print_timing("rolloutcopy (full)", full_ms, num_segments);
+    free_rolloutcopyargs(full_args);
     printf("\n");
 
     // --- Proportional breakdown ---

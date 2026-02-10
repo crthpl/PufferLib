@@ -249,15 +249,53 @@ PPOLossArgsTorch* create_ppolossargs_torch(PPOLossArgs* raw) {
     return args;
 }
 
-void run_ppoloss_forward_torch(PPOLossArgsTorch* args) {
-    torch::NoGradGuard no_grad;
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+// Run fused PPO loss forward and return the loss tensor
+torch::Tensor run_fused_ppo_forward(PPOLossArgsTorch* args) {
     auto logstd = torch::empty({0}, args->logits.options());
-    fused_ppo_loss_optimized(
+    return fused_ppo_loss_optimized(
         args->logits, logstd, args->values_pred, args->actions,
         args->old_logprobs, args->advantages, args->prio,
         args->values, args->returns, args->adv_mean, args->adv_var,
         args->ratio_out, args->newvalue_out, args->act_sizes,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef);
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef)[0];
+}
+
+// Compute train loss (kernel or cpp) with fresh clones for independent gradient tracking
+struct TrainLossResult {
+    Tensor loss;
+    Tensor logits;
+    Tensor values_pred;
+};
+
+TrainLossResult compute_test_loss(PPOLossArgsTorch* args, bool use_kernels) {
+    int N = args->N, T = args->T, A = args->A;
+    auto logits = args->logits.detach().clone().requires_grad_(true);
+    auto values_pred = args->values_pred.detach().clone().requires_grad_(true);
+    auto ratio_out = torch::zeros({N, T}, logits.options());
+    auto newvalue_out = torch::zeros({N, T}, logits.options());
+    Logits logits_struct = {.mean = logits};
+    auto loss = compute_train_loss(
+        logits_struct, values_pred,
+        args->actions, args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, ratio_out, newvalue_out,
+        args->act_sizes, torch::tensor({(int64_t)A}, torch::dtype(torch::kInt64)),
+        N * T, T,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        /*is_continuous=*/false, use_kernels);
+    return {loss, logits, values_pred};
+}
+
+// ============================================================================
+// Run functions
+// ============================================================================
+
+void run_ppoloss_forward_torch(PPOLossArgsTorch* args) {
+    torch::NoGradGuard no_grad;
+    run_fused_ppo_forward(args);
 }
 
 void run_ppoloss_backward_torch(PPOLossArgsTorch* args) {
@@ -267,40 +305,8 @@ void run_ppoloss_backward_torch(PPOLossArgsTorch* args) {
 }
 
 void test_ppoloss_correct(PPOLossArgsTorch* args) {
-    int N = args->N;
-    int T = args->T;
-    int A = args->A;
-    int minibatch_size = N * T;
-
-    // Kernel path via compute_train_loss
-    auto logits_k = args->logits.detach().clone().requires_grad_(true);
-    auto values_pred_k = args->values_pred.detach().clone().requires_grad_(true);
-    auto ratio_out_k = torch::zeros({N, T}, logits_k.options());
-    auto newvalue_out_k = torch::zeros({N, T}, logits_k.options());
-    Logits logits_struct_k = {.mean = logits_k};
-    auto loss_k = compute_train_loss(
-        logits_struct_k, values_pred_k,
-        args->actions, args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, ratio_out_k, newvalue_out_k,
-        args->act_sizes, torch::tensor({(int64_t)A}, torch::dtype(torch::kInt64)),
-        minibatch_size, T,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        /*is_continuous=*/false, /*kernels=*/true);
-
-    // Cpp reference path via compute_train_loss
-    auto logits_c = args->logits.detach().clone().requires_grad_(true);
-    auto values_pred_c = args->values_pred.detach().clone().requires_grad_(true);
-    auto ratio_out_c = torch::zeros({N, T}, logits_c.options());
-    auto newvalue_out_c = torch::zeros({N, T}, logits_c.options());
-    Logits logits_struct_c = {.mean = logits_c};
-    auto loss_c = compute_train_loss(
-        logits_struct_c, values_pred_c,
-        args->actions, args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, ratio_out_c, newvalue_out_c,
-        args->act_sizes, torch::tensor({(int64_t)A}, torch::dtype(torch::kInt64)),
-        minibatch_size, T,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        /*is_continuous=*/false, /*kernels=*/false);
+    auto [loss_k, logits_k, values_pred_k] = compute_test_loss(args, /*use_kernels=*/true);
+    auto [loss_c, logits_c, values_pred_c] = compute_test_loss(args, /*use_kernels=*/false);
 
     float rtol = 1e-2f, atol = 1e-3f;
     float loss_diff = (loss_k - loss_c).abs().item<float>();
@@ -348,13 +354,7 @@ void profile_ppoloss(int batch, int seq, int actions) {
     float fwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_forward_torch, args_torch);
     print_timing("forward (torch)", fwd_torch_ms, NT);
 
-    auto logstd_empty = torch::empty({0}, args_torch->logits.options());
-    args_torch->loss = fused_ppo_loss_optimized(
-        args_torch->logits, logstd_empty, args_torch->values_pred, args_torch->actions,
-        args_torch->old_logprobs, args_torch->advantages, args_torch->prio,
-        args_torch->values, args_torch->returns, args_torch->adv_mean, args_torch->adv_var,
-        args_torch->ratio_out, args_torch->newvalue_out, args_torch->act_sizes,
-        args_torch->clip_coef, args_torch->vf_clip_coef, args_torch->vf_coef, args_torch->ent_coef)[0];
+    args_torch->loss = run_fused_ppo_forward(args_torch);
 
     float bwd_torch_ms = profile_kernel((kernel_fn)run_ppoloss_backward_torch, args_torch);
     print_timing("backward (torch)", bwd_torch_ms, NT);

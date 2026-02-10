@@ -108,6 +108,8 @@ void run_env_rollout(EnvSpeedArgs* args) {
 }
 
 float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
+    const float ENV_TIMEOUT_SEC = 3.0f;  // timeout for CPU-based env stepping
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -118,7 +120,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
         cudaDeviceSynchronize();
         auto now = std::chrono::steady_clock::now();
         float elapsed = std::chrono::duration<float>(now - start_time).count();
-        if (elapsed > TIMEOUT_SEC) break;
+        if (elapsed > ENV_TIMEOUT_SEC) break;
     }
 
     start_time = std::chrono::steady_clock::now();
@@ -131,7 +133,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
         completed += 1;
         auto now = std::chrono::steady_clock::now();
         float elapsed = std::chrono::duration<float>(now - start_time).count();
-        if (elapsed > TIMEOUT_SEC) break;
+        if (elapsed > ENV_TIMEOUT_SEC) break;
     }
     cudaDeviceSynchronize();
     cudaEventRecord(stop);

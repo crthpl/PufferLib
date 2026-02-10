@@ -114,6 +114,23 @@ void free_trainargs(TrainArgs* args) {
 }
 
 // ============================================================================
+// Helper: compute loss from forward outputs (eliminates 5x duplicated arg list)
+// ============================================================================
+
+Tensor compute_loss_impl(TrainArgs* args, Logits& raw_logits, Tensor& newvalue) {
+    Logits ls = {.mean = raw_logits.mean};
+    if (raw_logits.logstd.defined()) ls.logstd = raw_logits.logstd;
+    int mb = args->N * args->T_seq;
+    return compute_train_loss(
+        ls, newvalue,
+        args->actions, args->old_logprobs, args->advantages, args->prio,
+        args->values, args->returns, args->ratio_out, args->newvalue_out,
+        args->act_sizes, args->act_sizes_cpu, mb, args->T_seq,
+        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
+        /*is_continuous=*/false, args->use_kernels);
+}
+
+// ============================================================================
 // Run functions for individual phases
 // ============================================================================
 
@@ -123,23 +140,11 @@ void free_trainargs(TrainArgs* args) {
 void run_train_forward(TrainArgs* args) {
     torch::NoGradGuard no_grad;
     auto [logits, newvalue] = args->policy_bf16->forward_train(args->obs, args->state);
-    Logits logits_struct = {.mean = logits.mean};
-    if (logits.logstd.defined()) logits_struct.logstd = logits.logstd;
-
-    int minibatch = args->N * args->T_seq;
-    auto loss = compute_train_loss(
-        logits_struct, newvalue,
-        args->actions, args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->ratio_out, args->newvalue_out,
-        args->act_sizes, args->act_sizes_cpu,
-        minibatch, args->T_seq,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        /*is_continuous=*/false, args->use_kernels);
+    compute_loss_impl(args, logits, newvalue);
 }
 
 // Full training forward + loss + backward
 void run_train_forward_backward(TrainArgs* args) {
-    // Zero grads
     args->policy_bf16->zero_grad();
 
     nvtxRangePushA("forward_train");
@@ -147,18 +152,7 @@ void run_train_forward_backward(TrainArgs* args) {
     nvtxRangePop();
 
     nvtxRangePushA("compute_loss");
-    Logits logits_struct = {.mean = logits.mean};
-    if (logits.logstd.defined()) logits_struct.logstd = logits.logstd;
-
-    int minibatch = args->N * args->T_seq;
-    auto loss = compute_train_loss(
-        logits_struct, newvalue,
-        args->actions, args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->ratio_out, args->newvalue_out,
-        args->act_sizes, args->act_sizes_cpu,
-        minibatch, args->T_seq,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        /*is_continuous=*/false, args->use_kernels);
+    auto loss = compute_loss_impl(args, logits, newvalue);
     nvtxRangePop();
 
     nvtxRangePushA("backward");
@@ -168,7 +162,6 @@ void run_train_forward_backward(TrainArgs* args) {
 
 // Full training step: forward + loss + backward + Muon optimizer (matches production)
 void run_train_step(TrainArgs* args) {
-    // Zero grads (matches production: muon->zero_grad() + policy_bf16->zero_grad())
     args->muon->zero_grad();
     args->policy_bf16->zero_grad();
 
@@ -177,18 +170,7 @@ void run_train_step(TrainArgs* args) {
     nvtxRangePop();
 
     nvtxRangePushA("compute_loss");
-    Logits logits_struct = {.mean = logits.mean};
-    if (logits.logstd.defined()) logits_struct.logstd = logits.logstd;
-
-    int minibatch = args->N * args->T_seq;
-    auto loss = compute_train_loss(
-        logits_struct, newvalue,
-        args->actions, args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->ratio_out, args->newvalue_out,
-        args->act_sizes, args->act_sizes_cpu,
-        minibatch, args->T_seq,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        /*is_continuous=*/false, args->use_kernels);
+    auto loss = compute_loss_impl(args, logits, newvalue);
     nvtxRangePop();
 
     nvtxRangePushA("backward");
@@ -284,16 +266,7 @@ FwdBwdTimings profile_fwdbwd_instrumented(TrainArgs* args, int num_iters = 200) 
         auto [logits, newvalue] = args->policy_bf16->forward_train(args->obs, args->state);
         cudaEventRecord(events[b + 1]);
 
-        Logits ls = {.mean = logits.mean};
-        if (logits.logstd.defined()) ls.logstd = logits.logstd;
-        int mb = args->N * args->T_seq;
-        auto loss = compute_train_loss(
-            ls, newvalue,
-            args->actions, args->old_logprobs, args->advantages, args->prio,
-            args->values, args->returns, args->ratio_out, args->newvalue_out,
-            args->act_sizes, args->act_sizes_cpu, mb, args->T_seq,
-            args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-            false, args->use_kernels);
+        auto loss = compute_loss_impl(args, logits, newvalue);
         cudaEventRecord(events[b + 2]);
 
         loss.backward();
@@ -345,16 +318,7 @@ StepTimings profile_step_instrumented(TrainArgs* args, int num_iters = 200) {
         auto [logits, newvalue] = args->policy_bf16->forward_train(args->obs, args->state);
         cudaEventRecord(events[b + 1]);
 
-        Logits ls = {.mean = logits.mean};
-        if (logits.logstd.defined()) ls.logstd = logits.logstd;
-        int mb = args->N * args->T_seq;
-        auto loss = compute_train_loss(
-            ls, newvalue,
-            args->actions, args->old_logprobs, args->advantages, args->prio,
-            args->values, args->returns, args->ratio_out, args->newvalue_out,
-            args->act_sizes, args->act_sizes_cpu, mb, args->T_seq,
-            args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-            false, args->use_kernels);
+        auto loss = compute_loss_impl(args, logits, newvalue);
         cudaEventRecord(events[b + 2]);
 
         loss.backward();

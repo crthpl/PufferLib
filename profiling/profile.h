@@ -55,8 +55,6 @@ using namespace pufferlib;
 
 const int WARMUP_ITERS = 100;
 const int TIMING_ITERS = 1000;
-const float TIMEOUT_SEC = 3.0f;
-const int BATCH_CHECK = 100;  // Check timeout every BATCH_CHECK iterations
 
 const int BUF = 2;
 const int BR = 4096;   // Rollout batch (no T dim)
@@ -79,12 +77,6 @@ inline void print_timing(const char* name, float ms, int N) {
 inline void print_timing_pct(const char* name, float ms, int N, float total_ms) {
     float pct = (total_ms > 0) ? (ms / total_ms * 100.0f) : 0.0f;
     printf("  %-28s %8.1f us  %5.1f%%\n", name, ms * 1000, pct);
-}
-
-inline float get_time_sec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9f;
 }
 
 inline void warmup_gpu() {
@@ -115,36 +107,19 @@ inline void float_to_device(precision_t* dst, const float* src, int count) {
 // ============================================================================
 
 float profile_kernel(kernel_fn fn, void* args, const char* name = nullptr) {
+    for (int i = 0; i < WARMUP_ITERS; ++i) fn(args);
+    cudaDeviceSynchronize();
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    // Warmup with timeout
-    float warmup_start = get_time_sec();
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        fn(args);
-        if (i % BATCH_CHECK == 0) {
-            cudaDeviceSynchronize();
-            if (get_time_sec() - warmup_start > TIMEOUT_SEC) break;
-        }
-    }
-    cudaDeviceSynchronize();
-
-    // Timed runs with timeout
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
 
-    float timing_start = get_time_sec();
-    long iters = 0;
-    float elapsed = 0;
-    while (elapsed < TIMEOUT_SEC) {
-        for (int i = 0; i < BATCH_CHECK; ++i) {
-            fn(args);
-        }
-        iters += BATCH_CHECK;
-        cudaDeviceSynchronize();
-        elapsed = get_time_sec() - timing_start;
+    for (int i = 0; i < TIMING_ITERS; ++i) {
+        fn(args);
     }
 
     cudaEventRecord(stop);
@@ -161,7 +136,7 @@ float profile_kernel(kernel_fn fn, void* args, const char* name = nullptr) {
 #ifdef USE_TORCH
     c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
-    return ms / iters;
+    return ms / TIMING_ITERS;
 }
 
 #ifdef USE_TORCH
@@ -171,17 +146,10 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     at::cuda::CUDAGraph cuda_graph;
     at::cuda::CUDAStream current_stream = at::cuda::getCurrentCUDAStream();
 
-    // Warmup with timeout
+    // Warmup
     at::cuda::CUDAStream warmup_stream = at::cuda::getStreamFromPool();
     at::cuda::setCurrentCUDAStream(warmup_stream);
-    float warmup_start = get_time_sec();
-    for (int i = 0; i < WARMUP_ITERS; ++i) {
-        fn(args);
-        if (i % BATCH_CHECK == 0) {
-            warmup_stream.synchronize();
-            if (get_time_sec() - warmup_start > TIMEOUT_SEC) break;
-        }
-    }
+    for (int i = 0; i < WARMUP_ITERS; ++i) fn(args);
     warmup_stream.synchronize();
 
     // Capture graph
@@ -199,21 +167,12 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    // Timed runs with timeout
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
 
-    float timing_start = get_time_sec();
-    long iters = 0;
-    float elapsed = 0;
-    while (elapsed < TIMEOUT_SEC) {
-        for (int i = 0; i < BATCH_CHECK; ++i) {
-            cuda_graph.replay();
-        }
-        iters += BATCH_CHECK;
-        cudaDeviceSynchronize();
-        elapsed = get_time_sec() - timing_start;
+    for (int i = 0; i < TIMING_ITERS; ++i) {
+        cuda_graph.replay();
     }
 
     cudaEventRecord(stop);
@@ -228,6 +187,6 @@ float profile_graph(kernel_fn fn, void* args, const char* name = nullptr) {
 
     cudaDeviceSynchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();
-    return ms / iters;
+    return ms / TIMING_ITERS;
 }
 #endif
