@@ -242,54 +242,6 @@ void run_decoder_isolated(DecoderIsolatedArgs* args) {
 // (Avoids the error of subtracting independently-measured profile_kernel calls)
 // ============================================================================
 
-struct FwdBwdTimings {
-    float forward_ms;
-    float loss_ms;
-    float backward_ms;
-};
-
-FwdBwdTimings profile_fwdbwd_instrumented(TrainArgs* args, int num_iters = 200) {
-    // Warmup
-    for (int i = 0; i < 10; i++) run_train_forward_backward(args);
-    cudaDeviceSynchronize();
-
-    // Pre-allocate all events — NO per-iteration sync keeps GPU pipeline full
-    const int P = 4;  // 4 boundary markers per iteration
-    std::vector<cudaEvent_t> events(num_iters * P);
-    for (auto& e : events) cudaEventCreate(&e);
-
-    for (int i = 0; i < num_iters; i++) {
-        args->policy_bf16->zero_grad();
-        int b = i * P;
-
-        cudaEventRecord(events[b + 0]);
-        auto [logits, newvalue] = args->policy_bf16->forward_train(args->obs, args->state);
-        cudaEventRecord(events[b + 1]);
-
-        auto loss = compute_loss_impl(args, logits, newvalue);
-        cudaEventRecord(events[b + 2]);
-
-        loss.backward();
-        cudaEventRecord(events[b + 3]);
-    }
-
-    cudaDeviceSynchronize();  // single sync at end
-
-    FwdBwdTimings sum = {0, 0, 0};
-    for (int i = 0; i < num_iters; i++) {
-        int b = i * P;
-        float ms;
-        cudaEventElapsedTime(&ms, events[b+0], events[b+1]); sum.forward_ms += ms;
-        cudaEventElapsedTime(&ms, events[b+1], events[b+2]); sum.loss_ms += ms;
-        cudaEventElapsedTime(&ms, events[b+2], events[b+3]); sum.backward_ms += ms;
-    }
-
-    for (auto& e : events) cudaEventDestroy(e);
-
-    float n = (float)num_iters;
-    return { sum.forward_ms / n, sum.loss_ms / n, sum.backward_ms / n };
-}
-
 struct StepTimings {
     float forward_ms;
     float loss_ms;
@@ -458,21 +410,6 @@ void profile_trainforward(int N, int T_seq, int input_size, int hidden, int act_
     printf("  %-28s %8.1f us  100.0%%\n", "total (sum of phases)", total_phases * 1000);
     printf("  %-28s %8.1f us  (measured)\n", "forward+loss actual", fwd_ms * 1000);
     printf("\n");
-
-    // ----- Forward vs Backward split (instrumented — CUDA events within a single run) -----
-    printf("--- Forward vs Backward Split (instrumented) ---\n");
-    {
-        TrainArgs* args_inst = create_trainargs(N, T_seq, input_size, hidden, act_n, num_layers, use_kernels);
-        auto t = profile_fwdbwd_instrumented(args_inst);
-        float total = t.forward_ms + t.loss_ms + t.backward_ms;
-        print_timing_pct("forward", t.forward_ms, N * T_seq, total);
-        print_timing_pct("loss", t.loss_ms, N * T_seq, total);
-        print_timing_pct("backward", t.backward_ms, N * T_seq, total);
-        printf("  %-28s %8.1f us  100.0%%\n", "total fwd+loss+bwd", total * 1000);
-        printf("\n");
-        free_trainargs(args_inst);
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
 
     free_trainargs(args_fwd);
 }
