@@ -44,6 +44,7 @@ using namespace pufferlib;
 #include "pufferlib/extensions/cuda/advantage.cu"
 
 #include "pufferlib/extensions/cuda/compute_prio.cu"
+#include "pufferlib/extensions/cuda/select_copy.cu"
 
 #endif
 

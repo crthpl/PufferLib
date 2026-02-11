@@ -389,6 +389,7 @@ if not NO_TRAIN:
         extension = CUDAExtension
         torch_sources.append("pufferlib/extensions/cuda/advantage.cu")
         torch_sources.append("pufferlib/extensions/cuda/compute_prio.cu")
+        torch_sources.append("pufferlib/extensions/cuda/select_copy.cu")
         torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
         torch_sources.append("pufferlib/extensions/modules.cu")
     else:

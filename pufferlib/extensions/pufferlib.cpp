@@ -404,24 +404,14 @@ void train_impl(PuffeRL& pufferl) {
                                             hypers.total_agents, anneal_beta);
         profile_end(hypers.profile);
 
-        // Inlined train_select_and_copy
         profile_begin("train_select_and_copy", hypers.profile);
-        Tensor mb_obs = rollouts.observations.index_select(0, idx);
-        Tensor mb_actions = rollouts.actions.index_select(0, idx);
-        Tensor mb_logprobs = rollouts.logprobs.index_select(0, idx);
-        Tensor mb_values = rollouts.values.index_select(0, idx);
-        Tensor mb_advantages = advantages.index_select(0, idx);
-        Tensor mb_returns = mb_advantages + mb_values;
-
-        mb_state.zero_();
-        graph.mb_obs.copy_(mb_obs, false);
-        graph.mb_state.copy_(mb_state, false);
-        graph.mb_actions.copy_(mb_actions, false);
-        graph.mb_logprobs.copy_(mb_logprobs, false);
-        graph.mb_advantages.copy_(mb_advantages, false);
-        graph.mb_prio.copy_(mb_prio, false);
-        graph.mb_values.copy_(mb_values, false);
-        graph.mb_returns.copy_(mb_returns, false);
+        train_select_and_copy_cuda(
+            rollouts.observations, rollouts.actions, rollouts.logprobs,
+            rollouts.values, advantages,
+            idx, mb_prio,
+            graph.mb_obs, graph.mb_state, graph.mb_actions,
+            graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
+            graph.mb_values, graph.mb_returns);
         profile_end(hypers.profile);
 
         profile_begin("train_forward_graph", hypers.profile);
