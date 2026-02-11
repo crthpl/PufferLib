@@ -226,6 +226,16 @@ inline void profile_end(bool enable) {
     if (enable) { cudaDeviceSynchronize(); nvtxRangePop(); }
 }
 
+
+std::tuple<Tensor, Tensor> compute_prio(
+    Tensor& advantages, float prio_alpha, int minibatch_segments,
+    int total_agents, float anneal_beta
+) {
+    return compute_prio_cuda(
+        advantages, prio_alpha, minibatch_segments, total_agents, anneal_beta
+    );
+}
+
 void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
     compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
         rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
@@ -389,13 +399,9 @@ void train_impl(PuffeRL& pufferl) {
         compute_advantage(rollouts, advantages, hypers);
         profile_end(hypers.profile);
 
-        // Inlined compute_prio
         profile_begin("compute_prio", hypers.profile);
-        Tensor adv = advantages.abs().sum(1);
-        Tensor prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-        Tensor prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
-        Tensor idx = at::multinomial(prio_probs, minibatch_segments, true);
-        Tensor mb_prio = torch::pow(hypers.total_agents*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+        auto [idx, mb_prio] = compute_prio(advantages, prio_alpha, minibatch_segments,
+                                            hypers.total_agents, anneal_beta);
         profile_end(hypers.profile);
 
         // Inlined train_select_and_copy

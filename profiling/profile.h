@@ -43,6 +43,8 @@ using namespace pufferlib;
     static void _profiler_noop_advantage([[maybe_unused]] torch::Library& m)
 #include "pufferlib/extensions/cuda/advantage.cu"
 
+#include "pufferlib/extensions/cuda/compute_prio.cu"
+
 #endif
 
 #ifndef USE_TORCH

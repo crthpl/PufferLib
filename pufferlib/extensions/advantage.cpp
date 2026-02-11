@@ -72,3 +72,7 @@ void compute_puff_advantage_cuda(
     double rho_clip,
     double c_clip
 );
+
+std::tuple<torch::Tensor, torch::Tensor> compute_prio_cuda(
+    torch::Tensor advantages, float prio_alpha,
+    int minibatch_segments, int total_agents, float anneal_beta);

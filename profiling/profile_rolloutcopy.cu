@@ -202,9 +202,16 @@ void run_compute_advantage_torch(RolloutCopyArgs* args) {
     }
 }
 
-// Phase 2: compute_prio — priority-weighted sampling (all PyTorch ops)
-void run_compute_prio(RolloutCopyArgs* args) {
+// Phase 2 (PyTorch reference): compute_prio — priority-weighted sampling (all PyTorch ops)
+void run_compute_prio_torch(RolloutCopyArgs* args) {
     compute_prio_impl(args);
+}
+
+// Phase 2 (CUDA kernel): fused 3-kernel compute_prio (production path)
+void run_compute_prio_kernel(RolloutCopyArgs* args) {
+    pufferlib::compute_prio_cuda(
+        args->advantages, args->prio_alpha, args->minibatch_segs,
+        args->total_agents, args->anneal_beta);
 }
 
 // Phase 3: train_select_and_copy — pure select+copy using cached prio results
@@ -212,14 +219,16 @@ void run_select_and_copy(RolloutCopyArgs* args) {
     select_and_copy_impl(args, args->cached_idx, args->cached_mb_prio);
 }
 
-// Full rollout copy: advantage + prio + select_and_copy (one minibatch iteration)
+// Full rollout copy: advantage + kernel prio + select_and_copy (one minibatch iteration)
 void run_full_rolloutcopy(RolloutCopyArgs* args) {
     nvtxRangePushA("compute_advantage");
     run_compute_advantage(args);
     nvtxRangePop();
 
     nvtxRangePushA("compute_prio");
-    auto [idx, mb_prio] = compute_prio_impl(args);
+    auto [idx, mb_prio] = pufferlib::compute_prio_cuda(
+        args->advantages, args->prio_alpha, args->minibatch_segs,
+        args->total_agents, args->anneal_beta);
     nvtxRangePop();
 
     nvtxRangePushA("train_select_and_copy");
@@ -269,6 +278,33 @@ void test_advantage_correct(RolloutCopyArgs* args) {
 }
 
 // ============================================================================
+// Correctness check: kernel prio vs PyTorch prio
+// ============================================================================
+
+void test_prio_correct(RolloutCopyArgs* args) {
+    // Run the full kernel pipeline
+    auto [idx, mb_prio_kernel] = pufferlib::compute_prio_cuda(
+        args->advantages, args->prio_alpha, args->minibatch_segs,
+        args->total_agents, args->anneal_beta);
+
+    // PyTorch reference probs
+    Tensor adv = args->advantages.abs().sum(1);
+    Tensor prio_weights = adv.pow(args->prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+    Tensor probs_torch = (prio_weights + 1e-6f) / (prio_weights.sum() + 1e-6f);
+
+    // Check full pipeline: kernel's mb_prio vs torch mb_prio (using kernel's idx)
+    Tensor mb_prio_torch = torch::pow(
+        (float)args->total_agents * probs_torch.index_select(0, idx).unsqueeze(1),
+        -args->anneal_beta);
+
+    cudaDeviceSynchronize();
+
+    float prio_diff = (mb_prio_kernel - mb_prio_torch).abs().max().item<float>();
+    const char* prio_status = (prio_diff < 1e-2f) ? "PASS" : "FAIL";
+    printf("  correctness (mb_prio):  %s (max_diff=%.2e)\n", prio_status, prio_diff);
+}
+
+// ============================================================================
 // Profile function
 // ============================================================================
 
@@ -302,20 +338,39 @@ void profile_rolloutcopy(int num_segments, int horizon, int minibatch_segs,
     test_advantage_correct(args);
     printf("\n");
 
-    // === Per-Phase Timing (rollout copy pipeline) ===
+    // === Prio Kernel Comparison ===
+    printf("--- Prio Kernel Comparison (S=%d, T=%d, mb=%d) ---\n",
+           num_segments, horizon, minibatch_segs);
+
+    // Ensure advantages are populated for prio
+    run_compute_advantage(args);
+
+    float prio_torch_ms = profile_kernel((kernel_fn)run_compute_prio_torch, args, "prio_torch");
+    print_timing("prio (torch)", prio_torch_ms, num_segments);
+
+    float prio_kernel_ms = profile_kernel((kernel_fn)run_compute_prio_kernel, args, "prio_kernel");
+    print_timing("prio (kernel)", prio_kernel_ms, num_segments);
+
+    printf("  kernel vs torch:       %.2fx\n", prio_torch_ms / prio_kernel_ms);
+
+    test_prio_correct(args);
+    printf("\n");
+
+    // === Per-Phase Timing (rollout copy pipeline, using kernel prio) ===
     printf("--- Per-Phase Timing ---\n");
 
     float adv_ms = adv_vec_ms;
     print_timing("compute_advantage", adv_ms, num_segments);
 
-    // Ensure advantages are populated for prio/select phases
     run_compute_advantage(args);
 
-    float prio_ms = profile_kernel((kernel_fn)run_compute_prio, args, "compute_prio");
+    float prio_ms = prio_kernel_ms;  // use kernel prio (production path)
     print_timing("compute_prio", prio_ms, num_segments);
 
     // Pre-compute prio results so Phase 3 measures pure select+copy
-    auto [cached_idx, cached_mb_prio] = compute_prio_impl(args);
+    auto [cached_idx, cached_mb_prio] = pufferlib::compute_prio_cuda(
+        args->advantages, args->prio_alpha, args->minibatch_segs,
+        args->total_agents, args->anneal_beta);
     args->cached_idx = cached_idx;
     args->cached_mb_prio = cached_mb_prio;
 
