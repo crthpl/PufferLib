@@ -73,15 +73,3 @@ void compute_puff_advantage_cuda(
     double c_clip
 );
 
-std::tuple<torch::Tensor, torch::Tensor> compute_prio_cuda(
-    torch::Tensor advantages, float prio_alpha,
-    int minibatch_segments, int total_agents, float anneal_beta);
-
-void train_select_and_copy_cuda(
-    torch::Tensor observations, torch::Tensor actions,
-    torch::Tensor logprobs, torch::Tensor values, torch::Tensor advantages,
-    torch::Tensor idx, torch::Tensor mb_prio,
-    torch::Tensor dst_obs, torch::Tensor dst_state,
-    torch::Tensor dst_actions, torch::Tensor dst_logprobs,
-    torch::Tensor dst_advantages, torch::Tensor dst_prio,
-    torch::Tensor dst_values, torch::Tensor dst_returns);

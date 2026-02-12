@@ -582,4 +582,88 @@ torch::Tensor fc_max(torch::Tensor x, torch::Tensor W, torch::Tensor b) {
     return FCMaxFunction::apply(x, W, b)[0];
 }
 
+
+template<typename T>
+void launch_select_copy(
+    torch::Tensor& idx, int mb_segs, int horizon,
+    torch::Tensor& observations, torch::Tensor& dst_obs, int obs_row_bytes,
+    torch::Tensor& actions, torch::Tensor& dst_actions, int actions_row_bytes,
+    torch::Tensor& logprobs, torch::Tensor& dst_logprobs, int logprobs_row_bytes,
+    torch::Tensor& values, torch::Tensor& dst_values,
+    torch::Tensor& advantages, torch::Tensor& dst_advantages,
+    torch::Tensor& dst_returns,
+    torch::Tensor& mb_prio, torch::Tensor& dst_prio
+) {
+    select_copy_kernel<T><<<dim3(mb_segs, 5), SELECT_COPY_THREADS>>>(
+        idx.data_ptr<int64_t>(),
+        (const char*)observations.data_ptr(), (char*)dst_obs.data_ptr(), obs_row_bytes,
+        (const char*)actions.data_ptr(), (char*)dst_actions.data_ptr(), actions_row_bytes,
+        (const char*)logprobs.data_ptr(), (char*)dst_logprobs.data_ptr(), logprobs_row_bytes,
+        (const T*)values.data_ptr(), (T*)dst_values.data_ptr(),
+        advantages.data_ptr<float>(), dst_advantages.data_ptr<float>(),
+        (T*)dst_returns.data_ptr(), horizon,
+        (const T*)mb_prio.data_ptr(), (T*)dst_prio.data_ptr());
+}
+
+void train_select_and_copy_cuda(
+    torch::Tensor observations, torch::Tensor actions,
+    torch::Tensor logprobs, torch::Tensor values, torch::Tensor advantages,
+    torch::Tensor idx, torch::Tensor mb_prio,
+    torch::Tensor dst_obs, torch::Tensor dst_state,
+    torch::Tensor dst_actions, torch::Tensor dst_logprobs,
+    torch::Tensor dst_advantages, torch::Tensor dst_prio,
+    torch::Tensor dst_values, torch::Tensor dst_returns
+) {
+    int mb_segs = idx.size(0);
+    int horizon = values.size(1);
+    int obs_rb = observations.stride(0) * observations.element_size();
+    int act_rb = actions.stride(0) * actions.element_size();
+    int lp_rb = logprobs.stride(0) * logprobs.element_size();
+
+    dst_state.zero_();
+
+    if (values.scalar_type() == at::kBFloat16)
+        launch_select_copy<__nv_bfloat16>(idx, mb_segs, horizon,
+            observations, dst_obs, obs_rb, actions, dst_actions, act_rb,
+            logprobs, dst_logprobs, lp_rb, values, dst_values,
+            advantages, dst_advantages, dst_returns, mb_prio, dst_prio);
+    else
+        launch_select_copy<float>(idx, mb_segs, horizon,
+            observations, dst_obs, obs_rb, actions, dst_actions, act_rb,
+            logprobs, dst_logprobs, lp_rb, values, dst_values,
+            advantages, dst_advantages, dst_returns, mb_prio, dst_prio);
+}
+
+// Host dispatch: replaces ~9 PyTorch kernel launches with 3 custom + multinomial
+std::tuple<torch::Tensor, torch::Tensor> compute_prio_cuda(
+    torch::Tensor advantages,       // (S, T) float32
+    float prio_alpha,
+    int minibatch_segments,
+    int total_agents,
+    float anneal_beta
+) {
+    int S = advantages.size(0);
+    int T = advantages.size(1);
+
+    auto prio_probs = torch::empty({S}, advantages.options());
+
+    compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE>>>(
+        advantages.data_ptr<float>(), prio_probs.data_ptr<float>(),
+        prio_alpha, T);
+
+    compute_prio_normalize<<<1, PRIO_BLOCK_SIZE>>>(
+        prio_probs.data_ptr<float>(), S);
+
+    auto idx = at::multinomial(prio_probs, minibatch_segments, true);
+
+    auto mb_prio = torch::empty({minibatch_segments, 1}, advantages.options());
+    int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
+    compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE>>>(
+        idx.data_ptr<int64_t>(), prio_probs.data_ptr<float>(),
+        mb_prio.data_ptr<float>(),
+        total_agents, anneal_beta, minibatch_segments);
+
+    return {idx, mb_prio};
+}
+
 #endif // PUFFERLIB_MODULES_CU

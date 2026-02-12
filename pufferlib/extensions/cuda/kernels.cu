@@ -1033,5 +1033,160 @@ __global__ void fc_max_backward_kernel(
 }
 
 
+#define SELECT_COPY_THREADS 256
+
+__device__ __forceinline__ void copy_bytes(
+    const char* __restrict__ src, char* __restrict__ dst,
+    int src_row, int dst_row, int row_bytes
+) {
+    const int* soffset = (const int*)(src + (int64_t)src_row * row_bytes);
+    int* doffset = (int*)(dst + (int64_t)dst_row * row_bytes);
+    for (int i = threadIdx.x; i < row_bytes / 4; i += blockDim.x)
+        doffset[i] = soffset[i];
+}
+
+template<typename T>
+__device__ __forceinline__ void copy_values_adv_returns(
+    const T* __restrict__ src_values, T* __restrict__ dst_values,
+    const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
+    T* __restrict__ dst_returns,
+    int src_row, int dst_row, int horizon
+) {
+    int srh = (int64_t)src_row * horizon;
+    int drh = (int64_t)dst_row * horizon;
+    const T* s_values = src_values + srh;
+    const float* s_adv = src_advantages + srh;
+    T* d_values = dst_values + drh;
+    float* d_adv = dst_advantages + drh;
+    T* d_returns = dst_returns + drh;
+    for (int i = threadIdx.x; i < horizon; i += blockDim.x) {
+        T val = s_values[i];
+        float adv = s_adv[i];
+        d_values[i] = val;
+        d_adv[i] = adv;
+        d_returns[i] = (T)((float)val + adv);
+    }
+}
+
+template<typename T>
+__global__ void select_copy_kernel(
+    const int64_t* __restrict__ idx,
+    const char* __restrict__ src_obs, char* __restrict__ dst_obs, int obs_row_bytes,
+    const char* __restrict__ src_actions, char* __restrict__ dst_actions, int actions_row_bytes,
+    const char* __restrict__ src_logprobs, char* __restrict__ dst_logprobs, int logprobs_row_bytes,
+    const T* __restrict__ src_values, T* __restrict__ dst_values,
+    const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
+    T* __restrict__ dst_returns, int horizon,
+    const T* __restrict__ src_prio, T* __restrict__ dst_prio
+) {
+    int mb = blockIdx.x;
+    int ch = blockIdx.y;
+    int src_row = (int)idx[mb];
+
+    switch (ch) {
+    case 0:
+        copy_bytes(src_obs, dst_obs, src_row, mb, obs_row_bytes);
+        break;
+    case 1:
+        copy_bytes(src_actions, dst_actions, src_row, mb, actions_row_bytes);
+        break;
+    case 2:
+        copy_bytes(src_logprobs, dst_logprobs, src_row, mb, logprobs_row_bytes);
+        break;
+    case 3:
+        copy_values_adv_returns(src_values, dst_values, src_advantages,
+                dst_advantages, dst_returns, src_row, mb, horizon);
+        break;
+    case 4:
+        if (threadIdx.x == 0) {
+            dst_prio[mb] = src_prio[mb];
+            break;
+        }
+    }
+}
+
+#define PRIO_WARP_SIZE 32
+#define PRIO_FULL_MASK 0xffffffff
+#define PRIO_BLOCK_SIZE 256
+#define PRIO_NUM_WARPS (PRIO_BLOCK_SIZE / PRIO_WARP_SIZE)
+
+__global__ void compute_prio_adv_reduction(
+    const float* __restrict__ advantages,
+    float* prio_weights,
+    float prio_alpha,
+    int stride
+) {
+    int row = blockIdx.x;
+    int tx = threadIdx.x;
+    int offset = row * stride;
+
+    float local_sum = 0.0f;
+    for (int t = tx; t < stride; t += blockDim.x) {
+        local_sum += fabsf(advantages[offset + t]);
+    }
+
+    for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
+        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s);
+    }
+    if (tx == 0) {
+        float pw = __powf(local_sum, prio_alpha);
+        if (isnan(pw) || isinf(pw)) pw = 0.0f;
+        prio_weights[row] = pw;
+    }
+}
+
+__global__ void compute_prio_normalize(
+    float* prio_weights,
+    int length
+) {
+    __shared__ float shmem[PRIO_NUM_WARPS];
+    __shared__ float block_sum;
+
+    int tx = threadIdx.x;
+    int lane = tx % PRIO_WARP_SIZE;
+    int warp_id = tx / PRIO_WARP_SIZE;
+    const float eps = 1e-6f;
+
+    float local_sum = 0.0f;
+    for (int t = tx; t < length; t += blockDim.x) {
+        local_sum += prio_weights[t];
+    }
+    for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
+        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s);
+    }
+    if (lane == 0) shmem[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane < PRIO_NUM_WARPS) ? shmem[lane] : 0.0f;
+        for (int s = PRIO_NUM_WARPS / 2; s >= 1; s /= 2) {
+            val += __shfl_down_sync(PRIO_FULL_MASK, val, s);
+        }
+        if (tx == 0) block_sum = val + eps;
+    }
+    __syncthreads();
+
+    for (int t = tx; t < length; t += blockDim.x) {
+        prio_weights[t] = (prio_weights[t] + eps) / block_sum;
+    }
+}
+
+// Part 3: compute importance weights for sampled indices
+// mb_prio[i] = pow(total_agents * prio_probs[idx[i]], -anneal_beta)
+__global__ void compute_prio_imp_weights(
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ prio_probs,
+    float* mb_prio,
+    int total_agents,
+    float anneal_beta,
+    int minibatch_segments
+) {
+    int tx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tx < minibatch_segments) {
+        float value = prio_probs[indices[tx]] * (float)total_agents;
+        mb_prio[tx] = __powf(value, -anneal_beta);
+    }
+}
+
 
 #endif // PUFFERLIB_KERNELS_CU

@@ -209,7 +209,7 @@ void run_compute_prio_torch(RolloutCopyArgs* args) {
 
 // Phase 2 (CUDA kernel): fused 3-kernel compute_prio (production path)
 void run_compute_prio_kernel(RolloutCopyArgs* args) {
-    pufferlib::compute_prio_cuda(
+    compute_prio_cuda(
         args->advantages, args->prio_alpha, args->minibatch_segs,
         args->total_agents, args->anneal_beta);
 }
@@ -221,7 +221,7 @@ void run_select_and_copy_torch(RolloutCopyArgs* args) {
 
 // Phase 3 (kernel): train_select_and_copy — fused CUDA kernel using cached prio results
 void run_select_and_copy_kernel(RolloutCopyArgs* args) {
-    pufferlib::train_select_and_copy_cuda(
+    train_select_and_copy_cuda(
         args->observations, args->actions, args->logprobs,
         args->values, args->advantages,
         args->cached_idx, args->cached_mb_prio,
@@ -237,7 +237,7 @@ void run_full_rolloutcopy(RolloutCopyArgs* args) {
     nvtxRangePop();
 
     nvtxRangePushA("compute_prio");
-    auto [idx, mb_prio] = pufferlib::compute_prio_cuda(
+    auto [idx, mb_prio] = compute_prio_cuda(
         args->advantages, args->prio_alpha, args->minibatch_segs,
         args->total_agents, args->anneal_beta);
     nvtxRangePop();
@@ -296,7 +296,7 @@ void test_advantage_correct(RolloutCopyArgs* args) {
 
 void test_prio_correct(RolloutCopyArgs* args) {
     // Run the full kernel pipeline
-    auto [idx, mb_prio_kernel] = pufferlib::compute_prio_cuda(
+    auto [idx, mb_prio_kernel] = compute_prio_cuda(
         args->advantages, args->prio_alpha, args->minibatch_segs,
         args->total_agents, args->anneal_beta);
 
@@ -323,7 +323,7 @@ void test_prio_correct(RolloutCopyArgs* args) {
 
 void test_select_copy_correct(RolloutCopyArgs* args) {
     // Pre-compute prio results for both paths
-    auto [idx, mb_prio] = pufferlib::compute_prio_cuda(
+    auto [idx, mb_prio] = compute_prio_cuda(
         args->advantages, args->prio_alpha, args->minibatch_segs,
         args->total_agents, args->anneal_beta);
     args->cached_idx = idx;
@@ -422,7 +422,7 @@ void profile_rolloutcopy(int num_segments, int horizon, int minibatch_segs,
     // Ensure advantages + cached prio are populated
     run_compute_advantage(args);
     {
-        auto [idx, mb_prio] = pufferlib::compute_prio_cuda(
+        auto [idx, mb_prio] = compute_prio_cuda(
             args->advantages, args->prio_alpha, args->minibatch_segs,
             args->total_agents, args->anneal_beta);
         args->cached_idx = idx;
