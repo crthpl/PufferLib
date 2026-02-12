@@ -4,6 +4,19 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 
+// Loss component indices for the shared accumulator tensor
+enum LossIdx {
+    LOSS_PG = 0,
+    LOSS_VF = 1,
+    LOSS_ENT = 2,
+    LOSS_TOTAL = 3,
+    LOSS_OLD_APPROX_KL = 4,
+    LOSS_APPROX_KL = 5,
+    LOSS_CLIPFRAC = 6,
+    LOSS_N = 7,           // number of accumulations (also == number of loss components)
+    NUM_LOSSES = 8,
+};
+
 // CUDA kernel wrappers (implemented in modules.cu)
 
 // Fused mingru gate inference
@@ -31,6 +44,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     torch::Tensor ratio_out,
     torch::Tensor newvalue_out,
     torch::Tensor act_sizes,
+    torch::Tensor losses_acc,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,

@@ -403,6 +403,7 @@ __global__ void logcumsumexp_backward_kernel(
 
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
+    float* __restrict__ losses_acc,      // accumulator for loss components [LOSS_N floats]
     double* __restrict__ saved_for_backward,
     precision_t* __restrict__ ratio_out,
     precision_t* __restrict__ newvalue_out,
@@ -434,11 +435,18 @@ __global__ void ppo_loss_forward_kernel_optimized(
     bool is_continuous
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
     int total_elements = N * T_seq;
-    if (idx >= total_elements) return;
 
-    __shared__ float block_loss[PPO_THREADS];
+    // LOSS_N == 7 loss components to reduce (N count handled in C++)
+    __shared__ float block_losses[LOSS_N][PPO_THREADS];
+    for (int c = 0; c < LOSS_N; c++) {
+        block_losses[c][tid] = 0.0f;
+    }
 
+    if (idx >= total_elements) goto reduce;
+
+    {
     int n = idx / T_seq;
     int t = idx % T_seq;
     int nt = n * T_seq + t;
@@ -557,19 +565,34 @@ __global__ void ppo_loss_forward_kernel_optimized(
     //ratio_out[nt] = T(ratio);
     //newvalue_out[nt] = T(val_pred);
 
-    int tid = threadIdx.x;
-    block_loss[tid] = thread_loss;
+    // Per-thread loss components (mean = sum / total_elements)
+    float inv_total = 1.0f / float(total_elements);
+    block_losses[LOSS_PG][tid] = pg_loss * inv_total;
+    block_losses[LOSS_VF][tid] = v_loss * inv_total;
+    block_losses[LOSS_ENT][tid] = entropy * inv_total;
+    block_losses[LOSS_TOTAL][tid] = thread_loss;
+    block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_total;
+    block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_total;
+    block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > clip_coef ? 1.0f : 0.0f) * inv_total;
+    } // end if (idx < total_elements)
+
+reduce:
     __syncthreads();
 
     for (int stride = PPO_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            block_loss[tid] += block_loss[tid + stride];
+            for (int c = 0; c < LOSS_N; c++) {
+                block_losses[c][tid] += block_losses[c][tid + stride];
+            }
         }
         __syncthreads();
     }
 
     if (tid == 0) {
-        atomicAdd(loss, block_loss[0]);
+        atomicAdd(loss, block_losses[LOSS_TOTAL][0]);
+        for (int c = 0; c < LOSS_N; c++) {
+            atomicAdd(&losses_acc[c], block_losses[c][0]);
+        }
     }
 }
 

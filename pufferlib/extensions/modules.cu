@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
+#include "modules.h"
 #include "cuda/kernels.cu"
 
 #include <stdio.h>
@@ -223,6 +224,7 @@ public:
         torch::Tensor ratio_out,        // (N, T) - output for ratio
         torch::Tensor newvalue_out,     // (N, T) - output for newvalue
         torch::Tensor act_sizes,        // (num_atns,) int32 CUDA tensor - size of each action head
+        torch::Tensor losses_acc,       // (NUM_LOSSES,) float32 - accumulator for loss components
         double clip_coef,
         double vf_clip_coef,
         double vf_coef,
@@ -271,6 +273,7 @@ public:
         cudaMemsetAsync(loss_output.data_ptr<float>(), 0, sizeof(float), stream);
         ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             loss_output.data_ptr<float>(),
+            losses_acc.data_ptr<float>(),
             saved_for_backward.data_ptr<double>(),
             (precision_t*)ratio_out.data_ptr(),
             (precision_t*)newvalue_out.data_ptr(),
@@ -394,6 +397,7 @@ public:
             {}, {},                   // adv_mean, adv_std
             {}, {},                   // ratio_out, newvalue_out (no grad needed)
             {},                       // act_sizes (no grad needed)
+            {},                       // losses_acc (no grad needed)
             {}, {}, {}, {}           // clip_coef, vf_clip_coef, vf_coef, ent_coef
         };
     }
@@ -414,6 +418,7 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
     torch::Tensor ratio_out,
     torch::Tensor newvalue_out,
     torch::Tensor act_sizes,  // (num_atns,) int32 CUDA tensor - size of each action head
+    torch::Tensor losses_acc,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
@@ -421,7 +426,8 @@ torch::autograd::tensor_list fused_ppo_loss_optimized(
 ) {
     return PPOFusedLossOptimizedFunction::apply(logits, logstd, values_pred, actions,
         old_logprobs, advantages, prio, values, returns, adv_mean,
-        adv_var, ratio_out, newvalue_out, act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef);
+        adv_var, ratio_out, newvalue_out, act_sizes, losses_acc,
+        clip_coef, vf_clip_coef, vf_coef, ent_coef);
 }
 
 // Fused sample_logits: handles both discrete and continuous action sampling
