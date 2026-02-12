@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Usage: ./profile_v2.sh [timing|nsys|all]
+# Usage: ./profile.sh [timing|nsys|all]
 #   timing - Run all profiles without nsys (fast, just timings)
 #   nsys   - Run composite operations with nsys kernel breakdown
 #   all    - Run both (default)
@@ -32,7 +32,7 @@ run_nsys() {
         --cuda-graph-trace=node \
         --stats=false \
         --force-overwrite=true \
-        -o nprof-v2-"$name" \
+        -o nprof-"$name" \
         "$BIN" "$name" 2>&1 | grep -v "^Generating\|^Processing"
 
     nsys stats --report cuda_gpu_kern_sum:base --force-export=true nprof-"$name".nsys-rep 2>/dev/null | tail -n +4

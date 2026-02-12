@@ -251,7 +251,7 @@ class ProfilerBuildExt(build_ext):
         import sysconfig
         import torch.utils.cpp_extension as cpp_ext
 
-        src = 'profiling/main.cu'
+        src = 'profile_kernels.cu'
         out = 'profile'
 
         nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
