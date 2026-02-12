@@ -91,6 +91,7 @@ static void* static_omp_threadmanager(void* arg) {
 
     Env* envs = (Env*)vec->envs;
 
+    printf("Num workers: %d\n", num_workers);
     while (true) {
         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
             if (atomic_load(&threading->shutdown)) {

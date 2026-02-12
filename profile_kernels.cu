@@ -1755,6 +1755,9 @@ EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_thr
         fprintf(stderr, "Failed to create environments\n");
         return nullptr;
     }
+    for (int i = 0; i < num_buffers; i++) {
+        cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+    }
 
     int num_envs = vec->size;
     printf("Created %d envs (%s) for %d total_agents\n", num_envs, TOSTRING(ENV_NAME), total_agents);
@@ -1794,16 +1797,15 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
     cudaEventCreate(&stop);
 
     // Warmup
-    auto start_time = std::chrono::steady_clock::now();
-    for (int i = 0; i < 10; ++i) {
+    float start_time = get_time_sec();
+    for (int i = 0; i < 100; ++i) {
         run_env_rollout(args);
         cudaDeviceSynchronize();
-        auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - start_time).count();
+        auto elapsed = get_time_sec() - start_time;
         if (elapsed > TIMEOUT_SEC) break;
     }
 
-    start_time = std::chrono::steady_clock::now();
+    start_time = get_time_sec();
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
@@ -1811,8 +1813,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
     for (int i = 0; i < 1000; ++i) {
         run_env_rollout(args);
         completed += 1;
-        auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - start_time).count();
+        float elapsed = get_time_sec() - start_time;
         if (elapsed > TIMEOUT_SEC) break;
     }
     cudaDeviceSynchronize();
@@ -1883,10 +1884,12 @@ int main(int argc, char** argv) {
     int buffers = BUF;
     int threads = 16;
     int horizon = T;
+    int total_agents = BR * buffers;
     for (int i = 2; i < argc - 1; i++) {
         if (strcmp(argv[i], "--buffers") == 0) buffers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0) threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--horizon") == 0) horizon = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--total-agents") == 0) total_agents = atoi(argv[++i]);
     }
 
     warmup_gpu();
@@ -1914,7 +1917,7 @@ int main(int argc, char** argv) {
 
 #ifdef USE_STATIC_ENV
     if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
-        profile_envspeed(buffers * BR, buffers, threads, horizon);
+        profile_envspeed(total_agents, buffers, threads, horizon);
     }
 #endif
 
