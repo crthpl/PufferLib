@@ -221,6 +221,10 @@ TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {
   m.impl("compute_puff_advantage", &compute_puff_advantage_cpu);
 }
 
+TORCH_LIBRARY_IMPL(pufferlib, CUDA, m) {
+  m.impl("compute_puff_advantage", &compute_puff_advantage_cuda);
+}
+
 TORCH_LIBRARY(_C, m) {
     m.def("mingru_gate(Tensor state, Tensor combined) -> (Tensor, Tensor)");
     m.def("fc_max(Tensor x, Tensor W, Tensor b) -> Tensor");
@@ -246,14 +250,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("profiler_start", &profiler_start);
     m.def("profiler_stop", &profiler_stop);
 
-    py::class_<torch::optim::MuonOptions>(m, "MuonOptions")
-        .def(py::init<double>());
-
-    py::class_<torch::optim::MuonParamState>(m, "MuonParamState")
-        .def(py::init<>());
-
-    py::class_<torch::optim::Muon>(m, "Muon")
-        .def(py::init<std::vector<torch::optim::OptimizerParamGroup>, torch::optim::MuonOptions>());
+    py::class_<Muon>(m, "Muon")
+        .def_readwrite("lr", &Muon::lr)
+        .def_readwrite("weight_buffer", &Muon::weight_buffer)
+        .def_readwrite("momentum_buffer", &Muon::momentum_buffer)
+        .def("state_dict", &Muon::state_dict)
+        .def("load_state_dict", &Muon::load_state_dict);
 
     py::class_<HypersT>(m, "HypersT")
         .def_readwrite("horizon", &HypersT::horizon)

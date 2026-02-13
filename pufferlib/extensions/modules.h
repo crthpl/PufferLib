@@ -82,4 +82,12 @@ void train_select_and_copy_cuda(
     torch::Tensor dst_advantages, torch::Tensor dst_prio,
     torch::Tensor dst_values, torch::Tensor dst_returns);
 
+// Puff Advantage CUDA dispatch (in namespace pufferlib)
+namespace pufferlib {
+void compute_puff_advantage_cuda(
+    torch::Tensor values, torch::Tensor rewards,
+    torch::Tensor dones, torch::Tensor importance, torch::Tensor advantages,
+    double gamma, double lambda, double rho_clip, double c_clip);
+}
+
 #endif // PUFFERLIB_MODULES_H
