@@ -424,7 +424,7 @@ void train_impl(PuffeRL& pufferl) {
             auto out = compute_prio_cuda(advantages, prio_alpha, minibatch_segments,
                 hypers.total_agents, anneal_beta);
             idx = std::get<0>(out);
-            mb_prio = std::get<1>(out);
+            mb_prio = std::get<1>(out); // always fp32 (comes from advantages)
         }
         else {
             Tensor adv = advantages.abs().sum(1);
@@ -436,8 +436,7 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        // Broken kernel
-        if (false && hypers.kernels) {
+        if (hypers.kernels) {
             train_select_and_copy_cuda(
                 rollouts.observations, rollouts.actions, rollouts.logprobs,
                 rollouts.values, advantages,
