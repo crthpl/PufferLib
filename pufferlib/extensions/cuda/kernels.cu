@@ -1098,7 +1098,7 @@ __global__ void select_copy_kernel(
     const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
     const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
     precision_t* __restrict__ dst_returns, int horizon,
-    const precision_t* __restrict__ src_prio, precision_t* __restrict__ dst_prio
+    const float* __restrict__ src_prio, precision_t* __restrict__ dst_prio
 ) {
     int mb = blockIdx.x;
     int ch = blockIdx.y;
@@ -1120,7 +1120,7 @@ __global__ void select_copy_kernel(
         break;
     case 4:
         if (threadIdx.x == 0) {
-            dst_prio[mb] = src_prio[mb];
+            dst_prio[mb] = from_float(src_prio[mb]);
             break;
         }
     }

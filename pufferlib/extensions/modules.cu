@@ -614,7 +614,7 @@ void train_select_and_copy_cuda(
         (const precision_t*)values.data_ptr(), (precision_t*)dst_values.data_ptr(),
         advantages.data_ptr<float>(), dst_advantages.data_ptr<float>(),
         (precision_t*)dst_returns.data_ptr(), horizon,
-        (const precision_t*)mb_prio.data_ptr(), (precision_t*)dst_prio.data_ptr()); 
+        mb_prio.data_ptr<float>(), (precision_t*)dst_prio.data_ptr()); 
 }
 
 // Host dispatch: replaces ~9 PyTorch kernel launches with 3 custom + multinomial
