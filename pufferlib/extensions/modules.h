@@ -67,4 +67,19 @@ void sample_logits(
 // FCMax: fused FC -> Max
 torch::Tensor fc_max(torch::Tensor x, torch::Tensor W, torch::Tensor b);
 
+// Compute prio: fused priority sampling for minibatch selection
+std::tuple<torch::Tensor, torch::Tensor> compute_prio_cuda(
+    torch::Tensor advantages, float prio_alpha,
+    int minibatch_segments, int total_agents, float anneal_beta);
+
+// Select + Copy: fused index_select and copy for minibatch preparation
+void train_select_and_copy_cuda(
+    torch::Tensor observations, torch::Tensor actions,
+    torch::Tensor logprobs, torch::Tensor values, torch::Tensor advantages,
+    torch::Tensor idx, torch::Tensor mb_prio,
+    torch::Tensor dst_obs, torch::Tensor dst_state,
+    torch::Tensor dst_actions, torch::Tensor dst_logprobs,
+    torch::Tensor dst_advantages, torch::Tensor dst_prio,
+    torch::Tensor dst_values, torch::Tensor dst_returns);
+
 #endif // PUFFERLIB_MODULES_H
