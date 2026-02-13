@@ -1068,39 +1068,37 @@ __device__ __forceinline__ void copy_bytes(
         doffset[i] = soffset[i];
 }
 
-template<typename T>
 __device__ __forceinline__ void copy_values_adv_returns(
-    const T* __restrict__ src_values, T* __restrict__ dst_values,
+    const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
     const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
-    T* __restrict__ dst_returns,
+    precision_t* __restrict__ dst_returns,
     int src_row, int dst_row, int horizon
 ) {
     int srh = (int64_t)src_row * horizon;
     int drh = (int64_t)dst_row * horizon;
-    const T* s_values = src_values + srh;
+    const precision_t* s_values = src_values + srh;
     const float* s_adv = src_advantages + srh;
-    T* d_values = dst_values + drh;
+    precision_t* d_values = dst_values + drh;
     float* d_adv = dst_advantages + drh;
-    T* d_returns = dst_returns + drh;
+    precision_t* d_returns = dst_returns + drh;
     for (int i = threadIdx.x; i < horizon; i += blockDim.x) {
-        T val = s_values[i];
+        precision_t val = s_values[i];
         float adv = s_adv[i];
         d_values[i] = val;
         d_adv[i] = adv;
-        d_returns[i] = (T)((float)val + adv);
+        d_returns[i] = from_float(to_float(val) + adv);
     }
 }
 
-template<typename T>
 __global__ void select_copy_kernel(
     const int64_t* __restrict__ idx,
     const char* __restrict__ src_obs, char* __restrict__ dst_obs, int obs_row_bytes,
     const char* __restrict__ src_actions, char* __restrict__ dst_actions, int actions_row_bytes,
     const char* __restrict__ src_logprobs, char* __restrict__ dst_logprobs, int logprobs_row_bytes,
-    const T* __restrict__ src_values, T* __restrict__ dst_values,
+    const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
     const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
-    T* __restrict__ dst_returns, int horizon,
-    const T* __restrict__ src_prio, T* __restrict__ dst_prio
+    precision_t* __restrict__ dst_returns, int horizon,
+    const precision_t* __restrict__ src_prio, precision_t* __restrict__ dst_prio
 ) {
     int mb = blockIdx.x;
     int ch = blockIdx.y;
