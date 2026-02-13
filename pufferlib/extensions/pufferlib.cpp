@@ -251,22 +251,6 @@ inline void profile_end(bool enable) {
     if (enable) { cudaDeviceSynchronize(); nvtxRangePop(); }
 }
 
-
-std::tuple<Tensor, Tensor> compute_prio(
-    Tensor& advantages, float prio_alpha, int minibatch_segments,
-    int total_agents, float anneal_beta
-) {
-    return compute_prio_cuda(
-        advantages, prio_alpha, minibatch_segments, total_agents, anneal_beta
-    );
-}
-
-void compute_advantage(RolloutBuf& rollouts, Tensor& advantages, HypersT& hypers) {
-    compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
-        rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
-        hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
-}
-
 // Thread initialization callback - sets CUDA stream once per thread
 extern "C" void thread_init_wrapper(void* ctx, int buf) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
@@ -389,22 +373,13 @@ void train_impl(PuffeRL& pufferl) {
         muon->lr.fill_(lr);
     }
 
-    // Annealed priority exponent - TODO: graphed?
+    // Annealed priority exponent
     float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
 
     // Zero out ratio at start of epoch (matches Python: self.ratio[:] = 1)
     rollouts.ratio.fill_(1.0);
 
     Tensor advantages = torch::zeros_like(rollouts.values, torch::kFloat32);  // fp32 precision
-    compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
-        rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
-        hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
-
-    Tensor mb_state = torch::zeros(
-        {hypers.num_layers, minibatch_segments, 1, (int64_t)hypers.hidden_size},
-        torch::dtype(PRECISION_DTYPE).device(rollouts.values.device())
-    );
-
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
 
     TrainGraph& graph = pufferl.train_buf;
@@ -415,54 +390,24 @@ void train_impl(PuffeRL& pufferl) {
         advantages.fill_(0.0);
 
         profile_begin("compute_advantage", hypers.profile);
-        compute_advantage(rollouts, advantages, hypers);
+        compute_puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
+            rollouts.ratio, advantages, hypers.gamma, hypers.gae_lambda,
+            hypers.vtrace_rho_clip, hypers.vtrace_c_clip);
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
-        Tensor idx, mb_prio;
-        if (hypers.kernels) {
-            auto out = compute_prio_cuda(advantages, prio_alpha, minibatch_segments,
-                hypers.total_agents, anneal_beta);
-            idx = std::get<0>(out);
-            mb_prio = std::get<1>(out);
-        }
-        else {
-            Tensor adv = advantages.abs().sum(1);
-            Tensor prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
-            Tensor prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
-            idx = at::multinomial(prio_probs, minibatch_segments, true);
-            mb_prio = torch::pow(hypers.total_agents*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
-        }
+        auto [idx, mb_prio] = compute_prio(advantages, prio_alpha, minibatch_segments,
+                hypers.total_agents, anneal_beta, hypers.kernels);
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        // Broken kernel
-        if (false && hypers.kernels) {
-            train_select_and_copy_cuda(
-                rollouts.observations, rollouts.actions, rollouts.logprobs,
-                rollouts.values, advantages,
-                idx, mb_prio,
-                graph.mb_obs, graph.mb_state, graph.mb_actions,
-                graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
-                graph.mb_values, graph.mb_returns);
-        } else {
-            Tensor mb_obs = rollouts.observations.index_select(0, idx);
-            Tensor mb_actions = rollouts.actions.index_select(0, idx);
-            Tensor mb_logprobs = rollouts.logprobs.index_select(0, idx);
-            Tensor mb_values = rollouts.values.index_select(0, idx);
-            Tensor mb_advantages = advantages.index_select(0, idx);
-            Tensor mb_returns = mb_advantages + mb_values;
-
-            mb_state.zero_();
-            graph.mb_obs.copy_(mb_obs, false);
-            graph.mb_state.copy_(mb_state, false);
-            graph.mb_actions.copy_(mb_actions, false);
-            graph.mb_logprobs.copy_(mb_logprobs, false);
-            graph.mb_advantages.copy_(mb_advantages, false);
-            graph.mb_prio.copy_(mb_prio, false);
-            graph.mb_values.copy_(mb_values, false);
-            graph.mb_returns.copy_(mb_returns, false);
-        }
+        train_select_and_copy(
+            rollouts.observations, rollouts.actions, rollouts.logprobs,
+            rollouts.values, advantages,
+            idx, mb_prio,
+            graph.mb_obs, graph.mb_state, graph.mb_actions,
+            graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
+            graph.mb_values, graph.mb_returns, hypers.kernels);
         profile_end(hypers.profile);
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
