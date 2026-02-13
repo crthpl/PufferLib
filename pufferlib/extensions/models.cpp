@@ -568,6 +568,61 @@ void sample_actions(Logits& logits, Tensor value,
     }
 }
 
+void train_select_and_copy(
+    Tensor observations, Tensor actions,
+    Tensor logprobs, Tensor values, Tensor advantages,
+    Tensor idx, Tensor mb_prio,
+    Tensor dst_obs, Tensor dst_state,
+    Tensor dst_actions, Tensor dst_logprobs,
+    Tensor dst_advantages, Tensor dst_prio,
+    Tensor dst_values, Tensor dst_returns,
+    bool kernels
+) {
+    // This kernel is broken
+    if (kernels) {
+        train_select_and_copy_cuda(
+            observations, actions, logprobs, values, advantages,
+            idx, mb_prio,
+            dst_obs, dst_state, dst_actions,
+            dst_logprobs, dst_advantages, dst_prio,
+            dst_values, dst_returns);
+    } else {
+        Tensor mb_obs = observations.index_select(0, idx);
+        Tensor mb_actions = actions.index_select(0, idx);
+        Tensor mb_logprobs = logprobs.index_select(0, idx);
+        Tensor mb_values = values.index_select(0, idx);
+        Tensor mb_advantages = advantages.index_select(0, idx);
+        Tensor mb_returns = mb_advantages + mb_values;
+
+        dst_obs.copy_(mb_obs, false);
+        dst_state.zero_();
+        dst_actions.copy_(mb_actions, false);
+        dst_logprobs.copy_(mb_logprobs, false);
+        dst_advantages.copy_(mb_advantages, false);
+        dst_prio.copy_(mb_prio, false);
+        dst_values.copy_(mb_values, false);
+        dst_returns.copy_(mb_returns, false);
+    }
+}
+
+std::tuple<Tensor, Tensor> compute_prio(
+    Tensor& advantages, float prio_alpha, int minibatch_segments,
+    int total_agents, float anneal_beta, bool kernels
+) {
+    if (kernels) {
+        return compute_prio_cuda(advantages, prio_alpha, minibatch_segments,
+            total_agents, anneal_beta);
+    }
+    else {
+        Tensor adv = advantages.abs().sum(1);
+        Tensor prio_weights = adv.pow(prio_alpha).nan_to_num_(0.0, 0.0, 0.0);
+        Tensor prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6);
+        Tensor idx = at::multinomial(prio_probs, minibatch_segments, true);
+        Tensor mb_prio = torch::pow(total_agents*prio_probs.index_select(0, idx).unsqueeze(1), -anneal_beta);
+        return {idx, mb_prio};
+    }
+}
+
 // Dispatch: compute PPO loss using kernel or cpp path
 // Writes ratio and newvalue to output buffers as side effect
 // Accumulates loss components into losses tensor for logging
