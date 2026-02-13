@@ -21,6 +21,7 @@ auto cuda_f32 = torch::dtype(torch::kFloat32).device(torch::kCUDA);
 auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
 auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
 auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
+auto cuda_t = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
 
 // Raw struct bundling decoder outputs: mean (logits for discrete) + logstd
 struct Logits {
@@ -518,7 +519,9 @@ vector<Tensor> continuous_logprob_entropy_cpp(Tensor mean, Tensor logstd, Tensor
 // PPO clipped loss with clipped value loss
 Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
         Tensor newvalue, Tensor values, Tensor returns, Tensor entropy,
-        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef) {
+        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        Tensor losses) {
+    auto logratio = ratio.log();
     auto adv_normalized = prio * (advantages - advantages.mean()) / (advantages.std() + 1e-8);
     auto pg_loss1 = -adv_normalized * ratio;
     auto pg_loss2 = -adv_normalized * torch::clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef);
@@ -528,7 +531,19 @@ Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
     auto v_clipped = values + torch::clamp(newvalue - values, -vf_clip_coef, vf_clip_coef);
     auto v_loss = 0.5 * torch::max((newvalue - returns).pow(2), (v_clipped - returns).pow(2)).mean();
 
-    return pg_loss + vf_coef * v_loss - ent_coef * entropy;
+    auto total = pg_loss + vf_coef * v_loss - ent_coef * entropy;
+
+    // Accumulate loss components for logging (detached, no grad)
+    losses.select(0, LOSS_PG).add_(pg_loss.detach());
+    losses.select(0, LOSS_VF).add_(v_loss.detach());
+    losses.select(0, LOSS_ENT).add_(entropy.detach());
+    losses.select(0, LOSS_TOTAL).add_(total.detach());
+    losses.select(0, LOSS_OLD_APPROX_KL).add_((-logratio).mean().detach());
+    losses.select(0, LOSS_APPROX_KL).add_(((ratio - 1) - logratio).mean().detach());
+    losses.select(0, LOSS_CLIPFRAC).add_(((ratio - 1.0).abs() > clip_coef).to(torch::kFloat32).mean().detach());
+    losses.select(0, LOSS_N).add_(1.0);
+
+    return total;
 }
 
 // Dispatch: sample actions using kernel or cpp path, write to output buffers
@@ -555,6 +570,7 @@ void sample_actions(Logits& logits, Tensor value,
 
 // Dispatch: compute PPO loss using kernel or cpp path
 // Writes ratio and newvalue to output buffers as side effect
+// Accumulates loss components into losses tensor for logging
 Tensor compute_train_loss(Logits& logits, Tensor newvalue,
         Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio,
         Tensor values, Tensor returns,
@@ -562,18 +578,21 @@ Tensor compute_train_loss(Logits& logits, Tensor newvalue,
         Tensor act_sizes, Tensor act_sizes_cpu,
         int minibatch_size, int horizon,
         float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-        bool is_continuous, bool kernels) {
+        bool is_continuous, bool kernels, Tensor losses) {
     if (kernels) {
         Tensor logstd_safe = logits.logstd.defined() ? logits.logstd : torch::empty({0}, logits.mean.options());
         // TODO: Try using global (epoch-level) adv mean/std instead of per-minibatch
         auto [adv_var, adv_mean] = torch::var_mean(advantages);
-        return fused_ppo_loss_optimized(
+        auto result = fused_ppo_loss_optimized(
             logits.mean, logstd_safe, newvalue,
             actions, old_logprobs, advantages, prio, values, returns,
             adv_mean, adv_var,  // variance, not std - kernel does sqrtf
             ratio_out, newvalue_out,
-            act_sizes, clip_coef, vf_clip_coef, vf_coef, ent_coef
+            act_sizes, losses,
+            clip_coef, vf_clip_coef, vf_coef, ent_coef
         )[0];
+        losses.select(0, LOSS_N).add_(1.0);
+        return result;
     } else {
         int num_heads = actions.size(-1);
         int batch = minibatch_size;
@@ -596,7 +615,7 @@ Tensor compute_train_loss(Logits& logits, Tensor newvalue,
 
         return ppo_loss_cpp(ratio, advantages, prio,
             newvalue, values, returns, result[1],
-            clip_coef, vf_clip_coef, vf_coef, ent_coef);
+            clip_coef, vf_clip_coef, vf_coef, ent_coef, losses);
     }
 }
 

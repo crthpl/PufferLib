@@ -1717,6 +1717,9 @@ EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_thr
         fprintf(stderr, "Failed to create environments\n");
         return nullptr;
     }
+    for (int i = 0; i < num_buffers; i++) {
+        cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
+    }
 
     int num_envs = vec->size;
     printf("Created %d envs (%s) for %d total_agents\n", num_envs, TOSTRING(ENV_NAME), total_agents);
@@ -1762,7 +1765,7 @@ float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
         if (elapsed > ENV_TIMEOUT_SEC) break;
     }
 
-    start_time = std::chrono::steady_clock::now();
+    start_time = get_time_sec();
     cudaProfilerStart();
     if (name) nvtxRangePushA(name);
     cudaEventRecord(start);
@@ -2764,7 +2767,10 @@ void print_usage(const char* prog) {
     printf("  rolloutcopy    - Per-minibatch data prep: advantage+prio+copy (requires torch)\n");
 #endif
 #ifdef USE_STATIC_ENV
-    printf("  envspeed       - Environment step throughput (requires static env)\n");
+    printf("  envspeed       - Environment step throughput (static linked)\n");
+    printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
+    printf("    --threads N  - Number of threads (default: 16)\n");
+    printf("    --horizon N  - Horizon length (default: %d)\n", T);
 #endif
     printf("  all            - Run all available profiles\n");
 }
@@ -2776,6 +2782,19 @@ int main(int argc, char** argv) {
     }
 
     const char* profile = argv[1];
+
+    // Parse optional CLI args for envspeed
+    int buffers = BUF;
+    int threads = 16;
+    int horizon = T;
+    int total_agents = BR * buffers;
+    for (int i = 2; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--buffers") == 0) buffers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--threads") == 0) threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--horizon") == 0) horizon = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--total-agents") == 0) total_agents = atoi(argv[++i]);
+    }
+
     warmup_gpu();
 
     // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
@@ -2821,8 +2840,8 @@ int main(int argc, char** argv) {
 
     // === Environment speed (requires static env link) ===
 #ifdef USE_STATIC_ENV
-    if (strcmp(profile, "envspeed") == 0 || run_all) {
-        profile_envspeed(BUF*BR, BUF, 16, T);
+    if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
+        profile_envspeed(total_agents, buffers, threads, horizon);
     }
 #endif
 
