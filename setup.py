@@ -291,7 +291,7 @@ class ProfilerBuildExt(build_ext):
                 static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
                 cmd += [static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL']
             cmd += ['-lomp5']
-            cmd += ['pufferlib/extensions/muon.cpp', src, '-o', out]
+            cmd += [src, '-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)
@@ -383,11 +383,9 @@ torch_extensions = []
 if not NO_TRAIN:
     torch_sources = [
         "pufferlib/extensions/bindings.cpp",
-        "pufferlib/extensions/muon.cpp",
     ]
     if BUID_CUDA_EXT:
         extension = CUDAExtension
-        torch_sources.append("pufferlib/extensions/cuda/advantage.cu")
         torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
         torch_sources.append("pufferlib/extensions/modules.cu")
     else:

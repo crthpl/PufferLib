@@ -9,7 +9,6 @@
 
 #include <torch/extension.h>
 #include <torch/torch.h>
-#include <torch/optim/optimizer.h>
 
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
@@ -206,7 +205,7 @@ typedef struct {
     Policy* policy_bf16;  // Working weights (bf16) - used for forward/backward
     Policy* policy_fp32;  // Master weights (fp32) - used for optimizer
     StaticVec* vec;
-    torch::optim::Muon* muon;
+    Muon* muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
@@ -364,7 +363,7 @@ void train_impl(PuffeRL& pufferl) {
 
     Policy* policy_bf16 = pufferl.policy_bf16;
     // Policy* policy_fp32 = pufferl.policy_fp32;
-    torch::optim::Muon* muon = pufferl.muon;
+    Muon* muon = pufferl.muon;
 
     int total_epochs = hypers.total_timesteps / batch_size;
 
@@ -609,8 +608,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     float lr = hypers.lr;
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
-    pufferl->muon = new torch::optim::Muon(policy_fp32->parameters(),
-        torch::optim::MuonOptions(lr).momentum(beta1).eps(eps));
+    pufferl->muon = new Muon(policy_fp32->parameters(), lr, beta1, eps, 0.0);
     pufferl->muon->init_contiguous_weights();
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
@@ -726,12 +724,6 @@ void close_impl(PuffeRL& pufferl) {
     pufferl.train_cudagraph.reset();
     pufferl.fused_rollout_cudagraphs.clear();
 
-    // Clear optimizer buffers explicitly (policy params are views into weight_buffer)
-    pufferl.muon->weight_buffer = Tensor();
-    pufferl.muon->momentum_buffer = Tensor();
-    pufferl.muon->lr = Tensor();
-    // Clear the param_groups to release parameter references
-    pufferl.muon->param_groups().clear();
     delete pufferl.muon;
     pufferl.muon = nullptr;
 
