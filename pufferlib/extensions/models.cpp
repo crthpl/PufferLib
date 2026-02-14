@@ -148,101 +148,66 @@ vector<Tensor> fused_scan_cpp(Tensor combined, Tensor state) {
     return {out, next_state};
 }
 
-// Helper: accumulate gradient on a parameter (handles undefined grad case)
-static inline void acc_grad(Tensor& param, Tensor grad) {
-    if (param.grad().defined()) {
-        param.mutable_grad().add_(grad);
-    } else {
-        param.mutable_grad() = grad;
-    }
-}
-
-struct RNN : public nn::Module {
-    virtual tuple<Tensor, Tensor> forward(Tensor x, Tensor state) = 0;
-    virtual Tensor forward_train(Tensor x, Tensor state) = 0;
-    virtual Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) = 0;
-};
-
-struct MinGRU : public RNN {
+// Native MinGRU — no nn::Module, no autograd. Kernels only.
+struct MinGRU {
     int hidden, num_layers;
-    bool kernels;
-    vector<nn::Linear> layers;
+    vector<Tensor> weights;       // (3*H, H) per layer, views into allocator
+    vector<Tensor> weight_grads;  // (3*H, H) per layer, views into allocator
 
-    MinGRU(int hidden, int num_layers = 1, bool kernels = true)
-            : hidden(hidden), num_layers(num_layers), kernels(kernels) {
+    // Saved activations for backward
+    vector<Tensor> saved_inputs;
+    vector<PrefixScanBuffers> saved_scan_bufs;
+
+    MinGRU() : hidden(0), num_layers(0) {}
+
+    // Just allocate vectors — registration happens in Policy constructor
+    // to ensure param_buffer layout matches parameters() order
+    MinGRU(int hidden, int num_layers)
+        : hidden(hidden), num_layers(num_layers),
+          weights(num_layers), weight_grads(num_layers) {}
+
+    void init_weights() {
         for (int i = 0; i < num_layers; i++) {
-            nn::Linear layer = nn::Linear(nn::LinearOptions(hidden, 3*hidden).bias(false));
-            nn::init::orthogonal_(layer->weight);
-            layers.push_back(register_module("layer_" + std::to_string(i), layer));
+            nn::init::orthogonal_(weights[i]);
         }
     }
 
-    Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) override {
+    Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) {
         return torch::zeros({num_layers, batch_size, hidden},
             torch::dtype(dtype).device(device));
     }
 
     // Inference: x (B, H), state (num_layers, B, H) -> (h, state)
-    tuple<Tensor, Tensor> forward(Tensor x, Tensor state) override {
-        TORCH_CHECK(x.dim() == 2 && state.dim() == 3 && state.size(0) == num_layers
-            && x.size(0) == state.size(1) && x.size(1) == hidden && state.size(2) == hidden,
-            "Expected x={B, H=", hidden, "}, state={layers=", num_layers, ", B, H=", hidden, "}, ",
-            "Got x=", x.sizes(), ", state=", state.sizes());
-
+    tuple<Tensor, Tensor> forward(Tensor x, Tensor state) {
         for (int i = 0; i < num_layers; i++) {
             Tensor state_i = state.select(0, i);
-            Tensor combined = layers[i]->forward(x);
-            auto result = kernels ? mingru_gate(state_i, combined.contiguous())
-                                  : mingru_gate_cpp(state_i, combined);
+            Tensor combined = torch::mm(x, weights[i].t());
+            auto result = mingru_gate(state_i, combined.contiguous());
             x = result[0];
             state.select(0, i).copy_(result[1]);
         }
         return {x, state};
     }
 
-    // Training: x (B, TT, H), state (num_layers, B, 1, H) -> h (B, TT, H)
-    Tensor forward_train(Tensor x, Tensor state) override {
-        TORCH_CHECK(x.dim() == 3 && x.size(2) == hidden
-            && state.dim() == 4 && state.size(0) == num_layers && x.size(0) == state.size(1)
-            && state.size(2) == 1 && state.size(3) == hidden,
-            "Expected x={B, TT, H=", hidden, "}, state={layers=", num_layers, ", B, 1, H=", hidden, "}, ",
-            "Got x=", x.sizes(), ", state=", state.sizes());
-
-        for (int i = 0; i < num_layers; i++) {
-            Tensor state_i = state.select(0, i);
-            Tensor combined = layers[i]->forward(x);
-            auto result = kernels ? PrefixScan::apply(combined, state_i)
-                                  : fused_scan_cpp(combined, state_i);
-            x = result[0];
-        }
-        return x;
-    }
-
-    // === Manual forward/backward (no autograd) ===
-
-    // Saved activations for manual backward
-    vector<Tensor> saved_rnn_inputs;          // input to each layer's linear
-    vector<PrefixScanBuffers> saved_scan_bufs; // prefix scan buffers per layer
-
-    // Training forward without autograd: x (B, TT, H), state (num_layers, B, 1, H) -> h (B, TT, H)
-    Tensor forward_train_manual(Tensor x, Tensor state) {
+    // Training forward (saves activations): x (B, TT, H), state (num_layers, B, 1, H) -> h (B, TT, H)
+    Tensor forward_train(Tensor x, Tensor state) {
         torch::NoGradGuard no_grad;
-        saved_rnn_inputs.resize(num_layers);
+        saved_inputs.resize(num_layers);
         saved_scan_bufs.resize(num_layers);
 
         for (int i = 0; i < num_layers; i++) {
-            saved_rnn_inputs[i] = x;
+            saved_inputs[i] = x;
             Tensor state_i = state.select(0, i);
-            Tensor combined = layers[i]->forward(x);
+            Tensor combined = torch::matmul(x, weights[i].t());
             saved_scan_bufs[i] = prefix_scan_forward_direct(combined.contiguous(), state_i);
             x = saved_scan_bufs[i].out;
         }
         return x;
     }
 
-    // Manual backward: grad (B, TT, H) bf16 -> grad_input (B, TT, H) bf16
-    // All matmuls in bf16 (matching autograd). Only small weight grads converted to fp32.
-    Tensor backward_manual(Tensor grad, MinGRU* target) {
+    // Backward: grad (B, TT, H) bf16 -> grad_input (B, TT, H) bf16
+    // All matmuls in bf16. Only small weight grads converted to fp32 for accumulation.
+    Tensor backward(Tensor grad, MinGRU* target) {
         torch::NoGradGuard no_grad;
         int B = grad.size(0);
         int TT = grad.size(1);
@@ -253,176 +218,172 @@ struct MinGRU : public RNN {
         for (int i = num_layers - 1; i >= 0; i--) {
             auto scan_grads = prefix_scan_backward_direct(
                 grad.contiguous(), grad_next_state, saved_scan_bufs[i]);
-            Tensor gc_flat = scan_grads[0].reshape({B * TT, 3 * H});  // bf16
-            Tensor inp_flat = saved_rnn_inputs[i].reshape({B * TT, H});  // bf16
+            Tensor gc_flat = scan_grads[0].reshape({B * TT, 3 * H});
+            Tensor inp_flat = saved_inputs[i].reshape({B * TT, H});
 
-            // Weight grad: bf16 matmul -> small result converted to fp32
-            acc_grad(target->layers[i]->weight,
-                     torch::mm(gc_flat.t(), inp_flat).to(torch::kFloat32));
+            target->weight_grads[i].add_(
+                torch::mm(gc_flat.t(), inp_flat).to(torch::kFloat32));
 
-            // Input grad: bf16 matmul with self's bf16 weights, stays bf16
-            grad = torch::mm(gc_flat, layers[i]->weight).reshape({B, TT, H});
+            grad = torch::mm(gc_flat, weights[i]).reshape({B, TT, H});
         }
 
-        saved_rnn_inputs.clear();
+        saved_inputs.clear();
         saved_scan_bufs.clear();
         return grad;
     }
+
+    vector<Tensor> parameters() { return weights; }
 };
 
-struct Policy : public nn::Module {
+// Native Policy — no nn::Module, no autograd. Kernels only.
+// Encoder = single Linear(input, hidden, bias=false)
+// Decoder = single Linear(hidden, output+1, bias=false) + optional logstd
+struct Policy {
     int input, hidden, num_atns;
-    shared_ptr<Encoder> encoder{nullptr};
-    shared_ptr<Decoder> decoder{nullptr};
-    shared_ptr<RNN> rnn{nullptr};
+    int output;       // decoder logits size (= num_atns for default)
+    bool continuous;
 
-    Policy(shared_ptr<Encoder> enc, shared_ptr<Decoder> dec, shared_ptr<RNN> rnn_module,
-            int input, int num_atns, int hidden = 128)
-            : input(input), hidden(hidden), num_atns(num_atns) {
-        encoder = register_module("encoder", enc);
-        decoder = register_module("decoder", dec);
-        rnn = register_module("rnn", rnn_module);
+    Tensor encoder_weight;        // (hidden, input) — view into allocator
+    Tensor decoder_weight;        // (output+1, hidden) — view into allocator
+    Tensor logstd_param;          // (1, output) or undefined — view into allocator
+
+    // Explicit grad tensors — views into allocator's grad_buffer
+    Tensor encoder_weight_grad;
+    Tensor decoder_weight_grad;
+    Tensor logstd_grad;
+
+    MinGRU rnn;
+
+    // Saved activations for backward
+    Tensor saved_obs_flat;
+    Tensor saved_decoder_input;
+
+    Policy() : input(0), hidden(0), num_atns(0), output(0), continuous(false) {}
+
+    Policy(Allocator& alloc, int input, int hidden, int output, int num_layers, int num_atns, bool continuous)
+        : input(input), hidden(hidden), num_atns(num_atns), output(output), continuous(continuous),
+          rnn(hidden, num_layers) {
+        // Register in same order as parameters() returns: encoder, decoder, [logstd], rnn weights
+        // This ensures param_buffer/grad_buffer layout matches Muon's iteration order
+        alloc.register_param(&encoder_weight, {hidden, input});
+        alloc.register_grad(&encoder_weight_grad, {hidden, input});
+
+        alloc.register_param(&decoder_weight, {output + 1, hidden});
+        alloc.register_grad(&decoder_weight_grad, {output + 1, hidden});
+
+        if (continuous) {
+            alloc.register_param(&logstd_param, {1, output});
+            alloc.register_grad(&logstd_grad, {1, output});
+        }
+
+        for (int i = 0; i < num_layers; i++) {
+            alloc.register_param(&rnn.weights[i], {3 * hidden, hidden});
+            alloc.register_grad(&rnn.weight_grads[i], {3 * hidden, hidden});
+        }
+    }
+
+    void init_weights() {
+        nn::init::orthogonal_(encoder_weight, std::sqrt(2.0));
+        nn::init::orthogonal_(decoder_weight, 0.01);
+        if (continuous) logstd_param.zero_();
+        rnn.init_weights();
     }
 
     Tensor initial_state(int batch_size, torch::Device device) {
-        auto dtype = parameters().empty() ? torch::kFloat32 : parameters()[0].scalar_type();
-        return rnn->initial_state(batch_size, device, dtype);
+        return rnn.initial_state(batch_size, device, encoder_weight.scalar_type());
     }
 
+    // Inference: obs (B, input), state (num_layers, B, H) -> (logits, value, state)
     tuple<Logits, Tensor, Tensor> forward(Tensor observations, Tensor state) {
-        TORCH_CHECK(observations.dim() == 2 && observations.size(1) == input,
-            "Expected obs={B, ", input, "}, Got ", observations.sizes());
+        Tensor h = torch::mm(observations.to(encoder_weight.dtype()), encoder_weight.t());
+        auto [h_out, state_out] = rnn.forward(h, state);
 
-        Tensor h = encoder->forward(observations);
-        auto [h_out, state_out] = rnn->forward(h, state);
-        auto [logits, values] = decoder->forward(h_out);
-        return {logits, values, state_out};
-    }
-
-    tuple<Logits, Tensor> forward_train(Tensor x, Tensor state) {
-        TORCH_CHECK(x.dim() == 3 && x.size(-1) == input,
-            "Expected obs={B, TT, ", input, "}, Got ", x.sizes());
-
-        int B = x.size(0);
-        int TT = x.size(1);
-
-        x = x.reshape({B*TT, input});
-        Tensor h = encoder->forward(x);
-        h = h.reshape({B, TT, hidden});
-
-        h = rnn->forward_train(h, state);
-        Tensor flat_h = h.reshape({-1, hidden});
-
-        auto [logits, values] = decoder->forward(flat_h);
-
-        logits.mean = logits.mean.reshape({B, TT, num_atns});
-        if (logits.logstd.defined()) {
-            logits.logstd = logits.logstd.reshape({B, TT, num_atns});
-        } else {
-            logits.logstd = torch::empty({0}, logits.mean.options());
+        Tensor dec_out = torch::mm(h_out, decoder_weight.t());
+        Logits logits = {.mean = dec_out.narrow(-1, 0, output)};
+        Tensor value = dec_out.narrow(-1, output, 1).squeeze(-1);
+        if (continuous) {
+            logits.logstd = logstd_param.expand_as(logits.mean);
         }
-        values = values.reshape({B, TT, 1});
-
-        return {logits, values};
+        return {logits, value, state_out};
     }
 
-    // === Manual forward/backward (no autograd) ===
-
-    // Saved activations for manual backward
-    Tensor saved_obs_flat;       // (B*TT, input) precision_t
-    Tensor saved_decoder_input;  // (B*TT, hidden) precision_t
-
-    // Training forward without autograd
-    tuple<Logits, Tensor> forward_train_manual(Tensor x, Tensor state) {
+    // Training forward (saves activations): x (B, TT, input), state (num_layers, B, 1, H)
+    tuple<Logits, Tensor> forward_train(Tensor x, Tensor state) {
         torch::NoGradGuard no_grad;
-        TORCH_CHECK(x.dim() == 3 && x.size(-1) == input,
-            "Expected obs={B, TT, ", input, "}, Got ", x.sizes());
-
         int B = x.size(0);
         int TT = x.size(1);
 
-        x = x.reshape({B*TT, input});
+        x = x.reshape({B * TT, input});
         saved_obs_flat = x;
 
-        Tensor h = encoder->forward(x);
+        Tensor h = torch::mm(x.to(encoder_weight.dtype()), encoder_weight.t());
         h = h.reshape({B, TT, hidden});
 
-        auto mingru = std::dynamic_pointer_cast<MinGRU>(rnn);
-        TORCH_CHECK(mingru, "forward_train_manual only supports MinGRU");
-        h = mingru->forward_train_manual(h, state);
+        h = rnn.forward_train(h, state);
 
         Tensor flat_h = h.reshape({-1, hidden});
         saved_decoder_input = flat_h;
 
-        auto [logits, values] = decoder->forward(flat_h);
+        Tensor dec_out = torch::mm(flat_h, decoder_weight.t());
+        Logits logits = {.mean = dec_out.narrow(-1, 0, output).reshape({B, TT, num_atns})};
+        Tensor value = dec_out.narrow(-1, output, 1).squeeze(-1).reshape({B, TT, 1});
 
-        logits.mean = logits.mean.reshape({B, TT, num_atns});
-        if (logits.logstd.defined()) {
-            logits.logstd = logits.logstd.reshape({B, TT, num_atns});
+        if (continuous) {
+            logits.logstd = logstd_param.expand({B * TT, output}).reshape({B, TT, num_atns});
         } else {
             logits.logstd = torch::empty({0}, logits.mean.options());
         }
-        values = values.reshape({B, TT, 1});
-
-        return {logits, values};
+        return {logits, value};
     }
 
-    // Manual backward: chains grad through decoder -> rnn -> encoder
+    // Backward: chains grad through decoder -> rnn -> encoder
     // All matmuls in bf16 (matching autograd). Only small weight grads converted to fp32.
-    void backward_manual(Tensor grad_logits, Tensor grad_logstd, Tensor grad_value,
-                         Policy* target) {
+    void backward(Tensor grad_logits, Tensor grad_logstd, Tensor grad_value,
+                  Policy* target) {
         torch::NoGradGuard no_grad;
-
-        auto dec_self = std::dynamic_pointer_cast<DefaultDecoder>(decoder);
-        auto dec_target = std::dynamic_pointer_cast<DefaultDecoder>(target->decoder);
-        TORCH_CHECK(dec_target, "backward_manual only supports DefaultDecoder");
-
         int B_TT = saved_decoder_input.size(0);
-        int output = dec_target->output;
         int B = grad_logits.size(0);
         int TT = grad_logits.size(1);
 
-        // --- Decoder backward ---
         // Cast PPO fp32 grads to bf16 (matching autograd's implicit cast)
         Tensor grad_dec_out = torch::cat({
             grad_logits.reshape({B_TT, -1}).to(PRECISION_DTYPE),
             grad_value.reshape({B_TT, 1}).to(PRECISION_DTYPE)
-        }, 1);  // (B*TT, output+1) bf16
+        }, 1);
 
-        // Weight grad: bf16 matmul -> small result converted to fp32
-        acc_grad(dec_target->linear->weight,
-                 torch::mm(grad_dec_out.t(), saved_decoder_input).to(torch::kFloat32));
+        // Decoder weight grad: bf16 matmul -> small result to fp32
+        target->decoder_weight_grad.add_(
+            torch::mm(grad_dec_out.t(), saved_decoder_input).to(torch::kFloat32));
 
-        // logstd grad (continuous only)
-        if (dec_target->continuous && grad_logstd.defined() && grad_logstd.numel() > 0) {
-            Tensor logstd_grad = grad_logstd.reshape({-1, output}).sum(0, /*keepdim=*/true);
-            acc_grad(dec_target->logstd_param, logstd_grad);
+        // logstd grad
+        if (continuous && grad_logstd.defined() && grad_logstd.numel() > 0) {
+            target->logstd_grad.add_(
+                grad_logstd.reshape({-1, output}).sum(0, /*keepdim=*/true));
         }
 
-        // Input grad: bf16 matmul with self's bf16 weight, stays bf16
-        Tensor grad_h = torch::mm(grad_dec_out, dec_self->linear->weight)
-                            .reshape({B, TT, hidden});
+        // Decoder input grad: bf16 matmul with self's bf16 weight
+        Tensor grad_h = torch::mm(grad_dec_out, decoder_weight).reshape({B, TT, hidden});
 
-        // --- MinGRU backward ---
-        auto mingru_self = std::dynamic_pointer_cast<MinGRU>(rnn);
-        auto mingru_target = std::dynamic_pointer_cast<MinGRU>(target->rnn);
-        TORCH_CHECK(mingru_self && mingru_target, "backward_manual only supports MinGRU");
-        grad_h = mingru_self->backward_manual(grad_h, mingru_target.get());
+        // RNN backward
+        grad_h = rnn.backward(grad_h, &target->rnn);
 
-        // --- Encoder backward ---
-        auto enc_self = std::dynamic_pointer_cast<DefaultEncoder>(encoder);
-        auto enc_target = std::dynamic_pointer_cast<DefaultEncoder>(target->encoder);
-        TORCH_CHECK(enc_target, "backward_manual only supports DefaultEncoder");
+        // Encoder weight grad: bf16 matmul -> small result to fp32
+        Tensor grad_enc = grad_h.reshape({B_TT, hidden});
+        target->encoder_weight_grad.add_(
+            torch::mm(grad_enc.t(), saved_obs_flat).to(torch::kFloat32));
 
-        Tensor grad_enc = grad_h.reshape({B_TT, hidden});  // bf16
-
-        // Weight grad: bf16 matmul -> small result converted to fp32
-        acc_grad(enc_target->linear->weight,
-                 torch::mm(grad_enc.t(), saved_obs_flat).to(torch::kFloat32));
-
-        // Clear saved activations
         saved_obs_flat = Tensor();
         saved_decoder_input = Tensor();
+    }
+
+    vector<Tensor> parameters() {
+        vector<Tensor> params;
+        params.push_back(encoder_weight);
+        params.push_back(decoder_weight);
+        if (logstd_param.defined()) params.push_back(logstd_param);
+        auto rnn_params = rnn.parameters();
+        params.insert(params.end(), rnn_params.begin(), rnn_params.end());
+        return params;
     }
 };
 
@@ -589,17 +550,6 @@ void sync_policy_weights(Policy* policy_bf16, Policy* policy_fp32) {
     auto params_bf16 = policy_bf16->parameters();
     for (size_t i = 0; i < params_fp32.size(); ++i) {
         params_bf16[i].data().copy_(params_fp32[i].data().to(torch::kBFloat16));
-    }
-}
-
-// Copy gradients from bf16 policy to fp32 policy (for optimizer step)
-void copy_gradients_to_fp32(Policy* policy_bf16, Policy* policy_fp32) {
-    auto params_fp32 = policy_fp32->parameters();
-    auto params_bf16 = policy_bf16->parameters();
-    for (size_t i = 0; i < params_fp32.size(); ++i) {
-        if (params_bf16[i].grad().defined()) {
-            params_fp32[i].mutable_grad() = params_bf16[i].grad().to(torch::kFloat32);
-        }
     }
 }
 
@@ -799,41 +749,12 @@ torch::autograd::tensor_list fused_ppo_loss_cpp(
         clip_coef, vf_clip_coef, vf_coef, ent_coef, losses)};
 }
 
-// Fast clip_grad_norm_ for contiguous weights
-// Cats all grads for one-shot norm computation, then scales each grad
-void clip_grad_norm_(
-    const vector<Tensor>& parameters,
-    double max_norm
-    ) {
-  // Collect flattened grads
-  vector<Tensor> flat_grads;
-  flat_grads.reserve(parameters.size());
-
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      flat_grads.push_back(grad.flatten());
-    }
-  }
-
-  if (flat_grads.empty()) {
-    return;
-  }
-
-  // Single cat + norm (avoids per-param norm calls)
-  Tensor all_grads = torch::cat(flat_grads);
-  Tensor total_norm = all_grads.to(torch::kFloat32).norm(2);
-
-  // Compute clip coefficient
-  Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
-
-  // Scale each grad in-place
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      grad.mul_(clip_coef);
-    }
-  }
+// Fast clip_grad_norm_ for contiguous grad buffer
+void clip_grad_norm_(Tensor grad_buffer, double max_norm) {
+    if (!grad_buffer.defined() || grad_buffer.numel() == 0) return;
+    Tensor total_norm = grad_buffer.to(torch::kFloat32).norm(2);
+    Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
+    grad_buffer.mul_(clip_coef);
 }
 
 float cosine_annealing(float lr_base, float lr_min, int t, int T) {

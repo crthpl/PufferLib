@@ -44,47 +44,26 @@ struct Muon {
 
     // State
     torch::Tensor lr;              // scalar CUDA tensor
-    torch::Tensor weight_buffer;   // contiguous fp32 param buffer
+    torch::Tensor weight_buffer;   // contiguous fp32 param buffer (from allocator)
+    torch::Tensor grad_buffer;     // contiguous fp32 grad buffer (from allocator)
     torch::Tensor momentum_buffer; // contiguous momentum buffer
-    std::vector<torch::Tensor> params;
+    std::vector<torch::Tensor> params;  // views into weight_buffer (for per-param Newton-Schulz)
 
     // Multi-GPU
     ncclComm_t nccl_comm = nullptr;
     int world_size = 1;
 
-    Muon(std::vector<torch::Tensor> params, double lr_val, double momentum,
+    Muon(std::vector<torch::Tensor> params, torch::Tensor weight_buffer,
+         torch::Tensor grad_buffer, double lr_val, double momentum,
          double eps, double weight_decay)
         : momentum(momentum), weight_decay(weight_decay), eps(eps),
+          weight_buffer(weight_buffer), grad_buffer(grad_buffer),
           params(std::move(params))
     {
         TORCH_CHECK(lr_val >= 0, "Invalid learning rate: ", lr_val);
         TORCH_CHECK(eps >= 0, "Invalid epsilon value: ", eps);
         TORCH_CHECK(weight_decay >= 0, "Invalid weight_decay value: ", weight_decay);
         lr = torch::tensor(lr_val, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
-    }
-
-    void init_contiguous_weights() {
-        torch::NoGradGuard no_grad;
-
-        int64_t total_size = 0;
-        for (auto& p : params) {
-            total_size += p.numel();
-        }
-
-        auto device = params[0].device();
-        weight_buffer = torch::zeros({total_size},
-            torch::dtype(torch::kFloat32).device(device));
-        weight_buffer.set_requires_grad(true);
-
-        int64_t offset = 0;
-        for (auto& p : params) {
-            int64_t size = p.numel();
-            auto shape = p.sizes().vec();
-            weight_buffer.narrow(0, offset, size).copy_(p.flatten());
-            torch::Tensor view = weight_buffer.narrow(0, offset, size).view(shape);
-            p.set_data(view);
-            offset += size;
-        }
     }
 
     void step() {
@@ -97,16 +76,8 @@ struct Muon {
             momentum_buffer = torch::zeros_like(weight_buffer);
         }
 
-        // Gather grads into contiguous buffer
-        torch::Tensor all_grads = torch::zeros_like(weight_buffer);
-        int64_t offset = 0;
-        for (auto& p : params) {
-            int64_t size = p.numel();
-            if (p.grad().defined()) {
-                all_grads.narrow(0, offset, size).copy_(p.grad().flatten());
-            }
-            offset += size;
-        }
+        // Grads are already contiguous in grad_buffer
+        torch::Tensor all_grads = grad_buffer.clone();
 
         // Multi-GPU gradient sync
         if (nccl_comm != nullptr && world_size > 1) {
@@ -122,20 +93,18 @@ struct Muon {
 
         // Newton-Schulz per param
         torch::Tensor all_updates = torch::zeros_like(weight_buffer);
-        offset = 0;
+        int64_t offset = 0;
         for (auto& p : params) {
             int64_t size = p.numel();
-            if (p.grad().defined()) {
-                torch::Tensor update = all_grads.narrow(0, offset, size).view(p.sizes());
-                if (p.dim() >= 2) {
-                    auto G = update.view({update.size(0), -1});
-                    update = zeropower_via_newtonschulz(G);
-                    double ratio = (double)update.size(-2) / (double)update.size(-1);
-                    double scale = std::sqrt(std::max(1.0, ratio));
-                    update.mul_(scale);
-                }
-                all_updates.narrow(0, offset, size).copy_(update.flatten());
+            torch::Tensor update = all_grads.narrow(0, offset, size).view(p.sizes());
+            if (p.dim() >= 2) {
+                auto G = update.view({update.size(0), -1});
+                update = zeropower_via_newtonschulz(G);
+                double ratio = (double)update.size(-2) / (double)update.size(-1);
+                double scale = std::sqrt(std::max(1.0, ratio));
+                update.mul_(scale);
             }
+            all_updates.narrow(0, offset, size).copy_(update.flatten());
             offset += size;
         }
 
@@ -147,10 +116,8 @@ struct Muon {
     }
 
     void zero_grad() {
-        for (auto& p : params) {
-            if (p.grad().defined()) {
-                p.grad().zero_();
-            }
+        if (grad_buffer.defined()) {
+            grad_buffer.zero_();
         }
     }
 

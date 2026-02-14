@@ -204,6 +204,8 @@ typedef struct {
 typedef struct {
     Policy* policy_bf16;  // Working weights (bf16) - used for forward/backward
     Policy* policy_fp32;  // Master weights (fp32) - used for optimizer
+    Allocator alloc_fp32; // Contiguous param+grad buffers for fp32 policy
+    Allocator alloc_bf16; // Contiguous param buffer for bf16 policy
     StaticVec* vec;
     Muon* muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
@@ -423,49 +425,24 @@ void train_impl(PuffeRL& pufferl) {
 
             Tensor newvalue_out = graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)});
 
-            if (hypers.kernels) {
-                // Manual forward/backward path (no autograd)
-                auto [logits, newvalue] = pufferl.policy_bf16->forward_train_manual(graph.mb_obs, graph.mb_state);
+            auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
 
-                auto ppo_grads = ppo_loss_fwd_bwd(
-                    logits.mean, logits.logstd, newvalue,
-                    graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
-                    graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
-                    pufferl.act_sizes, pufferl.losses,
-                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef);
+            auto ppo_grads = ppo_loss_fwd_bwd(
+                logits.mean, logits.logstd, newvalue,
+                graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
+                graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
+                pufferl.act_sizes, pufferl.losses,
+                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef);
 
-                pufferl.policy_bf16->backward_manual(
-                    ppo_grads.grad_logits, ppo_grads.grad_logstd, ppo_grads.grad_values,
-                    pufferl.policy_fp32);
+            pufferl.policy_bf16->backward(
+                ppo_grads.grad_logits, ppo_grads.grad_logstd, ppo_grads.grad_values,
+                pufferl.policy_fp32);
 
-                clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
-                pufferl.muon->step();
-                pufferl.muon->zero_grad();
-                if (USE_BF16) {
-                    sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
-                }
-            } else {
-                // Autograd path
-                auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
-
-                Tensor loss = fused_ppo_loss_cpp(logits.mean, logits.logstd, newvalue,
-                    graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
-                    graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
-                    pufferl.act_sizes, pufferl.losses,
-                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef)[0];
-
-                loss.backward();
-
-                if (USE_BF16) {
-                    copy_gradients_to_fp32(pufferl.policy_bf16, pufferl.policy_fp32);
-                }
-                clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
-                pufferl.muon->step();
-                pufferl.muon->zero_grad();
-                if (USE_BF16) {
-                    pufferl.policy_bf16->zero_grad();
-                    sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
-                }
+            clip_grad_norm_(pufferl.alloc_fp32.grad_buffer, hypers.max_grad_norm);
+            pufferl.muon->step();
+            pufferl.muon->zero_grad();
+            if (USE_BF16) {
+                sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
             }
 
             if (capturing) {
@@ -608,30 +585,30 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
 
     // Create fp32 master policy (for optimizer - precise gradient accumulation)
-    Policy* policy_fp32 = create_policy(env_name, input_size, hidden_size,
-        decoder_output_size, num_layers, act_n, is_continuous, kernels);
-    policy_fp32->to(torch::kCUDA);
-    policy_fp32->to(torch::kFloat32);
+    Policy* policy_fp32 = create_policy(env_name, pufferl->alloc_fp32,
+        input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
+    pufferl->alloc_fp32.create(torch::kCUDA, torch::kFloat32);
+    policy_fp32->init_weights();
     pufferl->policy_fp32 = policy_fp32;
 
     if (USE_BF16) {
-        // create bf16 working policy (for fwd/bwd)
-        Policy* policy_bf16 = create_policy(env_name, input_size, hidden_size,
-            decoder_output_size, num_layers, act_n, is_continuous, kernels);
-        policy_bf16->to(torch::kCUDA);
-        policy_bf16->to(torch::kBFloat16);
+        // create bf16 working policy (for fwd/bwd — no grads needed)
+        Policy* policy_bf16 = create_policy(env_name, pufferl->alloc_bf16,
+            input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
+        pufferl->alloc_bf16.create(torch::kCUDA, torch::kBFloat16);
         pufferl->policy_bf16 = policy_bf16;
         sync_policy_weights(policy_bf16, policy_fp32); // initial sync
     } else {
         pufferl->policy_bf16 = policy_fp32;
     }
 
-    // Optimizer uses fp32 master weights for precise gradient accumulation
+    // Optimizer uses fp32 master weights with contiguous buffers from allocator
     float lr = hypers.lr;
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
-    pufferl->muon = new Muon(policy_fp32->parameters(), lr, beta1, eps, 0.0);
-    pufferl->muon->init_contiguous_weights();
+    pufferl->muon = new Muon(policy_fp32->parameters(),
+        pufferl->alloc_fp32.param_buffer, pufferl->alloc_fp32.grad_buffer,
+        lr, beta1, eps, 0.0);
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weight_buffer.numel());
@@ -714,9 +691,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             sync_policy_weights(pufferl->policy_bf16, pufferl->policy_fp32);
         }
         pufferl->muon->zero_grad();
-        if (USE_BF16) {
-            pufferl->policy_bf16->zero_grad();
-        }
         } // end NoGradGuard
 
         pufferl->epoch = 0;

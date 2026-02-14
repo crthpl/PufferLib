@@ -110,6 +110,57 @@ PPOGrads ppo_loss_fwd_bwd(
     torch::Tensor act_sizes, torch::Tensor losses_acc,
     float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef);
 
+// Contiguous memory allocator for params/grads
+struct Allocator {
+    struct Registration {
+        torch::Tensor* ptr;
+        int64_t size;
+        std::vector<int64_t> shape;
+    };
+    std::vector<Registration> params, grads;
+    torch::Tensor param_buffer, grad_buffer;
+
+    void register_param(torch::Tensor* ptr, std::vector<int64_t> shape) {
+        int64_t size = 1;
+        for (auto s : shape) size *= s;
+        params.push_back({ptr, size, shape});
+    }
+
+    void register_grad(torch::Tensor* ptr, std::vector<int64_t> shape) {
+        int64_t size = 1;
+        for (auto s : shape) size *= s;
+        grads.push_back({ptr, size, shape});
+    }
+
+    void create(torch::Device device, torch::ScalarType dtype) {
+        // Allocate contiguous param buffer
+        int64_t total_params = 0;
+        for (auto& r : params) total_params += r.size;
+        if (total_params > 0) {
+            param_buffer = torch::zeros({total_params},
+                torch::dtype(dtype).device(device));
+            int64_t offset = 0;
+            for (auto& r : params) {
+                *r.ptr = param_buffer.narrow(0, offset, r.size).view(r.shape);
+                offset += r.size;
+            }
+        }
+
+        // Allocate contiguous grad buffer
+        int64_t total_grads = 0;
+        for (auto& r : grads) total_grads += r.size;
+        if (total_grads > 0) {
+            grad_buffer = torch::zeros({total_grads},
+                torch::dtype(dtype).device(device));
+            int64_t offset = 0;
+            for (auto& r : grads) {
+                *r.ptr = grad_buffer.narrow(0, offset, r.size).view(r.shape);
+                offset += r.size;
+            }
+        }
+    }
+};
+
 // Puff Advantage CUDA dispatch
 namespace pufferlib {
 void puff_advantage_cuda(

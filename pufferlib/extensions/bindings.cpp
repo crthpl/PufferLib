@@ -338,12 +338,32 @@ PYBIND11_MODULE(_C, m) {
     py::class_<DriveEncoder, std::shared_ptr<DriveEncoder>, Encoder>(m, "DriveEncoder")
         .def(py::init<int, int>());
 
-    py::class_<RNN, std::shared_ptr<RNN>, torch::nn::Module>(m, "RNN");
-    py::class_<MinGRU, std::shared_ptr<MinGRU>, RNN>(m, "MinGRU")
-        .def(py::init<int, int, bool>(), py::arg("hidden"), py::arg("num_layers") = 1, py::arg("kernels") = true);
+    py::class_<Allocator>(m, "Allocator")
+        .def(py::init<>())
+        .def_readwrite("param_buffer", &Allocator::param_buffer)
+        .def_readwrite("grad_buffer", &Allocator::grad_buffer);
 
-    py::class_<Policy, std::shared_ptr<Policy>, torch::nn::Module> cls2(m, "Policy");
-    cls2.def(py::init<std::shared_ptr<Encoder>, std::shared_ptr<Decoder>, std::shared_ptr<RNN>, int, int, int>());
-    cls2.def("forward", &Policy::forward);
-    cls2.def("forward_train", &Policy::forward_train);
+    py::class_<MinGRU>(m, "MinGRU")
+        .def(py::init<int, int>(), py::arg("hidden"), py::arg("num_layers") = 1);
+
+    py::class_<Policy>(m, "Policy")
+        .def(py::init([](Allocator& alloc, int input, int hidden, int output,
+                         int num_layers, int num_atns, bool continuous) {
+            return new Policy(alloc, input, hidden, output, num_layers, num_atns, continuous);
+        }))
+        .def("forward", &Policy::forward)
+        .def("forward_train", &Policy::forward_train)
+        .def("init_weights", &Policy::init_weights)
+        .def("parameters", &Policy::parameters)
+        .def("named_parameters", [](Policy& self) {
+            auto params = self.parameters();
+            std::vector<std::string> names = {"encoder.linear.weight", "decoder.linear.weight"};
+            if (self.logstd_param.defined()) names.push_back("decoder.logstd");
+            for (int i = 0; i < self.rnn.num_layers; i++)
+                names.push_back("rnn.layer_" + std::to_string(i) + ".weight");
+            std::vector<std::pair<std::string, torch::Tensor>> result;
+            for (size_t i = 0; i < params.size(); i++)
+                result.push_back({names[i], params[i]});
+            return result;
+        });
 }
