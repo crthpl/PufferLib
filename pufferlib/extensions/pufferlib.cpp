@@ -349,6 +349,7 @@ void train_impl(PuffeRL& pufferl) {
     rollouts.terminals = pufferl.rollouts.terminals.transpose(0, 1).contiguous();
     rollouts.ratio = pufferl.rollouts.ratio.transpose(0, 1).contiguous();
     rollouts.values = pufferl.rollouts.values.transpose(0, 1).contiguous();
+    Tensor old_values = rollouts.values.clone();
 
     rollouts.rewards.clamp_(-1.0, 1.0);  // Clamp rewards here instead of in eval to save a kernel call per step
                                          
@@ -403,7 +404,7 @@ void train_impl(PuffeRL& pufferl) {
         profile_begin("train_select_and_copy", hypers.profile);
         train_select_and_copy(
             rollouts.observations, rollouts.actions, rollouts.logprobs,
-            rollouts.values, advantages,
+            old_values, advantages,
             idx, mb_prio,
             graph.mb_obs, graph.mb_state, graph.mb_actions,
             graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
@@ -456,10 +457,10 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_warmup++;
         }
 
-        Tensor new_ratio = graph.mb_ratio.detach().squeeze(-1).to(PRECISION_DTYPE).transpose(0, 1);
-        pufferl.rollouts.ratio.index_copy_(1, idx, new_ratio);
-        Tensor new_value = graph.mb_newvalue.detach().squeeze(-1).to(PRECISION_DTYPE).transpose(0, 1);
-        pufferl.rollouts.values.index_copy_(1, idx, new_value);
+        Tensor new_ratio = graph.mb_ratio.detach().squeeze(-1).to(PRECISION_DTYPE);
+        rollouts.ratio.index_copy_(0, idx, new_ratio);
+        Tensor new_value = graph.mb_newvalue.detach().squeeze(-1).to(PRECISION_DTYPE);
+        rollouts.values.index_copy_(0, idx, new_value);
         cudaEventRecord(pufferl.profile.events[4]);  // end forward
     }
     pufferl.epoch += 1;
