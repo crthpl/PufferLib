@@ -132,8 +132,8 @@ tensor_list PrefixScan::backward(AutogradCtx* ctx, tensor_list grad_outputs) {
     return {grad_combined, grad_state};
 }
 
-// Direct (non-autograd) prefix scan forward — returns buffers struct
-PrefixScanBuffers prefix_scan_forward_direct(Tensor combined, Tensor state) {
+// Direct (non-autograd) prefix scan forward — writes into pre-allocated bufs
+void prefix_scan_forward_direct(Tensor combined, Tensor state, PrefixScanBuffers& bufs) {
     TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
     TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
     TORCH_CHECK(combined.dtype() == state.dtype(), "dtypes must match");
@@ -145,37 +145,31 @@ PrefixScanBuffers prefix_scan_forward_direct(Tensor combined, Tensor state) {
     TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
                 "All tensors must be contiguous");
 
-    auto device = combined.device();
     int B = static_cast<int>(combined.size(0));
     int T = static_cast<int>(combined.size(1));
     int H = static_cast<int>(state.size(2));
-    auto T_buf = T + 1;
 
-    auto out = torch::empty({B, T, H}, state.options());
-    auto next_state = torch::empty({B, 1, H}, state.options());
+    // Save references for backward
+    bufs.combined = combined;
+    bufs.state = state;
 
-    auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    auto a_star = torch::empty({B, T_buf, H}, options_float);
-    auto s_vals = torch::empty({B, T_buf, H}, options_float);
-    auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // Write into pre-allocated out, next_state, a_star, s_vals, log_values_buf
     fused_scan_forward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)out.data_ptr(),
-        (precision_t*)next_state.data_ptr(),
-        a_star.data_ptr<float>(),
-        s_vals.data_ptr<float>(),
-        log_values_buf.data_ptr<float>(),
+        (precision_t*)bufs.out.data_ptr(),
+        (precision_t*)bufs.next_state.data_ptr(),
+        bufs.a_star.data_ptr<float>(),
+        bufs.s_vals.data_ptr<float>(),
+        bufs.log_values_buf.data_ptr<float>(),
         (const precision_t*)combined.data_ptr(),
         (const precision_t*)state.data_ptr(),
         T, H, B);
-
-    return {combined, state, a_star, s_vals, log_values_buf, out};
 }
 
-// Direct (non-autograd) prefix scan backward — takes buffers struct
-vector<Tensor> prefix_scan_backward_direct(
-    Tensor grad_out, Tensor grad_next_state, const PrefixScanBuffers& bufs) {
+// Direct (non-autograd) prefix scan backward — writes into pre-allocated bufs
+void prefix_scan_backward_direct(
+    Tensor grad_out, Tensor grad_next_state, PrefixScanBuffers& bufs) {
     TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");
     TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
 
@@ -183,13 +177,12 @@ vector<Tensor> prefix_scan_backward_direct(
     int T = static_cast<int>(bufs.combined.size(1));
     int H = static_cast<int>(bufs.state.size(2));
 
-    auto grad_combined = torch::empty_like(bufs.combined);
-    auto grad_state = torch::empty_like(bufs.state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // Write into pre-allocated grad_combined, grad_state
     fused_scan_backward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)grad_combined.data_ptr(),
-        (precision_t*)grad_state.data_ptr(),
+        (precision_t*)bufs.grad_combined.data_ptr(),
+        (precision_t*)bufs.grad_state.data_ptr(),
         (const precision_t*)grad_out.data_ptr(),
         (const precision_t*)grad_next_state.data_ptr(),
         (const precision_t*)bufs.combined.data_ptr(),
@@ -198,8 +191,6 @@ vector<Tensor> prefix_scan_backward_direct(
         bufs.s_vals.data_ptr<float>(),
         bufs.log_values_buf.data_ptr<float>(),
         T, H, B);
-
-    return {grad_combined, grad_state};
 }
 
 // LogCumsumExp x = (B, T, H)
@@ -447,14 +438,15 @@ tensor_list PPOLoss::backward(
 
 
 // Fused PPO loss forward + backward (no autograd)
-// Runs forward kernel then backward kernel, returns gradients directly
-PPOGrads ppo_loss_fwd_bwd(
+// Runs forward kernel then backward kernel, writes gradients into pre-allocated PPOBuffers
+void ppo_loss_fwd_bwd(
     Tensor logits, Tensor logstd, Tensor values_pred,
     Tensor actions, Tensor old_logprobs, Tensor advantages,
     Tensor prio, Tensor values, Tensor returns,
     Tensor ratio_out, Tensor newvalue_out,
     Tensor act_sizes, Tensor losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef
+    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+    PPOBuffers& bufs
 ) {
     TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
     TORCH_CHECK(act_sizes.is_cuda() && act_sizes.dtype() == torch::kInt32,
@@ -472,7 +464,6 @@ PPOGrads ppo_loss_fwd_bwd(
     bool is_continuous = logstd.defined() && logstd.numel() > 0;
     if (is_continuous) logstd = logstd.contiguous();
 
-    auto device = logits.device();
     int N = static_cast<int>(logits.size(0));
     int T = static_cast<int>(logits.size(1));
     int A_total = static_cast<int>(logits.size(2));
@@ -481,11 +472,6 @@ PPOGrads ppo_loss_fwd_bwd(
 
     auto [adv_var, adv_mean] = torch::var_mean(advantages);
     auto actions_flat = actions.reshape({total, num_atns}).contiguous();
-
-    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    auto opts_f64 = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-    auto loss_output = torch::empty({1}, opts_f32);
-    auto saved_for_backward = torch::zeros({total, 5}, opts_f64);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -497,12 +483,13 @@ PPOGrads ppo_loss_fwd_bwd(
 
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
 
-    // Forward kernel
-    cudaMemsetAsync(loss_output.data_ptr<float>(), 0, sizeof(float), stream);
+    // Forward kernel — writes into pre-allocated bufs.loss_output, bufs.saved_for_bwd
+    cudaMemsetAsync(bufs.loss_output.data_ptr<float>(), 0, sizeof(float), stream);
+    bufs.saved_for_bwd.zero_();
     ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        loss_output.data_ptr<float>(),
+        bufs.loss_output.data_ptr<float>(),
         losses_acc.data_ptr<float>(),
-        saved_for_backward.data_ptr<double>(),
+        bufs.saved_for_bwd.data_ptr<double>(),
         (precision_t*)ratio_out.data_ptr(),
         (precision_t*)newvalue_out.data_ptr(),
         (const precision_t*)logits.data_ptr(),
@@ -526,20 +513,12 @@ PPOGrads ppo_loss_fwd_bwd(
 
     losses_acc.select(0, LOSS_N).add_(1.0);
 
-    // Backward kernel with grad_loss = 1.0
-    auto grad_loss = torch::ones({1}, opts_f32);
-    auto grad_logits = torch::empty(logits.sizes(), opts_f32);
-    auto grad_values_pred = torch::empty(values_pred.sizes(), opts_f32);
-    Tensor grad_logstd_out;
-    if (is_continuous) {
-        grad_logstd_out = torch::empty(logstd.sizes(), opts_f32);
-    }
-
+    // Backward kernel — writes into pre-allocated bufs.grad_logits, bufs.grad_values, bufs.grad_logstd
     ppo_loss_backward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        grad_logits.data_ptr<float>(),
-        is_continuous ? grad_logstd_out.data_ptr<float>() : nullptr,
-        grad_values_pred.data_ptr<float>(),
-        grad_loss.data_ptr<float>(),
+        bufs.grad_logits.data_ptr<float>(),
+        is_continuous ? bufs.grad_logstd.data_ptr<float>() : nullptr,
+        bufs.grad_values.data_ptr<float>(),
+        bufs.grad_loss.data_ptr<float>(),
         (const precision_t*)logits.data_ptr(),
         is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
         (const precision_t*)values_pred.data_ptr(),
@@ -558,8 +537,6 @@ PPOGrads ppo_loss_fwd_bwd(
         logits_stride_n, logits_stride_t, logits_stride_a,
         values_stride_n, values_stride_t,
         is_continuous);
-
-    return {grad_logits, grad_logstd_out, grad_values_pred};
 }
 
 // Fused sample_logits: handles both discrete and continuous action sampling

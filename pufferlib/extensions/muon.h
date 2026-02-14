@@ -47,6 +47,8 @@ struct Muon {
     torch::Tensor weight_buffer;   // contiguous fp32 param buffer (from allocator)
     torch::Tensor grad_buffer;     // contiguous fp32 grad buffer (from allocator)
     torch::Tensor momentum_buffer; // contiguous momentum buffer
+    torch::Tensor grad_clone;      // pre-allocated clone buffer for nesterov momentum
+    torch::Tensor updates;         // pre-allocated buffer for Newton-Schulz updates
     std::vector<torch::Tensor> params;  // views into weight_buffer (for per-param Newton-Schulz)
 
     // Multi-GPU
@@ -71,32 +73,34 @@ struct Muon {
 
         if (!weight_buffer.defined()) return;
 
-        // Initialize momentum buffer lazily
+        // Initialize persistent buffers lazily
         if (!momentum_buffer.defined()) {
             momentum_buffer = torch::zeros_like(weight_buffer);
+            grad_clone = torch::empty_like(weight_buffer);
+            updates = torch::empty_like(weight_buffer);
         }
 
-        // Grads are already contiguous in grad_buffer
-        torch::Tensor all_grads = grad_buffer.clone();
+        // Copy grads into persistent clone buffer
+        grad_clone.copy_(grad_buffer);
 
         // Multi-GPU gradient sync
         if (nccl_comm != nullptr && world_size > 1) {
-            ncclAllReduce(all_grads.data_ptr(), all_grads.data_ptr(),
-                          all_grads.numel(), ncclFloat, ncclAvg,
+            ncclAllReduce(grad_clone.data_ptr(), grad_clone.data_ptr(),
+                          grad_clone.numel(), ncclFloat, ncclAvg,
                           nccl_comm, at::cuda::getCurrentCUDAStream());
         }
 
         // Nesterov momentum
         momentum_buffer.mul_(momentum);
-        momentum_buffer.add_(all_grads);
-        all_grads.add_(momentum_buffer, momentum);
+        momentum_buffer.add_(grad_clone);
+        grad_clone.add_(momentum_buffer, momentum);
 
         // Newton-Schulz per param
-        torch::Tensor all_updates = torch::zeros_like(weight_buffer);
+        updates.zero_();
         int64_t offset = 0;
         for (auto& p : params) {
             int64_t size = p.numel();
-            torch::Tensor update = all_grads.narrow(0, offset, size).view(p.sizes());
+            torch::Tensor update = grad_clone.narrow(0, offset, size).view(p.sizes());
             if (p.dim() >= 2) {
                 auto G = update.view({update.size(0), -1});
                 update = zeropower_via_newtonschulz(G);
@@ -104,7 +108,7 @@ struct Muon {
                 double scale = std::sqrt(std::max(1.0, ratio));
                 update.mul_(scale);
             }
-            all_updates.narrow(0, offset, size).copy_(update.flatten());
+            updates.narrow(0, offset, size).copy_(update.flatten());
             offset += size;
         }
 
@@ -112,7 +116,7 @@ struct Muon {
         if (weight_decay != 0) {
             weight_buffer.mul_(1 - lr * weight_decay);
         }
-        weight_buffer.sub_(all_updates * lr);
+        weight_buffer.sub_(updates * lr);
     }
 
     void zero_grad() {
@@ -135,6 +139,12 @@ struct Muon {
         it = state.find("weight_buffer");
         if (it != state.end()) weight_buffer.copy_(it->second);
         it = state.find("momentum_buffer");
-        if (it != state.end()) momentum_buffer.copy_(it->second);
+        if (it != state.end()) {
+            momentum_buffer.copy_(it->second);
+            if (!grad_clone.defined()) {
+                grad_clone = torch::empty_like(weight_buffer);
+                updates = torch::empty_like(weight_buffer);
+            }
+        }
     }
 };

@@ -344,7 +344,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("grad_buffer", &Allocator::grad_buffer);
 
     py::class_<MinGRU>(m, "MinGRU")
-        .def(py::init<int, int>(), py::arg("hidden"), py::arg("num_layers") = 1);
+        .def(py::init<Allocator&, int, int>(), py::arg("alloc"), py::arg("hidden"), py::arg("num_layers") = 1);
 
     py::class_<Policy>(m, "Policy")
         .def(py::init([](Allocator& alloc, int input, int hidden, int output,
@@ -358,7 +358,7 @@ PYBIND11_MODULE(_C, m) {
         .def("named_parameters", [](Policy& self) {
             auto params = self.parameters();
             std::vector<std::string> names = {"encoder.linear.weight", "decoder.linear.weight"};
-            if (self.logstd_param.defined()) names.push_back("decoder.logstd");
+            if (self.decoder.logstd.defined()) names.push_back("decoder.logstd");
             for (int i = 0; i < self.rnn.num_layers; i++)
                 names.push_back("rnn.layer_" + std::to_string(i) + ".weight");
             std::vector<std::pair<std::string, torch::Tensor>> result;

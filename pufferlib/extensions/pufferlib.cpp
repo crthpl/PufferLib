@@ -223,6 +223,7 @@ typedef struct {
     Tensor act_sizes;      // CUDA int32 tensor of action head sizes for MultiDiscrete
     Tensor act_sizes_cpu;  // CPU int64 tensor (pre-computed to avoid alloc during graph replay)
     Tensor losses;         // (NUM_LOSSES,) float32 accumulator for loss components
+    PPOBuffers ppo_bufs;   // Pre-allocated buffers for ppo_loss_fwd_bwd
     ProfileT profile;
     nvmlDevice_t nvml_device;
     int epoch;
@@ -427,22 +428,23 @@ void train_impl(PuffeRL& pufferl) {
 
             auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
 
-            auto ppo_grads = ppo_loss_fwd_bwd(
+            ppo_loss_fwd_bwd(
                 logits.mean, logits.logstd, newvalue,
                 graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
                 graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
                 pufferl.act_sizes, pufferl.losses,
-                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef);
+                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
+                pufferl.ppo_bufs);
 
             pufferl.policy_bf16->backward(
-                ppo_grads.grad_logits, ppo_grads.grad_logstd, ppo_grads.grad_values,
+                pufferl.ppo_bufs.grad_logits, pufferl.ppo_bufs.grad_logstd, pufferl.ppo_bufs.grad_values,
                 pufferl.policy_fp32);
 
             clip_grad_norm_(pufferl.alloc_fp32.grad_buffer, hypers.max_grad_norm);
             pufferl.muon->step();
             pufferl.muon->zero_grad();
             if (USE_BF16) {
-                sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
+                sync_policy_weights(pufferl.alloc_bf16.param_buffer, pufferl.alloc_fp32.param_buffer);
             }
 
             if (capturing) {
@@ -584,10 +586,17 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     bool is_continuous = pufferl->is_continuous;
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
 
+    int minibatch_segments = hypers.minibatch_size / hypers.horizon;
+
     // Create fp32 master policy (for optimizer - precise gradient accumulation)
     Policy* policy_fp32 = create_policy(env_name, pufferl->alloc_fp32,
         input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
+    if (!USE_BF16) {
+        // fp32-only mode: fp32 policy also runs forward/backward, needs activations
+        policy_fp32->register_activations(pufferl->alloc_fp32, minibatch_segments, hypers.horizon);
+    }
     pufferl->alloc_fp32.create(torch::kCUDA, torch::kFloat32);
+    if (!USE_BF16) policy_fp32->bind_zero_buffer(pufferl->alloc_fp32);
     policy_fp32->init_weights();
     pufferl->policy_fp32 = policy_fp32;
 
@@ -595,9 +604,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         // create bf16 working policy (for fwd/bwd — no grads needed)
         Policy* policy_bf16 = create_policy(env_name, pufferl->alloc_bf16,
             input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
+        policy_bf16->register_activations(pufferl->alloc_bf16, minibatch_segments, hypers.horizon);
         pufferl->alloc_bf16.create(torch::kCUDA, torch::kBFloat16);
+        policy_bf16->bind_zero_buffer(pufferl->alloc_bf16);
         pufferl->policy_bf16 = policy_bf16;
-        sync_policy_weights(policy_bf16, policy_fp32); // initial sync
+        sync_policy_weights(pufferl->alloc_bf16.param_buffer, pufferl->alloc_fp32.param_buffer); // initial sync
     } else {
         pufferl->policy_bf16 = policy_fp32;
     }
@@ -613,6 +624,10 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weight_buffer.numel());
 
+    // Pre-allocate PPO loss buffers
+    pufferl->ppo_bufs.create(minibatch_segments, hypers.horizon, decoder_output_size,
+        is_continuous, torch::kCUDA);
+
     // Allocate buffers
     int horizon = hypers.horizon;
     int total_agents = vec->total_agents;
@@ -621,8 +636,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
 
     printf("DEBUG: num_envs=%d, total_agents=%d, batch=%d, num_buffers=%d\n",
         vec->size, total_agents, batch, num_buffers);
-
-    int minibatch_segments = hypers.minibatch_size / horizon;
 
     pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
@@ -686,9 +699,11 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             pufferl->muon->momentum_buffer.copy_(saved_momentum);
         } else {
             pufferl->muon->momentum_buffer = Tensor();
+            pufferl->muon->grad_clone = Tensor();
+            pufferl->muon->updates = Tensor();
         }
         if (USE_BF16) {
-            sync_policy_weights(pufferl->policy_bf16, pufferl->policy_fp32);
+            sync_policy_weights(pufferl->alloc_bf16.param_buffer, pufferl->alloc_fp32.param_buffer);
         }
         pufferl->muon->zero_grad();
         } // end NoGradGuard
@@ -760,6 +775,7 @@ void close_impl(PuffeRL& pufferl) {
     pufferl.act_sizes_cpu = Tensor();
     pufferl.losses = Tensor();
     pufferl.rng_offset = Tensor();
+    pufferl.ppo_bufs = PPOBuffers();
 
     // Clear env tensors (from_blob wrappers - don't own memory but hold refs)
     pufferl.env.obs = Tensor();
