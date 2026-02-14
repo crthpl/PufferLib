@@ -78,6 +78,38 @@ void train_select_and_copy_cuda(
     torch::Tensor dst_advantages, torch::Tensor dst_prio,
     torch::Tensor dst_values, torch::Tensor dst_returns);
 
+// Direct (non-autograd) prefix scan buffers
+struct PrefixScanBuffers {
+    torch::Tensor combined;       // (B, T, 3*H) precision_t
+    torch::Tensor state;          // (B, 1, H) precision_t
+    torch::Tensor a_star;         // (B, T+1, H) float32
+    torch::Tensor s_vals;         // (B, T+1, H) float32
+    torch::Tensor log_values_buf; // (B, T+1, H) float32
+    torch::Tensor out;            // (B, T, H) precision_t
+};
+
+// PPO gradient outputs from fused forward+backward
+struct PPOGrads {
+    torch::Tensor grad_logits;    // (N, T, A_total) float32
+    torch::Tensor grad_logstd;    // (N, T, A_total) float32, or empty for discrete
+    torch::Tensor grad_values;    // (N, T, 1) float32
+};
+
+// Direct (non-autograd) prefix scan forward/backward
+PrefixScanBuffers prefix_scan_forward_direct(torch::Tensor combined, torch::Tensor state);
+std::vector<torch::Tensor> prefix_scan_backward_direct(
+    torch::Tensor grad_out, torch::Tensor grad_next_state,
+    const PrefixScanBuffers& bufs);
+
+// Fused PPO loss forward + backward (no autograd)
+PPOGrads ppo_loss_fwd_bwd(
+    torch::Tensor logits, torch::Tensor logstd, torch::Tensor values_pred,
+    torch::Tensor actions, torch::Tensor old_logprobs, torch::Tensor advantages,
+    torch::Tensor prio, torch::Tensor values, torch::Tensor returns,
+    torch::Tensor ratio_out, torch::Tensor newvalue_out,
+    torch::Tensor act_sizes, torch::Tensor losses_acc,
+    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef);
+
 // Puff Advantage CUDA dispatch
 namespace pufferlib {
 void puff_advantage_cuda(

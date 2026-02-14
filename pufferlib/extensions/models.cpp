@@ -148,6 +148,15 @@ vector<Tensor> fused_scan_cpp(Tensor combined, Tensor state) {
     return {out, next_state};
 }
 
+// Helper: accumulate gradient on a parameter (handles undefined grad case)
+static inline void acc_grad(Tensor& param, Tensor grad) {
+    if (param.grad().defined()) {
+        param.mutable_grad().add_(grad);
+    } else {
+        param.mutable_grad() = grad;
+    }
+}
+
 struct RNN : public nn::Module {
     virtual tuple<Tensor, Tensor> forward(Tensor x, Tensor state) = 0;
     virtual Tensor forward_train(Tensor x, Tensor state) = 0;
@@ -208,6 +217,57 @@ struct MinGRU : public RNN {
         }
         return x;
     }
+
+    // === Manual forward/backward (no autograd) ===
+
+    // Saved activations for manual backward
+    vector<Tensor> saved_rnn_inputs;          // input to each layer's linear
+    vector<PrefixScanBuffers> saved_scan_bufs; // prefix scan buffers per layer
+
+    // Training forward without autograd: x (B, TT, H), state (num_layers, B, 1, H) -> h (B, TT, H)
+    Tensor forward_train_manual(Tensor x, Tensor state) {
+        torch::NoGradGuard no_grad;
+        saved_rnn_inputs.resize(num_layers);
+        saved_scan_bufs.resize(num_layers);
+
+        for (int i = 0; i < num_layers; i++) {
+            saved_rnn_inputs[i] = x;
+            Tensor state_i = state.select(0, i);
+            Tensor combined = layers[i]->forward(x);
+            saved_scan_bufs[i] = prefix_scan_forward_direct(combined.contiguous(), state_i);
+            x = saved_scan_bufs[i].out;
+        }
+        return x;
+    }
+
+    // Manual backward: grad (B, TT, H) bf16 -> grad_input (B, TT, H) bf16
+    // All matmuls in bf16 (matching autograd). Only small weight grads converted to fp32.
+    Tensor backward_manual(Tensor grad, MinGRU* target) {
+        torch::NoGradGuard no_grad;
+        int B = grad.size(0);
+        int TT = grad.size(1);
+        int H = grad.size(2);
+        Tensor grad_next_state = torch::zeros({B, 1, H},
+            torch::dtype(PRECISION_DTYPE).device(grad.device()));
+
+        for (int i = num_layers - 1; i >= 0; i--) {
+            auto scan_grads = prefix_scan_backward_direct(
+                grad.contiguous(), grad_next_state, saved_scan_bufs[i]);
+            Tensor gc_flat = scan_grads[0].reshape({B * TT, 3 * H});  // bf16
+            Tensor inp_flat = saved_rnn_inputs[i].reshape({B * TT, H});  // bf16
+
+            // Weight grad: bf16 matmul -> small result converted to fp32
+            acc_grad(target->layers[i]->weight,
+                     torch::mm(gc_flat.t(), inp_flat).to(torch::kFloat32));
+
+            // Input grad: bf16 matmul with self's bf16 weights, stays bf16
+            grad = torch::mm(gc_flat, layers[i]->weight).reshape({B, TT, H});
+        }
+
+        saved_rnn_inputs.clear();
+        saved_scan_bufs.clear();
+        return grad;
+    }
 };
 
 struct Policy : public nn::Module {
@@ -264,6 +324,105 @@ struct Policy : public nn::Module {
         values = values.reshape({B, TT, 1});
 
         return {logits, values};
+    }
+
+    // === Manual forward/backward (no autograd) ===
+
+    // Saved activations for manual backward
+    Tensor saved_obs_flat;       // (B*TT, input) precision_t
+    Tensor saved_decoder_input;  // (B*TT, hidden) precision_t
+
+    // Training forward without autograd
+    tuple<Logits, Tensor> forward_train_manual(Tensor x, Tensor state) {
+        torch::NoGradGuard no_grad;
+        TORCH_CHECK(x.dim() == 3 && x.size(-1) == input,
+            "Expected obs={B, TT, ", input, "}, Got ", x.sizes());
+
+        int B = x.size(0);
+        int TT = x.size(1);
+
+        x = x.reshape({B*TT, input});
+        saved_obs_flat = x;
+
+        Tensor h = encoder->forward(x);
+        h = h.reshape({B, TT, hidden});
+
+        auto mingru = std::dynamic_pointer_cast<MinGRU>(rnn);
+        TORCH_CHECK(mingru, "forward_train_manual only supports MinGRU");
+        h = mingru->forward_train_manual(h, state);
+
+        Tensor flat_h = h.reshape({-1, hidden});
+        saved_decoder_input = flat_h;
+
+        auto [logits, values] = decoder->forward(flat_h);
+
+        logits.mean = logits.mean.reshape({B, TT, num_atns});
+        if (logits.logstd.defined()) {
+            logits.logstd = logits.logstd.reshape({B, TT, num_atns});
+        } else {
+            logits.logstd = torch::empty({0}, logits.mean.options());
+        }
+        values = values.reshape({B, TT, 1});
+
+        return {logits, values};
+    }
+
+    // Manual backward: chains grad through decoder -> rnn -> encoder
+    // All matmuls in bf16 (matching autograd). Only small weight grads converted to fp32.
+    void backward_manual(Tensor grad_logits, Tensor grad_logstd, Tensor grad_value,
+                         Policy* target) {
+        torch::NoGradGuard no_grad;
+
+        auto dec_self = std::dynamic_pointer_cast<DefaultDecoder>(decoder);
+        auto dec_target = std::dynamic_pointer_cast<DefaultDecoder>(target->decoder);
+        TORCH_CHECK(dec_target, "backward_manual only supports DefaultDecoder");
+
+        int B_TT = saved_decoder_input.size(0);
+        int output = dec_target->output;
+        int B = grad_logits.size(0);
+        int TT = grad_logits.size(1);
+
+        // --- Decoder backward ---
+        // Cast PPO fp32 grads to bf16 (matching autograd's implicit cast)
+        Tensor grad_dec_out = torch::cat({
+            grad_logits.reshape({B_TT, -1}).to(PRECISION_DTYPE),
+            grad_value.reshape({B_TT, 1}).to(PRECISION_DTYPE)
+        }, 1);  // (B*TT, output+1) bf16
+
+        // Weight grad: bf16 matmul -> small result converted to fp32
+        acc_grad(dec_target->linear->weight,
+                 torch::mm(grad_dec_out.t(), saved_decoder_input).to(torch::kFloat32));
+
+        // logstd grad (continuous only)
+        if (dec_target->continuous && grad_logstd.defined() && grad_logstd.numel() > 0) {
+            Tensor logstd_grad = grad_logstd.reshape({-1, output}).sum(0, /*keepdim=*/true);
+            acc_grad(dec_target->logstd_param, logstd_grad);
+        }
+
+        // Input grad: bf16 matmul with self's bf16 weight, stays bf16
+        Tensor grad_h = torch::mm(grad_dec_out, dec_self->linear->weight)
+                            .reshape({B, TT, hidden});
+
+        // --- MinGRU backward ---
+        auto mingru_self = std::dynamic_pointer_cast<MinGRU>(rnn);
+        auto mingru_target = std::dynamic_pointer_cast<MinGRU>(target->rnn);
+        TORCH_CHECK(mingru_self && mingru_target, "backward_manual only supports MinGRU");
+        grad_h = mingru_self->backward_manual(grad_h, mingru_target.get());
+
+        // --- Encoder backward ---
+        auto enc_self = std::dynamic_pointer_cast<DefaultEncoder>(encoder);
+        auto enc_target = std::dynamic_pointer_cast<DefaultEncoder>(target->encoder);
+        TORCH_CHECK(enc_target, "backward_manual only supports DefaultEncoder");
+
+        Tensor grad_enc = grad_h.reshape({B_TT, hidden});  // bf16
+
+        // Weight grad: bf16 matmul -> small result converted to fp32
+        acc_grad(enc_target->linear->weight,
+                 torch::mm(grad_enc.t(), saved_obs_flat).to(torch::kFloat32));
+
+        // Clear saved activations
+        saved_obs_flat = Tensor();
+        saved_decoder_input = Tensor();
     }
 };
 

@@ -361,7 +361,6 @@ void train_impl(PuffeRL& pufferl) {
     bool anneal_lr = hypers.anneal_lr;
     int current_epoch = pufferl.epoch;
 
-    Policy* policy_bf16 = pufferl.policy_bf16;
     // Policy* policy_fp32 = pufferl.policy_fp32;
     Muon* muon = pufferl.muon;
 
@@ -422,34 +421,51 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.train_cudagraph.capture_begin(pufferl.train_pool_id);
             }
 
-            auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
             Tensor newvalue_out = graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)});
 
-            // TODO: Try using global (epoch-level) adv mean/std instead of per-minibatch
-            Tensor loss = (hypers.kernels
-                ? PPOLoss::apply(logits.mean, logits.logstd, newvalue,
+            if (hypers.kernels) {
+                // Manual forward/backward path (no autograd)
+                auto [logits, newvalue] = pufferl.policy_bf16->forward_train_manual(graph.mb_obs, graph.mb_state);
+
+                auto ppo_grads = ppo_loss_fwd_bwd(
+                    logits.mean, logits.logstd, newvalue,
                     graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
                     graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
                     pufferl.act_sizes, pufferl.losses,
-                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef)
-                : fused_ppo_loss_cpp(logits.mean, logits.logstd, newvalue,
+                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef);
+
+                pufferl.policy_bf16->backward_manual(
+                    ppo_grads.grad_logits, ppo_grads.grad_logstd, ppo_grads.grad_values,
+                    pufferl.policy_fp32);
+
+                clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
+                pufferl.muon->step();
+                pufferl.muon->zero_grad();
+                if (USE_BF16) {
+                    sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
+                }
+            } else {
+                // Autograd path
+                auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
+
+                Tensor loss = fused_ppo_loss_cpp(logits.mean, logits.logstd, newvalue,
                     graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
                     graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
                     pufferl.act_sizes, pufferl.losses,
-                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef)
-            )[0];
+                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef)[0];
 
-            loss.backward();
+                loss.backward();
 
-            if (USE_BF16) {
-                copy_gradients_to_fp32(pufferl.policy_bf16, pufferl.policy_fp32);
-            }
-            clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
-            pufferl.muon->step();
-            pufferl.muon->zero_grad();
-            if (USE_BF16) {
-                pufferl.policy_bf16->zero_grad();
-                sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
+                if (USE_BF16) {
+                    copy_gradients_to_fp32(pufferl.policy_bf16, pufferl.policy_fp32);
+                }
+                clip_grad_norm_(pufferl.policy_fp32->parameters(), hypers.max_grad_norm);
+                pufferl.muon->step();
+                pufferl.muon->zero_grad();
+                if (USE_BF16) {
+                    pufferl.policy_bf16->zero_grad();
+                    sync_policy_weights(pufferl.policy_bf16, pufferl.policy_fp32);
+                }
             }
 
             if (capturing) {
