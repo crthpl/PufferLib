@@ -54,8 +54,9 @@ public:
     static tensor_list backward(AutogradCtx* ctx, tensor_list grad_outputs);
 };
 
-// Fused mingru gate inference
-std::vector<torch::Tensor> mingru_gate(torch::Tensor state, torch::Tensor combined);
+// Fused mingru gate inference — writes into pre-allocated out and next_state
+void mingru_gate(torch::Tensor state, torch::Tensor combined,
+    torch::Tensor out, torch::Tensor next_state);
 
 // Fused sample_logits: handles both discrete and continuous action sampling
 void sample_logits(

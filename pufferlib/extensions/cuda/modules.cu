@@ -25,7 +25,7 @@ using AutogradCtx = torch::autograd::AutogradContext;
 // returns {out, next_state} where:
 //   out (B, H) = sigmoid(proj) * mingru_out
 //   next_state (B, H) = mingru_out (for recurrence)
-vector<Tensor> mingru_gate(Tensor state, Tensor combined) {
+void mingru_gate(Tensor state, Tensor combined, Tensor out, Tensor next_state) {
     TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
     TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
     TORCH_CHECK(state.dtype() == combined.dtype(), "dtypes must match");
@@ -36,9 +36,6 @@ vector<Tensor> mingru_gate(Tensor state, Tensor combined) {
 
     int B = static_cast<int>(state.size(0));
     int H = static_cast<int>(state.size(1));
-
-    auto out = torch::empty_like(state);
-    auto next_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     mingru_gate_inference_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
@@ -47,7 +44,6 @@ vector<Tensor> mingru_gate(Tensor state, Tensor combined) {
         (const precision_t*)combined.data_ptr(),
         (const precision_t*)state.data_ptr(),
         H, B);
-    return {out, next_state};
 }
 
 // PrefixScan: checkpointed associative scan for MinGRU training
@@ -452,16 +448,16 @@ void ppo_loss_fwd_bwd(
     TORCH_CHECK(act_sizes.is_cuda() && act_sizes.dtype() == torch::kInt32,
                 "act_sizes must be int32 on CUDA");
 
-    // Make inputs contiguous for both kernels
-    logits = logits.contiguous();
-    values_pred = values_pred.contiguous();
-    old_logprobs = old_logprobs.contiguous();
-    advantages = advantages.contiguous();
-    prio = prio.contiguous();
-    values = values.contiguous();
-    returns = returns.contiguous();
+    // logits/values_pred may be non-contiguous (fused decoder output) — kernel handles via strides
+    // Grad outputs use contiguous layout (nt * A_total indexing)
+    TORCH_CHECK(old_logprobs.is_contiguous(), "old_logprobs must be contiguous");
+    TORCH_CHECK(advantages.is_contiguous(), "advantages must be contiguous");
+    TORCH_CHECK(prio.is_contiguous(), "prio must be contiguous");
+    TORCH_CHECK(values.is_contiguous(), "values must be contiguous");
+    TORCH_CHECK(returns.is_contiguous(), "returns must be contiguous");
 
     bool is_continuous = logstd.defined() && logstd.numel() > 0;
+    // TODO: pre-allocate contiguous logstd buffer to remove this alloc
     if (is_continuous) logstd = logstd.contiguous();
 
     int N = static_cast<int>(logits.size(0));
@@ -471,7 +467,8 @@ void ppo_loss_fwd_bwd(
     int total = N * T;
 
     auto [adv_var, adv_mean] = torch::var_mean(advantages);
-    auto actions_flat = actions.reshape({total, num_atns}).contiguous();
+    auto actions_flat = actions.reshape({total, num_atns});
+    TORCH_CHECK(actions_flat.is_contiguous(), "actions must be contiguous");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

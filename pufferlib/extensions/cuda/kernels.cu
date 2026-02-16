@@ -638,8 +638,12 @@ __global__ void ppo_loss_backward_kernel_optimized(
     int t = idx % T_seq;
     int nt = n * T_seq + t;
 
+    // Input strides (for reading non-contiguous logits/values_pred)
     int logits_base = n * logits_stride_n + t * logits_stride_t;
     int values_idx = n * values_stride_n + t * values_stride_t;
+    // Output indices (for writing to contiguous grad buffers)
+    int grad_logits_base = nt * A_total;
+    int grad_values_idx = nt;
 
     float old_logp = to_float(old_logprobs[nt]);
     float adv = float(advantages[nt]);
@@ -672,7 +676,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
     } else {
         d_val_pred = val_pred - ret;
     }
-    grad_values_pred[values_idx] = dL * vf_coef * d_val_pred;
+    grad_values_pred[grad_values_idx] = dL * vf_coef * d_val_pred;
 
     if (is_continuous) {
         // Continuous: compute total log prob first for ratio
@@ -724,14 +728,14 @@ __global__ void ppo_loss_backward_kernel_optimized(
 
             // Gradient wrt mean: d_log_prob/d_mean = (action - mean) / var
             float d_mean = d_new_logp * diff / var;
-            grad_logits[logits_base + h * logits_stride_a] = d_mean;
+            grad_logits[grad_logits_base + h] = d_mean;
 
             // Gradient wrt log_std:
             // d_log_prob/d_log_std = (action - mean)^2 / var - 1
             // d_entropy/d_log_std = 1
             // Total: d_new_logp * ((diff^2/var) - 1) + d_entropy_term * 1
             float d_log_std = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
-            grad_logstd[logits_base + h * logits_stride_a] = d_log_std;
+            grad_logstd[grad_logits_base + h] = d_log_std;
         }
     } else {
         // Discrete: original implementation
@@ -822,7 +826,7 @@ __global__ void ppo_loss_backward_kernel_optimized(
                 // Each head's entropy contributes independently to total entropy
                 d_logit += d_entropy_term * p * (-ent - logp);
 
-                grad_logits[logits_base + (logits_offset + a) * logits_stride_a] = d_logit;
+                grad_logits[grad_logits_base + logits_offset + a] = d_logit;
             }
 
             logits_offset += A;

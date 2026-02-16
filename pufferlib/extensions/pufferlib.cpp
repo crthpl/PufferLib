@@ -212,6 +212,8 @@ typedef struct {
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     vector<Tensor> buffer_states;  // Per-buffer states for contiguous access
+    vector<PolicyActivations> buffer_acts;  // Per-buffer inference activations
+    vector<Allocator> buffer_allocs;        // Per-buffer allocators for inference buffers
     RolloutBuf rollouts;
     EnvBuf env;
     TrainGraph train_buf;
@@ -295,7 +297,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Forward pass
     Tensor& state = pufferl->buffer_states[buf];
-    auto [logits, value, state_out] = pufferl->policy_bf16->forward(obs, state);
+    auto [logits, value, state_out] = pufferl->policy_bf16->forward(obs, state, pufferl->buffer_acts[buf]);
     state.copy_(state_out, false);
 
     // Sample actions, logprobs, values into rollout buffer
@@ -587,6 +589,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
 
     int minibatch_segments = hypers.minibatch_size / hypers.horizon;
+    int inf_batch = vec->total_agents / hypers.num_buffers;
 
     // Create fp32 master policy (for optimizer - precise gradient accumulation)
     Policy* policy_fp32 = create_policy(env_name, pufferl->alloc_fp32,
@@ -641,10 +644,20 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
         hidden_size, num_action_heads, num_layers);
 
-    // Per-buffer states: each is {num_layers, block_size, hidden} for contiguous access
+    // Per-buffer states and inference activations
     pufferl->buffer_states.resize(num_buffers);
+    pufferl->buffer_acts.reserve(num_buffers);
+    pufferl->buffer_allocs.resize(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_states[i] = pufferl->policy_bf16->initial_state(batch, torch::kCUDA);
+        pufferl->buffer_acts.emplace_back(num_layers);
+    }
+    // Register and allocate per-buffer inference activations
+    // (must be done after emplace_back so buffer_acts won't move)
+    for (int i = 0; i < num_buffers; i++) {
+        pufferl->policy_bf16->register_inference(
+            pufferl->buffer_allocs[i], pufferl->buffer_acts[i], inf_batch);
+        pufferl->buffer_allocs[i].create(torch::kCUDA, PRECISION_DTYPE);
     }
 
     if (hypers.cudagraphs >= 0) {
@@ -745,8 +758,10 @@ void close_impl(PuffeRL& pufferl) {
     pufferl.policy_bf16 = nullptr;
     pufferl.policy_fp32 = nullptr;
 
-    // Clear buffer states (releases CUDA tensors)
+    // Clear buffer states and per-buffer inference activations
     pufferl.buffer_states.clear();
+    pufferl.buffer_acts.clear();
+    pufferl.buffer_allocs.clear();
 
     // Clear rollout buffers (releases CUDA tensors)
     pufferl.rollouts.observations = Tensor();

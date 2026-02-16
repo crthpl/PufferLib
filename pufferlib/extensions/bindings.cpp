@@ -226,7 +226,7 @@ TORCH_LIBRARY_IMPL(pufferlib, CUDA, m) {
 }
 
 TORCH_LIBRARY(_C, m) {
-    m.def("mingru_gate(Tensor state, Tensor combined) -> (Tensor, Tensor)");
+    m.def("mingru_gate(Tensor state, Tensor combined, Tensor out, Tensor next_state) -> ()");
     m.def("fc_max(Tensor x, Tensor W, Tensor b) -> Tensor");
 }
 
@@ -351,8 +351,8 @@ PYBIND11_MODULE(_C, m) {
                          int num_layers, int num_atns, bool continuous) {
             return new Policy(alloc, input, hidden, output, num_layers, num_atns, continuous);
         }))
-        .def("forward", &Policy::forward)
-        .def("forward_train", &Policy::forward_train)
+        .def("forward", static_cast<std::tuple<Logits, Tensor, Tensor> (Policy::*)(Tensor, Tensor)>(&Policy::forward))
+        .def("forward_train", static_cast<std::tuple<Logits, Tensor> (Policy::*)(Tensor, Tensor)>(&Policy::forward_train))
         .def("init_weights", &Policy::init_weights)
         .def("parameters", &Policy::parameters)
         .def("named_parameters", [](Policy& self) {
