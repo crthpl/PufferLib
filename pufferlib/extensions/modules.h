@@ -4,6 +4,116 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 
+// Minimal tensor: raw pointer + shape, no torch dependency in the struct itself.
+// Memory is owned by an Allocator buffer — PufTensor is just a view.
+struct PufTensor {
+    void* data;
+    int64_t shape[4];   // up to 4D, unused dims = 1
+    int ndim;
+    int64_t numel;
+    int dtype_size;      // bytes per element (2 for bf16/f16, 4 for f32, 8 for f64)
+
+    PufTensor() : data(nullptr), ndim(0), numel(0), dtype_size(0) {
+        for (int i = 0; i < 4; i++) shape[i] = 1;
+    }
+
+    int64_t size(int dim) const { return shape[dim]; }
+    int64_t nbytes() const { return numel * dtype_size; }
+
+    // Cast to torch::Tensor for interop (no copy — shares memory)
+    torch::Tensor to_torch(torch::ScalarType dtype) const {
+        return torch::from_blob(data, {shape, shape + ndim},
+            torch::dtype(dtype).device(torch::kCUDA));
+    }
+
+    // Create a PufTensor view of a torch::Tensor (no copy)
+    static PufTensor from_torch(const torch::Tensor& t) {
+        PufTensor p;
+        p.data = t.data_ptr();
+        p.ndim = t.dim();
+        p.numel = t.numel();
+        p.dtype_size = t.element_size();
+        for (int i = 0; i < 4; i++)
+            p.shape[i] = (i < t.dim()) ? t.size(i) : 1;
+        return p;
+    }
+};
+
+// Helper: bytes per element for a torch ScalarType
+inline int dtype_size(torch::ScalarType dtype) {
+    switch (dtype) {
+        case torch::kFloat32: return 4;
+        case torch::kFloat64: return 8;
+        case torch::kBFloat16: return 2;
+        case torch::kFloat16: return 2;
+        case torch::kInt32: return 4;
+        case torch::kInt64: return 8;
+        default: TORCH_CHECK(false, "Unsupported dtype for PufTensor"); return 0;
+    }
+}
+
+// cuBLAS matmuls: all row-major PufTensors, bf16 with f32 compute
+void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out);     // out(M,N) = a(M,K) @ b(N,K)^T
+void puf_mm_tn(PufTensor& a, PufTensor& b, PufTensor& out);  // out(M,N) = a(K,M)^T @ b(K,N)
+void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out);  // out(M,N) = a(M,K) @ b(K,N)
+
+// out = alpha * a @ b^T + beta * out (bf16, f32 compute)
+void puf_addmm(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta);
+// out = alpha * a @ b + beta * out (bf16, f32 compute, no transpose)
+void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta);
+
+// Copy from torch::Tensor into PufTensor with dtype conversion (e.g. f32→bf16)
+void puf_copy_from_torch(PufTensor& dst, torch::Tensor src);
+
+// Cast bf16→f32
+void puf_cast_bf16_to_f32(PufTensor& dst, const PufTensor& src);
+
+// Cast f32→bf16
+void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src);
+
+// Cast f32(R,C)→bf16(C,R) with transpose
+void puf_cast_f32_to_bf16_transpose(PufTensor& dst, const PufTensor& src);
+
+// Transpose f32(R,C) → f32(C,R)
+void puf_transpose_f32(PufTensor& dst, const PufTensor& src);
+
+// Frobenius norm → device scalar. Writes sqrt(sum(x^2)) to *out_ptr. src must be bf16.
+void puf_norm(const PufTensor& src, float* out_ptr);
+
+// dst *= 1.0 / max(*norm_ptr, eps) — normalize by device-resident norm
+void puf_normalize(PufTensor& dst, const float* norm_ptr, float eps);
+
+// PufTensor→PufTensor memcpy (same dtype, same size)
+void puf_copy(PufTensor& dst, const PufTensor& src);
+
+// Zero a PufTensor
+void puf_zero(PufTensor& dst);
+
+// dst *= alpha (f32)
+void puf_scale(PufTensor& dst, float alpha);
+
+// dst *= *alpha_ptr (f32, reads scalar from device memory)
+void puf_scale_dev(PufTensor& dst, const float* alpha_ptr);
+
+// dst += alpha * src (f32)
+void puf_axpy(PufTensor& dst, const PufTensor& src, float alpha);
+
+// dst += (*alpha_ptr) * src (f32, reads scalar from device memory)
+void puf_axpy_dev(PufTensor& dst, const PufTensor& src, const float* alpha_ptr);
+
+// Compute derived lr scalars on device: neg_lr = -lr, wd_scale = 1 - lr * wd
+void compute_lr_scalars(const float* lr_ptr, float weight_decay, float* neg_lr_ptr, float* wd_scale_ptr);
+
+// dst += src with mixed precision (fp32 += bf16)
+void puf_add(PufTensor& dst, const PufTensor& src);
+
+// dst(1, C) += src(R, C).sum(dim=0) — column-wise sum reduction, both f32
+void puf_sum_rows_add(PufTensor& dst, PufTensor& src);
+
+// Assemble fused decoder grad: dst(B_TT, output+1) = [grad_logits(B_TT, od) | grad_value(B_TT, 1)]
+// Handles f32→bf16 cast from fp32 PufTensor grad outputs into bf16 PufTensor
+void puf_assemble_decoder_grad(PufTensor& dst, PufTensor& grad_logits, PufTensor& grad_value);
+
 // Loss component indices for the shared accumulator tensor
 enum LossIdx {
     LOSS_PG = 0,
@@ -20,13 +130,6 @@ enum LossIdx {
 // Autograd modules (implementations in cuda/modules.cu)
 using tensor_list = torch::autograd::tensor_list;
 using AutogradCtx = torch::autograd::AutogradContext;
-
-class PrefixScan : public torch::autograd::Function<PrefixScan> {
-public:
-    static tensor_list forward(AutogradCtx* ctx,
-        torch::Tensor combined, torch::Tensor state);
-    static tensor_list backward(AutogradCtx* ctx, tensor_list grad_outputs);
-};
 
 class LogCumsumExp : public torch::autograd::Function<LogCumsumExp> {
 public:
@@ -58,6 +161,10 @@ public:
 void mingru_gate(torch::Tensor state, torch::Tensor combined,
     torch::Tensor out, torch::Tensor next_state);
 
+// PufTensor overload — all PufTensors
+void mingru_gate(PufTensor& state, PufTensor& combined,
+    PufTensor& out, PufTensor& next_state);
+
 // Fused sample_logits: handles both discrete and continuous action sampling
 void sample_logits(
     torch::Tensor logits, torch::Tensor logstd, torch::Tensor value,
@@ -80,18 +187,22 @@ void train_select_and_copy_cuda(
     torch::Tensor dst_values, torch::Tensor dst_returns);
 
 // Direct (non-autograd) prefix scan buffers — pre-allocated via Allocator
-struct PrefixScanBuffers {
-    // Forward buffers (saved for backward)
-    torch::Tensor combined;       // (B, T, 3*H) precision_t — reference to matmul result
-    torch::Tensor state;          // (B, 1, H) precision_t — reference to state input
-    torch::Tensor a_star;         // (B, T+1, H) float32 — pre-allocated
-    torch::Tensor s_vals;         // (B, T+1, H) float32 — pre-allocated
-    torch::Tensor log_values_buf; // (B, T+1, H) float32 — pre-allocated
-    torch::Tensor out;            // (B, T, H) precision_t — pre-allocated
-    torch::Tensor next_state;     // (B, 1, H) precision_t — pre-allocated scratch (output discarded)
+struct PrefixScan {
+    // Forward inputs saved for backward (raw pointers — data lives in pre-allocated buffers)
+    void* combined_ptr;           // (B, T, 3*H) precision_t
+    void* state_ptr;              // (B, 1, H) precision_t
+    int B, T, H;                  // dimensions saved from forward
+    // Pre-allocated activation buffers
+    PufTensor a_star;             // (B, T+1, H) float32
+    PufTensor s_vals;             // (B, T+1, H) float32
+    PufTensor log_values_buf;     // (B, T+1, H) float32
+    PufTensor out;                // (B, T, H) precision_t
+    PufTensor next_state;         // (B, 1, H) precision_t — scratch (output discarded)
     // Backward buffers
-    torch::Tensor grad_combined;  // (B, T, 3*H) precision_t — pre-allocated
-    torch::Tensor grad_state;     // (B, 1, H) precision_t — pre-allocated
+    PufTensor grad_combined;      // (B, T, 3*H) precision_t
+    PufTensor grad_state;         // (B, 1, H) precision_t
+
+    PrefixScan() : combined_ptr(nullptr), state_ptr(nullptr), B(0), T(0), H(0) {}
 };
 
 // PPO gradient outputs from fused forward+backward
@@ -124,12 +235,12 @@ struct PPOBuffers {
     }
 };
 
-// Direct (non-autograd) prefix scan forward/backward with pre-allocated buffers
-void prefix_scan_forward_direct(torch::Tensor combined, torch::Tensor state,
-    PrefixScanBuffers& bufs);
-void prefix_scan_backward_direct(
-    torch::Tensor grad_out, torch::Tensor grad_next_state,
-    PrefixScanBuffers& bufs);
+// Prefix scan forward/backward with pre-allocated buffers
+void prefix_scan_forward(PufTensor& combined, PufTensor& state,
+    PrefixScan& bufs);
+void prefix_scan_backward(
+    PufTensor& grad_out, PufTensor& grad_next_state,
+    PrefixScan& bufs);
 
 // Fused PPO loss forward + backward (no autograd) — uses pre-allocated buffers
 void ppo_loss_fwd_bwd(
@@ -141,44 +252,50 @@ void ppo_loss_fwd_bwd(
     float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
     PPOBuffers& bufs);
 
-// Contiguous memory allocator for params/grads
+// Contiguous memory allocator for params/grads/activations
 struct Allocator {
-    struct Registration {
-        torch::Tensor* ptr;
-        int64_t size;
+    struct PufRegistration {
+        PufTensor* ptr;
+        int64_t size;           // total elements
         std::vector<int64_t> shape;
+        int elem_size;          // bytes per element
     };
-    struct ActivationReg {
-        torch::Tensor* ptr;
-        std::vector<int64_t> shape;
-        torch::ScalarType dtype;  // explicit dtype (may differ from allocator default)
-    };
-    std::vector<Registration> params, grads, zero_activations;
-    std::vector<ActivationReg> activations;
-    torch::Tensor param_buffer, grad_buffer, zero_buffer;
+    std::vector<PufRegistration> params, grads, puf_activations;
+    torch::Tensor param_buffer, grad_buffer, puf_buffer;
 
-    void register_param(torch::Tensor* ptr, std::vector<int64_t> shape) {
+    void register_param(PufTensor* ptr, std::vector<int64_t> shape) {
         int64_t size = 1;
         for (auto s : shape) size *= s;
-        params.push_back({ptr, size, shape});
+        params.push_back({ptr, size, shape, 0});  // elem_size set in create()
     }
 
-    void register_grad(torch::Tensor* ptr, std::vector<int64_t> shape) {
+    void register_grad(PufTensor* ptr, std::vector<int64_t> shape) {
         int64_t size = 1;
         for (auto s : shape) size *= s;
-        grads.push_back({ptr, size, shape});
+        grads.push_back({ptr, size, shape, 0});
     }
 
-    void register_activation(torch::Tensor* ptr, std::vector<int64_t> shape,
-                             torch::ScalarType dtype) {
-        activations.push_back({ptr, shape, dtype});
-    }
-
-    // Activations that must be zeroed before use — contiguous buffer, single zero_() call
-    void register_zero_activation(torch::Tensor* ptr, std::vector<int64_t> shape) {
+    // Register a PufTensor activation — allocated from a contiguous byte buffer
+    void register_puf(PufTensor* ptr, std::vector<int64_t> shape, int elem_size) {
         int64_t size = 1;
         for (auto s : shape) size *= s;
-        zero_activations.push_back({ptr, size, shape});
+        puf_activations.push_back({ptr, size, shape, elem_size});
+    }
+
+    // Helper: assign PufTensor views into a contiguous torch buffer
+    void assign_puf_views(std::vector<PufRegistration>& regs, torch::Tensor& buffer) {
+        char* base = (char*)buffer.data_ptr();
+        int esz = buffer.element_size();
+        int64_t offset = 0;
+        for (auto& r : regs) {
+            r.ptr->data = base + offset * esz;
+            r.ptr->ndim = r.shape.size();
+            r.ptr->numel = r.size;
+            r.ptr->dtype_size = esz;
+            for (int i = 0; i < 4; i++)
+                r.ptr->shape[i] = (i < (int)r.shape.size()) ? r.shape[i] : 1;
+            offset += r.size;
+        }
     }
 
     void create(torch::Device device, torch::ScalarType dtype) {
@@ -188,11 +305,7 @@ struct Allocator {
         if (total_params > 0) {
             param_buffer = torch::zeros({total_params},
                 torch::dtype(dtype).device(device));
-            int64_t offset = 0;
-            for (auto& r : params) {
-                *r.ptr = param_buffer.narrow(0, offset, r.size).view(r.shape);
-                offset += r.size;
-            }
+            assign_puf_views(params, param_buffer);
         }
 
         // Allocate contiguous grad buffer
@@ -201,28 +314,26 @@ struct Allocator {
         if (total_grads > 0) {
             grad_buffer = torch::zeros({total_grads},
                 torch::dtype(dtype).device(device));
-            int64_t offset = 0;
-            for (auto& r : grads) {
-                *r.ptr = grad_buffer.narrow(0, offset, r.size).view(r.shape);
-                offset += r.size;
-            }
+            assign_puf_views(grads, grad_buffer);
         }
 
-        // Allocate contiguous zero-before-use activation buffer (same dtype as allocator)
-        int64_t total_zero = 0;
-        for (auto& r : zero_activations) total_zero += r.size;
-        if (total_zero > 0) {
-            zero_buffer = torch::zeros({total_zero}, torch::dtype(dtype).device(device));
+        // Allocate PufTensor activations from a contiguous byte buffer
+        int64_t total_puf_bytes = 0;
+        for (auto& r : puf_activations) total_puf_bytes += r.size * r.elem_size;
+        if (total_puf_bytes > 0) {
+            puf_buffer = torch::zeros({total_puf_bytes},
+                torch::dtype(torch::kUInt8).device(device));
+            char* base = (char*)puf_buffer.data_ptr();
             int64_t offset = 0;
-            for (auto& r : zero_activations) {
-                *r.ptr = zero_buffer.narrow(0, offset, r.size).view(r.shape);
-                offset += r.size;
+            for (auto& r : puf_activations) {
+                r.ptr->data = base + offset;
+                r.ptr->ndim = r.shape.size();
+                r.ptr->numel = r.size;
+                r.ptr->dtype_size = r.elem_size;
+                for (int i = 0; i < 4; i++)
+                    r.ptr->shape[i] = (i < (int)r.shape.size()) ? r.shape[i] : 1;
+                offset += r.size * r.elem_size;
             }
-        }
-
-        // Allocate activation tensors individually (mixed dtypes)
-        for (auto& r : activations) {
-            *r.ptr = torch::empty(r.shape, torch::dtype(r.dtype).device(device));
         }
     }
 };

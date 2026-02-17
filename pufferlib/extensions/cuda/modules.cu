@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include "../modules.h"
 #include "kernels.cu"
@@ -18,6 +19,444 @@ namespace nn = torch::nn;
 typedef torch::Tensor Tensor;
 using tensor_list = torch::autograd::tensor_list;
 using AutogradCtx = torch::autograd::AutogradContext;
+
+static cublasHandle_t get_cublas_handle() {
+    static cublasHandle_t handle = nullptr;
+    if (!handle) {
+        cublasCreate(&handle);
+    }
+    return handle;
+}
+
+// cuBLAS matmul: out(M,N) = a(M,K) @ b(N,K)^T, all row-major PufTensors
+// Uses bf16 inputs with f32 compute.
+void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out) {
+    int M = a.shape[0];
+    int K = a.shape[1];
+    int N = b.shape[0];
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = get_cublas_handle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    // Row-major C(M,N) = A(M,K) @ B(N,K)^T
+    // cuBLAS col-major: C^T(N,M) = B @ A^T
+    // transa=T on B(N,K), transb=N on A(M,K)
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b.data, CUDA_R_16BF, K,   // weight (N,K) row-major
+        a.data, CUDA_R_16BF, K,   // input  (M,K) row-major
+        &beta,
+        out.data, CUDA_R_16BF, N, // output (M,N) row-major
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// cuBLAS matmul: out(M,N) = a(K,M)^T @ b(K,N), all row-major PufTensors
+void puf_mm_tn(PufTensor& a, PufTensor& b, PufTensor& out) {
+    int K = a.shape[0];
+    int M = a.shape[1];
+    int N = b.shape[1];
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = get_cublas_handle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    // Row-major C(M,N) = A(K,M)^T @ B(K,N)
+    // cuBLAS col-major: C^T(N,M) = op(A_cub)(N,K) @ op(B_cub)(K,M)
+    // A_cub = b_ptr: row(K,N)→col(N,K), transa=N, lda=N
+    // B_cub = a_ptr: row(K,M)→col(M,K), transb=T → (K,M), ldb=M
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        N, M, K,
+        &alpha,
+        b.data, CUDA_R_16BF, N,   // b row(K,N) → col(N,K), lda=N
+        a.data, CUDA_R_16BF, M,   // a row(K,M) → col(M,K), ldb=M
+        &beta,
+        out.data, CUDA_R_16BF, N, // out row(M,N) → col(N,M), ldc=N
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// cuBLAS matmul: out(M,N) = a(M,K) @ b(K,N), all row-major PufTensors
+void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out) {
+    int M = a.shape[0];
+    int K = a.shape[1];
+    int N = b.shape[1];
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = get_cublas_handle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    // Row-major C(M,N) = A(M,K) @ B(K,N)
+    // cuBLAS col-major: C^T(N,M) = B^T(N,K) @ A^T(K,M)
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b.data, CUDA_R_16BF, N,   // B(K,N) row-major, ldb=N
+        a.data, CUDA_R_16BF, K,   // A(M,K) row-major, lda=K
+        &beta,
+        out.data, CUDA_R_16BF, N, // C(M,N) row-major, ldc=N
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// out = alpha * a @ b^T + beta * out (bf16, f32 compute)
+void puf_addmm(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta) {
+    int M = a.shape[0];
+    int K = a.shape[1];
+    int N = b.shape[0];
+
+    cublasHandle_t handle = get_cublas_handle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b.data, CUDA_R_16BF, K,
+        a.data, CUDA_R_16BF, K,
+        &beta,
+        out.data, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// out = alpha * a @ b + beta * out (bf16, f32 compute, no transpose)
+void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta) {
+    int M = a.shape[0];
+    int K = a.shape[1];
+    int N = b.shape[1];
+
+    cublasHandle_t handle = get_cublas_handle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b.data, CUDA_R_16BF, N,
+        a.data, CUDA_R_16BF, K,
+        &beta,
+        out.data, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// Cast+copy kernel: bf16 → f32
+__global__ void cast_bf16_to_f32_kernel(
+    float* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __bfloat162float(src[idx]);
+}
+
+void puf_cast_bf16_to_f32(PufTensor& dst, const PufTensor& src) {
+    assert(dst.numel == src.numel && "puf_cast_bf16_to_f32: size mismatch");
+    assert(dst.dtype_size == 4 && src.dtype_size == 2);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cast_bf16_to_f32_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const __nv_bfloat16*)src.data, dst.numel);
+}
+
+// Frobenius norm of bf16 tensor
+__global__ void norm_bf16_kernel(
+    float* __restrict__ out,
+    const __nv_bfloat16* __restrict__ src,
+    int n
+) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
+        float v = __bfloat162float(src[i]);
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, sdata[0]);
+}
+
+void puf_norm(const PufTensor& src, float* out_ptr) {
+    assert(src.dtype_size == 2 && "puf_norm: expected bf16");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaMemsetAsync(out_ptr, 0, sizeof(float), stream);
+    int blocks = std::min((int)grid_size(src.numel), 256);
+    norm_bf16_kernel<<<blocks, 256, 0, stream>>>(
+        out_ptr, (const __nv_bfloat16*)src.data, src.numel);
+    // out_ptr now holds sum of squares; caller uses puf_normalize to apply sqrt + divide
+}
+
+// dst(bf16) *= 1/max(sqrt(*norm_ptr), eps)
+__global__ void normalize_bf16_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const float* __restrict__ norm_ptr,
+    float eps, int n
+) {
+    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __float2bfloat16(__bfloat162float(dst[idx]) * inv_norm);
+    }
+}
+
+void puf_normalize(PufTensor& dst, const float* norm_ptr, float eps) {
+    assert(dst.dtype_size == 2 && "puf_normalize: expected bf16");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    normalize_bf16_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)dst.data, norm_ptr, eps, dst.numel);
+}
+
+// Cast+copy kernel: f32 → bf16
+__global__ void cast_f32_to_bf16_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const float* __restrict__ src,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __float2bfloat16(src[idx]);
+    }
+}
+
+void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src) {
+    assert(dst.numel == src.numel && "puf_cast_f32_to_bf16: size mismatch");
+    assert(dst.dtype_size == 2 && src.dtype_size == 4);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cast_f32_to_bf16_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)dst.data, (const float*)src.data, dst.numel);
+}
+
+// Cast f32(R,C) → bf16(C,R) with transpose
+__global__ void cast_f32_to_bf16_transpose_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const float* __restrict__ src,
+    int R, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    int r = idx / C;
+    int c = idx % C;
+    dst[c * R + r] = __float2bfloat16(src[r * C + c]);
+}
+
+void puf_cast_f32_to_bf16_transpose(PufTensor& dst, const PufTensor& src) {
+    assert(src.dtype_size == 4 && dst.dtype_size == 2);
+    int R = src.shape[0], C = src.shape[1];
+    assert(dst.shape[0] == C && dst.shape[1] == R);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cast_f32_to_bf16_transpose_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)dst.data, (const float*)src.data, R, C);
+}
+
+// Transpose f32(R,C) → f32(C,R)
+__global__ void transpose_f32_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int R, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    int r = idx / C;
+    int c = idx % C;
+    dst[c * R + r] = src[r * C + c];
+}
+
+void puf_transpose_f32(PufTensor& dst, const PufTensor& src) {
+    assert(src.dtype_size == 4 && dst.dtype_size == 4);
+    int R = src.shape[0], C = src.shape[1];
+    assert(dst.shape[0] == C && dst.shape[1] == R);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const float*)src.data, R, C);
+}
+
+// Copy from torch::Tensor into PufTensor with dtype conversion
+void puf_copy_from_torch(PufTensor& dst, Tensor src) {
+    assert(dst.numel == src.numel() && "puf_copy_from_torch: size mismatch");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (src.scalar_type() == torch::kFloat32 && dst.dtype_size == 2) {
+        // f32 → bf16
+        cast_f32_to_bf16_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+            (__nv_bfloat16*)dst.data,
+            (const float*)src.data_ptr(),
+            dst.numel);
+    } else if (src.element_size() == dst.dtype_size) {
+        // Same dtype: raw memcpy
+        cudaMemcpyAsync(dst.data, src.data_ptr(), dst.nbytes(),
+            cudaMemcpyDeviceToDevice, stream);
+    } else {
+        assert(false && "puf_copy_from_torch: unsupported dtype conversion");
+    }
+}
+
+// PufTensor→PufTensor memcpy (same dtype, same size)
+void puf_copy(PufTensor& dst, const PufTensor& src) {
+    assert(dst.numel == src.numel && "puf_copy: size mismatch");
+    assert(dst.dtype_size == src.dtype_size && "puf_copy: dtype mismatch");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaMemcpyAsync(dst.data, src.data, dst.nbytes(),
+        cudaMemcpyDeviceToDevice, stream);
+}
+
+void puf_zero(PufTensor& dst) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaMemsetAsync(dst.data, 0, dst.nbytes(), stream);
+}
+
+__global__ void scale_f32_kernel(float* __restrict__ dst, float alpha, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] *= alpha;
+}
+
+void puf_scale(PufTensor& dst, float alpha) {
+    assert(dst.dtype_size == 4 && "puf_scale: expected f32");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    scale_f32_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, alpha, dst.numel);
+}
+
+__global__ void axpy_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, float alpha, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += alpha * src[idx];
+}
+
+void puf_axpy(PufTensor& dst, const PufTensor& src, float alpha) {
+    assert(dst.numel == src.numel && "puf_axpy: size mismatch");
+    assert(dst.dtype_size == 4 && src.dtype_size == 4 && "puf_axpy: expected f32");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    axpy_f32_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const float*)src.data, alpha, dst.numel);
+}
+
+// Device-pointer variants: read scalar from device memory (graph-safe)
+__global__ void scale_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ alpha_ptr, int n) {
+    float alpha = *alpha_ptr;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] *= alpha;
+}
+
+void puf_scale_dev(PufTensor& dst, const float* alpha_ptr) {
+    assert(dst.dtype_size == 4 && "puf_scale_dev: expected f32");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    scale_f32_dev_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, alpha_ptr, dst.numel);
+}
+
+__global__ void axpy_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ src,
+                                     const float* __restrict__ alpha_ptr, int n) {
+    float alpha = *alpha_ptr;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += alpha * src[idx];
+}
+
+void puf_axpy_dev(PufTensor& dst, const PufTensor& src, const float* alpha_ptr) {
+    assert(dst.numel == src.numel && "puf_axpy_dev: size mismatch");
+    assert(dst.dtype_size == 4 && src.dtype_size == 4 && "puf_axpy_dev: expected f32");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    axpy_f32_dev_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const float*)src.data, alpha_ptr, dst.numel);
+}
+
+__global__ void compute_lr_scalars_kernel(const float* __restrict__ lr, float wd,
+                                           float* __restrict__ neg_lr, float* __restrict__ wd_scale) {
+    *neg_lr = -(*lr);
+    *wd_scale = 1.0f - (*lr) * wd;
+}
+
+void compute_lr_scalars(const float* lr_ptr, float weight_decay, float* neg_lr_ptr, float* wd_scale_ptr) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    compute_lr_scalars_kernel<<<1, 1, 0, stream>>>(lr_ptr, weight_decay, neg_lr_ptr, wd_scale_ptr);
+}
+
+// dst(fp32) += src(bf16) kernel
+__global__ void add_bf16_to_f32_kernel(
+    float* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] += __bfloat162float(src[idx]);
+    }
+}
+
+void puf_add(PufTensor& dst, const PufTensor& src) {
+    assert(dst.numel == src.numel && "puf_add: size mismatch");
+    assert(dst.dtype_size == 4 && src.dtype_size == 2 && "puf_add: expected fp32 += bf16");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    add_bf16_to_f32_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const __nv_bfloat16*)src.data, dst.numel);
+}
+
+// Column-wise sum reduction: dst(1, C) += src(R, C).sum(dim=0), both f32
+__global__ void sum_rows_add_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int R, int C
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= C) return;
+    float sum = 0.0f;
+    for (int r = 0; r < R; r++) {
+        sum += src[r * C + col];
+    }
+    dst[col] += sum;
+}
+
+void puf_sum_rows_add(PufTensor& dst, PufTensor& src) {
+    assert(dst.dtype_size == 4 && src.dtype_size == 4 && "puf_sum_rows_add: expected f32");
+    int R = src.numel / src.shape[src.ndim - 1];
+    int C = src.shape[src.ndim - 1];
+    assert(dst.numel == C && "puf_sum_rows_add: dst must have C elements");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    sum_rows_add_kernel<<<grid_size(C), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.data, (const float*)src.data, R, C);
+}
+
+// Assemble fused decoder grad from separate logits/value grads with f32→bf16 cast
+__global__ void assemble_decoder_grad_kernel(
+    __nv_bfloat16* __restrict__ dst,
+    const float* __restrict__ grad_logits,
+    const float* __restrict__ grad_value,
+    int B_TT, int od, int od_plus_1
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B_TT * od_plus_1) return;
+    int row = idx / od_plus_1;
+    int col = idx % od_plus_1;
+    float val = (col < od) ? grad_logits[row * od + col] : grad_value[row];
+    dst[idx] = __float2bfloat16(val);
+}
+
+void puf_assemble_decoder_grad(PufTensor& dst, PufTensor& grad_logits, PufTensor& grad_value) {
+    int B_TT = dst.size(0);
+    int od_plus_1 = dst.size(1);
+    int od = od_plus_1 - 1;
+
+    int total = B_TT * od_plus_1;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    assemble_decoder_grad_kernel<<<grid_size(total), BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)dst.data,
+        (const float*)grad_logits.data,
+        (const float*)grad_value.data,
+        B_TT, od, od_plus_1);
+}
 
 // Fused: chunk + mingru_gate + sigmoid(proj) * out
 // combined is (B, 3*H) = [hidden, gate, proj]
@@ -46,146 +485,71 @@ void mingru_gate(Tensor state, Tensor combined, Tensor out, Tensor next_state) {
         H, B);
 }
 
-// PrefixScan: checkpointed associative scan for MinGRU training
-// Combined is (B, T, 3*H) = [hidden, gate, proj]
-// State is (B, 1, H)
-tensor_list PrefixScan::forward(AutogradCtx* ctx, Tensor combined, Tensor state) {
-    TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
-    TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
-    TORCH_CHECK(combined.dtype() == state.dtype(), "dtypes must match");
-    TORCH_CHECK(combined.dim() == 3, "combined must be (B, T, 3*H)");
-    TORCH_CHECK(state.dim() == 3, "state must be (B, 1, H)");
-    TORCH_CHECK(state.size(0) == combined.size(0), "B must match");
-    TORCH_CHECK(state.size(1) == 1, "state T dim must be 1");
-    TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
-    TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
-                "All tensors must be contiguous");
+// PufTensor overload: all PufTensors
+void mingru_gate(PufTensor& state, PufTensor& combined, PufTensor& out, PufTensor& next_state) {
+    int B = static_cast<int>(state.size(0));
+    int H = static_cast<int>(state.size(1));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    auto device = combined.device();
+    mingru_gate_inference_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+        (precision_t*)out.data,
+        (precision_t*)next_state.data,
+        (const precision_t*)combined.data,
+        (const precision_t*)state.data,
+        H, B);
+}
+
+// Prefix scan forward — writes into pre-allocated bufs
+void prefix_scan_forward(PufTensor& combined, PufTensor& state, PrefixScan& bufs) {
+    assert(combined.ndim == 3 && "combined must be (B, T, 3*H)");
+    assert(state.ndim == 3 && "state must be (B, 1, H)");
+    assert(state.size(0) == combined.size(0) && "B must match");
+    assert(state.size(1) == 1 && "state T dim must be 1");
+    assert(combined.size(2) == 3 * state.size(2) && "combined must be 3*H");
+
     int B = static_cast<int>(combined.size(0));
     int T = static_cast<int>(combined.size(1));
     int H = static_cast<int>(state.size(2));
-    auto T_buf = T + 1;
 
-    auto out = torch::empty({B, T, H}, state.options());
-    auto next_state = torch::empty({B, 1, H}, state.options());
+    // Save raw pointers + dims for backward
+    bufs.combined_ptr = combined.data;
+    bufs.state_ptr = state.data;
+    bufs.B = B;
+    bufs.T = T;
+    bufs.H = H;
 
-    // Sparse checkpoint buffers (still needed for backward recomputation)
-    auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    auto a_star = torch::empty({B, T_buf, H}, options_float);
-    auto s_vals = torch::empty({B, T_buf, H}, options_float);
-    auto log_values_buf = torch::empty({B, T_buf, H}, options_float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     fused_scan_forward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)out.data_ptr(),
-        (precision_t*)next_state.data_ptr(),
-        a_star.data_ptr<float>(),
-        s_vals.data_ptr<float>(),
-        log_values_buf.data_ptr<float>(),
-        (const precision_t*)combined.data_ptr(),
-        (const precision_t*)state.data_ptr(),
+        (precision_t*)bufs.out.data,
+        (precision_t*)bufs.next_state.data,
+        (float*)bufs.a_star.data,
+        (float*)bufs.s_vals.data,
+        (float*)bufs.log_values_buf.data,
+        (const precision_t*)combined.data,
+        (const precision_t*)state.data,
         T, H, B);
-
-    ctx->save_for_backward({combined, state, a_star, s_vals, log_values_buf});
-    return {out, next_state};
 }
 
-tensor_list PrefixScan::backward(AutogradCtx* ctx, tensor_list grad_outputs) {
-    auto saved = ctx->get_saved_variables();
-    auto combined = saved[0];
-    auto state = saved[1];
-    auto a_star_buf = saved[2];
-    auto s_vals = saved[3];
-    auto log_values_buf = saved[4];
+// Prefix scan backward — writes into pre-allocated bufs
+void prefix_scan_backward(
+    PufTensor& grad_out, PufTensor& grad_next_state, PrefixScan& bufs) {
+    int B = bufs.B;
+    int T = bufs.T;
+    int H = bufs.H;
 
-    auto grad_out = grad_outputs[0];
-    TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");
-
-    auto grad_next_state = grad_outputs[1];
-    TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
-
-    int B = static_cast<int>(combined.size(0));
-    int T = static_cast<int>(combined.size(1));
-    int H = static_cast<int>(state.size(2));
-
-    auto grad_combined = torch::empty_like(combined);
-    auto grad_state = torch::empty_like(state);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     fused_scan_backward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)grad_combined.data_ptr(),
-        (precision_t*)grad_state.data_ptr(),
-        (const precision_t*)grad_out.data_ptr(),
-        (const precision_t*)grad_next_state.data_ptr(),
-        (const precision_t*)combined.data_ptr(),
-        (const precision_t*)state.data_ptr(),
-        a_star_buf.data_ptr<float>(),
-        s_vals.data_ptr<float>(),
-        log_values_buf.data_ptr<float>(),
-        T, H, B);
-
-    return {grad_combined, grad_state};
-}
-
-// Direct (non-autograd) prefix scan forward — writes into pre-allocated bufs
-void prefix_scan_forward_direct(Tensor combined, Tensor state, PrefixScanBuffers& bufs) {
-    TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
-    TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
-    TORCH_CHECK(combined.dtype() == state.dtype(), "dtypes must match");
-    TORCH_CHECK(combined.dim() == 3, "combined must be (B, T, 3*H)");
-    TORCH_CHECK(state.dim() == 3, "state must be (B, 1, H)");
-    TORCH_CHECK(state.size(0) == combined.size(0), "B must match");
-    TORCH_CHECK(state.size(1) == 1, "state T dim must be 1");
-    TORCH_CHECK(combined.size(2) == 3 * state.size(2), "combined must be 3*H");
-    TORCH_CHECK(combined.is_contiguous() && state.is_contiguous(),
-                "All tensors must be contiguous");
-
-    int B = static_cast<int>(combined.size(0));
-    int T = static_cast<int>(combined.size(1));
-    int H = static_cast<int>(state.size(2));
-
-    // Save references for backward
-    bufs.combined = combined;
-    bufs.state = state;
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    // Write into pre-allocated out, next_state, a_star, s_vals, log_values_buf
-    fused_scan_forward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)bufs.out.data_ptr(),
-        (precision_t*)bufs.next_state.data_ptr(),
-        bufs.a_star.data_ptr<float>(),
-        bufs.s_vals.data_ptr<float>(),
-        bufs.log_values_buf.data_ptr<float>(),
-        (const precision_t*)combined.data_ptr(),
-        (const precision_t*)state.data_ptr(),
-        T, H, B);
-}
-
-// Direct (non-autograd) prefix scan backward — writes into pre-allocated bufs
-void prefix_scan_backward_direct(
-    Tensor grad_out, Tensor grad_next_state, PrefixScanBuffers& bufs) {
-    TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous");
-    TORCH_CHECK(grad_next_state.is_contiguous(), "grad_next_state must be contiguous");
-
-    int B = static_cast<int>(bufs.combined.size(0));
-    int T = static_cast<int>(bufs.combined.size(1));
-    int H = static_cast<int>(bufs.state.size(2));
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    // Write into pre-allocated grad_combined, grad_state
-    fused_scan_backward_kernel_checkpointed<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)bufs.grad_combined.data_ptr(),
-        (precision_t*)bufs.grad_state.data_ptr(),
-        (const precision_t*)grad_out.data_ptr(),
-        (const precision_t*)grad_next_state.data_ptr(),
-        (const precision_t*)bufs.combined.data_ptr(),
-        (const precision_t*)bufs.state.data_ptr(),
-        bufs.a_star.data_ptr<float>(),
-        bufs.s_vals.data_ptr<float>(),
-        bufs.log_values_buf.data_ptr<float>(),
+        (precision_t*)bufs.grad_combined.data,
+        (precision_t*)bufs.grad_state.data,
+        (const precision_t*)grad_out.data,
+        (const precision_t*)grad_next_state.data,
+        (const precision_t*)bufs.combined_ptr,
+        (const precision_t*)bufs.state_ptr,
+        (float*)bufs.a_star.data,
+        (float*)bufs.s_vals.data,
+        (float*)bufs.log_values_buf.data,
         T, H, B);
 }
 

@@ -22,9 +22,9 @@
 #include <nvtx3/nvToolsExt.h>
 #include <nvml.h>
 
+#include "modules.h"
 #include "muon.h"
 #include "env_binding.h"
-#include "modules.h"
 
 namespace pufferlib {
 
@@ -296,9 +296,18 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     rollouts.terminals.select(0, t).narrow(0, start, block_size).copy_(terminals, true);
 
     // Forward pass
-    Tensor& state = pufferl->buffer_states[buf];
-    auto [logits, value, state_out] = pufferl->policy_bf16->forward(obs, state, pufferl->buffer_acts[buf]);
-    state.copy_(state_out, false);
+    PufTensor state_puf = PufTensor::from_torch(pufferl->buffer_states[buf]);
+    PufTensor obs_puf = PufTensor::from_torch(obs.to(PRECISION_DTYPE));
+    PufTensor dec_puf = pufferl->policy_bf16->forward(obs_puf, state_puf, pufferl->buffer_acts[buf]);
+    Tensor dec_out = dec_puf.to_torch(PRECISION_DTYPE);
+
+    // Split fused decoder output into logits + value
+    int od = pufferl->policy_bf16->decoder.output_dim;
+    Logits logits = {.mean = dec_out.narrow(-1, 0, od)};
+    Tensor value = dec_out.narrow(-1, od, 1).squeeze(-1);
+    if (pufferl->policy_bf16->decoder.continuous) {
+        logits.logstd = pufferl->policy_bf16->decoder.logstd.to_torch(PRECISION_DTYPE).expand_as(logits.mean);
+    }
 
     // Sample actions, logprobs, values into rollout buffer
     Tensor actions = rollouts.actions.select(0, t).narrow(0, start, block_size);
@@ -428,19 +437,37 @@ void train_impl(PuffeRL& pufferl) {
 
             Tensor newvalue_out = graph.mb_newvalue.view({graph.mb_ratio.size(0), graph.mb_ratio.size(1)});
 
-            auto [logits, newvalue] = pufferl.policy_bf16->forward_train(graph.mb_obs, graph.mb_state);
+            PufTensor obs_puf = PufTensor::from_torch(graph.mb_obs);
+            PufTensor state_puf = PufTensor::from_torch(graph.mb_state);
+            PufTensor dec_puf = pufferl.policy_bf16->forward_train(obs_puf, state_puf, pufferl.policy_bf16->act);
+            Tensor dec_out = dec_puf.to_torch(PRECISION_DTYPE);
+
+            // Split fused decoder output into logits + value
+            int od = pufferl.policy_bf16->decoder.output_dim;
+            Tensor logits_mean = dec_out.narrow(-1, 0, od);
+            Tensor newvalue = dec_out.narrow(-1, od, 1);
+            Tensor logstd;
+            if (pufferl.policy_bf16->decoder.continuous) {
+                logstd = pufferl.policy_bf16->decoder.logstd.to_torch(PRECISION_DTYPE).expand_as(logits_mean);
+            } else {
+                logstd = torch::empty({0}, logits_mean.options());
+            }
 
             ppo_loss_fwd_bwd(
-                logits.mean, logits.logstd, newvalue,
+                logits_mean, logstd, newvalue,
                 graph.mb_actions, graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
                 graph.mb_values, graph.mb_returns, graph.mb_ratio, newvalue_out,
                 pufferl.act_sizes, pufferl.losses,
                 hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
                 pufferl.ppo_bufs);
 
+            PufTensor grad_logits_puf = PufTensor::from_torch(pufferl.ppo_bufs.grad_logits);
+            PufTensor grad_logstd_puf = pufferl.ppo_bufs.grad_logstd.defined()
+                ? PufTensor::from_torch(pufferl.ppo_bufs.grad_logstd) : PufTensor();
+            PufTensor grad_values_puf = PufTensor::from_torch(pufferl.ppo_bufs.grad_values);
             pufferl.policy_bf16->backward(
-                pufferl.ppo_bufs.grad_logits, pufferl.ppo_bufs.grad_logstd, pufferl.ppo_bufs.grad_values,
-                pufferl.policy_fp32);
+                grad_logits_puf, grad_logstd_puf, grad_values_puf,
+                pufferl.policy_bf16->act, pufferl.policy_fp32);
 
             clip_grad_norm_(pufferl.alloc_fp32.grad_buffer, hypers.max_grad_norm);
             pufferl.muon->step();
@@ -599,7 +626,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         policy_fp32->register_activations(pufferl->alloc_fp32, minibatch_segments, hypers.horizon);
     }
     pufferl->alloc_fp32.create(torch::kCUDA, torch::kFloat32);
-    if (!USE_BF16) policy_fp32->bind_zero_buffer(pufferl->alloc_fp32);
     policy_fp32->init_weights();
     pufferl->policy_fp32 = policy_fp32;
 
@@ -609,7 +635,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
             input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
         policy_bf16->register_activations(pufferl->alloc_bf16, minibatch_segments, hypers.horizon);
         pufferl->alloc_bf16.create(torch::kCUDA, torch::kBFloat16);
-        policy_bf16->bind_zero_buffer(pufferl->alloc_bf16);
         pufferl->policy_bf16 = policy_bf16;
         sync_policy_weights(pufferl->alloc_bf16.param_buffer, pufferl->alloc_fp32.param_buffer); // initial sync
     } else {
@@ -620,12 +645,13 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     float lr = hypers.lr;
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
-    pufferl->muon = new Muon(policy_fp32->parameters(),
-        pufferl->alloc_fp32.param_buffer, pufferl->alloc_fp32.grad_buffer,
+    pufferl->muon = new Muon(policy_fp32->param_shapes(),
+        PufTensor::from_torch(pufferl->alloc_fp32.param_buffer),
+        PufTensor::from_torch(pufferl->alloc_fp32.grad_buffer),
         lr, beta1, eps, 0.0);
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
-    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weight_buffer.numel());
+    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel);
 
     // Pre-allocate PPO loss buffers
     pufferl->ppo_bufs.create(minibatch_segments, hypers.horizon, decoder_output_size,
@@ -676,7 +702,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         }
 
         // Snapshot weights + optimizer state before init-time capture
-        Tensor saved_weights = pufferl->muon->weight_buffer.clone();
+        Tensor saved_weights = pufferl->muon->wb_puf.to_torch(torch::kFloat32).clone();
         Tensor saved_momentum;
         if (pufferl->muon->momentum_buffer.defined()) {
             saved_momentum = pufferl->muon->momentum_buffer.clone();
@@ -707,7 +733,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         // Restore weights + optimizer state corrupted by warmup/capture
         {
         torch::NoGradGuard no_grad;
-        pufferl->muon->weight_buffer.copy_(saved_weights);
+        pufferl->muon->wb_puf.to_torch(torch::kFloat32).copy_(saved_weights);
         if (saved_momentum.defined()) {
             pufferl->muon->momentum_buffer.copy_(saved_momentum);
         } else {

@@ -405,7 +405,7 @@ if not NO_TRAIN:
             },
             extra_link_args=extra_link_args,
             extra_objects=[RAYLIB_A],
-            libraries=[nvtx_lib, 'omp5', 'nccl', 'nvidia-ml'],
+            libraries=[nvtx_lib, 'omp5', 'nccl', 'nvidia-ml', 'cublas'],
             library_dirs=[nvtx_lib_dir],
         ),
     ]

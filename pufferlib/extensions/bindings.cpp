@@ -240,7 +240,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("close", &puf_close);
     m.def("logcumsumexp_cuda", [](torch::Tensor x) { return LogCumsumExp::apply(x)[0]; });
     m.def("initial_state", &initial_state);
-    m.def("mingru_gate", &mingru_gate);
+    m.def("mingru_gate", static_cast<void(*)(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor)>(&mingru_gate));
     m.def("fc_max", [](torch::Tensor x, torch::Tensor W, torch::Tensor b) { return FCMax::apply(x, W, b)[0]; });
     m.def("fc_max_cpp", &fc_max_cpp);
     m.def("sample_logits", &sample_logits);
@@ -252,7 +252,9 @@ PYBIND11_MODULE(_C, m) {
 
     py::class_<Muon>(m, "Muon")
         .def_readwrite("lr", &Muon::lr)
-        .def_readwrite("weight_buffer", &Muon::weight_buffer)
+        .def_property_readonly("weight_buffer", [](Muon& self) {
+            return self.wb_puf.to_torch(torch::kFloat32);
+        })
         .def_readwrite("momentum_buffer", &Muon::momentum_buffer)
         .def("state_dict", &Muon::state_dict)
         .def("load_state_dict", &Muon::load_state_dict);
@@ -351,14 +353,28 @@ PYBIND11_MODULE(_C, m) {
                          int num_layers, int num_atns, bool continuous) {
             return new Policy(alloc, input, hidden, output, num_layers, num_atns, continuous);
         }))
-        .def("forward", static_cast<std::tuple<Logits, Tensor, Tensor> (Policy::*)(Tensor, Tensor)>(&Policy::forward))
-        .def("forward_train", static_cast<std::tuple<Logits, Tensor> (Policy::*)(Tensor, Tensor)>(&Policy::forward_train))
+        .def("forward", static_cast<std::tuple<Tensor, Tensor> (Policy::*)(Tensor, Tensor)>(&Policy::forward))
+        .def("forward_train", static_cast<Tensor (Policy::*)(Tensor, Tensor)>(&Policy::forward_train))
         .def("init_weights", &Policy::init_weights)
-        .def("parameters", &Policy::parameters)
+        .def("parameters", [](Policy& self) {
+            // Build torch views from PufTensor weights for Python interop
+            std::vector<torch::Tensor> params;
+            params.push_back(self.encoder.weight.to_torch(PRECISION_DTYPE));
+            params.push_back(self.decoder.weight.to_torch(PRECISION_DTYPE));
+            if (self.decoder.continuous) params.push_back(self.decoder.logstd.to_torch(PRECISION_DTYPE));
+            for (int i = 0; i < self.rnn.num_layers; i++)
+                params.push_back(self.rnn.weights[i].to_torch(PRECISION_DTYPE));
+            return params;
+        })
         .def("named_parameters", [](Policy& self) {
-            auto params = self.parameters();
+            std::vector<torch::Tensor> params;
+            params.push_back(self.encoder.weight.to_torch(PRECISION_DTYPE));
+            params.push_back(self.decoder.weight.to_torch(PRECISION_DTYPE));
+            if (self.decoder.continuous) params.push_back(self.decoder.logstd.to_torch(PRECISION_DTYPE));
+            for (int i = 0; i < self.rnn.num_layers; i++)
+                params.push_back(self.rnn.weights[i].to_torch(PRECISION_DTYPE));
             std::vector<std::string> names = {"encoder.linear.weight", "decoder.linear.weight"};
-            if (self.decoder.logstd.defined()) names.push_back("decoder.logstd");
+            if (self.decoder.continuous) names.push_back("decoder.logstd");
             for (int i = 0; i < self.rnn.num_layers; i++)
                 names.push_back("rnn.layer_" + std::to_string(i) + ".weight");
             std::vector<std::pair<std::string, torch::Tensor>> result;
