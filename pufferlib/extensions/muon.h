@@ -41,15 +41,17 @@ struct Muon {
     double momentum;
     double weight_decay;
     double eps;
+    float lr_val_init;                // initial lr value for post_create
 
     // State — all raw CUDA, no torch
-    float* lr_ptr = nullptr;          // 1 f32 on device — written by lr annealing, read by graph
-    float* lr_derived_ptr = nullptr;  // 2 f32 on device — [neg_lr, wd_scale]
+    float* lr_ptr = nullptr;          // alias into lr_puf.data after post_create
+    float* lr_derived_ptr = nullptr;  // alias into lr_derived_puf.data after post_create
+    PufTensor lr_puf;                 // (1,) f32 — registered in external Allocator
+    PufTensor lr_derived_puf;         // (2,) f32 — registered in external Allocator
+    PufTensor ns_norm_puf;            // (1,) f32 — norm scalar for Newton-Schulz
     PufTensor wb_puf, gb_puf, mb_puf, gc_puf, up_puf;
     bool bufs_initialized = false;
     NSScratch ns;
-    void* buf_mem = nullptr;    // owned: momentum + grad_clone + updates
-    void* ns_mem = nullptr;     // owned: NS scratch + norm scalar
     std::vector<ParamShape> param_shapes;
 
     // Multi-GPU
@@ -60,83 +62,66 @@ struct Muon {
          PufTensor grad_buffer, double lr_val, double momentum,
          double eps, double weight_decay)
         : momentum(momentum), weight_decay(weight_decay), eps(eps),
+          lr_val_init((float)lr_val),
           wb_puf(weight_buffer), gb_puf(grad_buffer),
           param_shapes(std::move(param_shapes))
     {
         assert(lr_val >= 0 && "Invalid learning rate");
         assert(eps >= 0 && "Invalid epsilon value");
         assert(weight_decay >= 0 && "Invalid weight_decay value");
-        cudaMalloc(&lr_ptr, sizeof(float));
-        float h = (float)lr_val;
-        cudaMemcpy(lr_ptr, &h, sizeof(float), cudaMemcpyHostToDevice);
-        cudaMalloc(&lr_derived_ptr, 2 * sizeof(float));
-        cudaMemset(lr_derived_ptr, 0, 2 * sizeof(float));
     }
 
-    ~Muon() {
-        if (lr_ptr) cudaFree(lr_ptr);
-        if (lr_derived_ptr) cudaFree(lr_derived_ptr);
-        if (buf_mem) cudaFree(buf_mem);
-        if (ns_mem) cudaFree(ns_mem);
-    }
+    ~Muon() {} // Memory owned by external Allocator
 
-    // Non-copyable (owns CUDA memory)
+    // Non-copyable
     Muon(const Muon&) = delete;
     Muon& operator=(const Muon&) = delete;
 
+    // Register all Muon buffers into an external Allocator (call before alloc.create())
+    void register_buffers(Allocator& alloc) {
+        int64_t n = wb_puf.numel;
+        alloc.register_puf(&lr_puf, {1}, sizeof(float));
+        alloc.register_puf(&lr_derived_puf, {2}, sizeof(float));
+        alloc.register_puf(&mb_puf, {n}, sizeof(float));
+        alloc.register_puf(&gc_puf, {n}, sizeof(float));
+        alloc.register_puf(&up_puf, {n}, sizeof(float));
+
+        // Pre-compute Newton-Schulz scratch sizes for largest 2D param
+        int64_t max_M = 0, max_N = 0;
+        for (auto& ps : param_shapes) {
+            if (ps.ndim >= 2) {
+                int64_t R = ps.shape[0];
+                int64_t C = ps.numel / R;
+                int64_t M = std::min(R, C), N = std::max(R, C);
+                max_M = std::max(max_M, M);
+                max_N = std::max(max_N, N);
+            }
+        }
+        if (max_M > 0) {
+            ns.max_M = max_M; ns.max_N = max_N;
+            alloc.register_puf(&ns.x, {max_M, max_N}, 2);           // bf16
+            alloc.register_puf(&ns.A, {max_M, max_M}, 2);           // bf16
+            alloc.register_puf(&ns.gram, {max_M, max_M}, 2);        // bf16
+            alloc.register_puf(&ns.tmp, {max_M, max_N}, 2);         // bf16
+            alloc.register_puf(&ns.result_f32, {max_M, max_N}, sizeof(float));
+            alloc.register_puf(&ns_norm_puf, {1}, sizeof(float));
+        }
+        bufs_initialized = true;
+    }
+
+    // Set up pointer aliases and initial values (call after alloc.create())
+    void post_create() {
+        lr_ptr = (float*)lr_puf.data;
+        lr_derived_ptr = (float*)lr_derived_puf.data;
+        if (ns_norm_puf.data) ns.norm_ptr = (float*)ns_norm_puf.data;
+        cudaMemcpy(lr_ptr, &lr_val_init, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemset(lr_derived_ptr, 0, 2 * sizeof(float));
+        // Zero momentum buffer
+        cudaMemset(mb_puf.data, 0, mb_puf.numel * sizeof(float));
+    }
+
     void step(cudaStream_t stream = 0) {
         if (wb_puf.data == nullptr) return;
-
-        // Initialize persistent buffers (once, during warmup before graph capture)
-        if (!bufs_initialized) {
-            int64_t n = wb_puf.numel;
-            cudaMalloc(&buf_mem, 3 * n * sizeof(float));
-            cudaMemset(buf_mem, 0, n * sizeof(float));  // zero momentum portion
-            float* p = (float*)buf_mem;
-            auto mk1d = [](void* ptr, int64_t numel) {
-                PufTensor t; t.data = ptr; t.shape[0] = numel;
-                t.ndim = 1; t.numel = numel; t.dtype_size = 4;
-                return t;
-            };
-            mb_puf = mk1d(p,       n);
-            gc_puf = mk1d(p + n,   n);
-            up_puf = mk1d(p + 2*n, n);
-
-            // Pre-allocate Newton-Schulz scratch for largest 2D param
-            // M = min(R,C), N = max(R,C) — matching transposed convention in NS
-            int64_t max_M = 0, max_N = 0;
-            for (auto& ps : param_shapes) {
-                if (ps.ndim >= 2) {
-                    int64_t R = ps.shape[0];
-                    int64_t C = ps.numel / R;
-                    int64_t M = std::min(R, C), N = std::max(R, C);
-                    max_M = std::max(max_M, M);
-                    max_N = std::max(max_N, N);
-                }
-            }
-            if (max_M > 0) {
-                ns.max_M = max_M; ns.max_N = max_N;
-                int bf16sz = 2, f32sz = 4;
-                int64_t total = (max_M*max_N + max_M*max_M + max_M*max_M + max_M*max_N) * bf16sz
-                              + max_M*max_N * f32sz + sizeof(float);
-                cudaMalloc(&ns_mem, total);
-                char* q = (char*)ns_mem;
-                auto mk_bf16 = [&](int64_t r, int64_t c) -> PufTensor {
-                    PufTensor t; t.data = q; t.shape[0] = r; t.shape[1] = c;
-                    t.ndim = 2; t.numel = r*c; t.dtype_size = bf16sz;
-                    q += r * c * bf16sz; return t;
-                };
-                ns.x = mk_bf16(max_M, max_N);
-                ns.A = mk_bf16(max_M, max_M);
-                ns.gram = mk_bf16(max_M, max_M);
-                ns.tmp = mk_bf16(max_M, max_N);
-                ns.result_f32.data = q; ns.result_f32.shape[0] = max_M; ns.result_f32.shape[1] = max_N;
-                ns.result_f32.ndim = 2; ns.result_f32.numel = max_M*max_N; ns.result_f32.dtype_size = f32sz;
-                q += max_M * max_N * f32sz;
-                ns.norm_ptr = (float*)q;
-            }
-            bufs_initialized = true;
-        }
 
         // Copy grads into persistent clone buffer
         puf_copy(gc_puf, gb_puf, stream);

@@ -180,6 +180,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int agents_created = 0;
     while (agents_created < total_agents) {
         srand(num_envs);
+        envs[num_envs].rng = num_envs;
         my_init(&envs[num_envs], env_kwargs);
         agents_created += envs[num_envs].num_agents;
         num_envs++;

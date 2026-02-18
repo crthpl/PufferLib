@@ -60,16 +60,3 @@ void puff_advantage_cpu(Tensor values, Tensor rewards,
     );
 }
 
-// Forward declare CUDA implementation
-void puff_advantage_cuda(
-    Tensor values,
-    Tensor rewards,
-    Tensor dones,
-    Tensor importance,
-    Tensor advantages,
-    double gamma,
-    double lambda,
-    double rho_clip,
-    double c_clip
-);
-

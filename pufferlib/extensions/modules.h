@@ -51,12 +51,12 @@ struct PufTensor {
 // Helper: bytes per element for a torch ScalarType
 inline int dtype_size(torch::ScalarType dtype) {
     switch (dtype) {
-        case torch::kFloat32: return 4;
-        case torch::kFloat64: return 8;
-        case torch::kBFloat16: return 2;
-        case torch::kFloat16: return 2;
-        case torch::kInt32: return 4;
-        case torch::kInt64: return 8;
+        case torch::kFloat32: return sizeof(float);
+        case torch::kFloat64: return sizeof(double);
+        case torch::kBFloat16: return 2;  // no native C++ type
+        case torch::kFloat16: return 2;   // no native C++ type
+        case torch::kInt32: return sizeof(int32_t);
+        case torch::kInt64: return sizeof(int64_t);
         default: TORCH_CHECK(false, "Unsupported dtype for PufTensor"); return 0;
     }
 }
@@ -71,11 +71,6 @@ void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream);
 void puf_addmm(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta, cudaStream_t stream);
 // out = alpha * a @ b + beta * out (bf16, f32 compute, no transpose)
 void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta, cudaStream_t stream);
-
-#ifdef PUFFERLIB_TORCH
-// Copy from torch::Tensor into PufTensor with dtype conversion (e.g. f32->bf16)
-void puf_copy_from_torch(PufTensor& dst, torch::Tensor src, cudaStream_t stream);
-#endif
 
 // Cast bf16->f32
 void puf_cast_bf16_to_f32(PufTensor& dst, const PufTensor& src, cudaStream_t stream);
@@ -309,7 +304,7 @@ struct Allocator {
 #ifdef PUFFERLIB_TORCH
     // Legacy: create with torch types (builds Tensor views for bindings/cpp paths)
     void create(torch::Device device, torch::ScalarType dtype) {
-        int esz = (dtype == torch::kFloat32) ? 4 : (dtype == torch::kBFloat16) ? 2 : 4;
+        int esz = (dtype == torch::kFloat32) ? sizeof(float) : (dtype == torch::kBFloat16) ? 2 : sizeof(float);
         create(esz);
         // Create Tensor views over the cudaMalloc'd memory
         if (param_mem) {

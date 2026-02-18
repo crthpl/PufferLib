@@ -352,7 +352,7 @@ class DriveEncoder : public Encoder {
         Tensor partner_features;
         if (use_fused_kernel) {
             // Fused FC -> Max kernel
-            partner_features = FCMax::apply(partner_objects, partner_W, partner_b)[0];
+            partner_features = fc_max_cpp(partner_objects, partner_W, partner_b);
         } else {
             // Torch: Linear -> LayerNorm -> Linear -> Max
             auto h = partner_linear1->forward(partner_objects);  // (B, 63, 128)
@@ -371,7 +371,7 @@ class DriveEncoder : public Encoder {
         Tensor road_features;
         if (use_fused_kernel) {
             // Fused FC -> Max kernel
-            road_features = FCMax::apply(road_combined, road_W, road_b)[0];
+            road_features = fc_max_cpp(road_combined, road_W, road_b);
         } else {
             // Torch: Linear -> LayerNorm -> Linear -> Max
             auto h = road_linear1->forward(road_combined);  // (B, 200, 128)

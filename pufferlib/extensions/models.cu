@@ -161,9 +161,9 @@ struct MinGRU {
             alloc.register_puf(&act.combined_bufs[i], {B_TT, 3 * H}, psz);
             alloc.register_puf(&act.scan_bufs[i].out, {B, TT, H}, psz);
             alloc.register_puf(&act.scan_bufs[i].next_state, {B, 1, H}, psz);
-            alloc.register_puf(&act.scan_bufs[i].a_star, {B, TT + 1, H}, 4);  // float32
-            alloc.register_puf(&act.scan_bufs[i].s_vals, {B, TT + 1, H}, 4);
-            alloc.register_puf(&act.scan_bufs[i].log_values_buf, {B, TT + 1, H}, 4);
+            alloc.register_puf(&act.scan_bufs[i].a_star, {B, TT + 1, H}, sizeof(float));
+            alloc.register_puf(&act.scan_bufs[i].s_vals, {B, TT + 1, H}, sizeof(float));
+            alloc.register_puf(&act.scan_bufs[i].log_values_buf, {B, TT + 1, H}, sizeof(float));
             alloc.register_puf(&act.scan_bufs[i].grad_combined, {B, TT, 3 * H}, psz);
             alloc.register_puf(&act.scan_bufs[i].grad_state, {B, 1, H}, psz);
         }

@@ -404,6 +404,7 @@ __global__ void logcumsumexp_backward_kernel(
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
     float* __restrict__ losses_acc,      // accumulator for loss components [LOSS_N floats]
+    float* __restrict__ ppo_partials,    // per-block partial sums for deterministic reduction
     double* __restrict__ saved_for_backward,
     precision_t* __restrict__ ratio_out,
     precision_t* __restrict__ newvalue_out,
@@ -588,11 +589,37 @@ reduce:
         __syncthreads();
     }
 
+    // Write per-block partials for deterministic reduction (no atomicAdd)
     if (tid == 0) {
-        atomicAdd(loss, block_losses[LOSS_TOTAL][0]);
+        int base = blockIdx.x * (LOSS_N + 1);
+        ppo_partials[base] = block_losses[LOSS_TOTAL][0];  // loss
         for (int c = 0; c < LOSS_N; c++) {
-            atomicAdd(&losses_acc[c], block_losses[c][0]);
+            ppo_partials[base + 1 + c] = block_losses[c][0];
         }
+    }
+}
+
+// Deterministic reduction of per-block PPO loss partials
+__global__ void ppo_loss_reduce_kernel(
+    float* __restrict__ loss,
+    float* __restrict__ losses_acc,
+    const float* __restrict__ partials,
+    int num_blocks
+) {
+    // Each thread handles one column (loss or loss_acc component)
+    // tid 0 = total loss, tid 1..LOSS_N = loss components
+    int tid = threadIdx.x;
+    if (tid > LOSS_N) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < num_blocks; b++) {
+        sum += partials[b * (LOSS_N + 1) + tid];
+    }
+
+    if (tid == 0) {
+        *loss += sum;
+    } else {
+        losses_acc[tid - 1] += sum;
     }
 }
 
@@ -1022,40 +1049,77 @@ __global__ void fc_max_forward_kernel(
     argmax_indices[idx] = argmax_n;
 }
 
-// Backward: grad_x, grad_W, grad_b are always float32 (atomicAdd requires fp32)
-// grad_out and x may be bf16
-__global__ void fc_max_backward_kernel(
-    float* __restrict__ grad_x,             // (B, N, D_in) - always float32 for atomicAdd
-    float* __restrict__ grad_W,             // (D_out, D_in) - always float32
-    float* __restrict__ grad_b,             // (D_out) - always float32
+// Deterministic backward: three separate kernels with no atomicAdd
+// Each kernel assigns threads so that each output element is written by exactly one thread.
+
+// grad_b[d_out] = sum over batch,t of grad_out[batch*D_out + d_out]
+// One thread per d_out, serial sum over batch dimension
+__global__ void fc_max_backward_grad_b_kernel(
+    float* __restrict__ grad_b,             // (D_out)
+    const precision_t* __restrict__ grad_out,         // (B, D_out)
+    int B, int D_out
+) {
+    int d_out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d_out >= D_out) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < B; b++) {
+        sum += to_float(grad_out[b * D_out + d_out]);
+    }
+    grad_b[d_out] = sum;
+}
+
+// grad_W[d_out, d_in] = sum over batch of grad_out[batch, d_out] * x[batch, argmax[batch, d_out], d_in]
+// One thread per (d_out, d_in) pair, serial sum over batch dimension
+__global__ void fc_max_backward_grad_W_kernel(
+    float* __restrict__ grad_W,             // (D_out, D_in)
     const precision_t* __restrict__ grad_out,         // (B, D_out)
     const precision_t* __restrict__ x,                // (B, N, D_in)
-    const float* __restrict__ W,            // (D_out, D_in) - always float32
     const int* __restrict__ argmax_indices, // (B, D_out)
     int B, int N, int D_in, int D_out
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * D_out) return;
+    if (idx >= D_out * D_in) return;
 
-    int batch = idx / D_out;
-    int d_out = idx % D_out;
+    int d_out = idx / D_in;
+    int d_in = idx % D_in;
 
-    float g_out = to_float(grad_out[idx]);
-    int argmax_n = argmax_indices[idx];
+    float sum = 0.0f;
+    for (int b = 0; b < B; b++) {
+        float g_out = to_float(grad_out[b * D_out + d_out]);
+        int argmax_n = argmax_indices[b * D_out + d_out];
+        float x_val = to_float(x[b * N * D_in + argmax_n * D_in + d_in]);
+        sum += g_out * x_val;
+    }
+    grad_W[idx] = sum;
+}
 
-    // grad_b[d_out] += g_out
-    atomicAdd(&grad_b[d_out], g_out);
+// grad_x[batch, n, d_in] = sum over d_out where argmax[batch, d_out]==n of grad_out[batch, d_out] * W[d_out, d_in]
+// One thread per (batch, d_in) pair, serial loop over d_out
+// Each thread writes to its own batch's grad_x — no cross-thread contention
+__global__ void fc_max_backward_grad_x_kernel(
+    float* __restrict__ grad_x,             // (B, N, D_in)
+    const precision_t* __restrict__ grad_out,         // (B, D_out)
+    const float* __restrict__ W,            // (D_out, D_in)
+    const int* __restrict__ argmax_indices, // (B, D_out)
+    int B, int N, int D_in, int D_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D_in) return;
 
-    // Backprop through FC at argmax position only
-    for (int di = 0; di < D_in; di++) {
-        int x_idx = batch * N * D_in + argmax_n * D_in + di;
-        int w_idx = d_out * D_in + di;
+    int batch = idx / D_in;
+    int d_in = idx % D_in;
 
-        // grad_W[d_out, di] += g_out * x[batch, argmax_n, di]
-        atomicAdd(&grad_W[w_idx], g_out * to_float(x[x_idx]));
+    // Zero this batch's grad_x column first
+    for (int n = 0; n < N; n++) {
+        grad_x[batch * N * D_in + n * D_in + d_in] = 0.0f;
+    }
 
-        // grad_x[batch, argmax_n, di] += g_out * W[d_out, di]
-        atomicAdd(&grad_x[x_idx], g_out * W[w_idx]);
+    // Accumulate: for each d_out, add grad_out * W to the argmax position
+    for (int d_out = 0; d_out < D_out; d_out++) {
+        float g_out = to_float(grad_out[batch * D_out + d_out]);
+        int argmax_n = argmax_indices[batch * D_out + d_out];
+        grad_x[batch * N * D_in + argmax_n * D_in + d_in] += g_out * W[d_out * D_in + d_in];
     }
 }
 

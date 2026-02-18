@@ -139,16 +139,21 @@ class PuffeRL:
 
     def train(self):
         _C.train(self.pufferl_cpp)
-        logs = None
         self.epoch += 1
+
+        # Always drain losses every epoch for deterministic accumulation
+        if HAS_TORCH:
+            torch.cuda.synchronize()
+        self.losses = _C.log_losses(self.pufferl_cpp)
+        self.profile = _C.log_profile(self.pufferl_cpp)
+
+        # Rate-limit dashboard/logging to avoid overhead, but env stats
+        # and display are purely cosmetic — they don't affect training state
+        logs = None
         done_training = self.global_step >= self.config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.6:
-            if HAS_TORCH:
-                torch.cuda.synchronize()
             logs = _C.log_environments(self.pufferl_cpp)
             self.stats = logs
-            self.losses = _C.log_losses(self.pufferl_cpp)
-            self.profile = _C.log_profile(self.pufferl_cpp)
             self.utilization = _C.log_utilization(self.pufferl_cpp)
             logs = self.write_logs(logs)
 

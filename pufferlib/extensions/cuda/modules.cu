@@ -1,11 +1,6 @@
 #ifndef PUFFERLIB_MODULES_CU
 #define PUFFERLIB_MODULES_CU
 
-#ifdef PUFFERLIB_TORCH
-#include <torch/extension.h>
-#include <torch/torch.h>
-#include <c10/cuda/CUDAStream.h>
-#endif
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -21,14 +16,15 @@
 
 using std::tuple;
 using std::vector;
-#ifdef PUFFERLIB_TORCH
-typedef torch::Tensor Tensor;
-#endif
 
 static cublasHandle_t get_cublas_handle() {
     static cublasHandle_t handle = nullptr;
     if (!handle) {
         cublasCreate(&handle);
+        // Allocate explicit workspace for deterministic results across streams
+        static void* workspace = nullptr;
+        if (!workspace) cudaMalloc(&workspace, 4096 * 8);
+        cublasSetWorkspace(handle, workspace, 4096 * 8);
     }
     return handle;
 }
@@ -168,9 +164,15 @@ void puf_cast_bf16_to_f32(PufTensor& dst, const PufTensor& src, cudaStream_t str
         (float*)dst.data, (const __nv_bfloat16*)src.data, dst.numel);
 }
 
-// Frobenius norm of bf16 tensor
+// Static buffer for deterministic norm reduction (256 blocks max)
+static float* norm_partials_buf = nullptr;
+static void ensure_norm_partials() {
+    if (!norm_partials_buf) cudaMalloc(&norm_partials_buf, 256 * sizeof(float));
+}
+
+// Frobenius norm of bf16 tensor — writes per-block partial to partials buffer
 __global__ void norm_bf16_kernel(
-    float* __restrict__ out,
+    float* __restrict__ partials,
     const __nv_bfloat16* __restrict__ src,
     int n
 ) {
@@ -187,20 +189,11 @@ __global__ void norm_bf16_kernel(
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(out, sdata[0]);
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
 }
 
-void puf_norm(const PufTensor& src, float* out_ptr, cudaStream_t stream) {
-    assert(src.dtype_size == 2 && "puf_norm: expected bf16");
-    cudaMemsetAsync(out_ptr, 0, sizeof(float), stream);
-    int blocks = std::min((int)grid_size(src.numel), 256);
-    norm_bf16_kernel<<<blocks, 256, 0, stream>>>(
-        out_ptr, (const __nv_bfloat16*)src.data, src.numel);
-    // out_ptr now holds sum of squares; caller uses puf_normalize to apply sqrt + divide
-}
-
-// f32 sum-of-squares reduction (same pattern as bf16 but reads float directly)
-__global__ void norm_f32_kernel(float* __restrict__ out, const float* __restrict__ src, int n) {
+// f32 sum-of-squares reduction — writes per-block partial to partials buffer
+__global__ void norm_f32_kernel(float* __restrict__ partials, const float* __restrict__ src, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -213,7 +206,30 @@ __global__ void norm_f32_kernel(float* __restrict__ out, const float* __restrict
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(out, sdata[0]);
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
+}
+
+// Deterministic reduction of per-block partials into a single output
+__global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) *out = sdata[0];
+}
+
+void puf_norm(const PufTensor& src, float* out_ptr, cudaStream_t stream) {
+    assert(src.dtype_size == 2 && "puf_norm: expected bf16");
+    ensure_norm_partials();
+    int blocks = std::min((int)grid_size(src.numel), 256);
+    norm_bf16_kernel<<<blocks, 256, 0, stream>>>(
+        norm_partials_buf, (const __nv_bfloat16*)src.data, src.numel);
+    norm_reduce_kernel<<<1, 256, 0, stream>>>(out_ptr, norm_partials_buf, blocks);
+    // out_ptr now holds sum of squares; caller uses puf_normalize to apply sqrt + divide
 }
 
 // dst *= min(max_norm / (sqrt(sum_sq) + eps), 1.0)
@@ -229,9 +245,10 @@ __global__ void clip_by_norm_f32_kernel(float* __restrict__ dst, const float* __
 
 void puf_clip_grad_norm(PufTensor& grad, float max_norm, float* scratch, cudaStream_t stream) {
     assert(grad.dtype_size == 4 && "puf_clip_grad_norm: expected f32");
-    cudaMemsetAsync(scratch, 0, sizeof(float), stream);
+    ensure_norm_partials();
     int blocks = std::min((int)grid_size(grad.numel), 256);
-    norm_f32_kernel<<<blocks, 256, 0, stream>>>(scratch, (float*)grad.data, grad.numel);
+    norm_f32_kernel<<<blocks, 256, 0, stream>>>(norm_partials_buf, (float*)grad.data, grad.numel);
+    norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, norm_partials_buf, blocks);
     clip_by_norm_f32_kernel<<<grid_size(grad.numel), BLOCK_SIZE, 0, stream>>>(
         (float*)grad.data, scratch, max_norm, 1e-6f, grad.numel);
 }
@@ -480,27 +497,6 @@ void puf_orthogonal_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t
     cudaFree(devInfo);
     cusolverDnDestroy(solver);
 }
-
-#ifdef PUFFERLIB_TORCH
-// Copy from torch::Tensor into PufTensor with dtype conversion
-void puf_copy_from_torch(PufTensor& dst, Tensor src, cudaStream_t stream) {
-    assert(dst.numel == src.numel() && "puf_copy_from_torch: size mismatch");
-
-    if (src.scalar_type() == torch::kFloat32 && dst.dtype_size == 2) {
-        // f32 → bf16
-        cast_f32_to_bf16_kernel<<<grid_size(dst.numel), BLOCK_SIZE, 0, stream>>>(
-            (__nv_bfloat16*)dst.data,
-            (const float*)src.data_ptr(),
-            dst.numel);
-    } else if (src.element_size() == dst.dtype_size) {
-        // Same dtype: raw memcpy
-        cudaMemcpyAsync(dst.data, src.data_ptr(), dst.nbytes(),
-            cudaMemcpyDeviceToDevice, stream);
-    } else {
-        assert(false && "puf_copy_from_torch: unsupported dtype conversion");
-    }
-}
-#endif // PUFFERLIB_TORCH
 
 // PufTensor→PufTensor memcpy (same dtype, same size)
 void puf_copy(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
@@ -836,367 +832,7 @@ void prefix_scan_backward(
         T, H, B);
 }
 
-// =============================================================================
-// Legacy torch-dependent functions (autograd, torch::Tensor wrappers)
-// Declarations in legacy_modules.h — will be removed as we migrate to PufTensor
-// =============================================================================
-#ifdef PUFFERLIB_TORCH
-
-using tensor_list = torch::autograd::tensor_list;
-using AutogradCtx = torch::autograd::AutogradContext;
-
-// Fused mingru gate inference (torch::Tensor overload)
-void mingru_gate(Tensor state, Tensor combined, Tensor out, Tensor next_state) {
-    TORCH_CHECK(state.is_cuda(), "state must be on CUDA");
-    TORCH_CHECK(combined.is_cuda(), "combined must be on CUDA");
-    TORCH_CHECK(state.dtype() == combined.dtype(), "dtypes must match");
-    TORCH_CHECK(state.dim() == 2 && combined.dim() == 2, "must be 2D tensors");
-    TORCH_CHECK(combined.size(1) == 3 * state.size(1), "combined must be 3*H");
-    TORCH_CHECK(state.size(0) == combined.size(0), "batch size must match");
-    TORCH_CHECK(state.is_contiguous() && combined.is_contiguous(), "must be contiguous");
-
-    int B = static_cast<int>(state.size(0));
-    int H = static_cast<int>(state.size(1));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    mingru_gate_inference_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)out.data_ptr(),
-        (precision_t*)next_state.data_ptr(),
-        (const precision_t*)combined.data_ptr(),
-        (const precision_t*)state.data_ptr(),
-        H, B);
-}
-
-// LogCumsumExp x = (B, T, H)
-tensor_list LogCumsumExp::forward(AutogradCtx* ctx, Tensor x) {
-    TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
-    auto device = x.device();
-    int B = static_cast<int>(x.size(0));
-    int T = static_cast<int>(x.size(1));
-    int H = static_cast<int>(x.size(2));
-
-    auto out = torch::empty({B, T, H}, x.options());
-    auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-    auto s_buf = torch::empty({B, T, H}, options_double);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    logcumsumexp_forward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)out.data_ptr(),
-        s_buf.data_ptr<double>(),
-        (const precision_t*)x.data_ptr(),
-        T, H, B);
-
-    ctx->save_for_backward({x, out, s_buf});
-    return {out};
-}
-
-tensor_list LogCumsumExp::backward(AutogradCtx* ctx, tensor_list grad_outputs) {
-    auto saved = ctx->get_saved_variables();
-    auto x = saved[0].contiguous();
-    auto s_buf = saved[2];
-
-    auto grad_out = grad_outputs[0].contiguous();
-    int B = static_cast<int>(x.size(0));
-    int T = static_cast<int>(x.size(1));
-    int H = static_cast<int>(x.size(2));
-
-    auto grad_x = torch::empty_like(x);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    logcumsumexp_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)grad_x.data_ptr(),
-        (const precision_t*)grad_out.data_ptr(),
-        (const precision_t*)x.data_ptr(),
-        s_buf.data_ptr<double>(),
-        T, H, B);
-
-    return {grad_x};
-}
-
-// PPOLoss: fused PPO clipped loss with value loss
-tensor_list PPOLoss::forward(
-    AutogradCtx* ctx,
-    Tensor logits,
-    Tensor logstd,
-    Tensor values_pred,
-    Tensor actions,
-    Tensor old_logprobs,
-    Tensor advantages,
-    Tensor prio,
-    Tensor values,
-    Tensor returns,
-    Tensor ratio_out,
-    Tensor newvalue_out,
-    Tensor act_sizes,
-    Tensor losses_acc,
-    double clip_coef,
-    double vf_clip_coef,
-    double vf_coef,
-    double ent_coef
-) {
-    TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
-    TORCH_CHECK(act_sizes.is_cuda(), "act_sizes must be on CUDA");
-    TORCH_CHECK(act_sizes.dtype() == torch::kInt32, "act_sizes must be int32");
-    auto dtype = logits.dtype();
-    TORCH_CHECK(dtype == torch::kFloat32 || dtype == torch::kBFloat16,
-                "Only float32 and bfloat16 supported");
-
-    bool is_continuous = logstd.defined() && logstd.numel() > 0;
-    auto logstd_to_save = is_continuous ? logstd : torch::empty({0}, logits.options());
-
-    auto device = logits.device();
-    int N = static_cast<int>(logits.size(0));
-    int T = static_cast<int>(logits.size(1));
-    int A_total = static_cast<int>(logits.size(2));
-    int num_atns = static_cast<int>(act_sizes.size(0));
-
-    auto [adv_var, adv_mean] = torch::var_mean(advantages);
-    auto actions_flat = actions.reshape({N * T, num_atns}).contiguous();
-
-    auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    auto options_double = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-    auto loss_output = torch::empty({1}, options_float);
-    auto saved_for_backward = torch::zeros({N * T, 5}, options_double);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto logits_strides = logits.strides();
-    auto values_strides = values_pred.strides();
-    int logits_stride_n = logits_strides[0];
-    int logits_stride_t = logits_strides[1];
-    int logits_stride_a = logits_strides[2];
-    int values_stride_n = values_strides[0];
-    int values_stride_t = values_strides[1];
-
-    int total = N * T;
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    cudaMemsetAsync(loss_output.data_ptr<float>(), 0, sizeof(float), stream);
-    ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        loss_output.data_ptr<float>(),
-        losses_acc.data_ptr<float>(),
-        saved_for_backward.data_ptr<double>(),
-        (precision_t*)ratio_out.data_ptr(),
-        (precision_t*)newvalue_out.data_ptr(),
-        (const precision_t*)logits.data_ptr(),
-        is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
-        (const precision_t*)values_pred.data_ptr(),
-        actions_flat.data_ptr<double>(),
-        (const precision_t*)old_logprobs.data_ptr(),
-        advantages.data_ptr<float>(),
-        (const precision_t*)prio.data_ptr(),
-        (const precision_t*)values.data_ptr(),
-        (const precision_t*)returns.data_ptr(),
-        adv_mean.data_ptr<float>(),
-        adv_var.data_ptr<float>(),
-        act_sizes.data_ptr<int>(),
-        num_atns,
-        static_cast<float>(clip_coef),
-        static_cast<float>(vf_clip_coef),
-        static_cast<float>(vf_coef),
-        static_cast<float>(ent_coef),
-        T, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-
-    losses_acc.select(0, LOSS_N).add_(1.0);
-
-    ctx->saved_data["clip_coef"] = clip_coef;
-    ctx->saved_data["vf_clip_coef"] = vf_clip_coef;
-    ctx->saved_data["vf_coef"] = vf_coef;
-    ctx->saved_data["ent_coef"] = ent_coef;
-    ctx->saved_data["is_continuous"] = is_continuous;
-
-    ctx->save_for_backward({logits, logstd_to_save, values_pred, actions_flat, old_logprobs, advantages,
-                            prio, values, returns, adv_mean, adv_var, act_sizes});
-
-    return {loss_output};
-}
-
-tensor_list PPOLoss::backward(
-    AutogradCtx* ctx,
-    tensor_list grad_outputs
-) {
-    auto saved = ctx->get_saved_variables();
-    auto logits = saved[0].contiguous();
-    auto logstd = saved[1];
-    auto values_pred = saved[2].contiguous();
-    auto actions_flat = saved[3].contiguous();
-    auto old_logprobs = saved[4].contiguous();
-    auto advantages = saved[5].contiguous();
-    auto prio = saved[6].contiguous();
-    auto values = saved[7].contiguous();
-    auto returns = saved[8].contiguous();
-    auto adv_mean = saved[9].contiguous();
-    auto adv_var = saved[10].contiguous();
-    auto act_sizes = saved[11];
-
-    int N = static_cast<int>(logits.size(0));
-    int T = static_cast<int>(logits.size(1));
-    int A_total = static_cast<int>(logits.size(2));
-    int num_atns = static_cast<int>(act_sizes.size(0));
-
-    float clip_coef = ctx->saved_data["clip_coef"].to<double>();
-    float vf_clip_coef = ctx->saved_data["vf_clip_coef"].to<double>();
-    float vf_coef = ctx->saved_data["vf_coef"].to<double>();
-    float ent_coef = ctx->saved_data["ent_coef"].to<double>();
-    bool is_continuous = ctx->saved_data["is_continuous"].to<bool>();
-
-    auto grad_loss = grad_outputs[0].to(torch::kFloat32).contiguous();
-    auto grad_logits = torch::empty(logits.sizes(), logits.options().dtype(torch::kFloat32));
-    auto grad_values_pred = torch::empty(values_pred.sizes(), values_pred.options().dtype(torch::kFloat32));
-    Tensor grad_logstd;
-    if (is_continuous) {
-        logstd = logstd.contiguous();
-        grad_logstd = torch::empty(logstd.sizes(), logstd.options().dtype(torch::kFloat32));
-    }
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto logits_strides = logits.strides();
-    auto values_strides = values_pred.strides();
-    int logits_stride_n = logits_strides[0];
-    int logits_stride_t = logits_strides[1];
-    int logits_stride_a = logits_strides[2];
-    int values_stride_n = values_strides[0];
-    int values_stride_t = values_strides[1];
-
-    int total = N * T;
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    ppo_loss_backward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        grad_logits.data_ptr<float>(),
-        is_continuous ? grad_logstd.data_ptr<float>() : nullptr,
-        grad_values_pred.data_ptr<float>(),
-        grad_loss.data_ptr<float>(),
-        (const precision_t*)logits.data_ptr(),
-        is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
-        (const precision_t*)values_pred.data_ptr(),
-        actions_flat.data_ptr<double>(),
-        (const precision_t*)old_logprobs.data_ptr(),
-        advantages.data_ptr<float>(),
-        (const precision_t*)prio.data_ptr(),
-        (const precision_t*)values.data_ptr(),
-        (const precision_t*)returns.data_ptr(),
-        adv_mean.data_ptr<float>(),
-        adv_var.data_ptr<float>(),
-        act_sizes.data_ptr<int>(),
-        num_atns,
-        clip_coef, vf_clip_coef,
-        vf_coef, ent_coef,
-        T, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-
-    return {
-        grad_logits,
-        is_continuous ? grad_logstd : Tensor(),
-        grad_values_pred,
-        {}, {}, {}, {}, {}, {},
-        {}, {},
-        {},
-        {},
-        {}, {}, {}, {}
-    };
-}
-
-// Fused PPO loss forward + backward (no autograd)
-void ppo_loss_fwd_bwd(
-    Tensor logits, Tensor logstd, Tensor values_pred,
-    Tensor actions, Tensor old_logprobs, Tensor advantages,
-    Tensor prio, Tensor values, Tensor returns,
-    Tensor ratio_out, Tensor newvalue_out,
-    Tensor act_sizes, Tensor losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    PPOBuffers& bufs
-) {
-    TORCH_CHECK(logits.is_cuda(), "logits must be on CUDA");
-    TORCH_CHECK(act_sizes.is_cuda() && act_sizes.dtype() == torch::kInt32,
-                "act_sizes must be int32 on CUDA");
-
-    TORCH_CHECK(old_logprobs.is_contiguous(), "old_logprobs must be contiguous");
-    TORCH_CHECK(advantages.is_contiguous(), "advantages must be contiguous");
-    TORCH_CHECK(prio.is_contiguous(), "prio must be contiguous");
-    TORCH_CHECK(values.is_contiguous(), "values must be contiguous");
-    TORCH_CHECK(returns.is_contiguous(), "returns must be contiguous");
-
-    bool is_continuous = logstd.defined() && logstd.numel() > 0;
-    if (is_continuous) logstd = logstd.contiguous();
-
-    int N = static_cast<int>(logits.size(0));
-    int T = static_cast<int>(logits.size(1));
-    int A_total = static_cast<int>(logits.size(2));
-    int num_atns = static_cast<int>(act_sizes.size(0));
-    int total = N * T;
-
-    auto [adv_var, adv_mean] = torch::var_mean(advantages);
-    auto actions_flat = actions.reshape({total, num_atns});
-    TORCH_CHECK(actions_flat.is_contiguous(), "actions must be contiguous");
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    int logits_stride_n = logits.stride(0);
-    int logits_stride_t = logits.stride(1);
-    int logits_stride_a = logits.stride(2);
-    int values_stride_n = values_pred.stride(0);
-    int values_stride_t = values_pred.stride(1);
-
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-
-    cudaMemsetAsync(bufs.loss_output.data_ptr<float>(), 0, sizeof(float), stream);
-    bufs.saved_for_bwd.zero_();
-    ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        bufs.loss_output.data_ptr<float>(),
-        losses_acc.data_ptr<float>(),
-        bufs.saved_for_bwd.data_ptr<double>(),
-        (precision_t*)ratio_out.data_ptr(),
-        (precision_t*)newvalue_out.data_ptr(),
-        (const precision_t*)logits.data_ptr(),
-        is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
-        (const precision_t*)values_pred.data_ptr(),
-        actions_flat.data_ptr<double>(),
-        (const precision_t*)old_logprobs.data_ptr(),
-        advantages.data_ptr<float>(),
-        (const precision_t*)prio.data_ptr(),
-        (const precision_t*)values.data_ptr(),
-        (const precision_t*)returns.data_ptr(),
-        adv_mean.data_ptr<float>(),
-        adv_var.data_ptr<float>(),
-        act_sizes.data_ptr<int>(),
-        num_atns,
-        clip_coef, vf_clip_coef, vf_coef, ent_coef,
-        T, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-
-    losses_acc.select(0, LOSS_N).add_(1.0);
-
-    ppo_loss_backward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        bufs.grad_logits.data_ptr<float>(),
-        is_continuous ? bufs.grad_logstd.data_ptr<float>() : nullptr,
-        bufs.grad_values.data_ptr<float>(),
-        bufs.grad_loss.data_ptr<float>(),
-        (const precision_t*)logits.data_ptr(),
-        is_continuous ? (const precision_t*)logstd.data_ptr() : nullptr,
-        (const precision_t*)values_pred.data_ptr(),
-        actions_flat.data_ptr<double>(),
-        (const precision_t*)old_logprobs.data_ptr(),
-        advantages.data_ptr<float>(),
-        (const precision_t*)prio.data_ptr(),
-        (const precision_t*)values.data_ptr(),
-        (const precision_t*)returns.data_ptr(),
-        adv_mean.data_ptr<float>(),
-        adv_var.data_ptr<float>(),
-        act_sizes.data_ptr<int>(),
-        num_atns,
-        clip_coef, vf_clip_coef, vf_coef, ent_coef,
-        T, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a,
-        values_stride_n, values_stride_t,
-        is_continuous);
-}
-#endif // PUFFERLIB_TORCH (ppo_loss_fwd_bwd Tensor overload)
-
-// PufTensor overload of ppo_loss_fwd_bwd — no torch deps
+// PufTensor ppo_loss_fwd_bwd — no torch deps
 void ppo_loss_fwd_bwd(
     PufTensor& logits, PufTensor& logstd, PufTensor& values_pred,
     PufTensor& actions, PufTensor& old_logprobs, PufTensor& advantages,
@@ -1222,12 +858,23 @@ void ppo_loss_fwd_bwd(
 
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
 
+    // Allocate per-block partials buffer for deterministic PPO loss reduction
+    static float* ppo_partials_buf = nullptr;
+    static int ppo_partials_capacity = 0;
+    int ppo_partials_needed = ppo_grid * (LOSS_N + 1);
+    if (!ppo_partials_buf || ppo_partials_needed > ppo_partials_capacity) {
+        if (ppo_partials_buf) cudaFree(ppo_partials_buf);
+        ppo_partials_capacity = ppo_partials_needed;
+        cudaMalloc(&ppo_partials_buf, ppo_partials_capacity * sizeof(float));
+    }
+
     cudaMemsetAsync((float*)bufs.loss_output.data, 0, sizeof(float), stream);
     puf_zero(bufs.saved_for_bwd, stream);
 
     ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS, 0, stream>>>(
         (float*)bufs.loss_output.data,
         (float*)losses_acc.data,
+        ppo_partials_buf,
         (double*)bufs.saved_for_bwd.data,
         (precision_t*)ratio_out.data,
         (precision_t*)newvalue_out.data,
@@ -1249,6 +896,13 @@ void ppo_loss_fwd_bwd(
         logits_stride_n, logits_stride_t, logits_stride_a,
         values_stride_n, values_stride_t,
         is_continuous);
+
+    // Deterministic reduction of per-block PPO loss partials
+    ppo_loss_reduce_kernel<<<1, LOSS_N + 1, 0, stream>>>(
+        (float*)bufs.loss_output.data,
+        (float*)losses_acc.data,
+        ppo_partials_buf,
+        ppo_grid);
 
     puf_add_scalar((float*)losses_acc.data + LOSS_N, 1.0f, stream);
 
@@ -1304,107 +958,6 @@ void sample_logits(
         is_continuous);
 }
 
-#ifdef PUFFERLIB_TORCH
-// Tensor overload for Python binding / legacy path
-void sample_logits(
-    Tensor logits, Tensor logstd, Tensor value,
-    Tensor actions_out, Tensor logprobs_out, Tensor value_out,
-    Tensor act_sizes, uint64_t seed, Tensor offset
-) {
-    PufTensor p_logits = PufTensor::from_torch(logits);
-    PufTensor p_logstd = (logstd.defined() && logstd.numel() > 0) ? PufTensor::from_torch(logstd) : PufTensor();
-    PufTensor p_value = PufTensor::from_torch(value);
-    PufTensor p_actions = PufTensor::from_torch(actions_out);
-    PufTensor p_logprobs = PufTensor::from_torch(logprobs_out);
-    PufTensor p_value_out = PufTensor::from_torch(value_out);
-    PufTensor p_act_sizes = PufTensor::from_torch(act_sizes);
-
-    int logits_stride = static_cast<int>(logits.stride(0));
-    int logstd_stride = (logstd.defined() && logstd.numel() > 0) ? static_cast<int>(logstd.stride(0)) : 0;
-    int value_stride = static_cast<int>(value.stride(0));
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    sample_logits(p_logits, p_logstd, p_value, p_actions, p_logprobs, p_value_out,
-        p_act_sizes, seed, offset.data_ptr<int64_t>(),
-        logits_stride, logstd_stride, value_stride, stream);
-}
-
-// FCMax: fused FC -> Max (torch autograd)
-tensor_list FCMax::forward(
-    AutogradCtx* ctx, Tensor x, Tensor W, Tensor b
-) {
-    TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
-    TORCH_CHECK(W.is_cuda(), "W must be on CUDA");
-    TORCH_CHECK(b.is_cuda(), "b must be on CUDA");
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(W.is_contiguous(), "W must be contiguous");
-    TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
-
-    int B = x.size(0);
-    int N = x.size(1);
-    int D_in = x.size(2);
-    int D_out = W.size(0);
-
-    auto out = torch::empty({B, D_out}, x.options());
-    auto argmax = torch::empty({B, D_out}, torch::dtype(torch::kInt32).device(x.device()));
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
-    auto b_f32 = b.dtype() == torch::kFloat32 ? b : b.to(torch::kFloat32);
-    fc_max_forward_kernel<<<grid_size(B * D_out), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)out.data_ptr(),
-        argmax.data_ptr<int>(),
-        (const precision_t*)x.data_ptr(),
-        W_f32.data_ptr<float>(),
-        b_f32.data_ptr<float>(),
-        B, N, D_in, D_out);
-
-    ctx->save_for_backward({x, W, argmax});
-    ctx->saved_data["B"] = B;
-    ctx->saved_data["N"] = N;
-    ctx->saved_data["D_in"] = D_in;
-    ctx->saved_data["D_out"] = D_out;
-
-    return {out, argmax};
-}
-
-tensor_list FCMax::backward(AutogradCtx* ctx, tensor_list grad_outputs) {
-    auto saved = ctx->get_saved_variables();
-    auto x = saved[0];
-    auto W = saved[1];
-    auto argmax = saved[2];
-    auto grad_out = grad_outputs[0].contiguous();
-
-    auto dtype = x.dtype();
-    int B = ctx->saved_data["B"].toInt();
-    int N = ctx->saved_data["N"].toInt();
-    int D_in = ctx->saved_data["D_in"].toInt();
-    int D_out = ctx->saved_data["D_out"].toInt();
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto opts_f32 = x.options().dtype(torch::kFloat32);
-    auto grad_x_f32 = torch::zeros({B, N, D_in}, opts_f32);
-    auto grad_W_f32 = torch::zeros({D_out, D_in}, opts_f32);
-    auto grad_b_f32 = torch::zeros({D_out}, opts_f32);
-    auto W_f32 = W.dtype() == torch::kFloat32 ? W : W.to(torch::kFloat32);
-
-    fc_max_backward_kernel<<<grid_size(B * D_out), BLOCK_SIZE, 0, stream>>>(
-        grad_x_f32.data_ptr<float>(),
-        grad_W_f32.data_ptr<float>(),
-        grad_b_f32.data_ptr<float>(),
-        (const precision_t*)grad_out.data_ptr(),
-        (const precision_t*)x.data_ptr(),
-        W_f32.data_ptr<float>(),
-        argmax.data_ptr<int>(),
-        B, N, D_in, D_out);
-
-    auto grad_x = (dtype == torch::kBFloat16) ? grad_x_f32.to(torch::kBFloat16) : grad_x_f32;
-    return {grad_x, grad_W_f32, grad_b_f32};
-}
-#endif // PUFFERLIB_TORCH (FCMax, sample_logits Tensor overload)
-
 void train_select_and_copy_cuda(
     PufTensor& observations, PufTensor& actions,
     PufTensor& logprobs, PufTensor& values, PufTensor& advantages,
@@ -1434,37 +987,6 @@ void train_select_and_copy_cuda(
         (float*)mb_prio.data, (precision_t*)dst_prio.data);
 }
 
-#ifdef PUFFERLIB_TORCH
-tuple<Tensor, Tensor> prio_replay_cuda(
-    Tensor advantages, float prio_alpha,
-    int minibatch_segments, int total_agents, float anneal_beta
-) {
-    int S = advantages.size(0);
-    int T = advantages.size(1);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto prio_probs = torch::empty({S}, advantages.options());
-
-    compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE, 0, stream>>>(
-        advantages.data_ptr<float>(), prio_probs.data_ptr<float>(),
-        prio_alpha, T);
-
-    compute_prio_normalize<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
-        prio_probs.data_ptr<float>(), S);
-
-    auto idx = at::multinomial(prio_probs, minibatch_segments, true);
-
-    auto mb_prio = torch::empty({minibatch_segments, 1}, advantages.options());
-    int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
-    compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
-        idx.data_ptr<int64_t>(), prio_probs.data_ptr<float>(),
-        mb_prio.data_ptr<float>(),
-        total_agents, anneal_beta, minibatch_segments);
-
-    return {idx, mb_prio};
-}
-#endif // PUFFERLIB_TORCH (prio_replay_cuda Tensor overload)
-
 // Multinomial with replacement: sample minibatch_segments indices from probs (S,)
 // Single-block: thread 0 builds CDF, then each thread samples one index via binary search
 __global__ void multinomial_with_replacement_kernel(
@@ -1485,12 +1007,11 @@ __global__ void multinomial_with_replacement_kernel(
     }
     __syncthreads();
 
-    // Each thread samples one index
+    // Each thread samples one index using a deterministic RNG offset
     if (tid < num_samples) {
-        int64_t off = atomicAdd((unsigned long long*)offset_ptr, 1ULL);
-        // Inline philox-style RNG (same as sample_logits_kernel)
+        uint64_t base_off = *offset_ptr;
         curandStatePhilox4_32_10_t rng_state;
-        curand_init(seed, off, 0, &rng_state);
+        curand_init(seed, base_off + tid, 0, &rng_state);
         float u = curand_uniform(&rng_state);
 
         // Binary search CDF
@@ -1501,6 +1022,10 @@ __global__ void multinomial_with_replacement_kernel(
             else hi = mid;
         }
         out_idx[tid] = lo;
+    }
+    // Advance offset deterministically (thread 0 only)
+    if (tid == 0) {
+        atomicAdd((unsigned long long*)offset_ptr, (unsigned long long)num_samples);
     }
 }
 
@@ -1565,22 +1090,6 @@ void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
         gamma, lambda, rho_clip, c_clip,
         num_steps, horizon);
 }
-
-#ifdef PUFFERLIB_TORCH
-// Tensor overload for legacy cpp fallback path
-void puff_advantage_cuda(Tensor values, Tensor rewards,
-        Tensor dones, Tensor importance, Tensor advantages,
-        double gamma, double lambda, double rho_clip, double c_clip) {
-    PufTensor v = PufTensor::from_torch(values);
-    PufTensor r = PufTensor::from_torch(rewards);
-    PufTensor d = PufTensor::from_torch(dones);
-    PufTensor imp = PufTensor::from_torch(importance);
-    PufTensor adv = PufTensor::from_torch(advantages);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    puff_advantage_cuda(v, r, d, imp, adv,
-        (float)gamma, (float)lambda, (float)rho_clip, (float)c_clip, stream);
-}
-#endif // PUFFERLIB_TORCH (puff_advantage_cuda Tensor overload)
 
 } // namespace pufferlib
 

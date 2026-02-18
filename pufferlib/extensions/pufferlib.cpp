@@ -78,9 +78,9 @@ inline PufTensor puf_slice(PufTensor& p, int t, int start, int count) {
 }
 
 int obs_dtype_size(int dtype) {
-    if (dtype == FLOAT || dtype == INT) return 4;
-    if (dtype == DOUBLE) return 8;
-    return 1;  // UNSIGNED_CHAR, CHAR
+    if (dtype == FLOAT || dtype == INT) return sizeof(float);
+    if (dtype == DOUBLE) return sizeof(double);
+    return sizeof(char);  // UNSIGNED_CHAR, CHAR
 }
 
 struct EnvBuf {
@@ -111,9 +111,9 @@ StaticVec* create_environments(int num_buffers, int total_agents,
     };
     env.obs = mk(vec->gpu_observations, {total_agents, obs_size}, obs_dtype_size(obs_type));
     env.obs_raw_dtype = obs_type;
-    env.actions = mk(vec->gpu_actions, {total_agents, num_atns}, 8);     // f64
-    env.rewards = mk(vec->gpu_rewards, {total_agents}, 4);               // f32
-    env.terminals = mk(vec->gpu_terminals, {total_agents}, 4);           // f32
+    env.actions = mk(vec->gpu_actions, {total_agents, num_atns}, sizeof(double));
+    env.rewards = mk(vec->gpu_rewards, {total_agents}, sizeof(float));
+    env.terminals = mk(vec->gpu_terminals, {total_agents}, sizeof(float));
 
     return vec;
 }
@@ -129,56 +129,22 @@ struct TrainGraph {
     PufTensor mb_returns;     // (S, H) PRECISION
     PufTensor mb_ratio;       // (S, H) PRECISION
     PufTensor mb_newvalue;    // (S, H, 1) PRECISION
-    void* storage = nullptr;  // backing memory (cudaMalloc'd)
+
+    void register_buffers(Allocator& alloc, int S, int H, int input_size,
+            int hidden_size, int num_atns, int num_layers) {
+        int psz = PRECISION_SIZE;
+        alloc.register_puf(&mb_obs, {S, H, input_size}, psz);
+        alloc.register_puf(&mb_state, {num_layers, S, 1, hidden_size}, psz);
+        alloc.register_puf(&mb_actions, {S, H, num_atns}, sizeof(double));
+        alloc.register_puf(&mb_logprobs, {S, H}, psz);
+        alloc.register_puf(&mb_advantages, {S, H}, sizeof(float));
+        alloc.register_puf(&mb_prio, {S, 1}, psz);
+        alloc.register_puf(&mb_values, {S, H}, psz);
+        alloc.register_puf(&mb_returns, {S, H}, psz);
+        alloc.register_puf(&mb_ratio, {S, H}, psz);
+        alloc.register_puf(&mb_newvalue, {S, H, 1}, psz);
+    }
 };
-
-TrainGraph create_train_graph(int S, int H, int input_size,
-        int hidden_size, int num_atns, int num_layers) {
-    int psz = PRECISION_SIZE;
-    int64_t obs_n = (int64_t)S * H * input_size;
-    int64_t state_n = (int64_t)num_layers * S * 1 * hidden_size;
-    int64_t act_n = (int64_t)S * H * num_atns;
-    int64_t sh_n = (int64_t)S * H;
-
-    int64_t total_bytes = obs_n * psz + state_n * psz + act_n * 8
-        + sh_n * psz          // logprobs
-        + sh_n * 4            // advantages (f32)
-        + S * 1 * psz         // prio
-        + sh_n * psz          // values
-        + sh_n * psz          // returns
-        + sh_n * psz          // ratio
-        + S * H * 1 * psz;    // newvalue
-
-    void* storage;
-    cudaMalloc(&storage, total_bytes);
-    cudaMemset(storage, 0, total_bytes);
-    char* base = (char*)storage;
-    int64_t off = 0;
-
-    auto mk = [&](int64_t n, int dsz, std::initializer_list<int64_t> dims) {
-        PufTensor p;
-        p.data = base + off; p.numel = n; p.dtype_size = dsz;
-        int i = 0; p.ndim = dims.size();
-        for (auto d : dims) p.shape[i++] = d;
-        for (; i < 4; i++) p.shape[i] = 1;
-        off += n * dsz;
-        return p;
-    };
-
-    TrainGraph g;
-    g.storage = storage;
-    g.mb_obs        = mk(obs_n,   psz, {S, H, input_size});
-    g.mb_state      = mk(state_n, psz, {num_layers, (int64_t)S, 1, hidden_size});
-    g.mb_actions    = mk(act_n,   8,   {S, H, num_atns});
-    g.mb_logprobs   = mk(sh_n,    psz, {S, H});
-    g.mb_advantages = mk(sh_n,    4,   {S, H});
-    g.mb_prio       = mk(S * 1,   psz, {S, 1});
-    g.mb_values     = mk(sh_n,    psz, {S, H});
-    g.mb_returns    = mk(sh_n,    psz, {S, H});
-    g.mb_ratio      = mk(sh_n,    psz, {S, H});
-    g.mb_newvalue   = mk(S*H*1,   psz, {S, H, 1});
-    return g;
-}
 
 struct RolloutBuf {
     PufTensor observations;  // (horizon, segments, input_size) PRECISION
@@ -189,48 +155,19 @@ struct RolloutBuf {
     PufTensor terminals;     // (horizon, segments) PRECISION
     PufTensor ratio;         // (horizon, segments) PRECISION
     PufTensor importance;    // (horizon, segments) PRECISION
-    void* storage = nullptr; // backing memory (cudaMalloc'd)
+
+    void register_buffers(Allocator& alloc, int dim0, int dim1, int input_size, int num_atns) {
+        int psz = PRECISION_SIZE;
+        alloc.register_puf(&observations, {dim0, dim1, input_size}, psz);
+        alloc.register_puf(&actions, {dim0, dim1, num_atns}, sizeof(double));
+        alloc.register_puf(&values, {dim0, dim1}, psz);
+        alloc.register_puf(&logprobs, {dim0, dim1}, psz);
+        alloc.register_puf(&rewards, {dim0, dim1}, psz);
+        alloc.register_puf(&terminals, {dim0, dim1}, psz);
+        alloc.register_puf(&ratio, {dim0, dim1}, psz);
+        alloc.register_puf(&importance, {dim0, dim1}, psz);
+    }
 };
-
-RolloutBuf create_rollouts(int horizon, int segments, int input_size, int num_atns) {
-    int psz = PRECISION_SIZE;
-    int64_t obs_n = (int64_t)horizon * segments * input_size;
-    int64_t act_n = (int64_t)horizon * segments * num_atns;
-    int64_t hs_n = (int64_t)horizon * segments;
-
-    // Total bytes: obs + actions(f64) + 6 x (horizon*segments) PRECISION
-    int64_t total_bytes = obs_n * psz + act_n * 8 + 6 * hs_n * psz;
-    void* storage;
-    cudaMalloc(&storage, total_bytes);
-    cudaMemset(storage, 0, total_bytes);
-    char* base = (char*)storage;
-    int64_t off = 0;
-
-    auto mk = [&](int64_t n, int dsz, std::initializer_list<int64_t> dims) {
-        PufTensor p;
-        p.data = base + off;
-        p.numel = n;
-        p.dtype_size = dsz;
-        int i = 0;
-        p.ndim = dims.size();
-        for (auto d : dims) p.shape[i++] = d;
-        for (; i < 4; i++) p.shape[i] = 1;
-        off += n * dsz;
-        return p;
-    };
-
-    RolloutBuf r;
-    r.storage = storage;
-    r.observations = mk(obs_n, psz, {horizon, segments, input_size});
-    r.actions      = mk(act_n, 8,   {horizon, segments, num_atns});
-    r.values       = mk(hs_n,  psz, {horizon, segments});
-    r.logprobs     = mk(hs_n,  psz, {horizon, segments});
-    r.rewards      = mk(hs_n,  psz, {horizon, segments});
-    r.terminals    = mk(hs_n,  psz, {horizon, segments});
-    r.ratio        = mk(hs_n,  psz, {horizon, segments});
-    r.importance   = mk(hs_n,  psz, {horizon, segments});
-    return r;
-}
 
 typedef struct {
     // Layout
@@ -309,18 +246,21 @@ typedef struct {
     Policy* policy_fp32;  // Master weights (fp32) - used for optimizer
     Allocator alloc_fp32; // Contiguous param+grad buffers for fp32 policy
     Allocator alloc_bf16; // Contiguous param buffer for bf16 policy
+    Allocator pufferl_alloc; // Consolidated allocator for all init-to-close buffers
     StaticVec* vec;
     Muon* muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     vector<PufTensor> buffer_states;  // Per-buffer states for contiguous access
-    void* buffer_states_storage = nullptr;  // Backing memory for all buffer_states
     vector<PolicyActivations> buffer_acts;  // Per-buffer inference activations
     vector<Allocator> buffer_allocs;        // Per-buffer allocators for inference buffers
     RolloutBuf rollouts;
+    RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
     TrainGraph train_buf;
+    PufTensor old_values_puf;   // Pre-allocated for train_impl (S, H) PRECISION
+    PufTensor advantages_puf;   // Pre-allocated for train_impl (S, H) f32
     vector<vector<RawCudaGraph>> fused_rollout_cudagraphs;  // [horizon][num_buffers]
     RawCudaGraph train_cudagraph;
     vector<cudaStream_t> streams;  // per-buffer raw CUDA streams
@@ -332,7 +272,8 @@ typedef struct {
     PufTensor grad_buffer_puf;   // cached PufTensor view of alloc_fp32.grad_buffer
     PufTensor param_fp32_puf;    // cached PufTensor view of alloc_fp32.param_buffer
     PufTensor param_bf16_puf;    // cached PufTensor view of alloc_bf16.param_buffer
-    float* grad_norm_scratch = nullptr;  // 1 device float for clip_grad_norm
+    PufTensor grad_norm_puf;     // (1,) f32 scratch for clip_grad_norm
+    PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
     nvmlDevice_t nvml_device;
     int epoch;
@@ -340,7 +281,6 @@ typedef struct {
     bool rollout_captured;
     bool train_captured;
     uint64_t rng_seed;
-    int64_t* rng_offset = nullptr;  // CUDA device pointer, incremented by kernel
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -408,9 +348,9 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     PufTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     // Cast env obs (uint8/f32/etc) directly into rollout buffer (precision_t)
-    if (obs_env.dtype_size == 1) {
+    if (obs_env.dtype_size == sizeof(char)) {
         puf_cast_u8_to_precision(obs_dst, obs_src, stream);
-    } else if (obs_env.dtype_size == 4) {
+    } else if (obs_env.dtype_size == sizeof(float)) {
         puf_cast_f32_to_precision(obs_dst, obs_src, stream);
     } else {
         assert(false && "Unsupported obs dtype: only uint8 and float32 are supported");
@@ -419,15 +359,15 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     // Rewards/terminals: env is f32, rollout is precision_t — cast via PufTensor
     PufTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     PufTensor rew_src;
-    rew_src.data = (char*)env.rewards.data + start * 4;
-    rew_src.shape[0] = block_size; rew_src.ndim = 1; rew_src.numel = block_size; rew_src.dtype_size = 4;
+    rew_src.data = (char*)env.rewards.data + start * sizeof(float);
+    rew_src.shape[0] = block_size; rew_src.ndim = 1; rew_src.numel = block_size; rew_src.dtype_size = sizeof(float);
     if (USE_BF16) { puf_cast_f32_to_bf16(rew_dst, rew_src, stream); }
     else { puf_copy(rew_dst, rew_src, stream); }
 
     PufTensor term_dst = puf_slice(rollouts.terminals, t, start, block_size);
     PufTensor term_src;
-    term_src.data = (char*)env.terminals.data + start * 4;
-    term_src.shape[0] = block_size; term_src.ndim = 1; term_src.numel = block_size; term_src.dtype_size = 4;
+    term_src.data = (char*)env.terminals.data + start * sizeof(float);
+    term_src.shape[0] = block_size; term_src.ndim = 1; term_src.numel = block_size; term_src.dtype_size = sizeof(float);
     if (USE_BF16) { puf_cast_f32_to_bf16(term_dst, term_src, stream); }
     else { puf_copy(term_dst, term_src, stream); }
 
@@ -462,8 +402,11 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     PufTensor p_act_sizes = pufferl->act_sizes_puf;
     // logstd is 1D (od,) broadcast across batch → stride 0
+    // Each buffer uses its own RNG seed and offset slot for deterministic parallel rollouts
+    int64_t* buf_rng_offset = (int64_t*)pufferl->rng_offset_puf.data + buf;
+    uint64_t buf_rng_seed = pufferl->rng_seed + buf;
     sample_logits(p_logits, p_logstd, p_value, act_slice, lp_slice, val_slice,
-        p_act_sizes, pufferl->rng_seed, pufferl->rng_offset,
+        p_act_sizes, buf_rng_seed, buf_rng_offset,
         fused_cols, 0, fused_cols, stream);
 
     // Copy actions to env
@@ -506,12 +449,9 @@ void train_impl(PuffeRL& pufferl) {
     cudaEventRecord(pufferl.profile.events[0]);  // pre-loop start
     cudaStream_t train_stream = pufferl.default_stream;
 
-    // Allocate transposed buffers (segments, horizon, ...)
+    // Use pre-allocated transposed buffers (segments, horizon, ...)
     RolloutBuf& src = pufferl.rollouts;
-    int H = src.observations.shape[0], S = src.observations.shape[1];
-    int input_size = src.observations.shape[2];
-    int num_atns = src.actions.shape[2];
-    RolloutBuf rollouts = create_rollouts(S, H, input_size, num_atns);  // note: swapped H,S → (S, H, ...)
+    RolloutBuf& rollouts = pufferl.train_rollouts;
 
     puf_transpose_01(rollouts.observations, src.observations, train_stream);
     puf_transpose_01(rollouts.actions, src.actions, train_stream);
@@ -525,26 +465,12 @@ void train_impl(PuffeRL& pufferl) {
     puf_clamp(rollouts.rewards, -1.0f, 1.0f, train_stream);
     puf_fill(rollouts.ratio, 1.0f, train_stream);
 
-    // old_values = values.clone() via PufTensor
-    PufTensor old_values_puf;
-    old_values_puf.ndim = rollouts.values.ndim; old_values_puf.numel = rollouts.values.numel;
-    old_values_puf.dtype_size = rollouts.values.dtype_size;
-    for (int i = 0; i < 4; i++) old_values_puf.shape[i] = rollouts.values.shape[i];
-    void* old_values_mem;
-    cudaMalloc(&old_values_mem, old_values_puf.numel * old_values_puf.dtype_size);
-    old_values_puf.data = old_values_mem;
+    // old_values = values.clone() via pre-allocated PufTensor
+    PufTensor& old_values_puf = pufferl.old_values_puf;
     puf_copy(old_values_puf, rollouts.values, train_stream);
 
-    // Advantages buffer (f32 for precision)
-    int64_t adv_n = (int64_t)S * H;
-    void* advantages_mem;
-    cudaMalloc(&advantages_mem, adv_n * 4);
-    cudaMemset(advantages_mem, 0, adv_n * 4);
-    PufTensor advantages_puf;
-    advantages_puf.data = advantages_mem;
-    advantages_puf.shape[0] = S; advantages_puf.shape[1] = H;
-    advantages_puf.shape[2] = 1; advantages_puf.shape[3] = 1;
-    advantages_puf.ndim = 2; advantages_puf.numel = adv_n; advantages_puf.dtype_size = 4;
+    // Zero pre-allocated advantages buffer
+    PufTensor& advantages_puf = pufferl.advantages_puf;
 
     // Inline any of these only used once
     int minibatch_size = hypers.minibatch_size;
@@ -584,9 +510,11 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
+        // Use the training RNG offset slot (last slot, index num_buffers)
+        int64_t* train_rng_offset = (int64_t*)pufferl.rng_offset_puf.data + hypers.num_buffers;
         prio_replay_cuda(advantages_puf, prio_alpha, minibatch_segments,
             hypers.total_agents, anneal_beta,
-            pufferl.prio_bufs, pufferl.rng_seed, pufferl.rng_offset, train_stream);
+            pufferl.prio_bufs, pufferl.rng_seed, train_rng_offset, train_stream);
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
@@ -673,7 +601,7 @@ void train_impl(PuffeRL& pufferl) {
                 grad_logits_puf, grad_logstd_puf, grad_values_puf,
                 pufferl.policy_bf16->act, pufferl.policy_fp32, stream);
 
-            clip_grad_norm_(pufferl.grad_buffer_puf, hypers.max_grad_norm, pufferl.grad_norm_scratch, stream);
+            clip_grad_norm_(pufferl.grad_buffer_puf, hypers.max_grad_norm, (float*)pufferl.grad_norm_puf.data, stream);
             pufferl.muon->step(stream);
             pufferl.muon->zero_grad(stream);
             if (USE_BF16) {
@@ -718,10 +646,6 @@ void train_impl(PuffeRL& pufferl) {
         pufferl.profile.accum[PROF_TRAIN_FORWARD] += ms * total_minibatches;
     }
 
-    // Free local allocations
-    cudaFree(rollouts.storage);
-    cudaFree(old_values_mem);
-    cudaFree(advantages_mem);
 }
 
 std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs) {
@@ -761,8 +685,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     // CC: Base seed should come from train config
     int seed = 42 + hypers.rank;
     pufferl->rng_seed = seed;
-    cudaMalloc(&pufferl->rng_offset, sizeof(int64_t));
-    cudaMemset(pufferl->rng_offset, 0, sizeof(int64_t));
 
     // Load environment first to get input_size and action info from env
     // Create environments and set up action sizes
@@ -775,24 +697,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     int act_n = 0;
     for (int i = 0; i < num_action_heads; i++) act_n += raw_act_sizes[i];
 
-    // act_sizes: cudaMalloc'd PufTensor (int32)
-    {
-        PufTensor& p = pufferl->act_sizes_puf;
-        p.ndim = 1; p.numel = num_action_heads; p.dtype_size = 4;
-        p.shape[0] = num_action_heads;
-        for (int i = 1; i < 4; i++) p.shape[i] = 1;
-        cudaMalloc(&p.data, num_action_heads * 4);
-        cudaMemcpy(p.data, raw_act_sizes, num_action_heads * 4, cudaMemcpyHostToDevice);
-    }
-    // losses: cudaMalloc'd PufTensor (f32) accumulator
-    {
-        PufTensor& p = pufferl->losses_puf;
-        p.ndim = 1; p.numel = NUM_LOSSES; p.dtype_size = 4;
-        p.shape[0] = NUM_LOSSES;
-        for (int i = 1; i < 4; i++) p.shape[i] = 1;
-        cudaMalloc(&p.data, NUM_LOSSES * 4);
-        cudaMemset(p.data, 0, NUM_LOSSES * 4);
-    }
     for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
         cudaEventCreate(&pufferl->profile.events[i]);
     }
@@ -840,14 +744,14 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         // fp32-only mode: fp32 policy also runs forward/backward, needs activations
         policy_fp32->register_activations(pufferl->alloc_fp32, minibatch_segments, hypers.horizon);
     }
-    pufferl->alloc_fp32.create(4);
+    pufferl->alloc_fp32.create(sizeof(float));
     auto mk_1d = [](void* data, int64_t n, int dsz) {
         PufTensor p; p.data = data; p.shape[0] = n; p.ndim = 1; p.numel = n; p.dtype_size = dsz;
         for (int i = 1; i < 4; i++) p.shape[i] = 1;
         return p;
     };
-    pufferl->grad_buffer_puf = mk_1d(pufferl->alloc_fp32.grad_mem, pufferl->alloc_fp32.total_grad_elems, 4);
-    pufferl->param_fp32_puf = mk_1d(pufferl->alloc_fp32.param_mem, pufferl->alloc_fp32.total_param_elems, 4);
+    pufferl->grad_buffer_puf = mk_1d(pufferl->alloc_fp32.grad_mem, pufferl->alloc_fp32.total_grad_elems, sizeof(float));
+    pufferl->param_fp32_puf = mk_1d(pufferl->alloc_fp32.param_mem, pufferl->alloc_fp32.total_param_elems, sizeof(float));
     policy_fp32->init_weights(pufferl->default_stream);
     pufferl->policy_fp32 = policy_fp32;
 
@@ -877,12 +781,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel);
 
-    // Pre-allocate PPO loss buffers
-    pufferl->ppo_bufs_puf.create(minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
-    pufferl->prio_bufs.create(hypers.total_agents, minibatch_segments);
-    cudaMalloc(&pufferl->grad_norm_scratch, sizeof(float));
-
-    // Allocate buffers
     int horizon = hypers.horizon;
     int total_agents = vec->total_agents;
     int batch = total_agents / hypers.num_buffers;
@@ -891,26 +789,58 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
     printf("DEBUG: num_envs=%d, total_agents=%d, batch=%d, num_buffers=%d\n",
         vec->size, total_agents, batch, num_buffers);
 
-    pufferl->rollouts = create_rollouts(horizon, total_agents, input_size, num_action_heads);
-    pufferl->train_buf = create_train_graph(minibatch_segments, horizon, input_size,
+    // ========================================================================
+    // Register all init-to-close buffers into pufferl_alloc, then create once
+    // ========================================================================
+    Allocator& alloc = pufferl->pufferl_alloc;
+
+    // Misc scalars
+    alloc.register_puf(&pufferl->rng_offset_puf, {num_buffers + 1}, sizeof(int64_t));
+    alloc.register_puf(&pufferl->act_sizes_puf, {num_action_heads}, sizeof(int32_t));
+    alloc.register_puf(&pufferl->losses_puf, {NUM_LOSSES}, sizeof(float));
+    alloc.register_puf(&pufferl->grad_norm_puf, {1}, sizeof(float));
+
+    // Per-buffer RNN states
+    pufferl->buffer_states.resize(num_buffers);
+    for (int i = 0; i < num_buffers; i++) {
+        alloc.register_puf(&pufferl->buffer_states[i],
+            {num_layers, batch, hidden_size}, PRECISION_SIZE);
+    }
+
+    // Rollout buffers (horizon, total_agents, ...)
+    pufferl->rollouts.register_buffers(alloc, horizon, total_agents, input_size, num_action_heads);
+
+    // Train graph buffers
+    pufferl->train_buf.register_buffers(alloc, minibatch_segments, horizon, input_size,
         hidden_size, num_action_heads, num_layers);
 
-    // Per-buffer states and inference activations
-    {
-        int64_t state_elems = (int64_t)num_layers * batch * hidden_size;
-        int64_t total_bytes = state_elems * num_buffers * PRECISION_SIZE;
-        cudaMalloc(&pufferl->buffer_states_storage, total_bytes);
-        cudaMemset(pufferl->buffer_states_storage, 0, total_bytes);
-        char* base = (char*)pufferl->buffer_states_storage;
-        int64_t stride = state_elems * PRECISION_SIZE;
-        pufferl->buffer_states.resize(num_buffers);
-        for (int i = 0; i < num_buffers; i++) {
-            PufTensor& s = pufferl->buffer_states[i];
-            s.data = base + i * stride;
-            s.shape[0] = num_layers; s.shape[1] = batch; s.shape[2] = hidden_size; s.shape[3] = 1;
-            s.ndim = 3; s.numel = state_elems; s.dtype_size = PRECISION_SIZE;
-        }
-    }
+    // Pre-allocated transposed rollouts for train_impl (total_agents, horizon, ...)
+    pufferl->train_rollouts.register_buffers(alloc, total_agents, horizon, input_size, num_action_heads);
+
+    // Pre-allocated train temporaries
+    alloc.register_puf(&pufferl->old_values_puf, {total_agents, horizon}, PRECISION_SIZE);
+    alloc.register_puf(&pufferl->advantages_puf, {total_agents, horizon}, sizeof(float));
+
+    // PPO loss buffers
+    pufferl->ppo_bufs_puf.register_buffers(alloc, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
+
+    // Priority replay buffers
+    pufferl->prio_bufs.register_buffers(alloc, hypers.total_agents, minibatch_segments);
+
+    // Muon optimizer buffers
+    pufferl->muon->register_buffers(alloc);
+
+    // Single allocation for all registered buffers
+    alloc.create(1);
+
+    // Post-create initialization: copy data, set constants
+    cudaMemset(pufferl->rng_offset_puf.data, 0, (num_buffers + 1) * sizeof(int64_t));
+    cudaMemcpy(pufferl->act_sizes_puf.data, raw_act_sizes, num_action_heads * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
+    pufferl->ppo_bufs_puf.post_create();
+    pufferl->muon->post_create();
+
+    // Per-buffer inference activations (separate allocators — different lifetime)
     pufferl->buffer_acts.reserve(num_buffers);
     pufferl->buffer_allocs.resize(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
@@ -938,11 +868,9 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         void* saved_weights;
         cudaMalloc(&saved_weights, wb_bytes);
         cudaMemcpy(saved_weights, pufferl->muon->wb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
-        void* saved_momentum = nullptr;
-        if (pufferl->muon->bufs_initialized) {
-            cudaMalloc(&saved_momentum, wb_bytes);
-            cudaMemcpy(saved_momentum, pufferl->muon->mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
-        }
+        void* saved_momentum;
+        cudaMalloc(&saved_momentum, wb_bytes);
+        cudaMemcpy(saved_momentum, pufferl->muon->mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
 
         // Run warmup + capture on a fresh stream.
         // Swap default_stream (used by train_impl) and tl_stream (used by callback on main thread).
@@ -971,15 +899,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers, const s
         // Restore weights + optimizer state corrupted by warmup/capture
         cudaMemcpy(pufferl->muon->wb_puf.data, saved_weights, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_weights);
-        if (saved_momentum) {
-            cudaMemcpy(pufferl->muon->mb_puf.data, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
-            cudaFree(saved_momentum);
-        } else {
-            // Buffers allocated during warmup — just zero momentum
-            if (pufferl->muon->buf_mem) {
-                cudaMemset(pufferl->muon->buf_mem, 0, wb_bytes);
-            }
-        }
+        cudaMemcpy(pufferl->muon->mb_puf.data, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaFree(saved_momentum);
         if (USE_BF16) {
             puf_cast_f32_to_bf16(pufferl->param_bf16_puf, pufferl->param_fp32_puf,
                 pufferl->default_stream);
@@ -1019,7 +940,6 @@ void close_impl(PuffeRL& pufferl) {
 
     delete pufferl.muon;
     pufferl.muon = nullptr;
-    if (pufferl.grad_norm_scratch) { cudaFree(pufferl.grad_norm_scratch); pufferl.grad_norm_scratch = nullptr; }
 
     if (USE_BF16) {
         delete pufferl.policy_bf16;
@@ -1028,34 +948,21 @@ void close_impl(PuffeRL& pufferl) {
     pufferl.policy_bf16 = nullptr;
     pufferl.policy_fp32 = nullptr;
 
-    // Destroy allocators (clears Tensor views, frees backing cudaMalloc memory)
+    // Destroy policy allocators (separate lifetime from pufferl_alloc)
     pufferl.alloc_fp32.destroy();
     pufferl.alloc_bf16.destroy();
 
-    // Clear buffer states and per-buffer inference activations
-    pufferl.buffer_states.clear();
-    if (pufferl.buffer_states_storage) { cudaFree(pufferl.buffer_states_storage); pufferl.buffer_states_storage = nullptr; }
+    // Destroy per-buffer inference allocators (separate lifetime)
     pufferl.buffer_acts.clear();
-    for (auto& alloc : pufferl.buffer_allocs) alloc.destroy();
+    for (auto& a : pufferl.buffer_allocs) a.destroy();
     pufferl.buffer_allocs.clear();
+    pufferl.buffer_states.clear();
 
-    // Clear rollout buffers
-    if (pufferl.rollouts.storage) { cudaFree(pufferl.rollouts.storage); }
-    pufferl.rollouts = RolloutBuf{};
+    // Single destroy for all consolidated buffers (rollouts, train, ppo, prio,
+    // muon, rng, act_sizes, losses, grad_norm, buffer_states, etc.)
+    pufferl.pufferl_alloc.destroy();
 
-    // Clear train buffers
-    if (pufferl.train_buf.storage) { cudaFree(pufferl.train_buf.storage); }
-    pufferl.train_buf = TrainGraph{};
-
-    // Clear misc PufTensor memory
-    if (pufferl.act_sizes_puf.data) { cudaFree(pufferl.act_sizes_puf.data); pufferl.act_sizes_puf = PufTensor(); }
-    if (pufferl.losses_puf.data) { cudaFree(pufferl.losses_puf.data); pufferl.losses_puf = PufTensor(); }
-    if (pufferl.rng_offset) { cudaFree(pufferl.rng_offset); pufferl.rng_offset = nullptr; }
-    if (pufferl.ppo_bufs_puf.storage) { cudaFree(pufferl.ppo_bufs_puf.storage); pufferl.ppo_bufs_puf.storage = nullptr; }
-    if (pufferl.prio_bufs.storage) { cudaFree(pufferl.prio_bufs.storage); pufferl.prio_bufs.storage = nullptr; }
-
-    // Clear env tensors (from_blob wrappers - don't own memory but hold refs)
-    // EnvBuf: obs is torch (released), actions/rewards/terminals are PufTensor (non-owning views of vec GPU mem)
+    // Clear env tensors (non-owning views of vec GPU mem)
     pufferl.env.obs = PufTensor();
     pufferl.env.actions = PufTensor();
     pufferl.env.rewards = PufTensor();
@@ -1076,7 +983,6 @@ void close_impl(PuffeRL& pufferl) {
     }
 
     cudaDeviceSynchronize();
-
 }
 
 void profiler_start() {

@@ -19,24 +19,17 @@ from setuptools.command.build_ext import build_ext
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
 NO_TRAIN = os.getenv("NO_TRAIN", "0") == "1"
-NO_TORCH = os.getenv("NO_TORCH", "0") == "1"
 
-# Import torch build utilities (unless NO_TORCH or NO_TRAIN)
+# Torch is only needed for profiler builds (build_profile_torch, build_profiler).
+# The main _C.so build is always torch-free.
 HAS_TORCH = False
-if not NO_TRAIN and not NO_TORCH:
-    from torch.utils import cpp_extension
-    from torch.utils.cpp_extension import (
-        CppExtension,
-        CUDAExtension,
-        BuildExtension,
-        CUDA_HOME,
-        ROCM_HOME
-    )
-    HAS_TORCH = True
-    # build cuda extension if torch can find CUDA or HIP/ROCM in the system
-    BUID_CUDA_EXT = bool(CUDA_HOME or ROCM_HOME)
-else:
-    BUID_CUDA_EXT = False
+if not NO_TRAIN:
+    try:
+        from torch.utils import cpp_extension
+        from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+        HAS_TORCH = True
+    except ImportError:
+        pass
 
 # Use ccache if available for faster rebuilds
 if shutil.which('ccache'):
@@ -175,22 +168,17 @@ else:
 # - 0.18-0.21 require setuptools<=65.5.0
 
 # Extensions
-extnames = ["pufferlib._C", "squared_torch._C"]
+extnames = ["pufferlib._C"]
 
 class BuildExt(build_ext):
     def run(self):
         # Propagate any build_ext options (e.g., --inplace, --force) to subcommands
         build_ext_opts = self.distribution.command_options.get('build_ext', {})
         if build_ext_opts:
-            # Copy flags so build_torch and build_c respect inplace/force
-            self.distribution.command_options['build_torch'] = build_ext_opts.copy()
             self.distribution.command_options['build_c'] = build_ext_opts.copy()
 
-        # Run the torch and C builds (which will handle copying when inplace is set)
-        if HAS_TORCH:
-            self.run_command('build_torch')
-        elif not NO_TRAIN:
-            # NO_TORCH but not NO_TRAIN: build _C.so via subprocess (no env linked)
+        # Build _C.so (always torch-free)
+        if not NO_TRAIN:
             _build_notorch_C()
         self.run_command('build_c')
 
@@ -205,13 +193,6 @@ cmdclass = {
     "build_c": CBuildExt,
 }
 
-if HAS_TORCH:
-    class TorchBuildExt(cpp_extension.BuildExtension):
-        def run(self):
-            self.extensions = [e for e in self.extensions if e.name in extnames]
-            super().run()
-
-    cmdclass["build_torch"] = TorchBuildExt
 
 INCLUDE = [f'{BOX2D_NAME}/include', f'{BOX2D_NAME}/src']
 RAYLIB_A = f'{RAYLIB_NAME}/lib/libraylib.a'
@@ -251,7 +232,59 @@ if not NO_OCEAN:
             c_ext.extra_link_args.extend(['-L/usr/local/lib', '-llammps'])
 
 
+class ProfileTorchBuildExt(build_ext):
+    """Build libprofile_torch.a — static torch library (slow, compile once)."""
+    user_options = build_ext.user_options + [
+        ('precision=', None, 'Precision: float or bf16 (default: float)'),
+    ]
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.precision = 'float'
+
+    def finalize_options(self):
+        super().finalize_options()
+
+    def run(self):
+        import subprocess
+        import sysconfig
+        import torch.utils.cpp_extension as cpp_ext
+
+        src = 'profile_torch_lib.cu'
+        obj = 'profile_torch_lib.o'
+        lib = 'libprofile_torch.a'
+
+        nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
+        arch = '-arch=sm_89'
+        lib_paths = cpp_ext.library_paths()
+        nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
+
+        precision_flag = '-DPRECISION_FLOAT' if self.precision == 'float' else ''
+
+        # Step 1: Compile to object file
+        cmd = [nvcc, '-c', '-O3', arch, '-DUSE_TORCH', '-DPUFFERLIB_TORCH',
+               '-I.', '-Ipufferlib/extensions',
+               '-Xcompiler', '-fPIC']
+        if precision_flag:
+            cmd.append(precision_flag)
+        cmd += ['-I' + sysconfig.get_path('include')]
+        cmd += ['-I' + p for p in cpp_ext.include_paths()]
+        cmd += [src, '-o', obj]
+
+        print(f'Building torch lib object: {" ".join(cmd)}')
+        subprocess.check_call(cmd)
+
+        # Step 2: Create static library
+        ar_cmd = ['ar', 'rcs', lib, obj]
+        print(f'Creating static library: {" ".join(ar_cmd)}')
+        subprocess.check_call(ar_cmd)
+        print(f'Built: {lib}')
+
+cmdclass["build_profile_torch"] = ProfileTorchBuildExt
+
+
 class ProfilerBuildExt(build_ext):
+    """Build profile binary — fast compile, links libprofile_torch.a if present."""
     user_options = build_ext.user_options + [
         ('no-torch', None, 'Build profiler without torch support'),
         ('env=', None, 'Static env to link (e.g., breakout, drive)'),
@@ -274,19 +307,31 @@ class ProfilerBuildExt(build_ext):
 
         src = 'profile_kernels.cu'
         out = 'profile'
+        torch_lib = 'libprofile_torch.a'
 
         nvcc = cpp_ext._join_cuda_home('bin', 'nvcc')
         arch = '-arch=sm_89'
 
-        cmd = [nvcc, '-O3', arch, '-I.', src, '-o', out]
+        precision_flag = '-DPRECISION_FLOAT' if self.precision == 'float' else ''
 
-        if not self.no_torch:
+        # Check if we should link torch
+        use_torch = not self.no_torch and os.path.exists(torch_lib)
+        if not self.no_torch and not os.path.exists(torch_lib):
+            print(f'Warning: {torch_lib} not found. Build it with: python setup.py build_profile_torch')
+            print('Building without torch support.')
+
+        if not use_torch:
+            # No-torch build: fast, kernel-only
+            cmd = [nvcc, '-O3', arch, '-I.']
+            if precision_flag:
+                cmd.append(precision_flag)
+            cmd += [src, '-o', out]
+        else:
             out = 'profile_torch'
             lib_paths = cpp_ext.library_paths()
             nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
 
-            precision_flag = '-DPRECISION_FLOAT' if self.precision == 'float' else ''
-            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH',
+            cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-DPUFFERLIB_TORCH',
                    '-I.', '-Ipufferlib/extensions']
             if precision_flag:
                 cmd.append(precision_flag)
@@ -302,17 +347,23 @@ class ProfilerBuildExt(build_ext):
 
             cmd += ['-I' + sysconfig.get_path('include')]
             cmd += ['-I' + p for p in cpp_ext.include_paths()]
+            cmd += [src]
+            # Link the static torch lib
+            cmd += [torch_lib]
             cmd += ['-L' + p for p in lib_paths]
             cmd += ['-L' + nvtx_lib_dir]
             cmd += ['-Xlinker', '-rpath,' + ':'.join(lib_paths)]
             cmd += ['-Xlinker', '--no-as-needed']
-            cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda', '-lnvToolsExt', '-ldl', '-lnccl']
+            cmd += ['-lc10', '-lc10_cuda', '-ltorch', '-ltorch_cpu', '-ltorch_cuda',
+                    '-lcublas', '-lcusolver', '-lcurand',
+                    '-lnvToolsExt', '-ldl', '-lnccl']
             cmd += ['-Xlinker', '--unresolved-symbols=ignore-in-shared-libs']
+            cmd += ['-Xlinker', '--allow-multiple-definition']
             if self.env:
                 static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
                 cmd += [static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL']
             cmd += ['-lomp5']
-            cmd += [src, '-o', out]
+            cmd += ['-o', out]
 
         print(f'Building profiler: {" ".join(cmd)}')
         subprocess.check_call(cmd)
@@ -432,24 +483,12 @@ def _build_notorch_C(static_lib=None):
     print(f'[NO_TORCH] Built: {output}')
 
 def create_static_env_build_class(env_name):
-    """Create a build class that compiles env with clang, and optionally links with torch extension."""
-    if HAS_TORCH:
-        # With torch: build static lib + torch extension linked against it
-        class StaticEnvBuildExt(cpp_extension.BuildExtension):
-            def run(self):
-                static_lib = _build_static_lib(env_name)
-                self.extensions = [e for e in self.extensions if e.name == 'pufferlib._C']
-                for ext in self.extensions:
-                    ext.extra_objects = [RAYLIB_A, static_lib]
-                super().run()
-        return StaticEnvBuildExt
-    else:
-        # Without torch: build static .a library + _C.so via subprocess
-        class StaticEnvBuildExtNoTorch(build_ext):
-            def run(self):
-                static_lib = _build_static_lib(env_name)
-                _build_notorch_C(static_lib)
-        return StaticEnvBuildExtNoTorch
+    """Create a build class that compiles env with clang, then links _C.so."""
+    class StaticEnvBuildExt(build_ext):
+        def run(self):
+            static_lib = _build_static_lib(env_name)
+            _build_notorch_C(static_lib)
+    return StaticEnvBuildExt
 
 # Add build_<env> for static-linked envs (always available, torch optional)
 for env_name in STATIC_ENVS:
@@ -469,41 +508,9 @@ if not NO_OCEAN:
         cmdclass[f"build_{env_name}_so"] = create_env_build_class(c_ext.name)
 
 
-# Torch extensions (only when torch is available and not disabled)
+# No torch extensions in the default build — _C.so is built via subprocess (torch-free).
+# Use build_profile_torch / build_profiler for torch-based profiling.
 torch_extensions = []
-if HAS_TORCH:
-    import torch
-    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH') or torch.utils.cpp_extension.CUDA_HOME or '/usr/local/cuda'
-    nvtx_lib_dir = os.path.join(cuda_home, 'lib64')  # Common on Linux; fall back to 'lib' if needed
-    nvtx_lib = 'nvToolsExt'
-
-    torch_sources = [
-        "pufferlib/extensions/bindings.cpp",
-    ]
-    if BUID_CUDA_EXT:
-        extension = CUDAExtension
-        torch_sources.append("pufferlib/extensions/cuda/squared_torch.cu")
-        torch_sources.append("pufferlib/extensions/cuda/modules.cu")
-    else:
-        extension = CppExtension
-
-    # Note: Use build_<envname> (e.g. build_breakout, build_drive) to build with static env linking
-    # build_torch alone won't link any env - it's for the training code only
-    torch_extensions = [
-       extension(
-            "pufferlib._C",
-            torch_sources,
-            include_dirs=[pybind11.get_include(), torch.utils.cpp_extension.include_paths()[0]],
-            extra_compile_args = {
-                "cxx": extra_compile_args + cxx_args + ['-DPUFFERLIB_TORCH'],
-                "nvcc": nvcc_args + ['-DPUFFERLIB_TORCH'],
-            },
-            extra_link_args=extra_link_args,
-            extra_objects=[RAYLIB_A],
-            libraries=[nvtx_lib, 'omp5', 'nccl', 'nvidia-ml', 'cublas', 'cusolver', 'curand'],
-            library_dirs=[nvtx_lib_dir],
-        ),
-    ]
 
 # Prevent Conda from injecting garbage compile flags
 from distutils.sysconfig import get_config_vars
@@ -550,7 +557,7 @@ setup(
     },
     include_package_data=True,
     install_requires=install_requires,
-    ext_modules = c_extensions + torch_extensions,
+    ext_modules = c_extensions,
     cmdclass=cmdclass,
     include_dirs=[numpy.get_include(), RAYLIB_NAME + '/include'],
 )

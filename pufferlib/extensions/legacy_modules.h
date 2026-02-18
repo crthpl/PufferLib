@@ -1,103 +1,13 @@
 #ifndef PUFFERLIB_LEGACY_MODULES_H
 #define PUFFERLIB_LEGACY_MODULES_H
 
-// Legacy torch-dependent modules: autograd functions, torch::Tensor wrappers
-// These will be removed as we migrate to PufTensor throughout.
+// PufTensor kernel declarations + buffer structs (torch-free)
+// Also contains torch-dependent reference implementations for numerical tests (guarded)
 
 #ifdef PUFFERLIB_TORCH
 #include <torch/torch.h>
 #endif
 #include "modules.h"
-
-#ifdef PUFFERLIB_TORCH
-// Autograd modules
-using tensor_list = torch::autograd::tensor_list;
-using AutogradCtx = torch::autograd::AutogradContext;
-
-class LogCumsumExp : public torch::autograd::Function<LogCumsumExp> {
-public:
-    static tensor_list forward(AutogradCtx* ctx, torch::Tensor x);
-    static tensor_list backward(AutogradCtx* ctx, tensor_list grad_outputs);
-};
-
-class PPOLoss : public torch::autograd::Function<PPOLoss> {
-public:
-    static tensor_list forward(AutogradCtx* ctx,
-        torch::Tensor logits, torch::Tensor logstd,
-        torch::Tensor values_pred, torch::Tensor actions,
-        torch::Tensor old_logprobs, torch::Tensor advantages,
-        torch::Tensor prio, torch::Tensor values, torch::Tensor returns,
-        torch::Tensor ratio_out, torch::Tensor newvalue_out,
-        torch::Tensor act_sizes, torch::Tensor losses_acc,
-        double clip_coef, double vf_clip_coef, double vf_coef, double ent_coef);
-    static tensor_list backward(AutogradCtx* ctx, tensor_list grad_outputs);
-};
-
-class FCMax : public torch::autograd::Function<FCMax> {
-public:
-    static tensor_list forward(AutogradCtx* ctx,
-        torch::Tensor x, torch::Tensor W, torch::Tensor b);
-    static tensor_list backward(AutogradCtx* ctx, tensor_list grad_outputs);
-};
-
-// Fused mingru gate inference (torch::Tensor overload)
-void mingru_gate(torch::Tensor state, torch::Tensor combined,
-    torch::Tensor out, torch::Tensor next_state);
-
-// Fused sample_logits: handles both discrete and continuous action sampling
-// Tensor overload (Python binding / legacy)
-void sample_logits(
-    torch::Tensor logits, torch::Tensor logstd, torch::Tensor value,
-    torch::Tensor actions_out, torch::Tensor logprobs_out, torch::Tensor value_out,
-    torch::Tensor act_sizes, uint64_t seed, torch::Tensor offset);
-
-// Priority replay: fused priority sampling for minibatch selection
-// Tensor overload (legacy)
-std::tuple<torch::Tensor, torch::Tensor> prio_replay_cuda(
-    torch::Tensor advantages, float prio_alpha,
-    int minibatch_segments, int total_agents, float anneal_beta);
-
-// PPO gradient outputs from fused forward+backward
-struct PPOGrads {
-    torch::Tensor grad_logits;    // (N, T, A_total) float32
-    torch::Tensor grad_logstd;    // (N, T, A_total) float32, or empty for discrete
-    torch::Tensor grad_values;    // (N, T, 1) float32
-};
-
-// Pre-allocated buffers for ppo_loss_fwd_bwd (avoids per-call allocations)
-struct PPOBuffers {
-    torch::Tensor loss_output;       // (1,) float32
-    torch::Tensor saved_for_bwd;     // (N*T, 5) float64
-    torch::Tensor grad_loss;         // (1,) float32, constant 1.0
-    torch::Tensor grad_logits;       // (N, T, A_total) float32
-    torch::Tensor grad_values;       // (N, T, 1) float32
-    torch::Tensor grad_logstd;       // (N, T, A_total) float32, or undefined for discrete
-
-    void create(int N, int T, int A_total, bool is_continuous, torch::Device device) {
-        auto f32 = torch::dtype(torch::kFloat32).device(device);
-        auto f64 = torch::dtype(torch::kFloat64).device(device);
-        loss_output = torch::empty({1}, f32);
-        saved_for_bwd = torch::zeros({N * T, 5}, f64);
-        grad_loss = torch::ones({1}, f32);
-        grad_logits = torch::empty({N, T, A_total}, f32);
-        grad_values = torch::empty({N, T, 1}, f32);
-        if (is_continuous) {
-            grad_logstd = torch::empty({N, T, A_total}, f32);
-        }
-    }
-};
-
-// Fused PPO loss forward + backward (no autograd) — uses pre-allocated buffers
-// Tensor overload (legacy)
-void ppo_loss_fwd_bwd(
-    torch::Tensor logits, torch::Tensor logstd, torch::Tensor values_pred,
-    torch::Tensor actions, torch::Tensor old_logprobs, torch::Tensor advantages,
-    torch::Tensor prio, torch::Tensor values, torch::Tensor returns,
-    torch::Tensor ratio_out, torch::Tensor newvalue_out,
-    torch::Tensor act_sizes, torch::Tensor losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    PPOBuffers& bufs);
-#endif // PUFFERLIB_TORCH
 
 // PufTensor sample_logits (native kernel path)
 void sample_logits(
@@ -113,26 +23,12 @@ struct PrioBuffers {
     PufTensor cdf;           // (S,) f32 — cumulative distribution for multinomial
     PufTensor idx;           // (minibatch_segments,) int64 — sampled indices
     PufTensor mb_prio;       // (minibatch_segments, 1) f32 — importance weights
-    void* storage = nullptr;
 
-    void create(int S, int minibatch_segments) {
-        int64_t bytes = S * 4 + S * 4 + minibatch_segments * 8 + minibatch_segments * 4;
-        cudaMalloc(&storage, bytes);
-        char* p = (char*)storage;
-        int64_t off = 0;
-        auto mk = [&](int64_t n, int dsz, std::initializer_list<int64_t> dims) {
-            PufTensor t;
-            t.data = p + off; t.numel = n; t.dtype_size = dsz;
-            int i = 0; t.ndim = dims.size();
-            for (auto d : dims) t.shape[i++] = d;
-            for (; i < 4; i++) t.shape[i] = 1;
-            off += n * dsz;
-            return t;
-        };
-        prio_probs = mk(S, 4, {S});
-        cdf        = mk(S, 4, {S});
-        idx        = mk(minibatch_segments, 8, {minibatch_segments});
-        mb_prio    = mk(minibatch_segments, 4, {minibatch_segments, 1});
+    void register_buffers(Allocator& alloc, int S, int minibatch_segments) {
+        alloc.register_puf(&prio_probs, {S}, sizeof(float));
+        alloc.register_puf(&cdf, {S}, sizeof(float));
+        alloc.register_puf(&idx, {minibatch_segments}, sizeof(int64_t));
+        alloc.register_puf(&mb_prio, {minibatch_segments, 1}, sizeof(float));
     }
 };
 
@@ -163,40 +59,21 @@ struct PPOBuffersPuf {
     PufTensor grad_values;       // (N, T, 1) float32
     PufTensor grad_logstd;       // (N, T, A_total) float32, or empty for discrete
     PufTensor adv_scratch;       // (2,) float32 — [variance, mean] scratch for var_mean
-    void* storage = nullptr;
 
-    void create(int N, int T, int A_total, bool is_continuous) {
-        int total = N * T;
-        int64_t bytes = sizeof(float)          // loss_output
-            + total * 5 * sizeof(double)       // saved_for_bwd
-            + sizeof(float)                    // grad_loss
-            + total * A_total * sizeof(float)  // grad_logits
-            + total * 1 * sizeof(float)        // grad_values
-            + (is_continuous ? total * A_total * sizeof(float) : 0)  // grad_logstd
-            + 2 * sizeof(float);               // adv_scratch
-        cudaMalloc(&storage, bytes);
-        cudaMemset(storage, 0, bytes);
-        char* p = (char*)storage;
-        int64_t off = 0;
-        auto mk = [&](int64_t n, int dsz, std::initializer_list<int64_t> dims) {
-            PufTensor t;
-            t.data = p + off; t.numel = n; t.dtype_size = dsz;
-            int i = 0; t.ndim = dims.size();
-            for (auto d : dims) t.shape[i++] = d;
-            for (; i < 4; i++) t.shape[i] = 1;
-            off += n * dsz;
-            return t;
-        };
-        loss_output   = mk(1, 4, {1});
-        saved_for_bwd = mk((int64_t)total * 5, 8, {total, 5});
-        grad_loss     = mk(1, 4, {1});
-        grad_logits   = mk((int64_t)total * A_total, 4, {N, T, A_total});
-        grad_values   = mk(total, 4, {N, T, 1});
+    void register_buffers(Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
+        int64_t total = (int64_t)N * T;
+        alloc.register_puf(&loss_output, {1}, sizeof(float));
+        alloc.register_puf(&saved_for_bwd, {total, 5}, sizeof(double));
+        alloc.register_puf(&grad_loss, {1}, sizeof(float));
+        alloc.register_puf(&grad_logits, {N, T, A_total}, sizeof(float));
+        alloc.register_puf(&grad_values, {N, T, 1}, sizeof(float));
         if (is_continuous) {
-            grad_logstd = mk((int64_t)total * A_total, 4, {N, T, A_total});
+            alloc.register_puf(&grad_logstd, {N, T, A_total}, sizeof(float));
         }
-        adv_scratch = mk(2, 4, {2});
-        // Set grad_loss to 1.0
+        alloc.register_puf(&adv_scratch, {2}, sizeof(float));
+    }
+
+    void post_create() {
         float one = 1.0f;
         cudaMemcpy(grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
     }
@@ -223,19 +100,11 @@ void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
     float gamma, float lambda, float rho_clip, float c_clip,
     cudaStream_t stream);
 
+// ============================================================================
+// Legacy torch-dependent code: reference implementations + PolicyLSTM
+// Everything below uses torch — kept for numerical tests
+// ============================================================================
 #ifdef PUFFERLIB_TORCH
-// Tensor version (legacy fallback)
-void puff_advantage_cuda(
-    torch::Tensor values, torch::Tensor rewards,
-    torch::Tensor dones, torch::Tensor importance, torch::Tensor advantages,
-    double gamma, double lambda, double rho_clip, double c_clip);
-
-// ============================================================================
-// Legacy torch-dependent code moved from models.cpp
-// Everything below uses torch and will eventually be removed
-// Guard with __CUDACC__ since nvcc should not compile torch-dependent code
-// ============================================================================
-#ifndef __CUDACC__
 
 using std::shared_ptr;
 using std::vector;
@@ -735,7 +604,6 @@ inline Tensor fc_max_cpp(Tensor x, Tensor W, Tensor b) {
     return std::get<0>(fc.max(1));
 }
 
-#endif // __CUDACC__
 #endif // PUFFERLIB_TORCH
 } // namespace pufferlib
 

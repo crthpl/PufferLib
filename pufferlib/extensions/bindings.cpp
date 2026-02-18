@@ -286,25 +286,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
     return pufferl;
 }
 
-#ifdef PUFFERLIB_TORCH
-TORCH_LIBRARY(pufferlib, m) {
-   m.def("compute_puff_advantage(Tensor(a!) values, Tensor(b!) rewards, Tensor(c!) dones, Tensor(d!) importance, Tensor(e!) advantages, float gamma, float lambda, float rho_clip, float c_clip) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {
-  m.impl("compute_puff_advantage", &puff_advantage_cpu);
-}
-
-TORCH_LIBRARY_IMPL(pufferlib, CUDA, m) {
-  m.impl("compute_puff_advantage", static_cast<void(*)(Tensor,Tensor,Tensor,Tensor,Tensor,double,double,double,double)>(&puff_advantage_cuda));
-}
-
-TORCH_LIBRARY(_C, m) {
-    m.def("mingru_gate(Tensor state, Tensor combined, Tensor out, Tensor next_state) -> ()");
-    m.def("fc_max(Tensor x, Tensor W, Tensor b) -> Tensor");
-}
-#endif // PUFFERLIB_TORCH
-
 PYBIND11_MODULE(_C, m) {
     // Core functions (torch-free)
     m.def("log_environments", &log_environments);
@@ -321,12 +302,8 @@ PYBIND11_MODULE(_C, m) {
 
 #ifdef PUFFERLIB_TORCH
     // Torch-dependent bindings
-    m.def("logcumsumexp_cuda", [](torch::Tensor x) { return LogCumsumExp::apply(x)[0]; });
     m.def("initial_state", &initial_state);
-    m.def("mingru_gate", static_cast<void(*)(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor)>(&mingru_gate));
-    m.def("fc_max", [](torch::Tensor x, torch::Tensor W, torch::Tensor b) { return FCMax::apply(x, W, b)[0]; });
     m.def("fc_max_cpp", &fc_max_cpp);
-    m.def("sample_logits", static_cast<void(*)(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, uint64_t, torch::Tensor)>(&sample_logits));
     m.def("env_buffers", &env_buffers);
     m.def("test_orthogonal_init", [](torch::Tensor t, float gain, int64_t seed) {
         PufTensor p = PufTensor::from_torch(t);
