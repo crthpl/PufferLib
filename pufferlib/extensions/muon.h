@@ -1,9 +1,9 @@
 #pragma once
 
-#include <torch/torch.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <nccl.h>
-#include "modules.h"  // PufTensor, puf_copy, puf_zero
+#include <cuda_runtime.h>
+#include <cassert>
+#include "modules.h"  // PufTensor, puf_copy, puf_zero, etc.
 
 static constexpr double ns_coeffs[5][3] = {
     {4.0848, -6.8946, 2.9270},
@@ -42,17 +42,15 @@ struct Muon {
     double weight_decay;
     double eps;
 
-    // State
-    torch::Tensor lr;              // (1,) f32 CUDA — written by lr annealing, read by graph
-    torch::Tensor lr_derived;      // (2,) f32 CUDA — [neg_lr, wd_scale], computed from lr
-    torch::Tensor momentum_buffer; // contiguous momentum buffer (torch for state_dict)
-    torch::Tensor grad_clone;      // pre-allocated clone buffer (torch for state_dict)
-    torch::Tensor updates;         // pre-allocated buffer (torch for state_dict)
-    PufTensor wb_puf, gb_puf, mb_puf, gc_puf, up_puf;  // cached PufTensor views
+    // State — all raw CUDA, no torch
+    float* lr_ptr = nullptr;          // 1 f32 on device — written by lr annealing, read by graph
+    float* lr_derived_ptr = nullptr;  // 2 f32 on device — [neg_lr, wd_scale]
+    PufTensor wb_puf, gb_puf, mb_puf, gc_puf, up_puf;
     bool bufs_initialized = false;
     NSScratch ns;
-    torch::Tensor ns_buffer;  // keeps NS scratch memory alive
-    std::vector<ParamShape> param_shapes;  // shapes for per-param Newton-Schulz
+    void* buf_mem = nullptr;    // owned: momentum + grad_clone + updates
+    void* ns_mem = nullptr;     // owned: NS scratch + norm scalar
+    std::vector<ParamShape> param_shapes;
 
     // Multi-GPU
     ncclComm_t nccl_comm = nullptr;
@@ -65,25 +63,44 @@ struct Muon {
           wb_puf(weight_buffer), gb_puf(grad_buffer),
           param_shapes(std::move(param_shapes))
     {
-        TORCH_CHECK(lr_val >= 0, "Invalid learning rate: ", lr_val);
-        TORCH_CHECK(eps >= 0, "Invalid epsilon value: ", eps);
-        TORCH_CHECK(weight_decay >= 0, "Invalid weight_decay value: ", weight_decay);
-        lr = torch::tensor(lr_val, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
-        lr_derived = torch::zeros({2}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        assert(lr_val >= 0 && "Invalid learning rate");
+        assert(eps >= 0 && "Invalid epsilon value");
+        assert(weight_decay >= 0 && "Invalid weight_decay value");
+        cudaMalloc(&lr_ptr, sizeof(float));
+        float h = (float)lr_val;
+        cudaMemcpy(lr_ptr, &h, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMalloc(&lr_derived_ptr, 2 * sizeof(float));
+        cudaMemset(lr_derived_ptr, 0, 2 * sizeof(float));
     }
 
-    void step() {
+    ~Muon() {
+        if (lr_ptr) cudaFree(lr_ptr);
+        if (lr_derived_ptr) cudaFree(lr_derived_ptr);
+        if (buf_mem) cudaFree(buf_mem);
+        if (ns_mem) cudaFree(ns_mem);
+    }
+
+    // Non-copyable (owns CUDA memory)
+    Muon(const Muon&) = delete;
+    Muon& operator=(const Muon&) = delete;
+
+    void step(cudaStream_t stream = 0) {
         if (wb_puf.data == nullptr) return;
 
-        // Initialize persistent buffers and cache PufTensor views (once)
+        // Initialize persistent buffers (once, during warmup before graph capture)
         if (!bufs_initialized) {
-            auto opts = torch::dtype(torch::kFloat32).device(torch::kCUDA);
-            momentum_buffer = torch::zeros({wb_puf.numel}, opts);
-            grad_clone = torch::empty({wb_puf.numel}, opts);
-            updates = torch::empty({wb_puf.numel}, opts);
-            mb_puf = PufTensor::from_torch(momentum_buffer);
-            gc_puf = PufTensor::from_torch(grad_clone);
-            up_puf = PufTensor::from_torch(updates);
+            int64_t n = wb_puf.numel;
+            cudaMalloc(&buf_mem, 3 * n * sizeof(float));
+            cudaMemset(buf_mem, 0, n * sizeof(float));  // zero momentum portion
+            float* p = (float*)buf_mem;
+            auto mk1d = [](void* ptr, int64_t numel) {
+                PufTensor t; t.data = ptr; t.shape[0] = numel;
+                t.ndim = 1; t.numel = numel; t.dtype_size = 4;
+                return t;
+            };
+            mb_puf = mk1d(p,       n);
+            gc_puf = mk1d(p + n,   n);
+            up_puf = mk1d(p + 2*n, n);
 
             // Pre-allocate Newton-Schulz scratch for largest 2D param
             // M = min(R,C), N = max(R,C) — matching transposed convention in NS
@@ -100,51 +117,43 @@ struct Muon {
             if (max_M > 0) {
                 ns.max_M = max_M; ns.max_N = max_N;
                 int bf16sz = 2, f32sz = 4;
-                // Allocate one contiguous buffer for all NS scratch
                 int64_t total = (max_M*max_N + max_M*max_M + max_M*max_M + max_M*max_N) * bf16sz
                               + max_M*max_N * f32sz + sizeof(float);
-                torch::Tensor ns_buf = torch::empty({total},
-                    torch::dtype(torch::kUInt8).device(torch::kCUDA));
-                char* p = (char*)ns_buf.data_ptr();
+                cudaMalloc(&ns_mem, total);
+                char* q = (char*)ns_mem;
                 auto mk_bf16 = [&](int64_t r, int64_t c) -> PufTensor {
-                    PufTensor t; t.data = p; t.shape[0] = r; t.shape[1] = c;
+                    PufTensor t; t.data = q; t.shape[0] = r; t.shape[1] = c;
                     t.ndim = 2; t.numel = r*c; t.dtype_size = bf16sz;
-                    p += r * c * bf16sz; return t;
+                    q += r * c * bf16sz; return t;
                 };
                 ns.x = mk_bf16(max_M, max_N);
                 ns.A = mk_bf16(max_M, max_M);
                 ns.gram = mk_bf16(max_M, max_M);
                 ns.tmp = mk_bf16(max_M, max_N);
-                // f32 result buffer
-                ns.result_f32.data = p; ns.result_f32.shape[0] = max_M; ns.result_f32.shape[1] = max_N;
+                ns.result_f32.data = q; ns.result_f32.shape[0] = max_M; ns.result_f32.shape[1] = max_N;
                 ns.result_f32.ndim = 2; ns.result_f32.numel = max_M*max_N; ns.result_f32.dtype_size = f32sz;
-                p += max_M * max_N * f32sz;
-                ns.norm_ptr = (float*)p;
-                // Keep ns_buf alive by storing it (hack: reuse updates tensor? No, just add a field)
-                // Actually the torch tensor going out of scope would free the memory.
-                // Store it as a member.
-                ns_buffer = ns_buf;
+                q += max_M * max_N * f32sz;
+                ns.norm_ptr = (float*)q;
             }
             bufs_initialized = true;
         }
 
         // Copy grads into persistent clone buffer
-        puf_copy(gc_puf, gb_puf);
+        puf_copy(gc_puf, gb_puf, stream);
 
         // Multi-GPU gradient sync
         if (nccl_comm != nullptr && world_size > 1) {
             ncclAllReduce(gc_puf.data, gc_puf.data, gc_puf.numel,
-                          ncclFloat, ncclAvg, nccl_comm,
-                          at::cuda::getCurrentCUDAStream());
+                          ncclFloat, ncclAvg, nccl_comm, stream);
         }
 
         // Nesterov momentum
-        puf_scale(mb_puf, (float)momentum);
-        puf_axpy(mb_puf, gc_puf, 1.0f);
-        puf_axpy(gc_puf, mb_puf, (float)momentum);
+        puf_scale(mb_puf, (float)momentum, stream);
+        puf_axpy(mb_puf, gc_puf, 1.0f, stream);
+        puf_axpy(gc_puf, mb_puf, (float)momentum, stream);
 
         // Newton-Schulz per param
-        puf_zero(up_puf);
+        puf_zero(up_puf, stream);
         int64_t offset = 0;
         for (auto& ps : param_shapes) {
             float* gc_ptr = (float*)gc_puf.data + offset;
@@ -171,14 +180,14 @@ struct Muon {
                 // Cast f32 → bf16 (with transpose if needed)
                 if (transposed) {
                     PufTensor x_view = x; // (C, R) = (M, N)
-                    puf_cast_f32_to_bf16_transpose(x_view, G_f32);
+                    puf_cast_f32_to_bf16_transpose(x_view, G_f32, stream);
                 } else {
-                    puf_cast_f32_to_bf16(x, G_f32);
+                    puf_cast_f32_to_bf16(x, G_f32, stream);
                 }
 
                 // Normalize: x /= max(norm(x), 1e-7)
-                puf_norm(x, ns.norm_ptr);
-                puf_normalize(x, ns.norm_ptr, 1e-7f);
+                puf_norm(x, ns.norm_ptr, stream);
+                puf_normalize(x, ns.norm_ptr, 1e-7f, stream);
 
                 // 5 Newton-Schulz iterations, ping-pong between x and tmp
                 for (int i = 0; i < 5; ++i) {
@@ -188,13 +197,13 @@ struct Muon {
                     PufTensor& src = (i % 2 == 0) ? x : tmp;
                     PufTensor& dst = (i % 2 == 0) ? tmp : x;
                     // A = src @ src^T
-                    puf_mm(src, src, A);
+                    puf_mm(src, src, A, stream);
                     // gram = c * A @ A + b * A  (reuse A as input, write to gram)
-                    puf_copy(gram, A);
-                    puf_addmm_nn(A, A, gram, c, b);
+                    puf_copy(gram, A, stream);
+                    puf_addmm_nn(A, A, gram, c, b, stream);
                     // dst = 1.0 * gram @ src + a * src  (ping-pong)
-                    puf_copy(dst, src);
-                    puf_addmm_nn(gram, src, dst, 1.0f, a);
+                    puf_copy(dst, src, stream);
+                    puf_addmm_nn(gram, src, dst, 1.0f, a, stream);
                 }
                 // After 5 (odd) iterations, result is in tmp
                 PufTensor& result_bf16 = tmp;
@@ -208,69 +217,38 @@ struct Muon {
 
                 PufTensor res_f32 = ns.slice(ns.result_f32, M, N);
                 res_f32.dtype_size = 4; res_f32.numel = M * N;
-                puf_cast_bf16_to_f32(res_f32, result_bf16);
-                if (scale != 1.0f) puf_scale(res_f32, scale);
+                puf_cast_bf16_to_f32(res_f32, result_bf16, stream);
+                if (scale != 1.0f) puf_scale(res_f32, scale, stream);
 
                 if (transposed) {
                     // res_f32 is (M=C, N=R), need (R, C) in out_f32
-                    puf_transpose_f32(out_f32, res_f32);
+                    puf_transpose_f32(out_f32, res_f32, stream);
                 } else {
-                    puf_copy(out_f32, res_f32);
+                    puf_copy(out_f32, res_f32, stream);
                 }
             } else {
                 // 1D param: just copy as-is
                 PufTensor src_puf, dst_puf;
                 src_puf.data = gc_ptr; src_puf.numel = ps.numel; src_puf.dtype_size = 4;
                 dst_puf.data = up_ptr; dst_puf.numel = ps.numel; dst_puf.dtype_size = 4;
-                puf_copy(dst_puf, src_puf);
+                puf_copy(dst_puf, src_puf, stream);
             }
             offset += ps.numel;
         }
 
-        // Compute derived lr scalars on device (graph-safe — reads lr from device memory)
-        float* lr_ptr = (float*)lr.data_ptr();
-        float* neg_lr_ptr = (float*)lr_derived.data_ptr();
-        float* wd_scale_ptr = neg_lr_ptr + 1;
-        compute_lr_scalars(lr_ptr, (float)weight_decay, neg_lr_ptr, wd_scale_ptr);
+        // Compute derived lr scalars on device (graph-safe)
+        compute_lr_scalars(lr_ptr, (float)weight_decay, lr_derived_ptr, lr_derived_ptr + 1, stream);
 
         // Apply update
         if (weight_decay != 0) {
-            puf_scale_dev(wb_puf, wd_scale_ptr);
+            puf_scale_dev(wb_puf, lr_derived_ptr + 1, stream);
         }
-        puf_axpy_dev(wb_puf, up_puf, neg_lr_ptr);
+        puf_axpy_dev(wb_puf, up_puf, lr_derived_ptr, stream);
     }
 
-    void zero_grad() {
+    void zero_grad(cudaStream_t stream) {
         if (gb_puf.data != nullptr) {
-            puf_zero(gb_puf);
-        }
-    }
-
-    std::unordered_map<std::string, torch::Tensor> state_dict() const {
-        std::unordered_map<std::string, torch::Tensor> state;
-        state["lr"] = lr;
-        if (wb_puf.data != nullptr) state["weight_buffer"] = wb_puf.to_torch(torch::kFloat32);
-        if (momentum_buffer.defined()) state["momentum_buffer"] = momentum_buffer;
-        return state;
-    }
-
-    void load_state_dict(const std::unordered_map<std::string, torch::Tensor>& state) {
-        auto it = state.find("lr");
-        if (it != state.end()) lr.copy_(it->second);
-        it = state.find("weight_buffer");
-        if (it != state.end() && wb_puf.data != nullptr) {
-            // Copy into the PufTensor-backed weight buffer
-            torch::Tensor wb_view = wb_puf.to_torch(torch::kFloat32);
-            wb_view.copy_(it->second);
-        }
-        it = state.find("momentum_buffer");
-        if (it != state.end()) {
-            momentum_buffer.copy_(it->second);
-            if (!grad_clone.defined()) {
-                auto opts = torch::dtype(torch::kFloat32).device(torch::kCUDA);
-                grad_clone = torch::empty({wb_puf.numel}, opts);
-                updates = torch::empty({wb_puf.numel}, opts);
-            }
+            puf_zero(gb_puf, stream);
         }
     }
 };

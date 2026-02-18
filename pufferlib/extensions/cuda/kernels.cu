@@ -1218,23 +1218,26 @@ __global__ void compute_prio_imp_weights(
 // Puff Advantage kernels (moved from cuda/advantage.cu)
 // =============================================================================
 
-// TIn = input type (bf16 or float), TOut = output type (always float for precision)
-template<typename TIn, typename TOut>
-__host__ __device__ void puff_advantage_row_cuda_fallback(
-    const TIn* values, const TIn* rewards, const TIn* dones,
-    const TIn* importance, TOut* advantages, float gamma, float lambda,
+// Advantage kernels: precision_t input, float output (advantages always f32)
+
+__device__ __forceinline__ float p2f(float x) { return x; }
+__device__ __forceinline__ float p2f(__nv_bfloat16 x) { return __bfloat162float(x); }
+
+__device__ void puff_advantage_row_scalar(
+    const precision_t* values, const precision_t* rewards, const precision_t* dones,
+    const precision_t* importance, float* advantages, float gamma, float lambda,
     float rho_clip, float c_clip, int horizon
 ) {
     float lastpufferlam = 0;
     for (int t = horizon-2; t >= 0; t--) {
         int t_next = t + 1;
-        float nextnonterminal = 1.0f - float(dones[t_next]);
-        float imp = float(importance[t]);
+        float nextnonterminal = 1.0f - p2f(dones[t_next]);
+        float imp = p2f(importance[t]);
         float rho_t = fminf(imp, rho_clip);
         float c_t = fminf(imp, c_clip);
-        float delta = rho_t*(float(rewards[t_next]) + gamma*float(values[t_next])*nextnonterminal - float(values[t]));
+        float delta = rho_t*(p2f(rewards[t_next]) + gamma*p2f(values[t_next])*nextnonterminal - p2f(values[t]));
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
-        advantages[t] = TOut(lastpufferlam);
+        advantages[t] = lastpufferlam;
     }
 }
 
@@ -1243,30 +1246,27 @@ __device__ __forceinline__ void adv_vec_load(const float* ptr, float* out) {
     out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
 }
 
-__device__ __forceinline__ void adv_vec_load(const c10::BFloat16* ptr, float* out) {
+__device__ __forceinline__ void adv_vec_load(const __nv_bfloat16* ptr, float* out) {
     uint4 raw = *reinterpret_cast<const uint4*>(ptr);
     const __nv_bfloat16* bf = reinterpret_cast<const __nv_bfloat16*>(&raw);
     #pragma unroll
     for (int i = 0; i < 8; i++) out[i] = __bfloat162float(bf[i]);
 }
 
-template<typename TIn, typename TOut>
-__device__ __forceinline__ void puff_advantage_row_cuda(
-    const TIn* values, const TIn* rewards, const TIn* dones,
-    const TIn* importance, TOut* advantages, float gamma, float lambda,
+__device__ __forceinline__ void puff_advantage_row_vec(
+    const precision_t* values, const precision_t* rewards, const precision_t* dones,
+    const precision_t* importance, float* advantages, float gamma, float lambda,
     float rho_clip, float c_clip, int horizon
 ) {
-    constexpr int N = 16 / sizeof(TIn);
+    constexpr int N = 16 / sizeof(precision_t);
 
     float lastpufferlam = 0.0f;
     int num_chunks = horizon / N;
 
-    // Track values across chunk boundaries
-    float next_value = float(values[horizon - 1]);
-    float next_done = float(dones[horizon - 1]);
-    float next_reward = float(rewards[horizon - 1]);
+    float next_value = p2f(values[horizon - 1]);
+    float next_done = p2f(dones[horizon - 1]);
+    float next_reward = p2f(rewards[horizon - 1]);
 
-    // Process chunks from end to beginning
     for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
         int base = chunk * N;
 
@@ -1277,7 +1277,6 @@ __device__ __forceinline__ void puff_advantage_row_cuda(
         adv_vec_load(importance + base, imp);
 
         float adv[N] = {0};
-        // Last chunk: skip element N-1 (horizon-1 doesn't produce an advantage)
         int start_idx = (chunk == num_chunks - 1) ? (N - 2) : (N - 1);
 
         #pragma unroll
@@ -1302,26 +1301,23 @@ __device__ __forceinline__ void puff_advantage_row_cuda(
     }
 }
 
-template<typename TIn, typename TOut>
-__global__ void puff_advantage_kernel(const TIn* values, const TIn* rewards,
-        const TIn* dones, const TIn* importance, TOut* advantages, float gamma,
+__global__ void puff_advantage_kernel(const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
     if (row >= num_steps) return;
     int offset = row*horizon;
-    puff_advantage_row_cuda<TIn, TOut>(values + offset, rewards + offset, dones + offset,
+    puff_advantage_row_vec(values + offset, rewards + offset, dones + offset,
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 
-// Scalar kernel (fallback for unaligned horizons)
-template<typename TIn, typename TOut>
-__global__ void puff_advantage_kernel_scalar(const TIn* values, const TIn* rewards,
-        const TIn* dones, const TIn* importance, TOut* advantages, float gamma,
+__global__ void puff_advantage_kernel_scalar(const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
     if (row >= num_steps) return;
     int offset = row*horizon;
-    puff_advantage_row_cuda_fallback<TIn, TOut>(values + offset, rewards + offset, dones + offset,
+    puff_advantage_row_scalar(values + offset, rewards + offset, dones + offset,
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 

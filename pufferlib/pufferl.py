@@ -24,11 +24,15 @@ from copy import deepcopy
 
 import numpy as np
 
-import torch
-from torch import func
-import torch.distributed
-from torch.distributed.elastic.multiprocessing.errors import record
-import torch.utils.cpp_extension
+try:
+    import torch
+    from torch import func
+    import torch.distributed
+    from torch.distributed.elastic.multiprocessing.errors import record
+    import torch.utils.cpp_extension
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 import pufferlib
 import pufferlib.sweep
@@ -49,13 +53,16 @@ rich.traceback.install(show_locals=False)
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
-from torch.utils.cpp_extension import (
-    CUDA_HOME,
-    ROCM_HOME
-)
-# Assume advantage kernel has been built if torch has been compiled with CUDA or HIP support
-# and can find CUDA or HIP in the system
-ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
+if HAS_TORCH:
+    from torch.utils.cpp_extension import (
+        CUDA_HOME,
+        ROCM_HOME
+    )
+    # Assume advantage kernel has been built if torch has been compiled with CUDA or HIP support
+    # and can find CUDA or HIP in the system
+    ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
+else:
+    ADVANTAGE_CUDA = False
 
 # DEBUG FLAG IS A BUG. FUCK THIS DO NOT NOT NOT ENABLE
 #torch.autograd.set_detect_anomaly(True)
@@ -67,7 +74,8 @@ class PuffeRL:
         seed = config['seed']
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
+        if HAS_TORCH:
+            torch.manual_seed(seed)
 
         minibatch_size = config['minibatch_size']
         horizon = config['horizon']
@@ -107,7 +115,10 @@ class PuffeRL:
         self.policy_fp32 = self.pufferl_cpp.policy_fp32
 
         # Dashboard
-        self.model_size = sum(p.numel() for p in self.policy_fp32.parameters() if p.requires_grad)
+        if hasattr(self.policy_fp32, 'parameters'):
+            self.model_size = sum(p.numel() for p in self.policy_fp32.parameters() if p.requires_grad)
+        else:
+            self.model_size = self.policy_fp32.num_params()
         self.start_time = time.time()
         self.print_dashboard(clear=True)
 
@@ -132,7 +143,8 @@ class PuffeRL:
         self.epoch += 1
         done_training = self.global_step >= self.config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.6:
-            torch.cuda.synchronize()
+            if HAS_TORCH:
+                torch.cuda.synchronize()
             logs = _C.log_environments(self.pufferl_cpp)
             self.stats = logs
             self.losses = _C.log_losses(self.pufferl_cpp)
@@ -185,15 +197,17 @@ class PuffeRL:
         self.rewards = None
         self.terminals = None
 
-        torch.cuda.synchronize()
+        if HAS_TORCH:
+            torch.cuda.synchronize()
         _C.close(self.pufferl_cpp)
         self.pufferl_cpp = None
 
-        # Clear cuBLAS workspaces that accumulate per-stream
-        # This is the only way to check for memleaks. May not
-        # be strictly necessary for normal training.
-        torch.cuda.empty_cache()
-        torch._C._cuda_clearCublasWorkspaces()
+        if HAS_TORCH:
+            # Clear cuBLAS workspaces that accumulate per-stream
+            # This is the only way to check for memleaks. May not
+            # be strictly necessary for normal training.
+            torch.cuda.empty_cache()
+            torch._C._cuda_clearCublasWorkspaces()
 
         if not self.logger:
             return
@@ -201,7 +215,8 @@ class PuffeRL:
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
             self.config["env"], f'{run_id}.pt')
-        shutil.copy(model_path, path)
+        if model_path and os.path.exists(model_path):
+            shutil.copy(model_path, path)
         return path
 
     def save_checkpoint(self):
@@ -219,19 +234,21 @@ class PuffeRL:
         if os.path.exists(model_path):
             return model_path
 
-        torch.save(dict(self.policy_fp32.named_parameters()), model_path)
+        if HAS_TORCH:
+            if hasattr(self.policy_fp32, 'named_parameters'):
+                torch.save(dict(self.policy_fp32.named_parameters()), model_path)
 
-        state = {
-            #'optimizer_state_dict': self.optimizer.state_dict(),
-            'global_step': self.global_step,
-            'agent_step': self.global_step,
-            'update': self.epoch,
-            'model_name': model_name,
-            'run_id': run_id,
-        }
-        state_path = os.path.join(path, 'trainer_state.pt')
-        torch.save(state, state_path + '.tmp')
-        os.replace(state_path + '.tmp', state_path)
+            state = {
+                #'optimizer_state_dict': self.optimizer.state_dict(),
+                'global_step': self.global_step,
+                'agent_step': self.global_step,
+                'update': self.epoch,
+                'model_name': model_name,
+                'run_id': run_id,
+            }
+            state_path = os.path.join(path, 'trainer_state.pt')
+            torch.save(state, state_path + '.tmp')
+            os.replace(state_path + '.tmp', state_path)
         return model_path
 
     def print_dashboard(self, clear=False, idx=[0],
@@ -242,7 +259,7 @@ class PuffeRL:
         config = self.config
         sps = self.sps * config['gpus']
         agent_steps = self.global_step * config['gpus']
-        if torch.distributed.is_initialized():
+        if HAS_TORCH and torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
                return
  
@@ -461,7 +478,7 @@ class Logger:
 def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     """Worker function for multi-GPU training. Runs on each GPU."""
 
-    if args:
+    if args and HAS_TORCH:
         torch.cuda.set_device(args['train']['rank'])
 
     args = args or load_config(env_name)
@@ -548,7 +565,8 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
         procs.append(p)
 
     # Run rank 0 on main process
-    torch.cuda.set_device(0)
+    if HAS_TORCH:
+        torch.cuda.set_device(0)
 
     args['train']['rank'] = 0
 
@@ -575,7 +593,8 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
         if i == 0 or i % 32 != 0:
             continue
 
-        torch.cuda.synchronize()
+        if HAS_TORCH:
+            torch.cuda.synchronize()
         logs = _C.log_environments(pufferl.pufferl_cpp)
         pufferl.stats = logs
 
