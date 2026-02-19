@@ -1,110 +1,15 @@
 #ifndef PUFFERLIB_LEGACY_MODULES_H
 #define PUFFERLIB_LEGACY_MODULES_H
 
-// PufTensor kernel declarations + buffer structs (torch-free)
-// Also contains torch-dependent reference implementations for numerical tests (guarded)
+// Legacy torch-dependent code: reference implementations + PolicyLSTM
+// Kept for numerical tests and profiler torch benchmarks.
+
+#include "../models.cu"
 
 #ifdef PUFFERLIB_TORCH
 #include <torch/torch.h>
-#endif
-#include "../modules.h"
 
-// PufTensor sample_logits (native kernel path)
-void sample_logits(
-    PufTensor& logits, PufTensor& logstd, PufTensor& value,
-    PufTensor& actions_out, PufTensor& logprobs_out, PufTensor& value_out,
-    PufTensor& act_sizes, uint64_t seed, int64_t* offset_ptr,
-    int logits_stride, int logstd_stride, int value_stride,
-    cudaStream_t stream);
-
-// Pre-allocated buffers for PufTensor prio_replay
-struct PrioBuffers {
-    PufTensor prio_probs;    // (S,) f32 — priority probabilities
-    PufTensor cdf;           // (S,) f32 — cumulative distribution for multinomial
-    PufTensor idx;           // (minibatch_segments,) int64 — sampled indices
-    PufTensor mb_prio;       // (minibatch_segments, 1) f32 — importance weights
-
-    void register_buffers(Allocator& alloc, int S, int minibatch_segments) {
-        alloc.register_puf(&prio_probs, {S}, sizeof(float));
-        alloc.register_puf(&cdf, {S}, sizeof(float));
-        alloc.register_puf(&idx, {minibatch_segments}, sizeof(int64_t));
-        alloc.register_puf(&mb_prio, {minibatch_segments, 1}, sizeof(float));
-    }
-};
-
-// PufTensor overload — no torch deps
-void prio_replay_cuda(
-    PufTensor& advantages, float prio_alpha,
-    int minibatch_segments, int total_agents, float anneal_beta,
-    PrioBuffers& bufs, uint64_t seed, int64_t* offset_ptr,
-    cudaStream_t stream);
-
-// Select + Copy: PufTensor version (native kernel path)
-void train_select_and_copy_cuda(
-    PufTensor& observations, PufTensor& actions,
-    PufTensor& logprobs, PufTensor& values, PufTensor& advantages,
-    PufTensor& idx, PufTensor& mb_prio,
-    PufTensor& dst_obs, PufTensor& dst_state,
-    PufTensor& dst_actions, PufTensor& dst_logprobs,
-    PufTensor& dst_advantages, PufTensor& dst_prio,
-    PufTensor& dst_values, PufTensor& dst_returns,
-    cudaStream_t stream);
-
-// Pre-allocated buffers for PufTensor ppo_loss_fwd_bwd
-struct PPOBuffersPuf {
-    PufTensor loss_output;       // (1,) float32
-    PufTensor saved_for_bwd;     // (N*T, 5) float64
-    PufTensor grad_loss;         // (1,) float32, constant 1.0
-    PufTensor grad_logits;       // (N, T, A_total) float32
-    PufTensor grad_values;       // (N, T, 1) float32
-    PufTensor grad_logstd;       // (N, T, A_total) float32, or empty for discrete
-    PufTensor adv_scratch;       // (2,) float32 — [variance, mean] scratch for var_mean
-
-    void register_buffers(Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
-        int64_t total = (int64_t)N * T;
-        alloc.register_puf(&loss_output, {1}, sizeof(float));
-        alloc.register_puf(&saved_for_bwd, {total, 5}, sizeof(double));
-        alloc.register_puf(&grad_loss, {1}, sizeof(float));
-        alloc.register_puf(&grad_logits, {N, T, A_total}, sizeof(float));
-        alloc.register_puf(&grad_values, {N, T, 1}, sizeof(float));
-        if (is_continuous) {
-            alloc.register_puf(&grad_logstd, {N, T, A_total}, sizeof(float));
-        }
-        alloc.register_puf(&adv_scratch, {2}, sizeof(float));
-    }
-
-    void post_create() {
-        float one = 1.0f;
-        cudaMemcpy(grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
-    }
-};
-
-// PufTensor overload — no torch deps
-void ppo_loss_fwd_bwd(
-    PufTensor& logits, PufTensor& logstd, PufTensor& values_pred,
-    PufTensor& actions, PufTensor& old_logprobs, PufTensor& advantages,
-    PufTensor& prio, PufTensor& values, PufTensor& returns,
-    PufTensor& ratio_out, PufTensor& newvalue_out,
-    PufTensor& act_sizes, PufTensor& losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    PPOBuffersPuf& bufs, bool is_continuous,
-    int logits_stride_n, int logits_stride_t, int logits_stride_a,
-    int values_stride_n, int values_stride_t,
-    cudaStream_t stream);
-
-// Puff Advantage CUDA dispatch
 namespace pufferlib {
-// PufTensor version (native kernel path)
-void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
-    PufTensor& dones, PufTensor& importance, PufTensor& advantages,
-    float gamma, float lambda, float rho_clip, float c_clip,
-    cudaStream_t stream);
-
-// ============================================================================
-// Legacy torch-dependent code: reference implementations + PolicyLSTM
-// Everything below uses torch — kept for numerical tests
-// ============================================================================
-#ifdef PUFFERLIB_TORCH
 
 using std::shared_ptr;
 using std::vector;

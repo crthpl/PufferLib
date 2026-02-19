@@ -440,9 +440,6 @@ def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=No
     policy_config = args['policy']
     pufferl = PuffeRL(train_config, vec_config, env_config, policy_config, logger, verbose)
 
-    if train_config['profile']:
-        _C.profiler_start()
-
     # Sweep needs data for early stopped runs, so send data when steps > 100M
     logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
     all_logs = []
@@ -466,15 +463,10 @@ def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=No
             all_logs.append(logs)
 
         if should_stop_early:
-            if train_config['profile']:
-                _C.profiler_stop()
             model_path = pufferl.close()
             pufferl.logger.log_cost(pufferl.uptime)
             pufferl.logger.close(model_path, early_stop=True)
             return pufferl, all_logs
-
-    if train_config['profile']:
-        _C.profiler_stop()
 
     pufferl.print_dashboard()
 

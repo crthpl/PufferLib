@@ -3,7 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <chrono>
-#include "pufferlib.cpp"
+#include "pufferlib.cu"
 
 using namespace pufferlib;
 namespace py = pybind11;
@@ -61,7 +61,7 @@ pybind11::dict log_losses(pybind11::object pufferl_obj) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     // Copy losses from device to host via cudaMemcpy (no torch dependency)
     float losses_host[NUM_LOSSES];
-    cudaMemcpy(losses_host, pufferl.losses_puf.data, sizeof(losses_host), cudaMemcpyDeviceToHost);
+    cudaMemcpy(losses_host, pufferl.losses_puf.bytes, sizeof(losses_host), cudaMemcpyDeviceToHost);
     float n = losses_host[LOSS_N];
     pybind11::dict result;
     if (n > 0) {
@@ -75,7 +75,7 @@ pybind11::dict log_losses(pybind11::object pufferl_obj) {
         result["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
     }
     // Zero the accumulator
-    cudaMemset(pufferl.losses_puf.data, 0, pufferl.losses_puf.nbytes());
+    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.nbytes());
     return result;
 }
 
@@ -156,7 +156,11 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
             std::to_string(nbytes) + " bytes, got " + std::to_string(file_size));
     }
     std::vector<char> buf(nbytes);
-    fread(buf.data(), 1, nbytes, f);
+    size_t nread = fread(buf.data(), 1, nbytes, f);
+    if ((int64_t)nread != nbytes) {
+        fclose(f);
+        throw std::runtime_error("Failed to read weight file");
+    }
     fclose(f);
     // Copy to fp32 param buffer
     cudaMemcpy(pufferl.alloc_fp32.param_mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
@@ -264,15 +268,13 @@ PYBIND11_MODULE(_C, m) {
     m.def("load_weights", &load_weights);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
-    m.def("profiler_start", &profiler_start);
-    m.def("profiler_stop", &profiler_stop);
-
     py::class_<Policy>(m, "Policy")
         .def("num_params", [](Policy& self) -> int64_t {
-            int64_t total = self.encoder.weight.numel + self.decoder.weight.numel;
-            if (self.decoder.continuous) total += self.decoder.logstd.numel;
-            for (int i = 0; i < self.rnn.num_layers; i++)
-                total += self.rnn.weights[i].numel;
+            int64_t total = self.encoder.weight.numel() + self.decoder.weight.numel();
+            if (self.decoder.continuous) total += self.decoder.logstd.numel();
+            for (int i = 0; i < self.rnn.num_layers; i++) {
+                total += self.rnn.weights[i].numel();
+            }
             return total;
         });
     py::class_<Muon>(m, "Muon");
@@ -317,7 +319,7 @@ PYBIND11_MODULE(_C, m) {
     py::class_<PufTensor>(m, "PufTensor")
         .def("__repr__", &PufTensor::repr)
         .def_readonly("ndim", &PufTensor::ndim)
-        .def_readonly("numel", &PufTensor::numel)
+        .def("numel", &PufTensor::numel)
         .def_readonly("dtype_size", &PufTensor::dtype_size);
 
     py::class_<RolloutBuf>(m, "RolloutBuf")

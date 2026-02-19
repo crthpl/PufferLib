@@ -14,7 +14,7 @@
 #include <cmath>
 #include <chrono>
 #include <cuda_bf16.h>
-#include "pufferlib/src/modules.h"
+#include "pufferlib/src/models.cu"
 
 // Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
 #ifdef PRECISION_FLOAT

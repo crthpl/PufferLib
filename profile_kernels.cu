@@ -669,7 +669,7 @@ void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atn
 
 #ifdef USE_STATIC_ENV
 
-#include "pufferlib/src/env_binding.h"
+#include "pufferlib/src/vecenv.h"
 #include "pufferlib/src/ini.h"
 
 #ifndef ENV_NAME

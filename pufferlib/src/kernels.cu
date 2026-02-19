@@ -2,13 +2,140 @@
 #define PUFFERLIB_KERNELS_CU
 
 /* Kernels must launch on the current torch stream to be traced by cudagraphs.
- * This file is included by modules.cu which calls kernels directly with <<<>>>.
+ * This file is included by models.cu which calls kernels directly with <<<>>>.
  * Callers should use at::cuda::getCurrentCUDAStream() when using with torch.
  */
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include "ops.cuh"
+// ============================================================================
+// Device math ops (formerly ops.cuh)
+// ============================================================================
+
+#ifndef CUDART_INF_F
+#define CUDART_INF_F __int_as_float(0x7f800000)
+#endif
+
+#define SOFTPLUS_BETA 1.0f
+#define SOFTPLUS_THRESHOLD 20.0f
+
+__device__ __forceinline__ float softplus_fwd(float x) {
+    float x_scaled = x * SOFTPLUS_BETA;
+    return (x_scaled > SOFTPLUS_THRESHOLD) ? x : log1pf(expf(x_scaled)) / SOFTPLUS_BETA;
+}
+
+__device__ __forceinline__ float softplus_bwd(float grad_output, float x) {
+    float beta_x = SOFTPLUS_BETA * x;
+    if (beta_x > SOFTPLUS_THRESHOLD) return grad_output;
+    float exp_beta_x = expf(beta_x);
+    return grad_output * (exp_beta_x / (1.0f + exp_beta_x));
+}
+
+__device__ __forceinline__ float relu(float x) { return fmaxf(0.0f, x); }
+__device__ __forceinline__ float relu_backward(float x, float grad_output) { return (x > 0.0f) ? grad_output : 0.0f; }
+
+__device__ __forceinline__ float sigmoid(float x) {
+    float z = expf(-fabsf(x));
+    return x >= 0.0f ? 1.0f / (1.0f + z) : z / (1.0f + z);
+}
+
+__device__ __forceinline__ float sigmoid_backward(float x, float grad_output) {
+    float sig = sigmoid(x);
+    return grad_output * sig * (1.0f - sig);
+}
+
+__device__ __inline__ float fast_tanh(float x) {
+    float v1 = fminf(fmaxf(x, -9.0f), 9.0f);
+    float v2 = v1 * v1;
+    float p = v2 * -2.76076847742355e-16f + 2.00018790482477e-13f;
+    p = v2 * p + -8.60467152213735e-11f;
+    p = v2 * p + 5.12229709037114e-08f;
+    p = v2 * p + 1.48572235717979e-05f;
+    p = v2 * p + 6.37261928875436e-04f;
+    p = v2 * p + 4.89352455891786e-03f;
+    p = v1 * p;
+    float q = v2 * 1.19825839466702e-06f + 1.18534705686654e-04f;
+    q = v2 * q + 2.26843463243900e-03f;
+    q = v2 * q + 4.89352518554385e-03f;
+    return p / q;
+}
+
+__device__ __inline__ float fast_sigmoid(float x) {
+    return fminf(1.0f, fmaxf(0.0f, (fast_tanh(x * 0.5f) + 1.0f) * 0.5f));
+}
+
+__device__ __forceinline__ float tilde_relu_fwd(float x) {
+    return (x >= 0.0f) ? x + 0.5f : fast_sigmoid(x);
+}
+
+__device__ __forceinline__ float tilde_relu_bwd(float x, float grad_output) {
+    if (x >= 0.0f) return grad_output;
+    float sig = fast_sigmoid(x);
+    return grad_output * sig * (1.0f - sig);
+}
+
+__device__ __forceinline__ float lerp(float a, float b, float w) {
+    float diff = b - a;
+    return (fabsf(w) < 0.5f) ? a + w * diff : b - diff * (1.0f - w);
+}
+__device__ __forceinline__ float lerp_backward_a(float a, float b, float w, float grad_output) { return grad_output * (1.0f - w); }
+__device__ __forceinline__ float lerp_backward_b(float a, float b, float w, float grad_output) { return grad_output * w; }
+__device__ __forceinline__ float lerp_backward_w(float a, float b, float w, float grad_output) {
+    float diff = b - a;
+    return (fabsf(w) < 0.5f) ? grad_output * diff : grad_output * diff;
+}
+
+__device__ __forceinline__ float mingru_gate(float h) { return h >= 0.0f ? h + 0.5f : sigmoid(h); }
+__device__ __forceinline__ float mingru_gate_backward(float h, float grad_output) {
+    if (h > 0.0f) return grad_output;
+    float sig = sigmoid(h);
+    return grad_output * sig * (1.0f - sig);
+}
+
+__device__ __forceinline__ float logaddexp(float a, float b) {
+    float m = fmaxf(a, b), diff = fminf(a, b) - m;
+    return (diff < -88.0f) ? m : m + log1pf(expf(diff));
+}
+
+__device__ __forceinline__ float exp_safe(float x) {
+    return (x > 88.0f) ? 1.651e38f : ((x < -88.0f) ? 0.0f : expf(x));
+}
+
+__device__ __forceinline__ void cumsum_forward(const float* x, float* y, int T) {
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) { sum += x[t]; y[t] = sum; }
+}
+
+__device__ __forceinline__ void cumsum_backward(const float* grad_y, float* grad_x, int T) {
+    float running = 0.0f;
+    for (int t = T - 1; t >= 0; t--) { running += grad_y[t]; grad_x[t] = running; }
+}
+
+__device__ __forceinline__ void logcumsumexp_forward(const float* x, float* y, int T) {
+    float lse = -CUDART_INF_F;
+    for (int t = 0; t < T; t++) { lse = (lse == -CUDART_INF_F) ? x[t] : logaddexp(lse, x[t]); y[t] = lse; }
+}
+
+__device__ __forceinline__ void logcumsumexp_backward(const float* x, const float* y, const float* grad_y, float* grad_x, int T) {
+    float running = 0.0f;
+    for (int t = T - 1; t >= 0; t--) { running += grad_y[t] * exp_safe(x[t] - y[t]); grad_x[t] = running; }
+}
+
+__device__ __forceinline__ void log_coeffs_and_values_fwd(float gate, float hidden, float* log_coeff_out, float* log_value_out) {
+    float abs_gate = fabsf(gate);
+    float sp_neg = log1pf(expf(-abs_gate));
+    float softplus_gate = (gate >= 0.0f) ? gate + sp_neg : sp_neg;
+    float softplus_neg_gate = (gate >= 0.0f) ? sp_neg : -gate + sp_neg;
+    *log_coeff_out = -softplus_gate;
+    float log_tilde_h = (hidden >= 0.0f) ? logf(hidden + 0.5f) : -softplus_fwd(-hidden);
+    *log_value_out = -softplus_neg_gate + log_tilde_h;
+}
+
+__device__ __forceinline__ void log_coeffs_and_values_bwd(float grad_log_coeffs, float grad_log_values, float gate, float hidden, float* grad_gate_out, float* grad_hidden_out) {
+    float sig_gate = sigmoid(gate);
+    *grad_gate_out = -grad_log_coeffs * sig_gate + grad_log_values * (1.0f - sig_gate);
+    *grad_hidden_out = (hidden >= 0.0f) ? grad_log_values / (hidden + 0.5f) : grad_log_values * sigmoid(-hidden);
+}
 #include <curand_kernel.h>
 
 #include <cstdio>
@@ -400,6 +527,58 @@ __global__ void logcumsumexp_backward_kernel(
 }
 
 
+// ============================================================================
+// PPO shared device helpers (used by both forward and backward kernels)
+// ============================================================================
+
+// Compute log-probability, entropy, and logsumexp for a single discrete action head.
+__device__ __forceinline__ void ppo_discrete_head(
+    const precision_t* __restrict__ logits,
+    int logits_base, int logits_stride_a, int logits_offset,
+    int A, int act,
+    float* out_logsumexp, float* out_entropy, float* out_logp
+) {
+    float max_logit = -INFINITY;
+    float sum = 0.0f;
+    float act_logit = 0.0f;
+
+    for (int a = 0; a < A; ++a) {
+        float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+        if (a == act) act_logit = l;
+        if (l > max_logit) {
+            sum *= __expf(max_logit - l);
+            max_logit = l;
+        }
+        sum += __expf(l - max_logit);
+    }
+    float logsumexp = max_logit + __logf(sum);
+
+    float ent = 0.0f;
+    for (int a = 0; a < A; ++a) {
+        float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+        float logp = l - logsumexp;
+        float p = __expf(logp);
+        ent -= p * logp;
+    }
+
+    *out_logsumexp = logsumexp;
+    *out_entropy = ent;
+    *out_logp = act_logit - logsumexp;
+}
+
+// Compute log-probability and entropy for a single continuous action dimension.
+__device__ __forceinline__ void ppo_continuous_head(
+    float mean, float log_std, float action,
+    float* out_logp, float* out_entropy
+) {
+    constexpr float HALF_LOG_2PI = 0.9189385332046727f;
+    constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;
+    float std = __expf(log_std);
+    float normalized = (action - mean) / std;
+    *out_logp = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
+    *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
+}
+
 
 __global__ void ppo_loss_forward_kernel_optimized(
     float* __restrict__ loss,
@@ -459,74 +638,24 @@ __global__ void ppo_loss_forward_kernel_optimized(
     float total_entropy = 0.0f;
 
     if (is_continuous) {
-        // Continuous actions: Normal distribution
-        // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log(std)
-        // Differential entropy = 0.5 * (1 + log(2*pi)) + log_std
-        constexpr float LOG_2PI = 1.8378770664093453f;
-        constexpr float HALF_LOG_2PI = 0.9189385332046727f;
-        constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;  // 0.5 * (1 + log(2*pi))
-
         for (int h = 0; h < num_atns; ++h) {
             float mean = to_float(logits[logits_base + h * logits_stride_a]);
             float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
-            float std = __expf(log_std);
             float action = float(actions[nt * num_atns + h]);
-
-            float normalized = (action - mean) / std;
-            float log_prob = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
-            // Differential entropy for Normal: 0.5 + 0.5*log(2*pi) + log_std
-            float entropy = HALF_1_PLUS_LOG_2PI + log_std;
-
-            total_log_prob += log_prob;
-            total_entropy += entropy;
+            float lp, ent;
+            ppo_continuous_head(mean, log_std, action, &lp, &ent);
+            total_log_prob += lp;
+            total_entropy += ent;
         }
     } else {
-        // Discrete actions: Categorical distribution
-        // Loop over action heads for MultiDiscrete support
         int logits_offset = 0;
-
         for (int h = 0; h < num_atns; ++h) {
-            int A = act_sizes[h];  // size of this action head
-            int act = static_cast<int>(actions[nt * num_atns + h]);  // action for this head
-
-            // Find max for numerical stability and cache action's logit
-            float max_logit = -INFINITY;
-            float sum = 0.0f;
-            float act_logit = 0.0f;
-
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-
-                if (a == act) {
-                    act_logit = l;
-                }
-
-                if (l > max_logit) {
-                    sum *= __expf(max_logit - l);
-                    max_logit = l;
-                }
-                sum += __expf(l - max_logit);
-            }
-
-            float logsumexp = max_logit + __logf(sum);
-
-            // Compute entropy for this head
-            float head_entropy = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-                float logp = l - logsumexp;
-                float p = __expf(logp);
-                head_entropy -= p * logp;
-            }
-
-            // Log prob for this head
-            float head_logp = act_logit - logsumexp;
-
-            // Accumulate across heads
-            total_log_prob += head_logp;
-            total_entropy += head_entropy;
-
-            // Advance to next action head
+            int A = act_sizes[h];
+            int act = static_cast<int>(actions[nt * num_atns + h]);
+            float lse, ent, lp;
+            ppo_discrete_head(logits, logits_base, logits_stride_a, logits_offset, A, act, &lse, &ent, &lp);
+            total_log_prob += lp;
+            total_entropy += ent;
             logits_offset += A;
         }
     }
@@ -706,19 +835,14 @@ __global__ void ppo_loss_backward_kernel_optimized(
     grad_values_pred[grad_values_idx] = dL * vf_coef * d_val_pred;
 
     if (is_continuous) {
-        // Continuous: compute total log prob first for ratio
-        constexpr float HALF_LOG_2PI = 0.9189385332046727f;
         float total_log_prob = 0.0f;
-
         for (int h = 0; h < num_atns; ++h) {
             float mean = to_float(logits[logits_base + h * logits_stride_a]);
             float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
-            float std = __expf(log_std);
             float action = float(actions[nt * num_atns + h]);
-
-            float normalized = (action - mean) / std;
-            float log_prob = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
-            total_log_prob += log_prob;
+            float lp, ent;
+            ppo_continuous_head(mean, log_std, action, &lp, &ent);
+            total_log_prob += lp;
         }
 
         float new_logp = total_log_prob;
@@ -779,38 +903,11 @@ __global__ void ppo_loss_backward_kernel_optimized(
             int A = act_sizes[h];
             int act = static_cast<int>(actions[nt * num_atns + h]);
             head_act[h] = act;
-
-            // Compute logsumexp for this head
-            float max_logit = -INFINITY;
-            float sum = 0.0f;
-            float act_logit = 0.0f;
-
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-                if (a == act) act_logit = l;
-
-                if (l > max_logit) {
-                    sum *= __expf(max_logit - l);
-                    max_logit = l;
-                }
-                sum += __expf(l - max_logit);
-            }
-            float logsumexp = max_logit + __logf(sum);
-            head_logsumexp[h] = logsumexp;
-
-            // Compute entropy for this head
-            float ent = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-                float logp = l - logsumexp;
-                float p = __expf(logp);
-                ent -= p * logp;
-            }
+            float lse, ent, lp;
+            ppo_discrete_head(logits, logits_base, logits_stride_a, logits_offset, A, act, &lse, &ent, &lp);
+            head_logsumexp[h] = lse;
             head_entropy[h] = ent;
-
-            // Accumulate total log prob
-            total_log_prob += act_logit - logsumexp;
-
+            total_log_prob += lp;
             logits_offset += A;
         }
 
@@ -1385,5 +1482,217 @@ __global__ void puff_advantage_kernel_scalar(const precision_t* values, const pr
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 
+
+// ============================================================================
+// Element-wise kernels (cast, fill, scale, norm, etc.)
+// Host wrappers live in models.cu
+// ============================================================================
+
+__global__ void cast_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __bfloat162float(src[idx]);
+}
+
+__global__ void cast_f32_to_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2bfloat16(src[idx]);
+}
+
+__global__ void cast_f32_to_bf16_transpose_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    dst[(idx % C) * R + idx / C] = __float2bfloat16(src[idx]);
+}
+
+__global__ void transpose_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    dst[(idx % C) * R + idx / C] = src[idx];
+}
+
+template <typename T>
+__global__ void transpose_01_kernel(T* __restrict__ dst, const T* __restrict__ src, int A, int B, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B * C;
+    if (idx >= total) return;
+    int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
+    dst[b * A * C + a * C + c] = src[idx];
+}
+
+__global__ void norm_bf16_kernel(float* __restrict__ partials, const __nv_bfloat16* __restrict__ src, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
+        float v = __bfloat162float(src[i]);
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
+}
+
+__global__ void norm_f32_kernel(float* __restrict__ partials, const float* __restrict__ src, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) sum += src[i] * src[i];
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
+}
+
+__global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    if (tid == 0) *out = sdata[0];
+}
+
+__global__ void clip_by_norm_f32_kernel(float* __restrict__ dst, const float* __restrict__ sum_sq_ptr,
+                                         float max_norm, float eps, int n) {
+    float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] *= clip_coef;
+}
+
+__global__ void normalize_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
+    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2bfloat16(__bfloat162float(dst[idx]) * inv_norm);
+}
+
+__global__ void fill_bf16_kernel(__nv_bfloat16* __restrict__ dst, __nv_bfloat16 val, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = val;
+}
+
+__global__ void fill_f32_kernel(float* __restrict__ dst, float val, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = val;
+}
+
+__global__ void clamp_bf16_kernel(__nv_bfloat16* __restrict__ dst, float lo, float hi, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) { float v = __bfloat162float(dst[idx]); dst[idx] = __float2bfloat16(fminf(fmaxf(v, lo), hi)); }
+}
+
+__global__ void scale_f32_kernel(float* __restrict__ dst, float alpha, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] *= alpha;
+}
+
+__global__ void axpy_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, float alpha, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += alpha * src[idx];
+}
+
+__global__ void scale_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ alpha_ptr, int n) {
+    float alpha = *alpha_ptr;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] *= alpha;
+}
+
+__global__ void axpy_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ src, const float* __restrict__ alpha_ptr, int n) {
+    float alpha = *alpha_ptr;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += alpha * src[idx];
+}
+
+__global__ void compute_lr_scalars_kernel(const float* __restrict__ lr, float wd,
+                                           float* __restrict__ neg_lr, float* __restrict__ wd_scale) {
+    *neg_lr = -(*lr);
+    *wd_scale = 1.0f - (*lr) * wd;
+}
+
+__global__ void add_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += __bfloat162float(src[idx]);
+}
+
+__global__ void sum_rows_add_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= C) return;
+    float sum = 0.0f;
+    for (int r = 0; r < R; r++) sum += src[r * C + col];
+    dst[col] += sum;
+}
+
+__global__ void assemble_decoder_grad_kernel(
+    __nv_bfloat16* __restrict__ dst, const float* __restrict__ grad_logits,
+    const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B_TT * od_plus_1) return;
+    int row = idx / od_plus_1, col = idx % od_plus_1;
+    dst[idx] = __float2bfloat16((col < od) ? grad_logits[row * od + col] : grad_value[row]);
+}
+
+__global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict__ var_out,
+        float* __restrict__ mean_out, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) sum += src[i];
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    float mean = sdata[0] / (float)n;
+    if (tid == 0) *mean_out = mean;
+    __syncthreads();
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) { float d = src[i] - mean; ss += d * d; }
+    sdata[tid] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    if (tid == 0) *var_out = sdata[0] / (float)(n - 1);
+}
+
+__global__ void add_scalar_kernel(float* __restrict__ ptr, float val) {
+    *ptr += val;
+}
+
+__global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restrict__ idx,
+        const char* __restrict__ src, int num_idx, int row_bytes) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < num_idx) {
+        int64_t dst_row = idx[i];
+        memcpy(dst + dst_row * row_bytes, src + (int64_t)i * row_bytes, row_bytes);
+    }
+}
+
+__global__ void cast_u8_to_precision_kernel(precision_t* __restrict__ dst,
+        const unsigned char* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float((float)src[idx]);
+}
+
+// Orthogonal init helpers (used by puf_orthogonal_init in models.cu)
+__global__ void sign_correct_columns_kernel(float* Q, const float* diag_signs, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    Q[idx] *= diag_signs[idx / m];
+}
+
+__global__ void extract_diag_sign_kernel(float* signs, const float* A, int m, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    signs[i] = (A[i + (int64_t)i * m] >= 0.0f) ? 1.0f : -1.0f;
+}
+
+__global__ void colmaj_to_rowmaj_scale_f32_kernel(float* dst, const float* Q, float gain, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    dst[idx] = Q[(idx / n) + (int64_t)(idx % n) * m] * gain;
+}
+
+__global__ void colmaj_to_rowmaj_scale_bf16_kernel(__nv_bfloat16* dst, const float* Q, float gain, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    dst[idx] = __float2bfloat16(Q[(idx / n) + (int64_t)(idx % n) * m] * gain);
+}
 
 #endif // PUFFERLIB_KERNELS_CU

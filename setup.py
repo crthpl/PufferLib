@@ -179,7 +179,7 @@ class BuildExt(build_ext):
 
         # Build _C.so (always torch-free)
         if not NO_TRAIN:
-            _build_notorch_C()
+            _build_notorch_C(force=self.force)
         self.run_command('build_c')
 
 class CBuildExt(build_ext):
@@ -378,15 +378,20 @@ STATIC_ENVS = [
     name for name in os.listdir(OCEAN_DIR)
     if os.path.isdir(os.path.join(OCEAN_DIR, name))
     and not name.startswith('__')
-    and os.path.exists(f'pufferlib/ocean/{name}/binding.h')
+    and os.path.exists(f'pufferlib/ocean/{name}/binding.c')
 ]
 
-def _build_static_lib(env_name):
+def _build_static_lib(env_name, force=False):
     """Build a static .a library for a given env using clang."""
     import subprocess
-    env_binding_src = 'pufferlib/src/env_binding.c'
+    env_binding_src = f'pufferlib/ocean/{env_name}/binding.c'
     static_lib = f'pufferlib/src/libstatic_{env_name}.a'
     static_obj = f'pufferlib/src/libstatic_{env_name}.o'
+
+    env_deps = [env_binding_src, 'pufferlib/src/vecenv.h']
+    if not force and not _needs_rebuild(static_lib, env_deps):
+        print(f'Static env up to date: {static_lib}')
+        return static_lib
 
     clang_cmd = [
         'clang', '-c', '-O2', '-DNDEBUG',
@@ -405,8 +410,26 @@ def _build_static_lib(env_name):
     subprocess.check_call(ar_cmd)
     return static_lib
 
-def _build_notorch_C(static_lib=None):
-    """Build _C.so via subprocess using nvcc + g++ (no torch dependency)."""
+def _needs_rebuild(output, sources):
+    """Check if output needs rebuilding based on source mtimes."""
+    if not os.path.exists(output):
+        return True
+    out_mtime = os.path.getmtime(output)
+    for src in sources:
+        if os.path.exists(src) and os.path.getmtime(src) > out_mtime:
+            return True
+    return False
+
+# Headers that affect the single compilation unit (for incremental builds)
+_BINDINGS_CU_DEPS = [
+    'pufferlib/src/bindings.cu', 'pufferlib/src/pufferlib.cu',
+    'pufferlib/src/models.cu', 'pufferlib/src/kernels.cu',
+    'pufferlib/src/vecenv.h',
+    'pufferlib/src/puffernet.h',
+]
+
+def _build_notorch_C(static_lib=None, force=False):
+    """Build _C.so via single nvcc compile (no torch dependency)."""
     import subprocess
     import sysconfig
 
@@ -415,54 +438,50 @@ def _build_notorch_C(static_lib=None):
     ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
     output = f'pufferlib/_C{ext_suffix}'
 
-    # Step 1: nvcc compile modules.cu -> modules.o
-    modules_cu = 'pufferlib/src/modules.cu'
-    modules_o = 'pufferlib/src/modules.o'
+    bindings_cu = 'pufferlib/src/bindings.cu'
+    bindings_o = 'pufferlib/src/bindings.o'
+
+    # Check what needs rebuilding
+    need_compile = force or _needs_rebuild(bindings_o, _BINDINGS_CU_DEPS)
+    need_link = need_compile or force or _needs_rebuild(output, [bindings_o] + ([static_lib] if static_lib else []))
+
+    if not need_link:
+        print(f'Up to date: {output}')
+        return
+
+    python_include = sysconfig.get_path('include')
+    pybind_include = pybind11.get_include()
     nvcc_cmd = [
         nvcc, '-c', '-Xcompiler', '-fPIC',
         '-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1',
+        '-Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
+        '-Xcompiler=-DPLATFORM_DESKTOP',
         '-std=c++17',
-        '-I.', '-Ipufferlib/src',
-        f'-I{cuda_home}/include',
-    ]
-    if DEBUG:
-        nvcc_cmd += ['-O0', '-g']
-    else:
-        nvcc_cmd += ['-O3']
-    nvcc_cmd += [modules_cu, '-o', modules_o]
-    print(f'[NO_TORCH] nvcc: {" ".join(nvcc_cmd)}')
-    subprocess.check_call(nvcc_cmd)
-
-    # Step 2: g++ compile bindings.cpp -> bindings.o
-    bindings_cpp = 'pufferlib/src/bindings.cpp'
-    bindings_o = 'pufferlib/src/bindings.o'
-    python_include = sysconfig.get_path('include')
-    pybind_include = pybind11.get_include()
-    gxx_cmd = [
-        'g++', '-c', '-fPIC', '-std=c++17',
-        '-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
-        '-DPLATFORM_DESKTOP',
         '-I.', '-Ipufferlib/src',
         f'-I{python_include}',
         f'-I{pybind_include}',
         f'-I{numpy.get_include()}',
         f'-I{cuda_home}/include',
         f'-I{RAYLIB_NAME}/include',
-        '-fopenmp',
+        '-Xcompiler=-fopenmp',
     ]
     if DEBUG:
-        gxx_cmd += ['-O0', '-g']
+        nvcc_cmd += ['-O0', '-g']
     else:
-        gxx_cmd += ['-O2', '-fno-semantic-interposition', '-fvisibility=hidden']
-    gxx_cmd += [bindings_cpp, '-o', bindings_o]
-    print(f'[NO_TORCH] g++: {" ".join(gxx_cmd)}')
-    subprocess.check_call(gxx_cmd)
+        nvcc_cmd += ['-O3']
+    nvcc_cmd += [bindings_cu, '-o', bindings_o]
 
-    # Step 3: Link into shared library
+    if need_compile:
+        print(f'nvcc: {" ".join(nvcc_cmd)}')
+        subprocess.check_call(nvcc_cmd)
+    else:
+        print(f'nvcc: up to date ({bindings_o})')
+
+    # Link into shared library
     link_cmd = [
         'g++', '-shared', '-fPIC',
         '-fopenmp',
-        modules_o, bindings_o,
+        bindings_o,
     ]
     if static_lib:
         link_cmd.append(static_lib)
@@ -478,16 +497,16 @@ def _build_notorch_C(static_lib=None):
         link_cmd += ['-O2']
     link_cmd += extra_link_args
     link_cmd += ['-o', output]
-    print(f'[NO_TORCH] link: {" ".join(link_cmd)}')
+    print(f'link: {" ".join(link_cmd)}')
     subprocess.check_call(link_cmd)
-    print(f'[NO_TORCH] Built: {output}')
+    print(f'Built: {output}')
 
 def create_static_env_build_class(env_name):
     """Create a build class that compiles env with clang, then links _C.so."""
     class StaticEnvBuildExt(build_ext):
         def run(self):
-            static_lib = _build_static_lib(env_name)
-            _build_notorch_C(static_lib)
+            static_lib = _build_static_lib(env_name, force=self.force)
+            _build_notorch_C(static_lib, force=self.force)
     return StaticEnvBuildExt
 
 # Add build_<env> for static-linked envs (always available, torch optional)
