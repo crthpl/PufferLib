@@ -387,6 +387,11 @@ void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]) {
     }
 }
 
+void static_vec_render(StaticVec* vec, int env_id) {
+    Env* envs = (Env*)vec->envs;
+    c_render(&envs[env_id]);
+}
+
 int get_obs_size(void) { return OBS_SIZE; }
 int get_obs_type(void) { return OBS_TYPE; }
 int get_num_atns(void) { return NUM_ATNS; }

@@ -1,43 +1,12 @@
-// bindings.cpp - Python/Torch bindings for pufferlib
-// Separated from pufferlib.cpp to allow clean inclusion for profiling
-
-// PUFFERLIB_TORCH is defined via -DPUFFERLIB_TORCH compile flag from setup.py
+// bindings.cpp - Python bindings for pufferlib (torch-free)
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <chrono>
-#ifdef PUFFERLIB_TORCH
-#include <torch/extension.h>
-#include <torch/torch.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <ATen/cuda/CUDAGraph.h>
-#include <ATen/cuda/CUDAGeneratorImpl.h>
-#include <ATen/cuda/CUDAContext.h>
-#endif
 #include "pufferlib.cpp"
 
 using namespace pufferlib;
 namespace py = pybind11;
-
-#ifdef PUFFERLIB_TORCH
-// Convert raw env dtype to torch ScalarType (moved from pufferlib.cpp)
-torch::Dtype to_torch_dtype(int dtype) {
-    if (dtype == FLOAT) {
-        return torch::kFloat32;
-    } else if (dtype == INT) {
-        return torch::kInt32;
-    } else if (dtype == UNSIGNED_CHAR) {
-        return torch::kUInt8;
-    } else if (dtype == DOUBLE) {
-        return torch::kFloat64;
-    } else if (dtype == CHAR) {
-        return torch::kInt8;
-    } else {
-        assert(false && "to_torch_dtype failed to convert dtype");
-    }
-    return torch::kFloat32;
-}
-#endif // PUFFERLIB_TORCH
 
 // Wrapper functions for Python bindings
 pybind11::dict log_environments(pybind11::object pufferl_obj) {
@@ -50,15 +19,6 @@ pybind11::dict log_environments(pybind11::object pufferl_obj) {
     return py_out;
 }
 
-#ifdef PUFFERLIB_TORCH
-Tensor initial_state(pybind11::object pufferl_obj, int64_t batch_size, torch::Device device) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    auto& rnn = pufferl.policy_bf16->rnn;
-    return torch::zeros({rnn.num_layers, batch_size, rnn.hidden},
-        torch::dtype(pufferlib::PRECISION_DTYPE).device(device));
-}
-#endif // PUFFERLIB_TORCH
-
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
     // Not used in static/OMP path
 }
@@ -67,18 +27,10 @@ void python_vec_send(pybind11::object pufferl_obj, int buf) {
     // Not used in static/OMP path
 }
 
-#ifdef PUFFERLIB_TORCH
-torch::autograd::tensor_list env_buffers(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    torch::ScalarType obs_dtype = (torch::ScalarType)to_torch_dtype(pufferl.env.obs_raw_dtype);
-    return {
-        pufferl.env.obs.to_torch(obs_dtype),
-        pufferl.env.actions.to_torch(torch::kFloat64),
-        pufferl.env.rewards.to_torch(torch::kFloat32),
-        pufferl.env.terminals.to_torch(torch::kFloat32),
-    };
+void render(pybind11::object pufferl_obj, int env_id) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    static_vec_render(pufferl.vec, env_id);
 }
-#endif // PUFFERLIB_TORCH
 
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
@@ -176,10 +128,42 @@ pybind11::dict log_utilization(pybind11::object pufferl_obj) {
 void puf_close(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     close_impl(pufferl);
-#ifdef PUFFERLIB_TORCH
-    // Force CUDA to release cached memory
-    c10::cuda::CUDACachingAllocator::emptyCache();
-#endif
+}
+
+void save_weights(pybind11::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    int64_t nbytes = pufferl.alloc_fp32.total_param_elems * sizeof(float);
+    std::vector<char> buf(nbytes);
+    cudaMemcpy(buf.data(), pufferl.alloc_fp32.param_mem, nbytes, cudaMemcpyDeviceToHost);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
+    fwrite(buf.data(), 1, nbytes, f);
+    fclose(f);
+}
+
+void load_weights(pybind11::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    int64_t nbytes = pufferl.alloc_fp32.total_param_elems * sizeof(float);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
+    // Verify file size matches
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size != nbytes) {
+        fclose(f);
+        throw std::runtime_error("Weight file size mismatch: expected " +
+            std::to_string(nbytes) + " bytes, got " + std::to_string(file_size));
+    }
+    std::vector<char> buf(nbytes);
+    fread(buf.data(), 1, nbytes, f);
+    fclose(f);
+    // Copy to fp32 param buffer
+    cudaMemcpy(pufferl.alloc_fp32.param_mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
+    // If bf16 policy is separate, cast fp32 -> bf16
+    if (pufferl.policy_bf16 != pufferl.policy_fp32) {
+        puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, pufferl.default_stream);
+    }
 }
 
 double get_config(py::dict& kwargs, const char* key) {
@@ -263,183 +247,26 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
         pufferl = create_pufferl_impl(hypers, env_name, vec_dict, env_dict);
     }
 
-#ifdef PUFFERLIB_TORCH
-    // Create Tensor views over allocator buffers for Python/torch interop
-    auto f32_opts = torch::dtype(torch::kFloat32).device(torch::kCUDA);
-    auto bf16_opts = torch::dtype(torch::kBFloat16).device(torch::kCUDA);
-    auto& a32 = pufferl->alloc_fp32;
-    if (a32.param_mem) {
-        a32.param_buffer = torch::from_blob(a32.param_mem, {a32.total_param_elems}, f32_opts);
-    }
-    if (a32.grad_mem) {
-        a32.grad_buffer = torch::from_blob(a32.grad_mem, {a32.total_grad_elems}, f32_opts);
-    }
-    auto& abf = pufferl->alloc_bf16;
-    if (abf.param_mem) {
-        abf.param_buffer = torch::from_blob(abf.param_mem, {abf.total_param_elems}, bf16_opts);
-    }
-    if (abf.grad_mem) {
-        abf.grad_buffer = torch::from_blob(abf.grad_mem, {abf.total_grad_elems}, bf16_opts);
-    }
-#endif // PUFFERLIB_TORCH
-
     return pufferl;
 }
 
 PYBIND11_MODULE(_C, m) {
-    // Core functions (torch-free)
+    // Core functions
     m.def("log_environments", &log_environments);
     m.def("log_losses", &log_losses);
     m.def("log_profile", &log_profile);
     m.def("log_utilization", &log_utilization);
+    m.def("render", &render);
     m.def("rollouts", &rollouts);
     m.def("train", &train);
     m.def("close", &puf_close);
+    m.def("save_weights", &save_weights);
+    m.def("load_weights", &load_weights);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
     m.def("profiler_start", &profiler_start);
     m.def("profiler_stop", &profiler_stop);
 
-#ifdef PUFFERLIB_TORCH
-    // Torch-dependent bindings
-    m.def("initial_state", &initial_state);
-    m.def("fc_max_cpp", &fc_max_cpp);
-    m.def("env_buffers", &env_buffers);
-    m.def("test_orthogonal_init", [](torch::Tensor t, float gain, int64_t seed) {
-        PufTensor p = PufTensor::from_torch(t);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-        puf_orthogonal_init(p, gain, (uint64_t)seed, stream);
-    });
-
-    py::class_<Muon>(m, "Muon")
-        .def_property("lr",
-            [](Muon& self) {
-                return torch::from_blob(self.lr_ptr, {1},
-                    torch::dtype(torch::kFloat32).device(torch::kCUDA));
-            },
-            [](Muon& self, torch::Tensor val) {
-                float v = val.item<float>();
-                cudaMemcpy(self.lr_ptr, &v, sizeof(float), cudaMemcpyHostToDevice);
-            })
-        .def_property_readonly("weight_buffer", [](Muon& self) {
-            return self.wb_puf.to_torch(torch::kFloat32);
-        })
-        .def_property_readonly("momentum_buffer", [](Muon& self) -> py::object {
-            if (!self.bufs_initialized) return py::none();
-            return py::cast(self.mb_puf.to_torch(torch::kFloat32));
-        })
-        .def("state_dict", [](Muon& self) {
-            std::unordered_map<std::string, torch::Tensor> state;
-            state["lr"] = torch::from_blob(self.lr_ptr, {1},
-                torch::dtype(torch::kFloat32).device(torch::kCUDA)).clone();
-            if (self.wb_puf.data) state["weight_buffer"] = self.wb_puf.to_torch(torch::kFloat32);
-            if (self.bufs_initialized) state["momentum_buffer"] = self.mb_puf.to_torch(torch::kFloat32);
-            return state;
-        })
-        .def("load_state_dict", [](Muon& self, const std::unordered_map<std::string, torch::Tensor>& state) {
-            auto it = state.find("lr");
-            if (it != state.end()) {
-                float v = it->second.item<float>();
-                cudaMemcpy(self.lr_ptr, &v, sizeof(float), cudaMemcpyHostToDevice);
-            }
-            it = state.find("weight_buffer");
-            if (it != state.end() && self.wb_puf.data) {
-                self.wb_puf.to_torch(torch::kFloat32).copy_(it->second);
-            }
-            it = state.find("momentum_buffer");
-            if (it != state.end() && self.bufs_initialized) {
-                self.mb_puf.to_torch(torch::kFloat32).copy_(it->second);
-            }
-        });
-
-    py::class_<PolicyLSTM, std::shared_ptr<PolicyLSTM>, torch::nn::Module> cls(m, "PolicyLSTM");
-    cls.def(py::init<int, int, int>());
-    cls.def("forward", &PolicyLSTM::forward);
-    cls.def("forward_train", &PolicyLSTM::forward_train);
-
-    py::class_<Logits>(m, "Logits")
-        .def_readwrite("mean", &Logits::mean)
-        .def_readwrite("logstd", &Logits::logstd);
-
-    py::class_<Encoder, std::shared_ptr<Encoder>, torch::nn::Module>(m, "Encoder");
-    py::class_<Decoder, std::shared_ptr<Decoder>, torch::nn::Module>(m, "Decoder");
-    py::class_<DefaultEncoder, std::shared_ptr<DefaultEncoder>, Encoder>(m, "DefaultEncoder")
-        .def(py::init<int, int>());
-    py::class_<SnakeEncoder, std::shared_ptr<SnakeEncoder>, Encoder>(m, "SnakeEncoder")
-        .def(py::init<int, int, int>());
-    py::class_<G2048Encoder, std::shared_ptr<G2048Encoder>, Encoder>(m, "G2048Encoder")
-        .def(py::init<int, int>());
-    py::class_<DefaultDecoder, std::shared_ptr<DefaultDecoder>, Decoder>(m, "DefaultDecoder")
-        .def(py::init<int, int, bool>(), py::arg("hidden"), py::arg("output"), py::arg("is_continuous") = false);
-    py::class_<G2048Decoder, std::shared_ptr<G2048Decoder>, Decoder>(m, "G2048Decoder")
-        .def(py::init<int, int>());
-    py::class_<NMMO3Encoder, std::shared_ptr<NMMO3Encoder>, Encoder>(m, "NMMO3Encoder")
-        .def(py::init<int, int>());
-    py::class_<NMMO3Decoder, std::shared_ptr<NMMO3Decoder>, Decoder>(m, "NMMO3Decoder")
-        .def(py::init<int, int>());
-    py::class_<DriveEncoder, std::shared_ptr<DriveEncoder>, Encoder>(m, "DriveEncoder")
-        .def(py::init<int, int>());
-
-    py::class_<Allocator>(m, "Allocator")
-        .def(py::init<>())
-        .def_readwrite("param_buffer", &Allocator::param_buffer)
-        .def_readwrite("grad_buffer", &Allocator::grad_buffer);
-
-    py::class_<MinGRU>(m, "MinGRU")
-        .def(py::init<Allocator&, int, int>(), py::arg("alloc"), py::arg("hidden"), py::arg("num_layers") = 1);
-
-    py::class_<Policy>(m, "Policy")
-        .def(py::init([](Allocator& alloc, int input, int hidden, int output,
-                         int num_layers, int num_atns, bool continuous) {
-            return new Policy(alloc, input, hidden, output, num_layers, num_atns, continuous);
-        }))
-        .def("forward", [](Policy& self, Tensor observations, Tensor state) {
-            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-            Tensor obs_cast = observations.to(pufferlib::PRECISION_DTYPE);
-            PufTensor obs_puf = PufTensor::from_torch(obs_cast);
-            PufTensor state_puf = PufTensor::from_torch(state);
-            PufTensor dec_out = self.forward(obs_puf, state_puf, self.act, stream);
-            return std::make_tuple(dec_out.to_torch(pufferlib::PRECISION_DTYPE), state);
-        })
-        .def("forward_train", [](Policy& self, Tensor x, Tensor state) {
-            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-            PufTensor x_puf = PufTensor::from_torch(x);
-            PufTensor state_puf = PufTensor::from_torch(state);
-            PufTensor dec_out = self.forward_train(x_puf, state_puf, self.act, stream);
-            return dec_out.to_torch(pufferlib::PRECISION_DTYPE);
-        })
-        .def("init_weights", [](Policy& self, uint64_t seed) {
-            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-            self.init_weights(stream, seed);
-        }, py::arg("seed") = 42)
-        .def("parameters", [](Policy& self) {
-            // Build torch views from PufTensor weights for Python interop
-            std::vector<torch::Tensor> params;
-            params.push_back(self.encoder.weight.to_torch(PRECISION_DTYPE));
-            params.push_back(self.decoder.weight.to_torch(PRECISION_DTYPE));
-            if (self.decoder.continuous) params.push_back(self.decoder.logstd.to_torch(PRECISION_DTYPE));
-            for (int i = 0; i < self.rnn.num_layers; i++)
-                params.push_back(self.rnn.weights[i].to_torch(PRECISION_DTYPE));
-            return params;
-        })
-        .def("named_parameters", [](Policy& self) {
-            std::vector<torch::Tensor> params;
-            params.push_back(self.encoder.weight.to_torch(PRECISION_DTYPE));
-            params.push_back(self.decoder.weight.to_torch(PRECISION_DTYPE));
-            if (self.decoder.continuous) params.push_back(self.decoder.logstd.to_torch(PRECISION_DTYPE));
-            for (int i = 0; i < self.rnn.num_layers; i++)
-                params.push_back(self.rnn.weights[i].to_torch(PRECISION_DTYPE));
-            std::vector<std::string> names = {"encoder.linear.weight", "decoder.linear.weight"};
-            if (self.decoder.continuous) names.push_back("decoder.logstd");
-            for (int i = 0; i < self.rnn.num_layers; i++)
-                names.push_back("rnn.layer_" + std::to_string(i) + ".weight");
-            std::vector<std::pair<std::string, torch::Tensor>> result;
-            for (size_t i = 0; i < params.size(); i++)
-                result.push_back({names[i], params[i]});
-            return result;
-        });
-#else
-    // Torch-free minimal Policy binding (no forward/parameters returning Tensors)
     py::class_<Policy>(m, "Policy")
         .def("num_params", [](Policy& self) -> int64_t {
             int64_t total = self.encoder.weight.numel + self.decoder.weight.numel;
@@ -451,7 +278,6 @@ PYBIND11_MODULE(_C, m) {
     py::class_<Muon>(m, "Muon");
     py::class_<Allocator>(m, "Allocator")
         .def(py::init<>());
-#endif // PUFFERLIB_TORCH
 
     py::class_<HypersT>(m, "HypersT")
         .def_readwrite("horizon", &HypersT::horizon)
@@ -487,6 +313,12 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("rank", &HypersT::rank)
         .def_readwrite("world_size", &HypersT::world_size)
         .def_readwrite("nccl_id_path", &HypersT::nccl_id_path);
+
+    py::class_<PufTensor>(m, "PufTensor")
+        .def("__repr__", &PufTensor::repr)
+        .def_readonly("ndim", &PufTensor::ndim)
+        .def_readonly("numel", &PufTensor::numel)
+        .def_readonly("dtype_size", &PufTensor::dtype_size);
 
     py::class_<RolloutBuf>(m, "RolloutBuf")
         .def_readwrite("observations", &RolloutBuf::observations)

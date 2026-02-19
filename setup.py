@@ -263,7 +263,7 @@ class ProfileTorchBuildExt(build_ext):
 
         # Step 1: Compile to object file
         cmd = [nvcc, '-c', '-O3', arch, '-DUSE_TORCH', '-DPUFFERLIB_TORCH',
-               '-I.', '-Ipufferlib/extensions',
+               '-I.', '-Ipufferlib/src',
                '-Xcompiler', '-fPIC']
         if precision_flag:
             cmd.append(precision_flag)
@@ -332,13 +332,13 @@ class ProfilerBuildExt(build_ext):
             nvtx_lib_dir = os.path.join(cpp_ext.CUDA_HOME, 'lib64')
 
             cmd = [nvcc, '-O3', arch, '-DUSE_TORCH', '-DPUFFERLIB_TORCH',
-                   '-I.', '-Ipufferlib/extensions']
+                   '-I.', '-Ipufferlib/src']
             if precision_flag:
                 cmd.append(precision_flag)
 
             # Optional static env for envspeed profiling
             if self.env:
-                static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
+                static_lib = f'pufferlib/src/libstatic_{self.env}.a'
                 if not os.path.exists(static_lib):
                     raise RuntimeError(f'Static library not found: {static_lib}\n'
                                        f'Build it first with: python setup.py build_{self.env}')
@@ -360,7 +360,7 @@ class ProfilerBuildExt(build_ext):
             cmd += ['-Xlinker', '--unresolved-symbols=ignore-in-shared-libs']
             cmd += ['-Xlinker', '--allow-multiple-definition']
             if self.env:
-                static_lib = f'pufferlib/extensions/libstatic_{self.env}.a'
+                static_lib = f'pufferlib/src/libstatic_{self.env}.a'
                 cmd += [static_lib, f'./{RAYLIB_NAME}/lib/libraylib.a', '-lGL']
             cmd += ['-lomp5']
             cmd += ['-o', out]
@@ -384,13 +384,13 @@ STATIC_ENVS = [
 def _build_static_lib(env_name):
     """Build a static .a library for a given env using clang."""
     import subprocess
-    env_binding_src = 'pufferlib/extensions/env_binding.c'
-    static_lib = f'pufferlib/extensions/libstatic_{env_name}.a'
-    static_obj = f'pufferlib/extensions/libstatic_{env_name}.o'
+    env_binding_src = 'pufferlib/src/env_binding.c'
+    static_lib = f'pufferlib/src/libstatic_{env_name}.a'
+    static_obj = f'pufferlib/src/libstatic_{env_name}.o'
 
     clang_cmd = [
         'clang', '-c', '-O2', '-DNDEBUG',
-        '-I.', '-Ipufferlib/extensions', f'-Ipufferlib/ocean/{env_name}',
+        '-I.', '-Ipufferlib/src', f'-Ipufferlib/ocean/{env_name}',
         f'-I./{RAYLIB_NAME}/include', '-I/usr/local/cuda/include',
         '-DPLATFORM_DESKTOP',
         '-fno-semantic-interposition', '-fvisibility=hidden',
@@ -416,13 +416,13 @@ def _build_notorch_C(static_lib=None):
     output = f'pufferlib/_C{ext_suffix}'
 
     # Step 1: nvcc compile modules.cu -> modules.o
-    modules_cu = 'pufferlib/extensions/cuda/modules.cu'
-    modules_o = 'pufferlib/extensions/cuda/modules.o'
+    modules_cu = 'pufferlib/src/modules.cu'
+    modules_o = 'pufferlib/src/modules.o'
     nvcc_cmd = [
         nvcc, '-c', '-Xcompiler', '-fPIC',
         '-Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1',
         '-std=c++17',
-        '-I.', '-Ipufferlib/extensions',
+        '-I.', '-Ipufferlib/src',
         f'-I{cuda_home}/include',
     ]
     if DEBUG:
@@ -434,15 +434,15 @@ def _build_notorch_C(static_lib=None):
     subprocess.check_call(nvcc_cmd)
 
     # Step 2: g++ compile bindings.cpp -> bindings.o
-    bindings_cpp = 'pufferlib/extensions/bindings.cpp'
-    bindings_o = 'pufferlib/extensions/bindings.o'
+    bindings_cpp = 'pufferlib/src/bindings.cpp'
+    bindings_o = 'pufferlib/src/bindings.o'
     python_include = sysconfig.get_path('include')
     pybind_include = pybind11.get_include()
     gxx_cmd = [
         'g++', '-c', '-fPIC', '-std=c++17',
         '-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
         '-DPLATFORM_DESKTOP',
-        '-I.', '-Ipufferlib/extensions',
+        '-I.', '-Ipufferlib/src',
         f'-I{python_include}',
         f'-I{pybind_include}',
         f'-I{numpy.get_include()}',
@@ -551,7 +551,7 @@ if not NO_TRAIN:
 
 setup(
     version="3.0.0",
-    packages=find_namespace_packages() + find_packages() + c_extension_paths + ['pufferlib/extensions'],
+    packages=find_namespace_packages() + find_packages() + c_extension_paths + ['pufferlib/src'],
     package_data={
         "pufferlib": [RAYLIB_NAME + '/lib/libraylib.a']
     },

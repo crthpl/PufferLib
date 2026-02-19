@@ -23,7 +23,7 @@
 // ============================================================================
 
 #include "profile_common.h"
-#include "pufferlib/extensions/cuda/kernels.cu"
+#include "pufferlib/src/kernels.cu"
 
 // ============================================================================
 // Section 2: MinGRU gate — raw kernel create/free/run
@@ -669,8 +669,8 @@ void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atn
 
 #ifdef USE_STATIC_ENV
 
-#include "pufferlib/extensions/env_binding.h"
-#include "pufferlib/extensions/ini.h"
+#include "pufferlib/src/env_binding.h"
+#include "pufferlib/src/ini.h"
 
 #ifndef ENV_NAME
 #error "ENV_NAME must be defined at compile time (e.g. -DENV_NAME=breakout)"

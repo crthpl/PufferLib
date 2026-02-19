@@ -16,7 +16,7 @@
 #include <nvml.h>
 
 #include "modules.h"
-#include "legacy_modules.h"
+#include "legacy/legacy_modules.h"
 #include "muon.h"
 #include "env_binding.h"
 
@@ -25,8 +25,8 @@ namespace pufferlib {
 #include "models.cu"
 #include "models.cpp"
 #ifdef PUFFERLIB_TORCH
-#include "advantage.cpp"
-#include "ocean.cpp"
+#include "legacy/advantage.cpp"
+#include "legacy/ocean.cpp"
 #else
 // Torch-free fallback: create_policy without custom torch encoders/decoders
 Policy* create_policy(const std::string& env_name, Allocator& alloc,

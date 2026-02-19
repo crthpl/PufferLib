@@ -7,8 +7,8 @@
 #include <curand.h>
 #include <cassert>
 
-#include "../modules.h"
-#include "../legacy_modules.h"
+#include "modules.h"
+#include "legacy/legacy_modules.h"
 #include "kernels.cu"
 
 #include <stdio.h>

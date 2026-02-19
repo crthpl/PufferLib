@@ -7,6 +7,7 @@
 #endif
 
 #include <vector>
+#include <string>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -25,6 +26,30 @@ struct PufTensor {
 
     int64_t size(int dim) const { return shape[dim]; }
     int64_t nbytes() const { return numel * dtype_size; }
+
+    const char* dtype_name() const {
+        switch (dtype_size) {
+            case 1: return "i8";
+            case 2: return "bf16";
+            case 4: return "f32";
+            case 8: return "f64";
+            default: return "?";
+        }
+    }
+
+    std::string repr() const {
+        std::string s = "PufTensor(";
+        if (!data) return s + "empty)";
+        s += dtype_name();
+        s += ", [";
+        for (int i = 0; i < ndim; i++) {
+            if (i > 0) s += ", ";
+            s += std::to_string(shape[i]);
+        }
+        s += "], ";
+        s += std::to_string(numel) + " elems)";
+        return s;
+    }
 
 #ifdef PUFFERLIB_TORCH
     // Cast to torch::Tensor for interop (no copy — shares memory)

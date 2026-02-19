@@ -8,8 +8,8 @@
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDACachingAllocator.h>
-#include "pufferlib/extensions/cuda/modules.cu"
-#include "pufferlib/extensions/legacy_modules.h"
+#include "pufferlib/src/modules.cu"
+#include "pufferlib/src/legacy/legacy_modules.h"
 
 using namespace pufferlib;
 
