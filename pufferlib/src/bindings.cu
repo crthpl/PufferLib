@@ -132,9 +132,9 @@ void puf_close(pybind11::object pufferl_obj) {
 
 void save_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.alloc_fp32.total_param_elems * sizeof(float);
+    int64_t nbytes = pufferl.alloc_fp32.params.total_elems * sizeof(float);
     std::vector<char> buf(nbytes);
-    cudaMemcpy(buf.data(), pufferl.alloc_fp32.param_mem, nbytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(buf.data(), pufferl.alloc_fp32.params.mem, nbytes, cudaMemcpyDeviceToHost);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
     fwrite(buf.data(), 1, nbytes, f);
@@ -143,7 +143,7 @@ void save_weights(pybind11::object pufferl_obj, const std::string& path) {
 
 void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.alloc_fp32.total_param_elems * sizeof(float);
+    int64_t nbytes = pufferl.alloc_fp32.params.total_elems * sizeof(float);
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
     // Verify file size matches
@@ -163,7 +163,7 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     }
     fclose(f);
     // Copy to fp32 param buffer
-    cudaMemcpy(pufferl.alloc_fp32.param_mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(pufferl.alloc_fp32.params.mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
     // If bf16 policy is separate, cast fp32 -> bf16
     if (pufferl.policy_bf16 != pufferl.policy_fp32) {
         puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, pufferl.default_stream);

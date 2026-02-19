@@ -25,9 +25,9 @@ using std::vector;
 // Minimal tensor: raw pointer + shape, no torch dependency in the struct itself.
 // Memory is owned by an Allocator buffer — PufTensor is just a view.
 struct PufTensor {
-    char* bytes;
-    int64_t shape[PUF_MAX_DIMS];
-    int dtype_size;      // bytes per element (2 for bf16/f16, 4 for f32, 8 for f64)
+    char* bytes = nullptr;
+    int64_t shape[PUF_MAX_DIMS] = {};
+    int dtype_size = 0;      // bytes per element (2 for bf16/f16, 4 for f32, 8 for f64)
 
     __host__ __device__ int ndim() const {
         int n = 0;
@@ -88,108 +88,68 @@ struct PrefixScan {
 };
 
 // ============================================================================
-// Allocator — contiguous memory for params/grads/activations
+// Allocator — single contiguous GPU buffer with PufTensor views
 // ============================================================================
 
 struct Allocator {
-    struct PufRegistration {
+    struct Reg {
         PufTensor* ptr;
         int64_t size;
         std::vector<int64_t> shape;
         int elem_size;
     };
-    std::vector<PufRegistration> params, grads, puf_activations;
-    void* param_mem = nullptr;
-    void* grad_mem = nullptr;
-    void* puf_mem = nullptr;
+    std::vector<Reg> regs;
+    void* mem = nullptr;
+    int64_t total_elems = 0;
 
-    void register_param(PufTensor* ptr, std::vector<int64_t> shape) {
+    void reg(PufTensor* ptr, std::vector<int64_t> shape, int esz) {
         int64_t size = 1;
         for (auto s : shape) size *= s;
-        params.push_back({ptr, size, shape, 0});
+        regs.push_back({ptr, size, shape, esz});
     }
 
-    void register_grad(PufTensor* ptr, std::vector<int64_t> shape) {
-        int64_t size = 1;
-        for (auto s : shape) size *= s;
-        grads.push_back({ptr, size, shape, 0});
-    }
-
-    void register_puf(PufTensor* ptr, std::vector<int64_t> shape, int elem_size) {
-        int64_t size = 1;
-        for (auto s : shape) size *= s;
-        puf_activations.push_back({ptr, size, shape, elem_size});
-    }
-
-    void assign_puf_views(std::vector<PufRegistration>& regs, char* base, int esz) {
-        int64_t offset = 0;
+    void create() {
+        int64_t total_bytes = 0;
+        total_elems = 0;
         for (auto& r : regs) {
-            r.ptr->bytes = base + offset * esz;
-            r.ptr->dtype_size = esz;
-            for (int i = 0; i < PUF_MAX_DIMS; i++) {
-                r.ptr->shape[i] = (i < (int)r.shape.size()) ? r.shape[i] : 0;
+            total_bytes += r.size * r.elem_size;
+            total_elems += r.size;
+        }
+        if (total_bytes > 0) {
+            cudaMalloc(&mem, total_bytes);
+            cudaMemset(mem, 0, total_bytes);
+            int64_t offset = 0;
+            for (auto& r : regs) {
+                r.ptr->bytes = (char*)mem + offset;
+                r.ptr->dtype_size = r.elem_size;
+                for (int i = 0; i < PUF_MAX_DIMS; i++)
+                    r.ptr->shape[i] = (i < (int)r.shape.size()) ? r.shape[i] : 0;
+                offset += r.size * r.elem_size;
             }
-            offset += r.size;
         }
     }
 
     void destroy() {
-        if (param_mem) { cudaFree(param_mem); param_mem = nullptr; }
-        if (grad_mem) { cudaFree(grad_mem); grad_mem = nullptr; }
-        if (puf_mem) { cudaFree(puf_mem); puf_mem = nullptr; }
+        if (mem) { cudaFree(mem); mem = nullptr; }
     }
+};
 
-    void create(int esz) {
-        int64_t total_params = 0;
-        for (auto& r : params) total_params += r.size;
-        if (total_params > 0) {
-            cudaMalloc(&param_mem, total_params * esz);
-            cudaMemset(param_mem, 0, total_params * esz);
-            assign_puf_views(params, (char*)param_mem, esz);
-        }
-        total_param_elems = total_params;
-
-        int64_t total_grads = 0;
-        for (auto& r : grads) total_grads += r.size;
-        if (total_grads > 0) {
-            cudaMalloc(&grad_mem, total_grads * esz);
-            cudaMemset(grad_mem, 0, total_grads * esz);
-            assign_puf_views(grads, (char*)grad_mem, esz);
-        }
-        total_grad_elems = total_grads;
-
-        int64_t total_puf_bytes = 0;
-        for (auto& r : puf_activations) total_puf_bytes += r.size * r.elem_size;
-        if (total_puf_bytes > 0) {
-            cudaMalloc(&puf_mem, total_puf_bytes);
-            cudaMemset(puf_mem, 0, total_puf_bytes);
-            char* base = (char*)puf_mem;
-            int64_t offset = 0;
-            for (auto& r : puf_activations) {
-                r.ptr->bytes = base + offset;
-                r.ptr->dtype_size = r.elem_size;
-                for (int i = 0; i < PUF_MAX_DIMS; i++) {
-                    r.ptr->shape[i] = (i < (int)r.shape.size()) ? r.shape[i] : 0;
-                }
-                offset += r.size * r.elem_size;
-            }
-        }
-        elem_size = esz;
-    }
-
-    int elem_size = 0;
-    int64_t total_param_elems = 0;
-    int64_t total_grad_elems = 0;
+// Groups 3 allocators for policy: params, grads, activations
+struct AllocSet {
+    Allocator params, grads, acts;
+    int esz = 0;  // element size for params/grads
+    void create() { params.create(); grads.create(); acts.create(); }
+    void destroy() { params.destroy(); grads.destroy(); acts.destroy(); }
 };
 
 // Pre-allocated buffers for prio_replay
 struct PrioBuffers {
     PufTensor prio_probs, cdf, idx, mb_prio;
     void register_buffers(Allocator& alloc, int S, int minibatch_segments) {
-        alloc.register_puf(&prio_probs, {S}, sizeof(float));
-        alloc.register_puf(&cdf, {S}, sizeof(float));
-        alloc.register_puf(&idx, {minibatch_segments}, sizeof(int64_t));
-        alloc.register_puf(&mb_prio, {minibatch_segments, 1}, sizeof(float));
+        alloc.reg(&prio_probs, {S}, sizeof(float));
+        alloc.reg(&cdf, {S}, sizeof(float));
+        alloc.reg(&idx, {minibatch_segments}, sizeof(int64_t));
+        alloc.reg(&mb_prio, {minibatch_segments, 1}, sizeof(float));
     }
 };
 
@@ -199,13 +159,13 @@ struct PPOBuffersPuf {
     PufTensor grad_logits, grad_values, grad_logstd, adv_scratch;
     void register_buffers(Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
         int64_t total = (int64_t)N * T;
-        alloc.register_puf(&loss_output, {1}, sizeof(float));
-        alloc.register_puf(&saved_for_bwd, {total, 5}, sizeof(double));
-        alloc.register_puf(&grad_loss, {1}, sizeof(float));
-        alloc.register_puf(&grad_logits, {N, T, A_total}, sizeof(float));
-        alloc.register_puf(&grad_values, {N, T, 1}, sizeof(float));
-        if (is_continuous) alloc.register_puf(&grad_logstd, {N, T, A_total}, sizeof(float));
-        alloc.register_puf(&adv_scratch, {2}, sizeof(float));
+        alloc.reg(&loss_output, {1}, sizeof(float));
+        alloc.reg(&saved_for_bwd, {total, 5}, sizeof(double));
+        alloc.reg(&grad_loss, {1}, sizeof(float));
+        alloc.reg(&grad_logits, {N, T, A_total}, sizeof(float));
+        alloc.reg(&grad_values, {N, T, 1}, sizeof(float));
+        if (is_continuous) alloc.reg(&grad_logstd, {N, T, A_total}, sizeof(float));
+        alloc.reg(&adv_scratch, {2}, sizeof(float));
     }
     void post_create() {
         float one = 1.0f;
@@ -271,14 +231,14 @@ struct RolloutBuf {
 
     void register_buffers(Allocator& alloc, int dim0, int dim1, int input_size, int num_atns) {
         int psz = pufferlib::PRECISION_SIZE;
-        alloc.register_puf(&observations, {dim0, dim1, input_size}, psz);
-        alloc.register_puf(&actions, {dim0, dim1, num_atns}, sizeof(double));
-        alloc.register_puf(&values, {dim0, dim1}, psz);
-        alloc.register_puf(&logprobs, {dim0, dim1}, psz);
-        alloc.register_puf(&rewards, {dim0, dim1}, psz);
-        alloc.register_puf(&terminals, {dim0, dim1}, psz);
-        alloc.register_puf(&ratio, {dim0, dim1}, psz);
-        alloc.register_puf(&importance, {dim0, dim1}, psz);
+        alloc.reg(&observations, {dim0, dim1, input_size}, psz);
+        alloc.reg(&actions, {dim0, dim1, num_atns}, sizeof(double));
+        alloc.reg(&values, {dim0, dim1}, psz);
+        alloc.reg(&logprobs, {dim0, dim1}, psz);
+        alloc.reg(&rewards, {dim0, dim1}, psz);
+        alloc.reg(&terminals, {dim0, dim1}, psz);
+        alloc.reg(&ratio, {dim0, dim1}, psz);
+        alloc.reg(&importance, {dim0, dim1}, psz);
     }
 };
 
@@ -297,16 +257,16 @@ struct TrainGraph {
     void register_buffers(Allocator& alloc, int S, int H, int input_size,
             int hidden_size, int num_atns, int num_layers) {
         int psz = pufferlib::PRECISION_SIZE;
-        alloc.register_puf(&mb_obs, {S, H, input_size}, psz);
-        alloc.register_puf(&mb_state, {num_layers, S, 1, hidden_size}, psz);
-        alloc.register_puf(&mb_actions, {S, H, num_atns}, sizeof(double));
-        alloc.register_puf(&mb_logprobs, {S, H}, psz);
-        alloc.register_puf(&mb_advantages, {S, H}, sizeof(float));
-        alloc.register_puf(&mb_prio, {S, 1}, psz);
-        alloc.register_puf(&mb_values, {S, H}, psz);
-        alloc.register_puf(&mb_returns, {S, H}, psz);
-        alloc.register_puf(&mb_ratio, {S, H}, psz);
-        alloc.register_puf(&mb_newvalue, {S, H, 1}, psz);
+        alloc.reg(&mb_obs, {S, H, input_size}, psz);
+        alloc.reg(&mb_state, {num_layers, S, 1, hidden_size}, psz);
+        alloc.reg(&mb_actions, {S, H, num_atns}, sizeof(double));
+        alloc.reg(&mb_logprobs, {S, H}, psz);
+        alloc.reg(&mb_advantages, {S, H}, sizeof(float));
+        alloc.reg(&mb_prio, {S, 1}, psz);
+        alloc.reg(&mb_values, {S, H}, psz);
+        alloc.reg(&mb_returns, {S, H}, psz);
+        alloc.reg(&mb_ratio, {S, H}, psz);
+        alloc.reg(&mb_newvalue, {S, H, 1}, psz);
     }
 };
 
@@ -640,19 +600,19 @@ struct NativeEncoder {
     int in_dim, out_dim;
 
     NativeEncoder() : in_dim(0), out_dim(0) {}
-    NativeEncoder(Allocator& alloc, int input, int hidden)
+    NativeEncoder(AllocSet& alloc, int input, int hidden)
         : in_dim(input), out_dim(hidden) {
-        alloc.register_param(&weight, {hidden, input});
-        alloc.register_grad(&weight_grad, {hidden, input});
+        alloc.params.reg(&weight, {hidden, input}, alloc.esz);
+        alloc.grads.reg(&weight_grad, {hidden, input}, alloc.esz);
     }
     void register_activations(Allocator& alloc, EncoderActivations& act, int B_TT) {
         int psz = PRECISION_SIZE;
-        alloc.register_puf(&act.saved_input, {B_TT, in_dim}, psz);
-        alloc.register_puf(&act.out, {B_TT, out_dim}, psz);
-        alloc.register_puf(&act.wgrad_scratch, {out_dim, in_dim}, psz);
+        alloc.reg(&act.saved_input, {B_TT, in_dim}, psz);
+        alloc.reg(&act.out, {B_TT, out_dim}, psz);
+        alloc.reg(&act.wgrad_scratch, {out_dim, in_dim}, psz);
     }
     void register_inference(Allocator& alloc, EncoderActivations& act, int B_inf) {
-        alloc.register_puf(&act.inf_out, {B_inf, out_dim}, PRECISION_SIZE);
+        alloc.reg(&act.inf_out, {B_inf, out_dim}, PRECISION_SIZE);
     }
     void init_weights(uint64_t& seed, cudaStream_t stream) {
         PufTensor w2d = {
@@ -671,24 +631,24 @@ struct NativeDecoder {
     bool continuous;
 
     NativeDecoder() : hidden_dim(0), output_dim(0), continuous(false) {}
-    NativeDecoder(Allocator& alloc, int hidden, int output, bool continuous)
+    NativeDecoder(AllocSet& alloc, int hidden, int output, bool continuous)
         : hidden_dim(hidden), output_dim(output), continuous(continuous) {
-        alloc.register_param(&weight, {output + 1, hidden});
-        alloc.register_grad(&weight_grad, {output + 1, hidden});
+        alloc.params.reg(&weight, {output + 1, hidden}, alloc.esz);
+        alloc.grads.reg(&weight_grad, {output + 1, hidden}, alloc.esz);
         if (continuous) {
-            alloc.register_param(&logstd, {1, output});
-            alloc.register_grad(&logstd_grad, {1, output});
+            alloc.params.reg(&logstd, {1, output}, alloc.esz);
+            alloc.grads.reg(&logstd_grad, {1, output}, alloc.esz);
         }
     }
     void register_activations(Allocator& alloc, DecoderActivations& act, int B_TT) {
         int psz = PRECISION_SIZE;
-        alloc.register_puf(&act.saved_input, {B_TT, hidden_dim}, psz);
-        alloc.register_puf(&act.out, {B_TT, output_dim + 1}, psz);
-        alloc.register_puf(&act.grad_out, {B_TT, output_dim + 1}, psz);
-        alloc.register_puf(&act.wgrad_scratch, {output_dim + 1, hidden_dim}, psz);
+        alloc.reg(&act.saved_input, {B_TT, hidden_dim}, psz);
+        alloc.reg(&act.out, {B_TT, output_dim + 1}, psz);
+        alloc.reg(&act.grad_out, {B_TT, output_dim + 1}, psz);
+        alloc.reg(&act.wgrad_scratch, {output_dim + 1, hidden_dim}, psz);
     }
     void register_inference(Allocator& alloc, DecoderActivations& act, int B_inf) {
-        alloc.register_puf(&act.inf_out, {B_inf, output_dim + 1}, PRECISION_SIZE);
+        alloc.reg(&act.inf_out, {B_inf, output_dim + 1}, PRECISION_SIZE);
     }
     void init_weights(uint64_t& seed, cudaStream_t stream) {
         PufTensor w2d = {
@@ -725,37 +685,37 @@ struct MinGRU {
     vector<PufTensor> weight_grads;
 
     MinGRU() : hidden(0), num_layers(0) {}
-    MinGRU(Allocator& alloc, int hidden, int num_layers)
+    MinGRU(AllocSet& alloc, int hidden, int num_layers)
         : hidden(hidden), num_layers(num_layers),
           weights(num_layers), weight_grads(num_layers) {
         for (int i = 0; i < num_layers; i++) {
-            alloc.register_param(&weights[i], {3 * hidden, hidden});
-            alloc.register_grad(&weight_grads[i], {3 * hidden, hidden});
+            alloc.params.reg(&weights[i], {3 * hidden, hidden}, alloc.esz);
+            alloc.grads.reg(&weight_grads[i], {3 * hidden, hidden}, alloc.esz);
         }
     }
     void register_activations(Allocator& alloc, MinGRUActivations& act, int B, int TT) {
         int H = hidden, B_TT = B * TT, psz = PRECISION_SIZE;
-        alloc.register_puf(&act.grad_input_buf, {B_TT, H}, psz);
-        alloc.register_puf(&act.grad_next_state, {B, 1, H}, psz);
-        alloc.register_puf(&act.wgrad_scratch, {3 * H, H}, psz);
+        alloc.reg(&act.grad_input_buf, {B_TT, H}, psz);
+        alloc.reg(&act.grad_next_state, {B, 1, H}, psz);
+        alloc.reg(&act.wgrad_scratch, {3 * H, H}, psz);
         for (int i = 0; i < num_layers; i++) {
-            alloc.register_puf(&act.saved_inputs[i], {B, TT, H}, psz);
-            alloc.register_puf(&act.combined_bufs[i], {B_TT, 3 * H}, psz);
-            alloc.register_puf(&act.scan_bufs[i].out, {B, TT, H}, psz);
-            alloc.register_puf(&act.scan_bufs[i].next_state, {B, 1, H}, psz);
-            alloc.register_puf(&act.scan_bufs[i].a_star, {B, TT + 1, H}, sizeof(float));
-            alloc.register_puf(&act.scan_bufs[i].s_vals, {B, TT + 1, H}, sizeof(float));
-            alloc.register_puf(&act.scan_bufs[i].log_values_buf, {B, TT + 1, H}, sizeof(float));
-            alloc.register_puf(&act.scan_bufs[i].grad_combined, {B, TT, 3 * H}, psz);
-            alloc.register_puf(&act.scan_bufs[i].grad_state, {B, 1, H}, psz);
+            alloc.reg(&act.saved_inputs[i], {B, TT, H}, psz);
+            alloc.reg(&act.combined_bufs[i], {B_TT, 3 * H}, psz);
+            alloc.reg(&act.scan_bufs[i].out, {B, TT, H}, psz);
+            alloc.reg(&act.scan_bufs[i].next_state, {B, 1, H}, psz);
+            alloc.reg(&act.scan_bufs[i].a_star, {B, TT + 1, H}, sizeof(float));
+            alloc.reg(&act.scan_bufs[i].s_vals, {B, TT + 1, H}, sizeof(float));
+            alloc.reg(&act.scan_bufs[i].log_values_buf, {B, TT + 1, H}, sizeof(float));
+            alloc.reg(&act.scan_bufs[i].grad_combined, {B, TT, 3 * H}, psz);
+            alloc.reg(&act.scan_bufs[i].grad_state, {B, 1, H}, psz);
         }
     }
     void register_inference(Allocator& alloc, MinGRUActivations& act, int B_inf) {
         int H = hidden, dsz = PRECISION_SIZE;
         for (int i = 0; i < num_layers; i++)
-            alloc.register_puf(&act.inf_combined[i], {B_inf, 3 * H}, dsz);
-        alloc.register_puf(&act.inf_out, {B_inf, H}, dsz);
-        alloc.register_puf(&act.inf_next_state, {B_inf, H}, dsz);
+            alloc.reg(&act.inf_combined[i], {B_inf, 3 * H}, dsz);
+        alloc.reg(&act.inf_out, {B_inf, H}, dsz);
+        alloc.reg(&act.inf_next_state, {B_inf, H}, dsz);
     }
     PufTensor state_layer(PufTensor& state, int i) {
         int64_t B = state.size(1), H = state.size(2);
@@ -845,7 +805,7 @@ struct Policy {
     PolicyActivations act;
 
     Policy() : num_atns(0) {}
-    Policy(Allocator& alloc, int input, int hidden, int output, int num_layers, int num_atns, bool continuous)
+    Policy(AllocSet& alloc, int input, int hidden, int output, int num_layers, int num_atns, bool continuous)
         : encoder(alloc, input, hidden),
           decoder(alloc, hidden, output, continuous),
           rnn(alloc, hidden, num_layers),
@@ -984,11 +944,11 @@ struct Muon {
 
     void register_buffers(Allocator& alloc) {
         int64_t n = wb_puf.numel();
-        alloc.register_puf(&lr_puf, {1}, sizeof(float));
-        alloc.register_puf(&lr_derived_puf, {2}, sizeof(float));
-        alloc.register_puf(&mb_puf, {n}, sizeof(float));
-        alloc.register_puf(&gc_puf, {n}, sizeof(float));
-        alloc.register_puf(&up_puf, {n}, sizeof(float));
+        alloc.reg(&lr_puf, {1}, sizeof(float));
+        alloc.reg(&lr_derived_puf, {2}, sizeof(float));
+        alloc.reg(&mb_puf, {n}, sizeof(float));
+        alloc.reg(&gc_puf, {n}, sizeof(float));
+        alloc.reg(&up_puf, {n}, sizeof(float));
         int64_t max_M = 0, max_N = 0;
         for (auto& ps : param_shapes) {
             if (ps.shape.size() >= 2) {
@@ -999,12 +959,12 @@ struct Muon {
         }
         if (max_M > 0) {
             ns.max_M = max_M; ns.max_N = max_N;
-            alloc.register_puf(&ns.x, {max_M, max_N}, 2);
-            alloc.register_puf(&ns.A, {max_M, max_M}, 2);
-            alloc.register_puf(&ns.gram, {max_M, max_M}, 2);
-            alloc.register_puf(&ns.tmp, {max_M, max_N}, 2);
-            alloc.register_puf(&ns.result_f32, {max_M, max_N}, sizeof(float));
-            alloc.register_puf(&ns_norm_puf, {1}, sizeof(float));
+            alloc.reg(&ns.x, {max_M, max_N}, 2);
+            alloc.reg(&ns.A, {max_M, max_M}, 2);
+            alloc.reg(&ns.gram, {max_M, max_M}, 2);
+            alloc.reg(&ns.tmp, {max_M, max_N}, 2);
+            alloc.reg(&ns.result_f32, {max_M, max_N}, sizeof(float));
+            alloc.reg(&ns_norm_puf, {1}, sizeof(float));
         }
         bufs_initialized = true;
     }
