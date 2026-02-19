@@ -318,7 +318,7 @@ PYBIND11_MODULE(_C, m) {
 
     py::class_<PufTensor>(m, "PufTensor")
         .def("__repr__", &PufTensor::repr)
-        .def_readonly("ndim", &PufTensor::ndim)
+        .def("ndim", &PufTensor::ndim)
         .def("numel", &PufTensor::numel)
         .def_readonly("dtype_size", &PufTensor::dtype_size);
 

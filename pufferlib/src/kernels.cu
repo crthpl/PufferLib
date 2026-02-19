@@ -580,17 +580,19 @@ __device__ __forceinline__ void ppo_continuous_head(
 }
 
 
-__global__ void ppo_loss_forward_kernel_optimized(
-    float* __restrict__ loss,
-    float* __restrict__ losses_acc,      // accumulator for loss components [LOSS_N floats]
+// Fused PPO forward + backward kernel: computes loss partials AND gradients in one pass.
+// Avoids redundant recomputation of logits, logsumexp, ratio, advantage normalization.
+__global__ void ppo_loss_fwd_bwd_kernel(
     float* __restrict__ ppo_partials,    // per-block partial sums for deterministic reduction
-    double* __restrict__ saved_for_backward,
-    precision_t* __restrict__ ratio_out,
-    precision_t* __restrict__ newvalue_out,
-    const precision_t* __restrict__ logits,       // For continuous: mean
-    const precision_t* __restrict__ logstd,       // For continuous: log standard deviation (nullptr for discrete)
+    // Gradient outputs
+    float* __restrict__ grad_logits,     // For continuous: grad_mean
+    float* __restrict__ grad_logstd,     // For continuous: grad_logstd (nullptr for discrete)
+    float* __restrict__ grad_values_pred,
+    // Inputs
+    const precision_t* __restrict__ logits,
+    const precision_t* __restrict__ logstd,       // nullptr for discrete
     const precision_t* __restrict__ values_pred,
-    const double* __restrict__ actions, // float64 for both continuous and discrete
+    const double* __restrict__ actions,
     const precision_t* __restrict__ old_logprobs,
     const float* __restrict__ advantages,
     const precision_t* __restrict__ prio,
@@ -598,14 +600,14 @@ __global__ void ppo_loss_forward_kernel_optimized(
     const precision_t* __restrict__ returns,
     const float* __restrict__ adv_mean,
     const float* __restrict__ adv_var,
-    const int* __restrict__ act_sizes,  // NEW: array of action head sizes
-    int num_atns,                        // NEW: number of action heads
+    const int* __restrict__ act_sizes,
+    int num_atns,
     float clip_coef,
     float vf_clip_coef,
     float vf_coef,
     float ent_coef,
     int T_seq,
-    int A_total,                         // renamed: sum of all action sizes
+    int A_total,
     int N,
     int logits_stride_n,
     int logits_stride_t,
@@ -617,8 +619,8 @@ __global__ void ppo_loss_forward_kernel_optimized(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
     int total_elements = N * T_seq;
+    float inv_NT = 1.0f / float(total_elements);
 
-    // LOSS_N == 7 loss components to reduce (N count handled in C++)
     __shared__ float block_losses[LOSS_N][PPO_THREADS];
     for (int c = 0; c < LOSS_N; c++) {
         block_losses[c][tid] = 0.0f;
@@ -633,11 +635,50 @@ __global__ void ppo_loss_forward_kernel_optimized(
 
     int logits_base = n * logits_stride_n + t * logits_stride_t;
     int values_idx = n * values_stride_n + t * values_stride_t;
+    int grad_logits_base = nt * A_total;
 
-    float total_log_prob = 0.0f;
-    float total_entropy = 0.0f;
+    // --- Shared computation (used by both forward and backward) ---
+
+    float old_logp = to_float(old_logprobs[nt]);
+    float adv = float(advantages[nt]);
+    float w = to_float(prio[n]);
+    float val = to_float(values[nt]);
+    float ret = to_float(returns[nt]);
+    float val_pred = to_float(values_pred[values_idx]);
+
+    float adv_std = sqrtf(float(adv_var[0]));
+    float adv_normalized = (adv - float(adv_mean[0])) / (adv_std + 1e-8f);
+
+    // grad_loss is always 1.0 (set in post_create, never changes)
+    float dL = inv_NT;
+    float d_pg_loss = dL;
+    float d_entropy_term = dL * (-ent_coef);
+
+    // --- Value loss (forward) + value gradient (backward) ---
+
+    float v_error = val_pred - val;
+    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
+    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+    float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
+
+    // Value gradient
+    bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
+    float d_val_pred = 0.0f;
+    if (use_clipped_vf) {
+        if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
+            d_val_pred = v_clipped - ret;
+        }
+    } else {
+        d_val_pred = val_pred - ret;
+    }
+    grad_values_pred[nt] = dL * vf_coef * d_val_pred;
+
+    // --- Policy loss + gradients (branch on continuous/discrete) ---
 
     if (is_continuous) {
+        float total_log_prob = 0.0f;
+        float total_entropy = 0.0f;
         for (int h = 0; h < num_atns; ++h) {
             float mean = to_float(logits[logits_base + h * logits_stride_a]);
             float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
@@ -647,63 +688,115 @@ __global__ void ppo_loss_forward_kernel_optimized(
             total_log_prob += lp;
             total_entropy += ent;
         }
+
+        float logratio = total_log_prob - old_logp;
+        float ratio = __expf(logratio);
+        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+        float wa = -w * adv_normalized;
+        float pg_loss1 = wa * ratio;
+        float pg_loss2 = wa * ratio_clipped;
+        float pg_loss = fmaxf(pg_loss1, pg_loss2);
+
+        // Backward: policy gradient
+        float d_ratio = wa * d_pg_loss;
+        if (pg_loss2 > pg_loss1) {
+            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
+                d_ratio = 0.0f;
+            }
+        }
+        float d_new_logp = d_ratio * ratio;
+
+        for (int h = 0; h < num_atns; ++h) {
+            float mean = to_float(logits[logits_base + h * logits_stride_a]);
+            float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
+            float std = __expf(log_std);
+            float var = std * std;
+            float action = float(actions[nt * num_atns + h]);
+            float diff = action - mean;
+
+            grad_logits[grad_logits_base + h] = d_new_logp * diff / var;
+            grad_logstd[grad_logits_base + h] = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
+        }
+
+        // Forward: loss partials
+        float thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * total_entropy) * inv_NT;
+        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
+        block_losses[LOSS_TOTAL][tid] = thread_loss;
+        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
+        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
+        block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > clip_coef ? 1.0f : 0.0f) * inv_NT;
     } else {
+        // Discrete: compute per-head logsumexp, entropy, log_prob in one pass
+        float head_logsumexp[MAX_ATN_HEADS];
+        float head_entropy[MAX_ATN_HEADS];
+        int head_act[MAX_ATN_HEADS];
+
         int logits_offset = 0;
+        float total_log_prob = 0.0f;
+        float total_entropy = 0.0f;
+
         for (int h = 0; h < num_atns; ++h) {
             int A = act_sizes[h];
             int act = static_cast<int>(actions[nt * num_atns + h]);
+            head_act[h] = act;
             float lse, ent, lp;
             ppo_discrete_head(logits, logits_base, logits_stride_a, logits_offset, A, act, &lse, &ent, &lp);
+            head_logsumexp[h] = lse;
+            head_entropy[h] = ent;
             total_log_prob += lp;
             total_entropy += ent;
             logits_offset += A;
         }
+
+        float logratio = total_log_prob - old_logp;
+        float ratio = __expf(logratio);
+        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
+        float wa = -w * adv_normalized;
+        float pg_loss1 = wa * ratio;
+        float pg_loss2 = wa * ratio_clipped;
+        float pg_loss = fmaxf(pg_loss1, pg_loss2);
+
+        // Backward: policy gradient
+        float d_ratio = wa * d_pg_loss;
+        if (pg_loss2 > pg_loss1) {
+            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
+                d_ratio = 0.0f;
+            }
+        }
+        float d_new_logp = d_ratio * ratio;
+
+        // Gradient pass over logits (reuses head_logsumexp, head_entropy)
+        logits_offset = 0;
+        for (int h = 0; h < num_atns; ++h) {
+            int A = act_sizes[h];
+            int act = head_act[h];
+            float logsumexp = head_logsumexp[h];
+            float ent = head_entropy[h];
+
+            for (int a = 0; a < A; ++a) {
+                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
+                float logp = l - logsumexp;
+                float p = __expf(logp);
+                float d_logit = (a == act) ? d_new_logp : 0.0f;
+                d_logit -= p * d_new_logp;
+                d_logit += d_entropy_term * p * (-ent - logp);
+                grad_logits[grad_logits_base + logits_offset + a] = d_logit;
+            }
+            logits_offset += A;
+        }
+
+        // Forward: loss partials
+        float thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * total_entropy) * inv_NT;
+        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
+        block_losses[LOSS_TOTAL][tid] = thread_loss;
+        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
+        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
+        block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > clip_coef ? 1.0f : 0.0f) * inv_NT;
     }
-
-    // Use accumulated values for the rest of computation
-    float new_logp = total_log_prob;
-    float entropy = total_entropy;
-
-    float old_logp = to_float(old_logprobs[nt]);
-    float adv = float(advantages[nt]);
-    float w = to_float(prio[n]);
-    float adv_std = sqrtf(float(adv_var[0]));
-    float adv_normalized = (adv - float(adv_mean[0])) / (adv_std + 1e-8f);
-
-    float logratio = new_logp - old_logp;
-    float ratio = __expf(logratio);
-
-    float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-    float wa = -w * adv_normalized;
-    float pg_loss1 = wa * ratio;
-    float pg_loss2 = wa * ratio_clipped;
-    float pg_loss = fmaxf(pg_loss1, pg_loss2);
-
-    float val = to_float(values[nt]);
-    float ret = to_float(returns[nt]);
-    float val_pred = to_float(values_pred[values_idx]);
-
-    float v_error = val_pred - val;
-    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
-    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
-    float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
-
-    float thread_loss = (pg_loss + vf_coef * v_loss - ent_coef * entropy) / float(total_elements);
-
-    // Write ratio and newvalue outputs
-    //ratio_out[nt] = T(ratio);
-    //newvalue_out[nt] = T(val_pred);
-
-    // Per-thread loss components (mean = sum / total_elements)
-    float inv_total = 1.0f / float(total_elements);
-    block_losses[LOSS_PG][tid] = pg_loss * inv_total;
-    block_losses[LOSS_VF][tid] = v_loss * inv_total;
-    block_losses[LOSS_ENT][tid] = entropy * inv_total;
-    block_losses[LOSS_TOTAL][tid] = thread_loss;
-    block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_total;
-    block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_total;
-    block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > clip_coef ? 1.0f : 0.0f) * inv_total;
     } // end if (idx < total_elements)
 
 reduce:
@@ -718,25 +811,22 @@ reduce:
         __syncthreads();
     }
 
-    // Write per-block partials for deterministic reduction (no atomicAdd)
     if (tid == 0) {
         int base = blockIdx.x * (LOSS_N + 1);
-        ppo_partials[base] = block_losses[LOSS_TOTAL][0];  // loss
+        ppo_partials[base] = block_losses[LOSS_TOTAL][0];
         for (int c = 0; c < LOSS_N; c++) {
             ppo_partials[base + 1 + c] = block_losses[c][0];
         }
     }
 }
 
-// Deterministic reduction of per-block PPO loss partials
+// Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce_kernel(
     float* __restrict__ loss,
     float* __restrict__ losses_acc,
     const float* __restrict__ partials,
     int num_blocks
 ) {
-    // Each thread handles one column (loss or loss_acc component)
-    // tid 0 = total loss, tid 1..LOSS_N = loss components
     int tid = threadIdx.x;
     if (tid > LOSS_N) return;
 
@@ -750,211 +840,10 @@ __global__ void ppo_loss_reduce_kernel(
     } else {
         losses_acc[tid - 1] += sum;
     }
-}
 
-
-__global__ void ppo_loss_backward_kernel_optimized(
-    float* __restrict__ grad_logits,    // For continuous: grad_mean
-    float* __restrict__ grad_logstd,    // For continuous: grad_logstd (nullptr for discrete)
-    float* __restrict__ grad_values_pred,
-    const float* __restrict__ grad_loss,
-    const precision_t* __restrict__ logits,       // For continuous: mean
-    const precision_t* __restrict__ logstd,       // For continuous: log standard deviation (nullptr for discrete)
-    const precision_t* __restrict__ values_pred,
-    const double* __restrict__ actions, // float64 for both continuous and discrete
-    const precision_t* __restrict__ old_logprobs,
-    const float* __restrict__ advantages,
-    const precision_t* __restrict__ prio,
-    const precision_t* __restrict__ values,
-    const precision_t* __restrict__ returns,
-    const float* __restrict__ adv_mean,
-    const float* __restrict__ adv_var,
-    const int* __restrict__ act_sizes,  // NEW: array of action head sizes
-    int num_atns,                        // NEW: number of action heads
-    float clip_coef,
-    float vf_clip_coef,
-    float vf_coef,
-    float ent_coef,
-    int T_seq,
-    int A_total,                         // renamed: sum of all action sizes
-    int N,
-    int logits_stride_n,
-    int logits_stride_t,
-    int logits_stride_a,
-    int values_stride_n,
-    int values_stride_t,
-    bool is_continuous
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = N * T_seq;
-    if (idx >= total_elements) return;
-
-    float inv_NT = 1.0f / float(total_elements);
-    int n = idx / T_seq;
-    int t = idx % T_seq;
-    int nt = n * T_seq + t;
-
-    // Input strides (for reading non-contiguous logits/values_pred)
-    int logits_base = n * logits_stride_n + t * logits_stride_t;
-    int values_idx = n * values_stride_n + t * values_stride_t;
-    // Output indices (for writing to contiguous grad buffers)
-    int grad_logits_base = nt * A_total;
-    int grad_values_idx = nt;
-
-    float old_logp = to_float(old_logprobs[nt]);
-    float adv = float(advantages[nt]);
-    float w = to_float(prio[n]);
-    float val = to_float(values[nt]);
-    float ret = to_float(returns[nt]);
-    float val_pred = to_float(values_pred[values_idx]);
-
-    // Normalize advantage
-    float adv_std_val = sqrtf(float(adv_var[0]));
-    float adv_normalized = (adv - float(adv_mean[0])) / (adv_std_val + 1e-8f);
-
-    // Loss gradient scaling
-    float dL = grad_loss[0] * inv_NT;
-    float d_pg_loss = dL;
-    float d_entropy_term = dL * (-ent_coef);
-
-    // Gradient wrt value function prediction
-    float v_error = val_pred - val;
-    float v_clipped = val + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, v_error));
-    float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-    float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
-    bool use_clipped_vf = (v_loss_clipped > v_loss_unclipped);
-
-    float d_val_pred = 0.0f;
-    if (use_clipped_vf) {
-        if (v_error >= -vf_clip_coef && v_error <= vf_clip_coef) {
-            d_val_pred = v_clipped - ret;
-        }
-    } else {
-        d_val_pred = val_pred - ret;
-    }
-    grad_values_pred[grad_values_idx] = dL * vf_coef * d_val_pred;
-
-    if (is_continuous) {
-        float total_log_prob = 0.0f;
-        for (int h = 0; h < num_atns; ++h) {
-            float mean = to_float(logits[logits_base + h * logits_stride_a]);
-            float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
-            float action = float(actions[nt * num_atns + h]);
-            float lp, ent;
-            ppo_continuous_head(mean, log_std, action, &lp, &ent);
-            total_log_prob += lp;
-        }
-
-        float new_logp = total_log_prob;
-        float ratio = __expf(new_logp - old_logp);
-
-        // Policy loss gradient
-        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-        float pg_loss1 = -w * adv_normalized * ratio;
-        float pg_loss2 = -w * adv_normalized * ratio_clipped;
-
-        float d_ratio = -w * adv_normalized * d_pg_loss;
-        if (pg_loss2 > pg_loss1) {
-            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
-                d_ratio = 0.0f;
-            }
-        }
-        float d_new_logp = d_ratio * ratio;
-
-        // Compute gradients for continuous actions
-        // log_prob = -0.5 * ((action - mean) / std)^2 - 0.5 * log(2*pi) - log_std
-        // d_log_prob/d_mean = (action - mean) / var
-        // d_log_prob/d_log_std = (action - mean)^2 / var - 1
-        // entropy = 0.5 + 0.5*log(2*pi) + log_std
-        // d_entropy/d_log_std = 1
-
-        for (int h = 0; h < num_atns; ++h) {
-            float mean = to_float(logits[logits_base + h * logits_stride_a]);
-            float log_std = to_float(logstd[logits_base + h * logits_stride_a]);
-            float std = __expf(log_std);
-            float var = std * std;
-            float action = float(actions[nt * num_atns + h]);
-
-            float diff = action - mean;
-
-            // Gradient wrt mean: d_log_prob/d_mean = (action - mean) / var
-            float d_mean = d_new_logp * diff / var;
-            grad_logits[grad_logits_base + h] = d_mean;
-
-            // Gradient wrt log_std:
-            // d_log_prob/d_log_std = (action - mean)^2 / var - 1
-            // d_entropy/d_log_std = 1
-            // Total: d_new_logp * ((diff^2/var) - 1) + d_entropy_term * 1
-            float d_log_std = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
-            grad_logstd[grad_logits_base + h] = d_log_std;
-        }
-    } else {
-        // Discrete: original implementation
-        // First pass: compute per-head logsumexp and entropy, accumulate total log prob
-        // Store per-head values for gradient computation (use register arrays)
-        float head_logsumexp[MAX_ATN_HEADS];
-        float head_entropy[MAX_ATN_HEADS];
-        int head_act[MAX_ATN_HEADS];
-
-        int logits_offset = 0;
-        float total_log_prob = 0.0f;
-
-        for (int h = 0; h < num_atns; ++h) {
-            int A = act_sizes[h];
-            int act = static_cast<int>(actions[nt * num_atns + h]);
-            head_act[h] = act;
-            float lse, ent, lp;
-            ppo_discrete_head(logits, logits_base, logits_stride_a, logits_offset, A, act, &lse, &ent, &lp);
-            head_logsumexp[h] = lse;
-            head_entropy[h] = ent;
-            total_log_prob += lp;
-            logits_offset += A;
-        }
-
-        // Compute ratio and policy gradient
-        float new_logp = total_log_prob;
-        float ratio = __expf(new_logp - old_logp);
-
-        // Policy loss gradient
-        float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
-        float pg_loss1 = -w * adv_normalized * ratio;
-        float pg_loss2 = -w * adv_normalized * ratio_clipped;
-
-        float d_ratio = -w * adv_normalized * d_pg_loss;
-        if (pg_loss2 > pg_loss1) {
-            if (ratio <= (1.0f - clip_coef) || ratio >= (1.0f + clip_coef)) {
-                d_ratio = 0.0f;
-            }
-        }
-        // d_new_logp flows to each head's log prob equally since total = sum of head log probs
-        float d_new_logp = d_ratio * ratio;
-
-        // Second pass: compute gradients per head
-        logits_offset = 0;
-        for (int h = 0; h < num_atns; ++h) {
-            int A = act_sizes[h];
-            int act = head_act[h];
-            float logsumexp = head_logsumexp[h];
-            float ent = head_entropy[h];
-
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-                float logp = l - logsumexp;
-                float p = __expf(logp);
-
-                // Policy gradient: d/dlogits[a] of head_logp = delta(a,act) - p
-                float d_logit = (a == act) ? d_new_logp : 0.0f;
-                d_logit -= p * d_new_logp;
-
-                // Entropy gradient: d/dlogits[a] of head_entropy = p * (-entropy - logp)
-                // Each head's entropy contributes independently to total entropy
-                d_logit += d_entropy_term * p * (-ent - logp);
-
-                grad_logits[grad_logits_base + logits_offset + a] = d_logit;
-            }
-
-            logits_offset += A;
-        }
+    // Fold add_scalar: increment epoch count
+    if (tid == 0) {
+        losses_acc[LOSS_N] += 1.0f;
     }
 }
 
@@ -979,22 +868,27 @@ __global__ void ppo_loss_backward_kernel_optimized(
 // Output: actions (B, num_atns) as float64, logprobs (B,), value_out (B,)
 // NOTE: offset is read from a pointer (not passed by value) so it works correctly with CUDA graphs.
 __global__ void sample_logits_kernel(
-    double* __restrict__ actions,         // (B, num_atns) output - sampled actions as float64
-    precision_t* __restrict__ logprobs,             // (B,) output - sum of log probs across action dims
-    precision_t* __restrict__ value_out,            // (B,) output - copied value (flattened)
-    const precision_t* __restrict__ logits,         // (B, num_atns or sum(act_sizes)) input - mean for continuous, logits for discrete
-    const precision_t* __restrict__ logstd,         // (B, num_atns) input - log std for continuous, nullptr for discrete
-    const precision_t* __restrict__ value,          // (B, 1) input - value from fused output (may be non-contiguous)
-    const int* __restrict__ act_sizes,    // (num_atns,) input - size of each action head
-    uint64_t seed,                        // RNG seed
-    const int64_t* __restrict__ offset_ptr, // RNG offset pointer (read at execution time for CUDA graph support)
-    int num_atns,                         // number of action heads/dimensions
-    int B,                                // batch size
-    int logits_stride,                    // stride between rows (for non-contiguous logits from fused output)
-    int logstd_stride,                    // stride between rows for logstd (may be 0 for broadcast)
-    int value_stride,                     // stride between rows (for non-contiguous value from fused output)
-    bool is_continuous                    // true for continuous actions, false for discrete
+    PufTensor dec_out,                    // (B, fused_cols) fused logits+value from decoder
+    PufTensor logstd_puf,                 // (1, od) log std for continuous, or empty
+    PufTensor act_sizes_puf,              // (num_atns,) action head sizes
+    double* __restrict__ actions,         // (B, num_atns) output
+    precision_t* __restrict__ logprobs,   // (B,) output
+    precision_t* __restrict__ value_out,  // (B,) output
+    uint64_t seed,
+    const int64_t* __restrict__ offset_ptr
 ) {
+    int B = dec_out.shape[0];
+    int fused_cols = dec_out.shape[1];
+    int num_atns = act_sizes_puf.numel();
+    const int* act_sizes = (const int*)act_sizes_puf.bytes;
+    const precision_t* logits = (const precision_t*)dec_out.bytes;
+    int logits_stride = fused_cols;
+    int value_stride = fused_cols;
+    bool is_continuous = logstd_puf.bytes != nullptr && logstd_puf.numel() > 0;
+    const precision_t* logstd = (const precision_t*)logstd_puf.bytes;
+    int logstd_stride = is_continuous ? 0 : 0;  // 1D broadcast: stride 0
+    const precision_t* value = logits + (fused_cols - 1);  // last column
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B) return;
 
@@ -1256,36 +1150,38 @@ __device__ __forceinline__ void copy_values_adv_returns(
 }
 
 __global__ void select_copy_kernel(
+    RolloutBuf rollouts, TrainGraph graph,
     const int64_t* __restrict__ idx,
-    const char* __restrict__ src_obs, char* __restrict__ dst_obs, int obs_row_bytes,
-    const char* __restrict__ src_actions, char* __restrict__ dst_actions, int actions_row_bytes,
-    const char* __restrict__ src_logprobs, char* __restrict__ dst_logprobs, int logprobs_row_bytes,
-    const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
-    const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
-    precision_t* __restrict__ dst_returns, int horizon,
-    const float* __restrict__ src_prio, precision_t* __restrict__ dst_prio
+    const float* __restrict__ advantages, const float* __restrict__ mb_prio
 ) {
     int mb = blockIdx.x;
     int ch = blockIdx.y;
     int src_row = (int)idx[mb];
 
+    // Compute row byte counts from tensor shapes
+    int obs_row_bytes = (rollouts.observations.numel() / rollouts.observations.shape[0]) * rollouts.observations.dtype_size;
+    int act_row_bytes = (rollouts.actions.numel() / rollouts.actions.shape[0]) * rollouts.actions.dtype_size;
+    int lp_row_bytes = (rollouts.logprobs.numel() / rollouts.logprobs.shape[0]) * rollouts.logprobs.dtype_size;
+    int horizon = rollouts.values.shape[1];
+
     switch (ch) {
     case 0:
-        copy_bytes(src_obs, dst_obs, src_row, mb, obs_row_bytes);
+        copy_bytes((const char*)rollouts.observations.bytes, graph.mb_obs.bytes, src_row, mb, obs_row_bytes);
         break;
     case 1:
-        copy_bytes(src_actions, dst_actions, src_row, mb, actions_row_bytes);
+        copy_bytes((const char*)rollouts.actions.bytes, graph.mb_actions.bytes, src_row, mb, act_row_bytes);
         break;
     case 2:
-        copy_bytes(src_logprobs, dst_logprobs, src_row, mb, logprobs_row_bytes);
+        copy_bytes((const char*)rollouts.logprobs.bytes, graph.mb_logprobs.bytes, src_row, mb, lp_row_bytes);
         break;
     case 3:
-        copy_values_adv_returns(src_values, dst_values, src_advantages,
-                dst_advantages, dst_returns, src_row, mb, horizon);
+        copy_values_adv_returns((const precision_t*)rollouts.values.bytes, (precision_t*)graph.mb_values.bytes,
+                advantages, (float*)graph.mb_advantages.bytes,
+                (precision_t*)graph.mb_returns.bytes, src_row, mb, horizon);
         break;
     case 4:
         if (threadIdx.x == 0) {
-            dst_prio[mb] = from_float(src_prio[mb]);
+            ((precision_t*)graph.mb_prio.bytes)[mb] = from_float(mb_prio[mb]);
             break;
         }
     }
@@ -1591,6 +1487,16 @@ __global__ void axpy_f32_kernel(float* __restrict__ dst, const float* __restrict
     if (idx < n) dst[idx] += alpha * src[idx];
 }
 
+// Fused Nesterov momentum: mb = mu*mb + gc; gc = gc + mu*mb
+__global__ void nesterov_f32_kernel(float* __restrict__ mb, float* __restrict__ gc, float mu, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float m = mu * mb[idx] + gc[idx];
+        mb[idx] = m;
+        gc[idx] += mu * m;
+    }
+}
+
 __global__ void scale_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ alpha_ptr, int n) {
     float alpha = *alpha_ptr;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1607,6 +1513,17 @@ __global__ void compute_lr_scalars_kernel(const float* __restrict__ lr, float wd
                                            float* __restrict__ neg_lr, float* __restrict__ wd_scale) {
     *neg_lr = -(*lr);
     *wd_scale = 1.0f - (*lr) * wd;
+}
+
+// Fused weight update: wb = wb * (1 - lr*wd) - lr * up
+__global__ void muon_weight_update_kernel(float* __restrict__ wb, const float* __restrict__ up,
+                                           const float* __restrict__ lr_ptr, float wd, int n) {
+    float lr = *lr_ptr;
+    float wd_scale = 1.0f - lr * wd;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        wb[idx] = wb[idx] * wd_scale - lr * up[idx];
+    }
 }
 
 __global__ void add_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {

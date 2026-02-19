@@ -56,23 +56,13 @@ struct RawCudaGraph {
 // For a 3D (H, S, F) tensor: returns a view of shape (count, F) at row t*S + start.
 // For a 2D (H, S) tensor: returns a view of shape (count,) at offset t*S + start.
 inline PufTensor puf_slice(PufTensor& p, int t, int start, int count) {
-    PufTensor s;
-    s.dtype_size = p.dtype_size;
-    if (p.ndim == 3) {
+    if (p.ndim() == 3) {
         int64_t S = p.shape[1], F = p.shape[2];
-        s.bytes = p.bytes + (t * S + start) * F * p.dtype_size;
-        s.shape[0] = count;
-        s.shape[1] = F;
-        for (int i = 2; i < PUF_MAX_DIMS; i++) s.shape[i] = 0;
-        s.ndim = 2;
+        return {.bytes = p.bytes + (t * S + start) * F * p.dtype_size, .shape = {count, F}, .dtype_size = p.dtype_size};
     } else {
         int64_t S = p.shape[1];
-        s.bytes = p.bytes + (t * S + start) * p.dtype_size;
-        s.shape[0] = count;
-        for (int i = 1; i < PUF_MAX_DIMS; i++) s.shape[i] = 0;
-        s.ndim = 1;
+        return {.bytes = p.bytes + (t * S + start) * p.dtype_size, .shape = {count}, .dtype_size = p.dtype_size};
     }
-    return s;
 }
 
 int obs_dtype_size(int dtype) {
@@ -103,80 +93,16 @@ StaticVec* create_environments(int num_buffers, int total_agents,
     int num_atns = get_num_atns();
     int obs_type = get_obs_type();
 
-    auto mk = [](void* ptr, std::initializer_list<int64_t> dims, int dsz) {
-        PufTensor p;
-        p.bytes = (char*)ptr;
-        p.dtype_size = dsz;
-        p.ndim = dims.size();
-        int i = 0;
-        for (auto d : dims) {
-            p.shape[i++] = d;
-        }
-        for (; i < PUF_MAX_DIMS; i++) {
-            p.shape[i] = 0;
-        }
-        return p;
-    };
-    env.obs = mk(vec->gpu_observations, {total_agents, obs_size}, obs_dtype_size(obs_type));
+    env.obs = {.bytes = (char*)vec->gpu_observations, .shape = {total_agents, obs_size}, .dtype_size = obs_dtype_size(obs_type)};
     env.obs_raw_dtype = obs_type;
-    env.actions = mk(vec->gpu_actions, {total_agents, num_atns}, sizeof(double));
-    env.rewards = mk(vec->gpu_rewards, {total_agents}, sizeof(float));
-    env.terminals = mk(vec->gpu_terminals, {total_agents}, sizeof(float));
+    env.actions = {.bytes = (char*)vec->gpu_actions, .shape = {total_agents, num_atns}, .dtype_size = (int)sizeof(double)};
+    env.rewards = {.bytes = (char*)vec->gpu_rewards, .shape = {total_agents}, .dtype_size = (int)sizeof(float)};
+    env.terminals = {.bytes = (char*)vec->gpu_terminals, .shape = {total_agents}, .dtype_size = (int)sizeof(float)};
 
     return vec;
 }
 
-struct TrainGraph {
-    PufTensor mb_obs;         // (S, H, input_size) PRECISION
-    PufTensor mb_state;       // (L, S, 1, hidden) PRECISION
-    PufTensor mb_actions;     // (S, H, num_atns) f64
-    PufTensor mb_logprobs;    // (S, H) PRECISION
-    PufTensor mb_advantages;  // (S, H) f32
-    PufTensor mb_prio;        // (S, 1) PRECISION
-    PufTensor mb_values;      // (S, H) PRECISION
-    PufTensor mb_returns;     // (S, H) PRECISION
-    PufTensor mb_ratio;       // (S, H) PRECISION
-    PufTensor mb_newvalue;    // (S, H, 1) PRECISION
-
-    void register_buffers(Allocator& alloc, int S, int H, int input_size,
-            int hidden_size, int num_atns, int num_layers) {
-        int psz = PRECISION_SIZE;
-        alloc.register_puf(&mb_obs, {S, H, input_size}, psz);
-        alloc.register_puf(&mb_state, {num_layers, S, 1, hidden_size}, psz);
-        alloc.register_puf(&mb_actions, {S, H, num_atns}, sizeof(double));
-        alloc.register_puf(&mb_logprobs, {S, H}, psz);
-        alloc.register_puf(&mb_advantages, {S, H}, sizeof(float));
-        alloc.register_puf(&mb_prio, {S, 1}, psz);
-        alloc.register_puf(&mb_values, {S, H}, psz);
-        alloc.register_puf(&mb_returns, {S, H}, psz);
-        alloc.register_puf(&mb_ratio, {S, H}, psz);
-        alloc.register_puf(&mb_newvalue, {S, H, 1}, psz);
-    }
-};
-
-struct RolloutBuf {
-    PufTensor observations;  // (horizon, segments, input_size) PRECISION
-    PufTensor actions;       // (horizon, segments, num_atns) f64
-    PufTensor values;        // (horizon, segments) PRECISION
-    PufTensor logprobs;      // (horizon, segments) PRECISION
-    PufTensor rewards;       // (horizon, segments) PRECISION
-    PufTensor terminals;     // (horizon, segments) PRECISION
-    PufTensor ratio;         // (horizon, segments) PRECISION
-    PufTensor importance;    // (horizon, segments) PRECISION
-
-    // Rename these. H, S
-    void register_buffers(Allocator& alloc, int dim0, int dim1, int input_size, int num_atns) {
-        int psz = PRECISION_SIZE;
-        alloc.register_puf(&observations, {dim0, dim1, input_size}, psz);
-        alloc.register_puf(&actions, {dim0, dim1, num_atns}, sizeof(double));
-        alloc.register_puf(&values, {dim0, dim1}, psz);
-        alloc.register_puf(&logprobs, {dim0, dim1}, psz);
-        alloc.register_puf(&rewards, {dim0, dim1}, psz);
-        alloc.register_puf(&terminals, {dim0, dim1}, psz);
-        alloc.register_puf(&ratio, {dim0, dim1}, psz);
-        alloc.register_puf(&importance, {dim0, dim1}, psz);
-    }
-};
+// RolloutBuf and TrainGraph defined in models.cu
 
 typedef struct {
     // Layout
@@ -356,30 +282,30 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Copy env data to rollout buffer (contiguous slices → cudaMemcpyAsync)
     PufTensor& obs_env = env.obs;
-    PufTensor obs_src;
-    obs_src.bytes = obs_env.bytes + (int64_t)start * obs_env.shape[1] * obs_env.dtype_size;
-    obs_src.shape[0] = block_size;
-    obs_src.shape[1] = obs_env.shape[1];
-    obs_src.ndim = 2;
-    obs_src.dtype_size = obs_env.dtype_size;
+    PufTensor obs_src = {
+        .bytes = obs_env.bytes + (int64_t)start * obs_env.shape[1] * obs_env.dtype_size,
+        .shape = {block_size, obs_env.shape[1]},
+        .dtype_size = obs_env.dtype_size
+    };
 
     PufTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     // Cast env obs (uint8/f32/etc) directly into rollout buffer (precision_t)
     if (obs_env.dtype_size == sizeof(char)) {
-        puf_cast_u8_to_precision(obs_dst, obs_src, stream);
+        cast_u8_to_precision_kernel<<<grid_size(obs_src.numel()), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)obs_dst.bytes, (const unsigned char*)obs_src.bytes, obs_src.numel());
     } else if (obs_env.dtype_size == sizeof(float)) {
-        puf_cast_f32_to_precision(obs_dst, obs_src, stream);
+        puf_cast_f32_to_bf16(obs_dst, obs_src, stream);
     } else {
         assert(false && "Unsupported obs dtype: only uint8 and float32 are supported");
     }
 
     // Rewards/terminals: env is f32, rollout is precision_t — cast via PufTensor
     PufTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
-    PufTensor rew_src;
-    rew_src.bytes = env.rewards.bytes + start * sizeof(float);
-    rew_src.shape[0] = block_size;
-    rew_src.ndim = 1;
-    rew_src.dtype_size = sizeof(float);
+    PufTensor rew_src = {
+        .bytes = env.rewards.bytes + start * (int)sizeof(float),
+        .shape = {block_size},
+        .dtype_size = (int)sizeof(float)
+    };
 
     if (USE_BF16) {
         puf_cast_f32_to_bf16(rew_dst, rew_src, stream);
@@ -388,11 +314,11 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     }
 
     PufTensor term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    PufTensor term_src;
-    term_src.bytes = env.terminals.bytes + start * sizeof(float);
-    term_src.shape[0] = block_size;
-    term_src.ndim = 1;
-    term_src.dtype_size = sizeof(float);
+    PufTensor term_src = {
+        .bytes = env.terminals.bytes + start * (int)sizeof(float),
+        .shape = {block_size},
+        .dtype_size = (int)sizeof(float)
+    };
     if (USE_BF16) {
         puf_cast_f32_to_bf16(term_dst, term_src, stream);
     } else {
@@ -408,36 +334,18 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PufTensor lp_slice = puf_slice(rollouts.logprobs, t, start, block_size);
     PufTensor val_slice = puf_slice(rollouts.values, t, start, block_size);
 
-    int od = pufferl->policy_bf16->decoder.output_dim;
-    // dec_puf is (B, od+1): first od cols = logits, last col = value
-    int fused_cols = od + 1;
-    PufTensor p_logits;
-    p_logits.bytes = dec_puf.bytes;
-    p_logits.shape[0] = block_size;
-    p_logits.shape[1] = od;
-    p_logits.ndim = 2;
-    p_logits.dtype_size = PRECISION_SIZE;
-
-    PufTensor p_value;
-    p_value.bytes = dec_puf.bytes + od * PRECISION_SIZE;
-    p_value.shape[0] = block_size;
-    p_value.shape[1] = 1;
-    p_value.ndim = 2;
-    p_value.dtype_size = PRECISION_SIZE;
-
     PufTensor p_logstd;
     if (pufferl->policy_bf16->decoder.continuous) {
         p_logstd = pufferl->policy_bf16->decoder.logstd;
     }
 
-    PufTensor p_act_sizes = pufferl->act_sizes_puf;
-    // logstd is 1D (od,) broadcast across batch → stride 0
     // Each buffer uses its own RNG seed and offset slot for deterministic parallel rollouts
     int64_t* buf_rng_offset = (int64_t*)pufferl->rng_offset_puf.bytes + buf;
     uint64_t buf_rng_seed = pufferl->rng_seed + buf;
-    sample_logits(p_logits, p_logstd, p_value, act_slice, lp_slice, val_slice,
-        p_act_sizes, buf_rng_seed, buf_rng_offset,
-        fused_cols, 0, fused_cols, stream);
+    sample_logits_kernel<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+        dec_puf, p_logstd, pufferl->act_sizes_puf,
+        (double*)act_slice.bytes, (precision_t*)lp_slice.bytes, (precision_t*)val_slice.bytes,
+        buf_rng_seed, buf_rng_offset);
 
     // Copy actions to env
     int64_t act_cols = env.actions.shape[1];
@@ -491,9 +399,11 @@ void train_impl(PuffeRL& pufferl) {
     puf_transpose_01(rollouts.ratio, src.ratio, train_stream);
     puf_transpose_01(rollouts.values, src.values, train_stream);
 
-    // Clamp rewards and fill ratio with PufTensor ops
-    puf_clamp(rollouts.rewards, -1.0f, 1.0f, train_stream);
-    puf_fill(rollouts.ratio, 1.0f, train_stream);
+    // Clamp rewards and fill ratio
+    clamp_bf16_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
+        (__nv_bfloat16*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
+    fill_bf16_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
+        (__nv_bfloat16*)rollouts.ratio.bytes, __float2bfloat16(1.0f), rollouts.ratio.numel());
 
     // old_values = values.clone() via pre-allocated PufTensor
     PufTensor& old_values_puf = pufferl.old_values_puf;
@@ -548,12 +458,16 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        train_select_and_copy_cuda(rollouts.observations, rollouts.actions,
-            rollouts.logprobs, old_values_puf, advantages_puf,
-            pufferl.prio_bufs.idx, pufferl.prio_bufs.mb_prio,
-            graph.mb_obs, graph.mb_state, graph.mb_actions,
-            graph.mb_logprobs, graph.mb_advantages, graph.mb_prio,
-            graph.mb_values, graph.mb_returns, train_stream);
+        puf_zero(graph.mb_state, train_stream);
+        {
+            // Build a RolloutBuf view with old_values and advantages swapped in
+            RolloutBuf sel_src = rollouts;
+            sel_src.values = old_values_puf;
+            int mb_segs = pufferl.prio_bufs.idx.shape[0];
+            select_copy_kernel<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
+                sel_src, graph, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                (const float*)advantages_puf.bytes, (const float*)pufferl.prio_bufs.mb_prio.bytes);
+        }
         profile_end(hypers.profile);
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
@@ -574,69 +488,34 @@ void train_impl(PuffeRL& pufferl) {
             int od = pufferl.policy_bf16->decoder.output_dim;
             int fused_cols = od + 1;
 
-            PufTensor grad_logits_puf, grad_logstd_puf, grad_values_puf;
-
-            // Split fused decoder output into logits (B, od) and value (B, 1) PufTensors
-            {
-                PufTensor p_logits;
-                p_logits.bytes = dec_puf.bytes;
-                p_logits.shape[0] = graph.mb_obs.shape[0];
-                p_logits.shape[1] = graph.mb_obs.shape[1];
-                p_logits.shape[2] = od;
-                p_logits.ndim = 3;
-                p_logits.dtype_size = PRECISION_SIZE;
-
-                PufTensor p_value;
-                p_value.bytes = dec_puf.bytes + od * PRECISION_SIZE;
-                p_value.shape[0] = graph.mb_obs.shape[0];
-                p_value.shape[1] = graph.mb_obs.shape[1];
-                p_value.shape[2] = 1;
-                p_value.ndim = 3;
-                p_value.dtype_size = PRECISION_SIZE;
-
-                PufTensor p_logstd;
-                if (pufferl.policy_bf16->decoder.continuous) {
-                    p_logstd = pufferl.policy_bf16->decoder.logstd;
-                }
-
-                PufTensor p_act_sizes = pufferl.act_sizes_puf;
-
-                // Strides for the fused (N, T, od+1) layout
-                int N = graph.mb_obs.shape[0], T = graph.mb_obs.shape[1];
-                int logits_stride_n = T * fused_cols;
-                int logits_stride_t = fused_cols;
-                int logits_stride_a = 1;
-                int values_stride_n = T * fused_cols;
-                int values_stride_t = fused_cols;
-
-                // PufTensor views for newvalue_out shaped as (N, T) for ratio scatter
-                PufTensor p_newvalue_out;
-                p_newvalue_out.bytes = graph.mb_newvalue.bytes;
-                p_newvalue_out.shape[0] = N;
-                p_newvalue_out.shape[1] = T;
-                p_newvalue_out.ndim = 2;
-                p_newvalue_out.dtype_size = PRECISION_SIZE;
-
-                ppo_loss_fwd_bwd(
-                    p_logits, p_logstd, p_value,
-                    graph.mb_actions, graph.mb_logprobs, graph.mb_advantages,
-                    graph.mb_prio, graph.mb_values, graph.mb_returns,
-                    graph.mb_ratio, p_newvalue_out,
-                    p_act_sizes, pufferl.losses_puf,
-                    hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
-                    pufferl.ppo_bufs_puf, pufferl.is_continuous,
-                    logits_stride_n, logits_stride_t, logits_stride_a,
-                    values_stride_n, values_stride_t, stream);
-
-                grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
-                grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : PufTensor();
-                grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
+            PufTensor p_logstd;
+            if (pufferl.policy_bf16->decoder.continuous) {
+                p_logstd = pufferl.policy_bf16->decoder.logstd;
             }
+
+            ppo_loss_fwd_bwd(dec_puf, p_logstd, graph,
+                pufferl.act_sizes_puf, pufferl.losses_puf,
+                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
+                pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
+
+            PufTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
+            PufTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : PufTensor();
+            PufTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
             pufferl.policy_bf16->backward(
                 grad_logits_puf, grad_logstd_puf, grad_values_puf,
                 pufferl.policy_bf16->act, pufferl.policy_fp32, stream);
 
-            clip_grad_norm_(pufferl.grad_buffer_puf, hypers.max_grad_norm, (float*)pufferl.grad_norm_puf.bytes, stream);
+            // clip grad norm
+            {
+                PufTensor& grad = pufferl.grad_buffer_puf;
+                float* scratch = (float*)pufferl.grad_norm_puf.bytes;
+                ensure_norm_partials();
+                int blocks = std::min((int)grid_size(grad.numel()), 256);
+                norm_f32_kernel<<<blocks, 256, 0, stream>>>(norm_partials_buf, (float*)grad.bytes, grad.numel());
+                norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, norm_partials_buf, blocks);
+                clip_by_norm_f32_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
+            }
             pufferl.muon->step(stream);
             pufferl.muon->zero_grad(stream);
             if (USE_BF16) {
@@ -654,15 +533,22 @@ void train_impl(PuffeRL& pufferl) {
         }
 
         // mb_ratio is (S, H) precision — scatter into rollouts.ratio (S_total, H)
-        puf_index_copy(rollouts.ratio, pufferl.prio_bufs.idx, graph.mb_ratio, train_stream);
+        {
+            int num_idx = pufferl.prio_bufs.idx.numel();
+            int row_bytes = graph.mb_ratio.numel() / graph.mb_ratio.shape[0] * graph.mb_ratio.dtype_size;
+            index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
+                rollouts.ratio.bytes, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                (const char*)graph.mb_ratio.bytes, num_idx, row_bytes);
+        }
         // mb_newvalue is (S, H, 1) — treat as (S, H) for scatter into rollouts.values
-        PufTensor nv_2d;
-        nv_2d.bytes = graph.mb_newvalue.bytes;
-        nv_2d.shape[0] = graph.mb_newvalue.shape[0];
-        nv_2d.shape[1] = graph.mb_newvalue.shape[1];
-        nv_2d.ndim = 2;
-        nv_2d.dtype_size = graph.mb_newvalue.dtype_size;
-        puf_index_copy(rollouts.values, pufferl.prio_bufs.idx, nv_2d, train_stream);
+        {
+            int num_idx = pufferl.prio_bufs.idx.numel();
+            int S = graph.mb_newvalue.shape[0], H = graph.mb_newvalue.shape[1];
+            int row_bytes = H * graph.mb_newvalue.dtype_size;
+            index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
+                rollouts.values.bytes, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                (const char*)graph.mb_newvalue.bytes, num_idx, row_bytes);
+        }
         cudaEventRecord(pufferl.profile.events[4]);  // end forward
     }
     pufferl.epoch += 1;
@@ -786,19 +672,8 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
         policy_fp32->register_activations(pufferl->alloc_fp32, minibatch_segments, hypers.horizon);
     }
     pufferl->alloc_fp32.create(sizeof(float));
-    auto mk_1d = [](void* data, int64_t n, int dsz) {
-        PufTensor p;
-        p.bytes = (char*)data;
-        p.shape[0] = n;
-        p.ndim = 1;
-        p.dtype_size = dsz;
-        for (int i = 1; i < PUF_MAX_DIMS; i++) {
-            p.shape[i] = 0;
-        }
-        return p;
-    };
-    pufferl->grad_buffer_puf = mk_1d(pufferl->alloc_fp32.grad_mem, pufferl->alloc_fp32.total_grad_elems, sizeof(float));
-    pufferl->param_fp32_puf = mk_1d(pufferl->alloc_fp32.param_mem, pufferl->alloc_fp32.total_param_elems, sizeof(float));
+    pufferl->grad_buffer_puf = {.bytes = (char*)pufferl->alloc_fp32.grad_mem, .shape = {pufferl->alloc_fp32.total_grad_elems}, .dtype_size = (int)sizeof(float)};
+    pufferl->param_fp32_puf = {.bytes = (char*)pufferl->alloc_fp32.param_mem, .shape = {pufferl->alloc_fp32.total_param_elems}, .dtype_size = (int)sizeof(float)};
     policy_fp32->init_weights(pufferl->default_stream);
     pufferl->policy_fp32 = policy_fp32;
 
@@ -808,7 +683,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
             input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
         policy_bf16->register_activations(pufferl->alloc_bf16, minibatch_segments, hypers.horizon);
         pufferl->alloc_bf16.create(2);
-        pufferl->param_bf16_puf = mk_1d(pufferl->alloc_bf16.param_mem, pufferl->alloc_bf16.total_param_elems, 2);
+        pufferl->param_bf16_puf = {.bytes = (char*)pufferl->alloc_bf16.param_mem, .shape = {pufferl->alloc_bf16.total_param_elems}, .dtype_size = 2};
         pufferl->policy_bf16 = policy_bf16;
         // Initial sync: fp32 → bf16
         puf_cast_f32_to_bf16(pufferl->param_bf16_puf, pufferl->param_fp32_puf,
