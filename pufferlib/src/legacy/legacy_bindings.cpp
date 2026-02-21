@@ -19,7 +19,6 @@ typedef torch::Tensor Tensor;
 
 
 namespace py = pybind11;
-using namespace pufferlib;
 
 PYBIND11_MODULE(_torch_ref, m) {
     m.doc() = "Torch reference implementations for numerical testing";

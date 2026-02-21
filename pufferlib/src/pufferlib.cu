@@ -18,12 +18,6 @@
 #include "models.cu"
 #include "vecenv.h"
 
-namespace pufferlib {
-Policy* create_policy(const std::string& env_name, AllocSet& alloc,
-        int input_size, int hidden_size,
-        int decoder_output_size, int num_layers, int act_n, bool is_continuous, bool kernels) {
-    return new Policy(alloc, input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous);
-}
 
 // Minimal CUDA graph wrapper using raw APIs (no torch dependency)
 struct RawCudaGraph {
@@ -188,7 +182,7 @@ typedef struct {
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     vector<PufTensor> buffer_states;  // Per-buffer states for contiguous access
-    vector<PolicyActivations> buffer_acts;  // Per-buffer inference activations
+    vector<PolicyRolloutBuffer> buffer_acts;  // Per-buffer inference activations
     vector<Allocator> buffer_allocs;        // Per-buffer allocators for inference buffers
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
@@ -204,9 +198,9 @@ typedef struct {
     PufTensor losses_puf;      // (NUM_LOSSES,) f32 accumulator
     PPOBuffersPuf ppo_bufs_puf; // Pre-allocated buffers for PufTensor ppo_loss_fwd_bwd (kernels path)
     PrioBuffers prio_bufs;      // Pre-allocated buffers for PufTensor prio_replay (kernels path)
-    PufTensor grad_buffer_puf;   // cached PufTensor view of alloc_fp32.grad_buffer
     PufTensor param_fp32_puf;    // cached PufTensor view of alloc_fp32.param_buffer
     PufTensor param_bf16_puf;    // cached PufTensor view of alloc_bf16.param_buffer
+    PufTensor grad_bf16_puf;     // cached PufTensor view of alloc_bf16.grads (contiguous bf16 weight grads)
     PufTensor grad_norm_puf;     // (1,) f32 scratch for clip_grad_norm
     PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
@@ -327,7 +321,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Forward pass — obs_dst already contains the cast obs in precision_t
     PufTensor state_puf = pufferl->buffer_states[buf];
-    PufTensor dec_puf = pufferl->policy_bf16->forward(obs_dst, state_puf, pufferl->buffer_acts[buf], stream);
+    PufTensor dec_puf = policy_forward(pufferl->policy_bf16, obs_dst, state_puf, pufferl->buffer_acts[buf], stream);
 
     // Sample actions, logprobs, values into rollout buffer
     PufTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
@@ -351,7 +345,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     int64_t act_cols = env.actions.shape[1];
     cudaMemcpyAsync(
         env.actions.bytes + start * act_cols * env.actions.dtype_size,
-        act_slice.bytes, act_slice.nbytes(), cudaMemcpyDeviceToDevice, stream);
+        act_slice.bytes, act_slice.numel() * act_slice.dtype_size, cudaMemcpyDeviceToDevice, stream);
 
     if (capturing) {
         pufferl->fused_rollout_cudagraphs[t][buf].capture_end(cap_stream_raw);
@@ -484,7 +478,7 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = cap_stream_raw;
             PufTensor obs_puf = graph.mb_obs;
             PufTensor state_puf = graph.mb_state;
-            PufTensor dec_puf = pufferl.policy_bf16->forward_train(obs_puf, state_puf, pufferl.policy_bf16->act, stream);
+            PufTensor dec_puf = policy_forward_train(pufferl.policy_bf16, obs_puf, state_puf, pufferl.policy_bf16->train, stream);
             int od = pufferl.policy_bf16->decoder.output_dim;
             int fused_cols = od + 1;
 
@@ -501,13 +495,16 @@ void train_impl(PuffeRL& pufferl) {
             PufTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
             PufTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : PufTensor();
             PufTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
-            pufferl.policy_bf16->backward(
+            policy_backward(pufferl.policy_bf16,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf,
-                pufferl.policy_bf16->act, pufferl.policy_fp32, stream);
+                pufferl.policy_bf16->train, stream);
 
-            // clip grad norm
+            // cast contiguous bf16 grads → f32 into muon gc_puf, then clip grad norm
+            cast_bf16_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+                (float*)pufferl.muon->gc_puf.bytes, (const __nv_bfloat16*)pufferl.grad_bf16_puf.bytes,
+                pufferl.grad_bf16_puf.numel());
             {
-                PufTensor& grad = pufferl.grad_buffer_puf;
+                PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;
                 ensure_norm_partials();
                 int blocks = std::min((int)grid_size(grad.numel()), 256);
@@ -516,8 +513,7 @@ void train_impl(PuffeRL& pufferl) {
                 clip_by_norm_f32_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
                     (float*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
             }
-            pufferl.muon->step(stream);
-            pufferl.muon->zero_grad(stream);
+            muon_step(pufferl.muon, stream);
             if (USE_BF16) {
                 puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, stream);
             }
@@ -570,9 +566,9 @@ void train_impl(PuffeRL& pufferl) {
 
 }
 
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
+std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs) {
-    auto pufferl = std::make_unique<pufferlib::PuffeRL>();
+    auto pufferl = std::make_unique<PuffeRL>();
     pufferl->hypers = hypers;
     pufferl->nccl_comm = nullptr;
 
@@ -617,7 +613,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
         env_name, vec_kwargs, env_kwargs, pufferl->env);
     pufferl->vec = vec;
 
-    int num_action_heads = pufferl->env.actions.size(1);
+    int num_action_heads = pufferl->env.actions.shape[1];
     int* raw_act_sizes = get_act_sizes();  // CPU int32 pointer from env
     int act_n = 0;
     for (int i = 0; i < num_action_heads; i++) {
@@ -664,43 +660,124 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
     int minibatch_segments = hypers.minibatch_size / hypers.horizon;
     int inf_batch = vec->total_agents / hypers.num_buffers;
 
-    // Create fp32 master policy (for optimizer - precise gradient accumulation)
-    pufferl->alloc_fp32.esz = sizeof(float);
-    Policy* policy_fp32 = create_policy(env_name, pufferl->alloc_fp32,
-        input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
-    if (!USE_BF16) {
-        // fp32-only mode: fp32 policy also runs forward/backward, needs activations
-        policy_fp32->register_activations(pufferl->alloc_fp32.acts, minibatch_segments, hypers.horizon);
-    }
+    // ========================================================================
+    // fp32 master weights (for optimizer)
+    // ========================================================================
+
+    int esz_fp32 = sizeof(float);
+    pufferl->alloc_fp32.esz = esz_fp32;
+    Allocator& fp32_params = pufferl->alloc_fp32.params;
+
+    Encoder encoder = {
+        .in_dim = input_size,
+        .out_dim = hidden_size,
+        .forward = linear_encoder_forward,
+        .backward = linear_encoder_backward,
+        .init_weights = linear_encoder_init_weights,
+        .reg_params = linear_encoder_reg_params,
+        .reg_train = linear_encoder_reg_train,
+        .reg_rollout = linear_encoder_reg_rollout,
+    };
+    Decoder decoder = {
+        .hidden_dim = hidden_size,
+        .output_dim = decoder_output_size,
+        .continuous = is_continuous,
+        .forward = linear_decoder_forward,
+        .backward = linear_decoder_backward,
+        .init_weights = linear_decoder_init_weights,
+        .reg_params = linear_decoder_reg_params,
+        .reg_train = linear_decoder_reg_train,
+        .reg_rollout = linear_decoder_reg_rollout,
+    };
+
+    // fp32 master weights
+    Policy* policy_fp32 = (Policy*)calloc(1, sizeof(Policy));
+    policy_fp32->num_atns = act_n;
+    policy_fp32->encoder = encoder;
+    policy_fp32->decoder = decoder;
+    Encoder* enc = &policy_fp32->encoder;
+    Decoder* dec = &policy_fp32->decoder;
+    enc->reg_params(enc, &fp32_params, esz_fp32);
+    dec->reg_params(dec, &fp32_params, esz_fp32);
+    mingru_init(&policy_fp32->rnn, fp32_params, hidden_size, num_layers, esz_fp32);
+
     pufferl->alloc_fp32.create();
-    pufferl->grad_buffer_puf = {.bytes = (char*)pufferl->alloc_fp32.grads.mem, .shape = {pufferl->alloc_fp32.grads.total_elems}, .dtype_size = (int)sizeof(float)};
-    pufferl->param_fp32_puf = {.bytes = (char*)pufferl->alloc_fp32.params.mem, .shape = {pufferl->alloc_fp32.params.total_elems}, .dtype_size = (int)sizeof(float)};
-    policy_fp32->init_weights(pufferl->default_stream);
+    pufferl->param_fp32_puf = {.bytes = (char*)fp32_params.mem, .shape = {fp32_params.total_elems}, .dtype_size = esz_fp32};
     pufferl->policy_fp32 = policy_fp32;
 
+    // Init weights on fp32 master
+    {
+        uint64_t seed = 42;
+        enc->init_weights(enc, &seed, pufferl->default_stream);
+        dec->init_weights(dec, &seed, pufferl->default_stream);
+        mingru_init_weights(&policy_fp32->rnn, seed, pufferl->default_stream);
+    }
+
+    // ========================================================================
+    // bf16 compute policy: working copy for fwd/bwd + activations + grads
+    // ========================================================================
+
+    int B_TT = minibatch_segments * hypers.horizon;
+    int psz = PRECISION_SIZE;
+
     if (USE_BF16) {
-        // create bf16 working policy (for fwd/bwd — no grads needed)
         pufferl->alloc_bf16.esz = 2;
-        Policy* policy_bf16 = create_policy(env_name, pufferl->alloc_bf16,
-            input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous, kernels);
-        policy_bf16->register_activations(pufferl->alloc_bf16.acts, minibatch_segments, hypers.horizon);
+        Allocator& bf16_params = pufferl->alloc_bf16.params;
+        Allocator& acts = pufferl->alloc_bf16.acts;
+        Allocator& grads = pufferl->alloc_bf16.grads;
+
+        Policy* policy_bf16 = (Policy*)calloc(1, sizeof(Policy));
+        policy_bf16->num_atns = act_n;
+        policy_bf16->encoder = encoder;
+        policy_bf16->decoder = decoder;
+        Encoder* enc = &policy_bf16->encoder;
+        Decoder* dec = &policy_bf16->decoder;
+        PolicyTrainBuffer& tb = policy_bf16->train;
+
+        enc->reg_params(enc, &bf16_params, psz);
+        enc->reg_train(enc, &tb.enc, &acts, &grads, B_TT);
+        dec->reg_params(dec, &bf16_params, psz);
+        dec->reg_train(dec, &tb.dec, &acts, &grads, B_TT);
+        mingru_init(&policy_bf16->rnn, bf16_params, hidden_size, num_layers, psz);
+        mingru_register_train(&policy_bf16->rnn, acts, tb.rnn, minibatch_segments, hypers.horizon);
+        tb.rnn.wgrad_scratch.resize(num_layers);
+        for (int i = 0; i < num_layers; i++) {
+            grads.reg(&tb.rnn.wgrad_scratch[i], {3 * hidden_size, hidden_size}, psz);
+        }
+
         pufferl->alloc_bf16.create();
-        pufferl->param_bf16_puf = {.bytes = (char*)pufferl->alloc_bf16.params.mem, .shape = {pufferl->alloc_bf16.params.total_elems}, .dtype_size = 2};
+        pufferl->param_bf16_puf = {.bytes = (char*)bf16_params.mem, .shape = {bf16_params.total_elems}, .dtype_size = 2};
+        pufferl->grad_bf16_puf = {.bytes = (char*)pufferl->alloc_bf16.grads.mem, .shape = {pufferl->alloc_bf16.grads.total_elems}, .dtype_size = 2};
         pufferl->policy_bf16 = policy_bf16;
-        // Initial sync: fp32 → bf16
+
         puf_cast_f32_to_bf16(pufferl->param_bf16_puf, pufferl->param_fp32_puf,
             pufferl->default_stream);
     } else {
         pufferl->policy_bf16 = policy_fp32;
     }
 
-    // Optimizer uses fp32 master weights with contiguous buffers from allocator
+    // ========================================================================
+    // Optimizer (Muon) — operates on fp32 master weights
+    // ========================================================================
+
+    vector<ParamShape> shapes;
+    {
+        auto push = [&](PufTensor& t) {
+            vector<int64_t> s(t.shape, t.shape + t.ndim());
+            shapes.push_back({t.numel(), s});
+        };
+        push(policy_fp32->encoder.weight);
+        push(policy_fp32->decoder.weight);
+        if (is_continuous) push(policy_fp32->decoder.logstd);
+        mingru_append_param_shapes(&policy_fp32->rnn, shapes);
+    }
+
     float lr = hypers.lr;
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
-    pufferl->muon = new Muon(policy_fp32->param_shapes(),
-        pufferl->param_fp32_puf, pufferl->grad_buffer_puf,
-        lr, beta1, eps, 0.0);
+    pufferl->muon = new Muon{};
+    muon_init(pufferl->muon, shapes,
+        pufferl->param_fp32_puf, lr, beta1, eps, 0.0);
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel());
@@ -732,27 +809,27 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
     }
 
     // Rollout buffers (horizon, total_agents, ...)
-    pufferl->rollouts.register_buffers(alloc, horizon, total_agents, input_size, num_action_heads);
+    register_rollout_buffers(pufferl->rollouts, alloc, horizon, total_agents, input_size, num_action_heads);
 
     // Train graph buffers
-    pufferl->train_buf.register_buffers(alloc, minibatch_segments, horizon, input_size,
+    register_train_buffers(pufferl->train_buf, alloc, minibatch_segments, horizon, input_size,
         hidden_size, num_action_heads, num_layers);
 
     // Pre-allocated transposed rollouts for train_impl (total_agents, horizon, ...)
-    pufferl->train_rollouts.register_buffers(alloc, total_agents, horizon, input_size, num_action_heads);
+    register_rollout_buffers(pufferl->train_rollouts, alloc, total_agents, horizon, input_size, num_action_heads);
 
     // Pre-allocated train temporaries
     alloc.reg(&pufferl->old_values_puf, {total_agents, horizon}, PRECISION_SIZE);
     alloc.reg(&pufferl->advantages_puf, {total_agents, horizon}, sizeof(float));
 
     // PPO loss buffers
-    pufferl->ppo_bufs_puf.register_buffers(alloc, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
+    register_ppo_buffers(pufferl->ppo_bufs_puf, alloc, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
 
     // Priority replay buffers
-    pufferl->prio_bufs.register_buffers(alloc, hypers.total_agents, minibatch_segments);
+    register_prio_buffers(pufferl->prio_bufs, alloc, hypers.total_agents, minibatch_segments);
 
     // Muon optimizer buffers
-    pufferl->muon->register_buffers(alloc);
+    muon_register_buffers(pufferl->muon, alloc);
 
     // Single allocation for all registered buffers
     alloc.create();
@@ -761,21 +838,23 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemset(pufferl->rng_offset_puf.bytes, 0, (num_buffers + 1) * sizeof(int64_t));
     cudaMemcpy(pufferl->act_sizes_puf.bytes, raw_act_sizes, num_action_heads * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses_puf.bytes, 0, NUM_LOSSES * sizeof(float));
-    pufferl->ppo_bufs_puf.post_create();
-    pufferl->muon->post_create();
+    post_create_ppo_buffers(pufferl->ppo_bufs_puf);
+    muon_post_create(pufferl->muon);
 
     // Per-buffer inference activations (separate allocators — different lifetime)
-    pufferl->buffer_acts.reserve(num_buffers);
+    pufferl->buffer_acts.resize(num_buffers);
     pufferl->buffer_allocs.resize(num_buffers);
-    for (int i = 0; i < num_buffers; i++) {
-        pufferl->buffer_acts.emplace_back(num_layers);
-    }
     // Register and allocate per-buffer inference activations
     // (must be done after emplace_back so buffer_acts won't move)
     for (int i = 0; i < num_buffers; i++) {
-        pufferl->policy_bf16->register_inference(
-            pufferl->buffer_allocs[i], pufferl->buffer_acts[i], inf_batch);
-        pufferl->buffer_allocs[i].create();
+        Encoder* enc_r = &pufferl->policy_bf16->encoder;
+        Decoder* dec_r = &pufferl->policy_bf16->decoder;
+        PolicyRolloutBuffer& rbuf = pufferl->buffer_acts[i];
+        Allocator& ralloc = pufferl->buffer_allocs[i];
+        enc_r->reg_rollout(enc_r, &rbuf.enc, &ralloc, inf_batch);
+        dec_r->reg_rollout(dec_r, &rbuf.dec, &ralloc, inf_batch);
+        mingru_register_rollout(&pufferl->policy_bf16->rnn, ralloc, rbuf.rnn, inf_batch);
+        ralloc.create();
     }
 
     if (hypers.cudagraphs >= 0) {
@@ -829,7 +908,6 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl_impl(HypersT& hypers,
             puf_cast_f32_to_bf16(pufferl->param_bf16_puf, pufferl->param_fp32_puf,
                 pufferl->default_stream);
         }
-        pufferl->muon->zero_grad(pufferl->default_stream);
 
         pufferl->epoch = 0;
     }
@@ -869,9 +947,9 @@ void close_impl(PuffeRL& pufferl) {
 
     delete pufferl.muon;
     if (USE_BF16) {
-        delete pufferl.policy_bf16;
+        free(pufferl.policy_bf16);
     }
-    delete pufferl.policy_fp32;
+    free(pufferl.policy_fp32);
 
     pufferl.alloc_fp32.destroy();
     pufferl.alloc_bf16.destroy();
@@ -894,5 +972,3 @@ void close_impl(PuffeRL& pufferl) {
         ncclCommDestroy(pufferl.nccl_comm);
     }
 }
-
-} // namespace pufferlib

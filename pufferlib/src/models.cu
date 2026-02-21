@@ -16,6 +16,15 @@
 
 using std::vector;
 
+// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
+#ifdef PRECISION_FLOAT
+constexpr bool USE_BF16 = false;
+constexpr int PRECISION_SIZE = 4;   // bytes per element
+#else
+constexpr bool USE_BF16 = true;
+constexpr int PRECISION_SIZE = 2;   // bytes per element
+#endif
+
 // ============================================================================
 // PufTensor — minimal tensor view (no torch dependency)
 // ============================================================================
@@ -31,18 +40,20 @@ struct PufTensor {
 
     __host__ __device__ int ndim() const {
         int n = 0;
-        while (n < PUF_MAX_DIMS && shape[n] != 0) n++;
+        while (n < PUF_MAX_DIMS && shape[n] != 0) {
+            n++;
+        }
         return n;
     }
 
     __host__ __device__ int64_t numel() const {
         int64_t n = 1;
-        for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) n *= shape[i];
+        for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) {
+            n *= shape[i];
+        }
         return n;
     }
 
-    __host__ __device__ int64_t size(int dim) const { return shape[dim]; }
-    __host__ __device__ int64_t nbytes() const { return numel() * dtype_size; }
 
     const char* dtype_name() const {
         switch (dtype_size) {
@@ -54,18 +65,15 @@ struct PufTensor {
         }
     }
 
-    std::string repr() const {
-        std::string s = "PufTensor(";
-        if (!bytes) return s + "empty)";
-        s += dtype_name();
-        s += ", [";
-        for (int i = 0; i < ndim(); i++) {
-            if (i > 0) s += ", ";
-            s += std::to_string(shape[i]);
+    const char* repr() const {
+        static char buf[256];
+        if (!bytes) { snprintf(buf, sizeof(buf), "PufTensor(empty)"); return buf; }
+        int pos = snprintf(buf, sizeof(buf), "PufTensor(%s, [", dtype_name());
+        for (int i = 0; i < ndim() && pos < (int)sizeof(buf) - 32; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
         }
-        s += "], ";
-        s += std::to_string(numel()) + " elems)";
-        return s;
+        snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)numel());
+        return buf;
     }
 };
 
@@ -145,75 +153,45 @@ struct AllocSet {
 // Pre-allocated buffers for prio_replay
 struct PrioBuffers {
     PufTensor prio_probs, cdf, idx, mb_prio;
-    void register_buffers(Allocator& alloc, int S, int minibatch_segments) {
-        alloc.reg(&prio_probs, {S}, sizeof(float));
-        alloc.reg(&cdf, {S}, sizeof(float));
-        alloc.reg(&idx, {minibatch_segments}, sizeof(int64_t));
-        alloc.reg(&mb_prio, {minibatch_segments, 1}, sizeof(float));
-    }
 };
+
+void register_prio_buffers(PrioBuffers& bufs, Allocator& alloc, int S, int minibatch_segments) {
+    alloc.reg(&bufs.prio_probs, {S}, sizeof(float));
+    alloc.reg(&bufs.cdf, {S}, sizeof(float));
+    alloc.reg(&bufs.idx, {minibatch_segments}, sizeof(int64_t));
+    alloc.reg(&bufs.mb_prio, {minibatch_segments, 1}, sizeof(float));
+}
 
 // Pre-allocated buffers for PPO loss
 struct PPOBuffersPuf {
     PufTensor loss_output, saved_for_bwd, grad_loss;
     PufTensor grad_logits, grad_values, grad_logstd, adv_scratch;
-    void register_buffers(Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
-        int64_t total = (int64_t)N * T;
-        alloc.reg(&loss_output, {1}, sizeof(float));
-        alloc.reg(&saved_for_bwd, {total, 5}, sizeof(double));
-        alloc.reg(&grad_loss, {1}, sizeof(float));
-        alloc.reg(&grad_logits, {N, T, A_total}, sizeof(float));
-        alloc.reg(&grad_values, {N, T, 1}, sizeof(float));
-        if (is_continuous) alloc.reg(&grad_logstd, {N, T, A_total}, sizeof(float));
-        alloc.reg(&adv_scratch, {2}, sizeof(float));
-    }
-    void post_create() {
-        float one = 1.0f;
-        cudaMemcpy(grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
-    }
 };
+
+void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
+    int64_t total = (int64_t)N * T;
+    alloc.reg(&bufs.loss_output, {1}, sizeof(float));
+    alloc.reg(&bufs.saved_for_bwd, {total, 5}, sizeof(double));
+    alloc.reg(&bufs.grad_loss, {1}, sizeof(float));
+    alloc.reg(&bufs.grad_logits, {N, T, A_total}, sizeof(float));
+    alloc.reg(&bufs.grad_values, {N, T, 1}, sizeof(float));
+    if (is_continuous) alloc.reg(&bufs.grad_logstd, {N, T, A_total}, sizeof(float));
+    alloc.reg(&bufs.adv_scratch, {2}, sizeof(float));
+}
+
+void post_create_ppo_buffers(PPOBuffersPuf& bufs) {
+    float one = 1.0f;
+    cudaMemcpy(bufs.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
+}
 
 // ============================================================================
 // Native Policy, Muon optimizer, and supporting structs
 // ============================================================================
 
-namespace pufferlib {
-
-using std::vector;
-
-// Param shape info (used by Muon and Policy)
 struct ParamShape {
     int64_t numel;
     std::vector<int64_t> shape;
 };
-
-// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
-#ifdef PRECISION_FLOAT
-constexpr bool USE_BF16 = false;
-constexpr int PRECISION_SIZE = 4;   // bytes per element
-#else
-constexpr bool USE_BF16 = true;
-constexpr int PRECISION_SIZE = 2;   // bytes per element
-#endif
-
-// Activation buffers for encoder — separate from weights so multiple copies can exist
-struct EncoderActivations {
-    PufTensor saved_input;   // (B_TT, in_dim) — saved for backward
-    PufTensor out;           // (B_TT, out_dim) — mm_out dest, reused as grad buffer in backward
-    PufTensor wgrad_scratch; // (out_dim, in_dim) — scratch for weight grad mm_out
-    PufTensor inf_out;       // (B_inf, out_dim) — inference mm_out dest
-};
-
-// Activation buffers for decoder — separate from weights so multiple copies can exist
-struct DecoderActivations {
-    PufTensor saved_input;   // (B_TT, hidden) — saved for backward
-    PufTensor out;           // (B_TT, output+1) — mm_out dest
-    PufTensor grad_out;      // (B_TT, output+1) — fused grad from PPO (assembled by kernel)
-    PufTensor wgrad_scratch; // (output+1, hidden) — scratch for weight grad mm_out
-    PufTensor inf_out;       // (B_inf, output+1) — inference mm_out dest
-};
-
-} // namespace pufferlib (constants + activation structs)
 
 // ============================================================================
 // Rollout and training graph buffers — used by both kernels and host code
@@ -229,18 +207,19 @@ struct RolloutBuf {
     PufTensor ratio;         // (horizon, segments) PRECISION
     PufTensor importance;    // (horizon, segments) PRECISION
 
-    void register_buffers(Allocator& alloc, int dim0, int dim1, int input_size, int num_atns) {
-        int psz = pufferlib::PRECISION_SIZE;
-        alloc.reg(&observations, {dim0, dim1, input_size}, psz);
-        alloc.reg(&actions, {dim0, dim1, num_atns}, sizeof(double));
-        alloc.reg(&values, {dim0, dim1}, psz);
-        alloc.reg(&logprobs, {dim0, dim1}, psz);
-        alloc.reg(&rewards, {dim0, dim1}, psz);
-        alloc.reg(&terminals, {dim0, dim1}, psz);
-        alloc.reg(&ratio, {dim0, dim1}, psz);
-        alloc.reg(&importance, {dim0, dim1}, psz);
-    }
 };
+
+void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int dim0, int dim1, int input_size, int num_atns) {
+    int psz = PRECISION_SIZE;
+    alloc.reg(&bufs.observations, {dim0, dim1, input_size}, psz);
+    alloc.reg(&bufs.actions, {dim0, dim1, num_atns}, sizeof(double));
+    alloc.reg(&bufs.values, {dim0, dim1}, psz);
+    alloc.reg(&bufs.logprobs, {dim0, dim1}, psz);
+    alloc.reg(&bufs.rewards, {dim0, dim1}, psz);
+    alloc.reg(&bufs.terminals, {dim0, dim1}, psz);
+    alloc.reg(&bufs.ratio, {dim0, dim1}, psz);
+    alloc.reg(&bufs.importance, {dim0, dim1}, psz);
+}
 
 struct TrainGraph {
     PufTensor mb_obs;         // (S, H, input_size) PRECISION
@@ -254,21 +233,22 @@ struct TrainGraph {
     PufTensor mb_ratio;       // (S, H) PRECISION
     PufTensor mb_newvalue;    // (S, H, 1) PRECISION
 
-    void register_buffers(Allocator& alloc, int S, int H, int input_size,
-            int hidden_size, int num_atns, int num_layers) {
-        int psz = pufferlib::PRECISION_SIZE;
-        alloc.reg(&mb_obs, {S, H, input_size}, psz);
-        alloc.reg(&mb_state, {num_layers, S, 1, hidden_size}, psz);
-        alloc.reg(&mb_actions, {S, H, num_atns}, sizeof(double));
-        alloc.reg(&mb_logprobs, {S, H}, psz);
-        alloc.reg(&mb_advantages, {S, H}, sizeof(float));
-        alloc.reg(&mb_prio, {S, 1}, psz);
-        alloc.reg(&mb_values, {S, H}, psz);
-        alloc.reg(&mb_returns, {S, H}, psz);
-        alloc.reg(&mb_ratio, {S, H}, psz);
-        alloc.reg(&mb_newvalue, {S, H, 1}, psz);
-    }
 };
+
+void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, int input_size,
+        int hidden_size, int num_atns, int num_layers) {
+    int psz = PRECISION_SIZE;
+    alloc.reg(&bufs.mb_obs, {S, H, input_size}, psz);
+    alloc.reg(&bufs.mb_state, {num_layers, S, 1, hidden_size}, psz);
+    alloc.reg(&bufs.mb_actions, {S, H, num_atns}, sizeof(double));
+    alloc.reg(&bufs.mb_logprobs, {S, H}, psz);
+    alloc.reg(&bufs.mb_advantages, {S, H}, sizeof(float));
+    alloc.reg(&bufs.mb_prio, {S, 1}, psz);
+    alloc.reg(&bufs.mb_values, {S, H}, psz);
+    alloc.reg(&bufs.mb_returns, {S, H}, psz);
+    alloc.reg(&bufs.mb_ratio, {S, H}, psz);
+    alloc.reg(&bufs.mb_newvalue, {S, H, 1}, psz);
+}
 
 #include "kernels.cu"
 
@@ -412,6 +392,7 @@ void puf_orthogonal_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t
 // PufTensor wrappers that dispatch to kernels
 // ============================================================================
 
+// Scratch buffer for partial sums in vector norm kernels (clip_grad_norm + Muon NS)
 static float* norm_partials_buf = nullptr;
 static void ensure_norm_partials() {
     if (!norm_partials_buf) cudaMalloc(&norm_partials_buf, 256 * sizeof(float));
@@ -445,11 +426,11 @@ void puf_transpose_01(PufTensor& dst, const PufTensor& src, cudaStream_t stream)
 void puf_copy(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_copy: size mismatch");
     assert(dst.dtype_size == src.dtype_size && "puf_copy: dtype mismatch");
-    cudaMemcpyAsync(dst.bytes, src.bytes, dst.nbytes(), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(dst.bytes, src.bytes, dst.numel() * dst.dtype_size, cudaMemcpyDeviceToDevice, stream);
 }
 
 void puf_zero(PufTensor& dst, cudaStream_t stream) {
-    cudaMemsetAsync(dst.bytes, 0, dst.nbytes(), stream);
+    cudaMemsetAsync(dst.bytes, 0, dst.numel() * dst.dtype_size, stream);
 }
 
 void puf_add(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
@@ -568,8 +549,6 @@ void prio_replay_cuda(
         (float*)bufs.mb_prio.bytes, total_agents, anneal_beta, minibatch_segments);
 }
 
-namespace pufferlib {
-
 void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
         PufTensor& dones, PufTensor& importance, PufTensor& advantages,
         float gamma, float lambda, float rho_clip, float c_clip, cudaStream_t stream) {
@@ -584,310 +563,350 @@ void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
         (float*)advantages.bytes, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
-} // namespace pufferlib
-
 // ============================================================================
 // Policy, MinGRU, Encoder, Decoder, Muon — defined after kernels/helpers
 // so method bodies can use kernel launches and cuBLAS wrappers inline.
 // ============================================================================
-
-namespace pufferlib {
-
-using std::vector;
-
-struct NativeEncoder {
-    PufTensor weight, weight_grad;
-    int in_dim, out_dim;
-
-    NativeEncoder() : in_dim(0), out_dim(0) {}
-    NativeEncoder(AllocSet& alloc, int input, int hidden)
-        : in_dim(input), out_dim(hidden) {
-        alloc.params.reg(&weight, {hidden, input}, alloc.esz);
-        alloc.grads.reg(&weight_grad, {hidden, input}, alloc.esz);
-    }
-    void register_activations(Allocator& alloc, EncoderActivations& act, int B_TT) {
-        int psz = PRECISION_SIZE;
-        alloc.reg(&act.saved_input, {B_TT, in_dim}, psz);
-        alloc.reg(&act.out, {B_TT, out_dim}, psz);
-        alloc.reg(&act.wgrad_scratch, {out_dim, in_dim}, psz);
-    }
-    void register_inference(Allocator& alloc, EncoderActivations& act, int B_inf) {
-        alloc.reg(&act.inf_out, {B_inf, out_dim}, PRECISION_SIZE);
-    }
-    void init_weights(uint64_t& seed, cudaStream_t stream) {
-        PufTensor w2d = {
-            .bytes = weight.bytes,
-            .shape = {out_dim, in_dim},
-            .dtype_size = weight.dtype_size
-        };
-        puf_orthogonal_init(w2d, std::sqrt(2.0f), seed++, stream);
-    }
+//
+struct EncoderRolloutBuffer {
+    PufTensor out;           // (B_inf, out_dim) — inference mm_out dest
 };
 
-struct NativeDecoder {
-    PufTensor weight, weight_grad;
-    PufTensor logstd, logstd_grad;
+struct EncoderTrainBuffer {
+    PufTensor out;           // (B_TT, out_dim) — mm_out dest, reused as grad buffer in backward
+    PufTensor saved_input;   // (B_TT, in_dim) — saved for backward
+    PufTensor wgrad_scratch; // (out_dim, in_dim) — bf16 weight grad output
+};
+
+// Function pointer types for swappable encoders
+struct Encoder;
+typedef void (*encoder_forward_fn)(Encoder* e, PufTensor input, PufTensor out, cudaStream_t stream);
+typedef void (*encoder_backward_fn)(Encoder* e, PufTensor grad, PufTensor saved_input, PufTensor wgrad, cudaStream_t stream);
+typedef void (*encoder_init_weights_fn)(Encoder* e, uint64_t* seed, cudaStream_t stream);
+typedef void (*encoder_reg_params_fn)(Encoder* e, Allocator* alloc, int esz);
+typedef void (*encoder_reg_train_fn)(Encoder* e, EncoderTrainBuffer* buf, Allocator* acts, Allocator* grads, int B_TT);
+typedef void (*encoder_reg_rollout_fn)(Encoder* e, EncoderRolloutBuffer* buf, Allocator* alloc, int B);
+
+struct Encoder {
+    PufTensor weight;
+    int in_dim, out_dim;
+    encoder_forward_fn forward;
+    encoder_backward_fn backward;
+    encoder_init_weights_fn init_weights;
+    encoder_reg_params_fn reg_params;
+    encoder_reg_train_fn reg_train;
+    encoder_reg_rollout_fn reg_rollout;
+};
+
+// --- Linear encoder implementation ---
+
+static void linear_encoder_forward(Encoder* e, PufTensor input, PufTensor out, cudaStream_t stream) {
+    puf_mm(input, e->weight, out, stream);
+}
+
+static void linear_encoder_backward(Encoder* e, PufTensor grad, PufTensor saved_input, PufTensor wgrad, cudaStream_t stream) {
+    puf_mm_tn(grad, saved_input, wgrad, stream);
+}
+
+static void linear_encoder_init_weights(Encoder* e, uint64_t* seed, cudaStream_t stream) {
+    PufTensor w = {.bytes = e->weight.bytes, .shape = {e->out_dim, e->in_dim}, .dtype_size = e->weight.dtype_size};
+    puf_orthogonal_init(w, std::sqrt(2.0f), (*seed)++, stream);
+}
+
+static void linear_encoder_reg_params(Encoder* e, Allocator* alloc, int esz) {
+    alloc->reg(&e->weight, {e->out_dim, e->in_dim}, esz);
+}
+
+static void linear_encoder_reg_train(Encoder* e, EncoderTrainBuffer* buf, Allocator* acts, Allocator* grads, int B_TT) {
+    int psz = PRECISION_SIZE;
+    acts->reg(&buf->out, {B_TT, e->out_dim}, psz);
+    acts->reg(&buf->saved_input, {B_TT, e->in_dim}, psz);
+    grads->reg(&buf->wgrad_scratch, {e->out_dim, e->in_dim}, psz);
+}
+
+static void linear_encoder_reg_rollout(Encoder* e, EncoderRolloutBuffer* buf, Allocator* alloc, int B) {
+    alloc->reg(&buf->out, {B, e->out_dim}, PRECISION_SIZE);
+}
+
+
+struct DecoderRolloutBuffer {
+    PufTensor out;           // (B_inf, output+1) — inference mm_out dest
+};
+
+struct DecoderTrainBuffer {
+    PufTensor out;            // (B_TT, output+1) — mm_out dest
+    PufTensor saved_input;    // (B_TT, hidden) — saved for backward
+    PufTensor grad_out;       // (B_TT, output+1) — fused grad from PPO (assembled by kernel)
+    PufTensor wgrad_scratch;  // (output+1, hidden) — bf16 weight grad output
+    PufTensor logstd_scratch; // (1, output) — bf16 logstd grad (continuous only, in grads allocator)
+};
+
+// Function pointer types for swappable decoders
+struct Decoder;
+typedef void (*decoder_forward_fn)(Decoder* d, PufTensor input, PufTensor out, cudaStream_t stream);
+typedef void (*decoder_backward_fn)(Decoder* d, PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value,
+    PufTensor saved_input, PufTensor grad_out, PufTensor wgrad, PufTensor logstd_scratch,
+    PufTensor grad_input, cudaStream_t stream);
+typedef void (*decoder_init_weights_fn)(Decoder* d, uint64_t* seed, cudaStream_t stream);
+typedef void (*decoder_reg_params_fn)(Decoder* d, Allocator* alloc, int esz);
+typedef void (*decoder_reg_train_fn)(Decoder* d, DecoderTrainBuffer* buf, Allocator* acts, Allocator* grads, int B_TT);
+typedef void (*decoder_reg_rollout_fn)(Decoder* d, DecoderRolloutBuffer* buf, Allocator* alloc, int B);
+
+struct Decoder {
+    PufTensor weight;
+    PufTensor logstd;
     int hidden_dim, output_dim;
     bool continuous;
-
-    NativeDecoder() : hidden_dim(0), output_dim(0), continuous(false) {}
-    NativeDecoder(AllocSet& alloc, int hidden, int output, bool continuous)
-        : hidden_dim(hidden), output_dim(output), continuous(continuous) {
-        alloc.params.reg(&weight, {output + 1, hidden}, alloc.esz);
-        alloc.grads.reg(&weight_grad, {output + 1, hidden}, alloc.esz);
-        if (continuous) {
-            alloc.params.reg(&logstd, {1, output}, alloc.esz);
-            alloc.grads.reg(&logstd_grad, {1, output}, alloc.esz);
-        }
-    }
-    void register_activations(Allocator& alloc, DecoderActivations& act, int B_TT) {
-        int psz = PRECISION_SIZE;
-        alloc.reg(&act.saved_input, {B_TT, hidden_dim}, psz);
-        alloc.reg(&act.out, {B_TT, output_dim + 1}, psz);
-        alloc.reg(&act.grad_out, {B_TT, output_dim + 1}, psz);
-        alloc.reg(&act.wgrad_scratch, {output_dim + 1, hidden_dim}, psz);
-    }
-    void register_inference(Allocator& alloc, DecoderActivations& act, int B_inf) {
-        alloc.reg(&act.inf_out, {B_inf, output_dim + 1}, PRECISION_SIZE);
-    }
-    void init_weights(uint64_t& seed, cudaStream_t stream) {
-        PufTensor w2d = {
-            .bytes = weight.bytes,
-            .shape = {output_dim + 1, hidden_dim},
-            .dtype_size = weight.dtype_size
-        };
-        puf_orthogonal_init(w2d, 0.01f, seed++, stream);
-    }
+    decoder_forward_fn forward;
+    decoder_backward_fn backward;
+    decoder_init_weights_fn init_weights;
+    decoder_reg_params_fn reg_params;
+    decoder_reg_train_fn reg_train;
+    decoder_reg_rollout_fn reg_rollout;
 };
 
-struct MinGRUActivations {
-    int num_layers;
-    vector<PufTensor> saved_inputs;
-    vector<PrefixScan> scan_bufs;
-    vector<PufTensor> combined_bufs;
-    PufTensor grad_input_buf;
-    PufTensor grad_next_state;
-    PufTensor wgrad_scratch;
-    vector<PufTensor> inf_combined;
-    PufTensor inf_out;
-    PufTensor inf_next_state;
+// --- Linear decoder implementation ---
 
-    MinGRUActivations() : num_layers(0) {}
-    MinGRUActivations(int num_layers)
-        : num_layers(num_layers),
-          saved_inputs(num_layers), scan_bufs(num_layers),
-          combined_bufs(num_layers), inf_combined(num_layers) {}
+static void linear_decoder_forward(Decoder* d, PufTensor input, PufTensor out, cudaStream_t stream) {
+    puf_mm(input, d->weight, out, stream);
+}
+
+static void linear_decoder_init_weights(Decoder* d, uint64_t* seed, cudaStream_t stream) {
+    PufTensor w = {.bytes = d->weight.bytes, .shape = {d->output_dim + 1, d->hidden_dim}, .dtype_size = d->weight.dtype_size};
+    puf_orthogonal_init(w, 0.01f, (*seed)++, stream);
+}
+
+static void linear_decoder_reg_params(Decoder* d, Allocator* alloc, int esz) {
+    alloc->reg(&d->weight, {d->output_dim + 1, d->hidden_dim}, esz);
+    if (d->continuous) alloc->reg(&d->logstd, {1, d->output_dim}, esz);
+}
+
+static void linear_decoder_reg_train(Decoder* d, DecoderTrainBuffer* buf, Allocator* acts, Allocator* grads, int B_TT) {
+    int psz = PRECISION_SIZE;
+    acts->reg(&buf->out, {B_TT, d->output_dim + 1}, psz);
+    acts->reg(&buf->saved_input, {B_TT, d->hidden_dim}, psz);
+    acts->reg(&buf->grad_out, {B_TT, d->output_dim + 1}, psz);
+    grads->reg(&buf->wgrad_scratch, {d->output_dim + 1, d->hidden_dim}, psz);
+    if (d->continuous) grads->reg(&buf->logstd_scratch, {1, d->output_dim}, psz);
+}
+
+static void linear_decoder_reg_rollout(Decoder* d, DecoderRolloutBuffer* buf, Allocator* alloc, int B) {
+    alloc->reg(&buf->out, {B, d->output_dim + 1}, PRECISION_SIZE);
+}
+
+static void linear_decoder_backward(Decoder* d, PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value,
+    PufTensor saved_input, PufTensor grad_out, PufTensor wgrad, PufTensor logstd_scratch,
+    PufTensor grad_input, cudaStream_t stream) {
+    int B_TT = saved_input.shape[0];
+    int od = d->output_dim, od1 = od + 1;
+    assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)grad_out.bytes, (const float*)grad_logits.bytes,
+        (const float*)grad_value.bytes, B_TT, od, od1);
+    puf_mm_tn(grad_out, saved_input, wgrad, stream);
+    if (d->continuous && grad_logstd.bytes != nullptr) {
+        sum_rows_to_bf16_kernel<<<grid_size(d->output_dim), BLOCK_SIZE, 0, stream>>>(
+            (__nv_bfloat16*)logstd_scratch.bytes, (const float*)grad_logstd.bytes,
+            B_TT, d->output_dim);
+    }
+    puf_mm_nn(grad_out, d->weight, grad_input, stream);
+}
+
+
+struct MinGRURolloutBuffer {
+    int num_layers;
+    vector<PufTensor> combined;  // per-layer (B_inf, 3*H)
+    PufTensor out;               // (B_inf, H)
+    PufTensor next_state;        // (B_inf, H)
+};
+
+struct MinGRUTrainBuffer {
+    int num_layers;
+    vector<PufTensor> saved_inputs;    // per-layer (B, TT, H)
+    vector<PrefixScan> scan_bufs;      // per-layer scan state
+    vector<PufTensor> combined_bufs;   // per-layer (B_TT, 3*H)
+    vector<PufTensor> wgrad_scratch;   // per-layer (3*H, H) bf16 weight grad output
+    PufTensor grad_input_buf;          // (B_TT, H)
+    PufTensor grad_next_state;         // (B, 1, H)
 };
 
 struct MinGRU {
     int hidden, num_layers;
     vector<PufTensor> weights;
-    vector<PufTensor> weight_grads;
-
-    MinGRU() : hidden(0), num_layers(0) {}
-    MinGRU(AllocSet& alloc, int hidden, int num_layers)
-        : hidden(hidden), num_layers(num_layers),
-          weights(num_layers), weight_grads(num_layers) {
-        for (int i = 0; i < num_layers; i++) {
-            alloc.params.reg(&weights[i], {3 * hidden, hidden}, alloc.esz);
-            alloc.grads.reg(&weight_grads[i], {3 * hidden, hidden}, alloc.esz);
-        }
-    }
-    void register_activations(Allocator& alloc, MinGRUActivations& act, int B, int TT) {
-        int H = hidden, B_TT = B * TT, psz = PRECISION_SIZE;
-        alloc.reg(&act.grad_input_buf, {B_TT, H}, psz);
-        alloc.reg(&act.grad_next_state, {B, 1, H}, psz);
-        alloc.reg(&act.wgrad_scratch, {3 * H, H}, psz);
-        for (int i = 0; i < num_layers; i++) {
-            alloc.reg(&act.saved_inputs[i], {B, TT, H}, psz);
-            alloc.reg(&act.combined_bufs[i], {B_TT, 3 * H}, psz);
-            alloc.reg(&act.scan_bufs[i].out, {B, TT, H}, psz);
-            alloc.reg(&act.scan_bufs[i].next_state, {B, 1, H}, psz);
-            alloc.reg(&act.scan_bufs[i].a_star, {B, TT + 1, H}, sizeof(float));
-            alloc.reg(&act.scan_bufs[i].s_vals, {B, TT + 1, H}, sizeof(float));
-            alloc.reg(&act.scan_bufs[i].log_values_buf, {B, TT + 1, H}, sizeof(float));
-            alloc.reg(&act.scan_bufs[i].grad_combined, {B, TT, 3 * H}, psz);
-            alloc.reg(&act.scan_bufs[i].grad_state, {B, 1, H}, psz);
-        }
-    }
-    void register_inference(Allocator& alloc, MinGRUActivations& act, int B_inf) {
-        int H = hidden, dsz = PRECISION_SIZE;
-        for (int i = 0; i < num_layers; i++)
-            alloc.reg(&act.inf_combined[i], {B_inf, 3 * H}, dsz);
-        alloc.reg(&act.inf_out, {B_inf, H}, dsz);
-        alloc.reg(&act.inf_next_state, {B_inf, H}, dsz);
-    }
-    PufTensor state_layer(PufTensor& state, int i) {
-        int64_t B = state.size(1), H = state.size(2);
-        return {.bytes = state.bytes + i * B * H * state.dtype_size, .shape = {B, H}, .dtype_size = state.dtype_size};
-    }
-    void append_param_shapes(vector<ParamShape>& out) {
-        for (int i = 0; i < num_layers; i++) {
-            vector<int64_t> s(weights[i].shape, weights[i].shape + weights[i].ndim());
-            out.push_back({weights[i].numel(), s});
-        }
-    }
-    void init_weights(uint64_t& seed, cudaStream_t stream) {
-        for (int i = 0; i < num_layers; i++) {
-            PufTensor w2d = {.bytes = weights[i].bytes, .shape = {3 * hidden, hidden}, .dtype_size = weights[i].dtype_size};
-            puf_orthogonal_init(w2d, 1.0f, seed++, stream);
-        }
-    }
-    PufTensor forward(PufTensor x, PufTensor state, MinGRUActivations& act, cudaStream_t stream) {
-        for (int i = 0; i < num_layers; i++) {
-            PufTensor state_i = state_layer(state, i);
-            puf_mm(x, weights[i], act.inf_combined[i], stream);
-            int Bi = static_cast<int>(state_i.size(0));
-            int Hi = static_cast<int>(state_i.size(1));
-            mingru_gate_inference_kernel<<<grid_size(Bi * Hi), BLOCK_SIZE, 0, stream>>>(
-                (precision_t*)act.inf_out.bytes, (precision_t*)act.inf_next_state.bytes,
-                (const precision_t*)act.inf_combined[i].bytes, (const precision_t*)state_i.bytes, Hi, Bi);
-            puf_copy(state_i, act.inf_next_state, stream);
-            x = act.inf_out;
-        }
-        return x;
-    }
-    PufTensor forward_train(PufTensor x, PufTensor state, MinGRUActivations& act, cudaStream_t stream) {
-        int B = x.size(0), TT = x.size(1);
-        for (int i = 0; i < num_layers; i++) {
-            puf_copy(act.saved_inputs[i], x, stream);
-            PufTensor state_i = state_layer(state, i);
-            PufTensor state_3d = {.bytes = state_i.bytes, .shape = {B, 1, hidden}, .dtype_size = state_i.dtype_size};
-            PufTensor x_flat = {.bytes = x.bytes, .shape = {B * TT, hidden}, .dtype_size = x.dtype_size};
-            puf_mm(x_flat, weights[i], act.combined_bufs[i], stream);
-            PufTensor combined_3d = {.bytes = act.combined_bufs[i].bytes, .shape = {B, TT, 3 * hidden}, .dtype_size = act.combined_bufs[i].dtype_size};
-            act.scan_bufs[i].combined_ptr = combined_3d.bytes;
-            act.scan_bufs[i].state_ptr = state_3d.bytes;
-            act.scan_bufs[i].B = B; act.scan_bufs[i].T = TT; act.scan_bufs[i].H = hidden;
-            fused_scan_forward_kernel_checkpointed<<<grid_size(B * hidden), BLOCK_SIZE, 0, stream>>>(
-                (precision_t*)act.scan_bufs[i].out.bytes, (precision_t*)act.scan_bufs[i].next_state.bytes,
-                (float*)act.scan_bufs[i].a_star.bytes, (float*)act.scan_bufs[i].s_vals.bytes,
-                (float*)act.scan_bufs[i].log_values_buf.bytes,
-                (const precision_t*)combined_3d.bytes, (const precision_t*)state_3d.bytes, TT, hidden, B);
-            x = act.scan_bufs[i].out;
-        }
-        return x;
-    }
-    PufTensor backward(PufTensor grad, MinGRUActivations& act, MinGRU* target, cudaStream_t stream) {
-        int B = grad.size(0), TT = grad.size(1), H = grad.size(2);
-        for (int i = num_layers - 1; i >= 0; i--) {
-            fused_scan_backward_kernel_checkpointed<<<grid_size(act.scan_bufs[i].B * act.scan_bufs[i].H), BLOCK_SIZE, 0, stream>>>(
-                (precision_t*)act.scan_bufs[i].grad_combined.bytes, (precision_t*)act.scan_bufs[i].grad_state.bytes,
-                (const precision_t*)grad.bytes, (const precision_t*)act.grad_next_state.bytes,
-                (const precision_t*)act.scan_bufs[i].combined_ptr, (const precision_t*)act.scan_bufs[i].state_ptr,
-                (float*)act.scan_bufs[i].a_star.bytes, (float*)act.scan_bufs[i].s_vals.bytes,
-                (float*)act.scan_bufs[i].log_values_buf.bytes,
-                act.scan_bufs[i].T, act.scan_bufs[i].H, act.scan_bufs[i].B);
-            PufTensor gc_flat = {.bytes = act.scan_bufs[i].grad_combined.bytes, .shape = {B * TT, 3 * H}, .dtype_size = act.scan_bufs[i].grad_combined.dtype_size};
-            PufTensor inp_flat = {.bytes = act.saved_inputs[i].bytes, .shape = {B * TT, H}, .dtype_size = act.saved_inputs[i].dtype_size};
-            puf_mm_tn(gc_flat, inp_flat, act.wgrad_scratch, stream);
-            puf_add(target->weight_grads[i], act.wgrad_scratch, stream);
-            puf_mm_nn(gc_flat, weights[i], act.grad_input_buf, stream);
-            grad = {.bytes = act.grad_input_buf.bytes, .shape = {B, TT, H}, .dtype_size = act.grad_input_buf.dtype_size};
-        }
-        return grad;
-    }
 };
 
-struct PolicyActivations {
-    EncoderActivations enc;
-    DecoderActivations dec;
-    MinGRUActivations rnn;
-    PolicyActivations() {}
-    PolicyActivations(int num_layers) : rnn(num_layers) {}
+void mingru_init(MinGRU* m, Allocator& params, int hidden, int num_layers, int esz) {
+    m->hidden = hidden;
+    m->num_layers = num_layers;
+    m->weights.resize(num_layers);
+    for (int i = 0; i < num_layers; i++) {
+        params.reg(&m->weights[i], {3 * hidden, hidden}, esz);
+    }
+}
+
+void mingru_register_train(MinGRU* m, Allocator& alloc, MinGRUTrainBuffer& buf, int B, int TT) {
+    int H = m->hidden, B_TT = B * TT, psz = PRECISION_SIZE;
+    buf.num_layers = m->num_layers;
+    buf.saved_inputs.resize(m->num_layers);
+    buf.scan_bufs.resize(m->num_layers);
+    buf.combined_bufs.resize(m->num_layers);
+    buf.wgrad_scratch.resize(m->num_layers);
+    alloc.reg(&buf.grad_input_buf, {B_TT, H}, psz);
+    alloc.reg(&buf.grad_next_state, {B, 1, H}, psz);
+    for (int i = 0; i < m->num_layers; i++) {
+        alloc.reg(&buf.saved_inputs[i], {B, TT, H}, psz);
+        alloc.reg(&buf.combined_bufs[i], {B_TT, 3 * H}, psz);
+        alloc.reg(&buf.scan_bufs[i].out, {B, TT, H}, psz);
+        alloc.reg(&buf.scan_bufs[i].next_state, {B, 1, H}, psz);
+        alloc.reg(&buf.scan_bufs[i].a_star, {B, TT + 1, H}, sizeof(float));
+        alloc.reg(&buf.scan_bufs[i].s_vals, {B, TT + 1, H}, sizeof(float));
+        alloc.reg(&buf.scan_bufs[i].log_values_buf, {B, TT + 1, H}, sizeof(float));
+        alloc.reg(&buf.scan_bufs[i].grad_combined, {B, TT, 3 * H}, psz);
+        alloc.reg(&buf.scan_bufs[i].grad_state, {B, 1, H}, psz);
+    }
+}
+
+void mingru_register_rollout(MinGRU* m, Allocator& alloc, MinGRURolloutBuffer& buf, int B_inf) {
+    int H = m->hidden, dsz = PRECISION_SIZE;
+    buf.num_layers = m->num_layers;
+    buf.combined.resize(m->num_layers);
+    for (int i = 0; i < m->num_layers; i++)
+        alloc.reg(&buf.combined[i], {B_inf, 3 * H}, dsz);
+    alloc.reg(&buf.out, {B_inf, H}, dsz);
+    alloc.reg(&buf.next_state, {B_inf, H}, dsz);
+}
+
+PufTensor mingru_state_layer(MinGRU* m, PufTensor& state, int i) {
+    int64_t B = state.shape[1], H = state.shape[2];
+    return {.bytes = state.bytes + i * B * H * state.dtype_size, .shape = {B, H}, .dtype_size = state.dtype_size};
+}
+
+void mingru_append_param_shapes(MinGRU* m, vector<ParamShape>& out) {
+    for (int i = 0; i < m->num_layers; i++) {
+        vector<int64_t> s(m->weights[i].shape, m->weights[i].shape + m->weights[i].ndim());
+        out.push_back({m->weights[i].numel(), s});
+    }
+}
+
+void mingru_init_weights(MinGRU* m, uint64_t& seed, cudaStream_t stream) {
+    for (int i = 0; i < m->num_layers; i++) {
+        PufTensor w2d = {.bytes = m->weights[i].bytes, .shape = {3 * m->hidden, m->hidden}, .dtype_size = m->weights[i].dtype_size};
+        puf_orthogonal_init(w2d, 1.0f, seed++, stream);
+    }
+}
+
+PufTensor mingru_forward(MinGRU* m, PufTensor x, PufTensor state, MinGRURolloutBuffer& buf, cudaStream_t stream) {
+    for (int i = 0; i < m->num_layers; i++) {
+        PufTensor state_i = mingru_state_layer(m, state, i);
+        puf_mm(x, m->weights[i], buf.combined[i], stream);
+        int Bi = static_cast<int>(state_i.shape[0]);
+        int Hi = static_cast<int>(state_i.shape[1]);
+        mingru_gate_inference_kernel<<<grid_size(Bi * Hi), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)buf.out.bytes, (precision_t*)buf.next_state.bytes,
+            (const precision_t*)buf.combined[i].bytes, (const precision_t*)state_i.bytes, Hi, Bi);
+        puf_copy(state_i, buf.next_state, stream);
+        x = buf.out;
+    }
+    return x;
+}
+
+PufTensor mingru_forward_train(MinGRU* m, PufTensor x, PufTensor state, MinGRUTrainBuffer& buf, cudaStream_t stream) {
+    int B = x.shape[0], TT = x.shape[1];
+    for (int i = 0; i < m->num_layers; i++) {
+        puf_copy(buf.saved_inputs[i], x, stream);
+        PufTensor state_i = mingru_state_layer(m, state, i);
+        PufTensor state_3d = {.bytes = state_i.bytes, .shape = {B, 1, m->hidden}, .dtype_size = state_i.dtype_size};
+        PufTensor x_flat = {.bytes = x.bytes, .shape = {B * TT, m->hidden}, .dtype_size = x.dtype_size};
+        puf_mm(x_flat, m->weights[i], buf.combined_bufs[i], stream);
+        PufTensor combined_3d = {.bytes = buf.combined_bufs[i].bytes, .shape = {B, TT, 3 * m->hidden}, .dtype_size = buf.combined_bufs[i].dtype_size};
+        buf.scan_bufs[i].combined_ptr = combined_3d.bytes;
+        buf.scan_bufs[i].state_ptr = state_3d.bytes;
+        buf.scan_bufs[i].B = B; buf.scan_bufs[i].T = TT; buf.scan_bufs[i].H = m->hidden;
+        fused_scan_forward_kernel_checkpointed<<<grid_size(B * m->hidden), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)buf.scan_bufs[i].out.bytes, (precision_t*)buf.scan_bufs[i].next_state.bytes,
+            (float*)buf.scan_bufs[i].a_star.bytes, (float*)buf.scan_bufs[i].s_vals.bytes,
+            (float*)buf.scan_bufs[i].log_values_buf.bytes,
+            (const precision_t*)combined_3d.bytes, (const precision_t*)state_3d.bytes, TT, m->hidden, B);
+        x = buf.scan_bufs[i].out;
+    }
+    return x;
+}
+
+PufTensor mingru_backward(MinGRU* m, PufTensor grad, MinGRUTrainBuffer& buf, cudaStream_t stream) {
+    int B = grad.shape[0], TT = grad.shape[1], H = grad.shape[2];
+    for (int i = m->num_layers - 1; i >= 0; i--) {
+        fused_scan_backward_kernel_checkpointed<<<grid_size(buf.scan_bufs[i].B * buf.scan_bufs[i].H), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)buf.scan_bufs[i].grad_combined.bytes, (precision_t*)buf.scan_bufs[i].grad_state.bytes,
+            (const precision_t*)grad.bytes, (const precision_t*)buf.grad_next_state.bytes,
+            (const precision_t*)buf.scan_bufs[i].combined_ptr, (const precision_t*)buf.scan_bufs[i].state_ptr,
+            (float*)buf.scan_bufs[i].a_star.bytes, (float*)buf.scan_bufs[i].s_vals.bytes,
+            (float*)buf.scan_bufs[i].log_values_buf.bytes,
+            buf.scan_bufs[i].T, buf.scan_bufs[i].H, buf.scan_bufs[i].B);
+        PufTensor gc_flat = {.bytes = buf.scan_bufs[i].grad_combined.bytes, .shape = {B * TT, 3 * H}, .dtype_size = buf.scan_bufs[i].grad_combined.dtype_size};
+        PufTensor inp_flat = {.bytes = buf.saved_inputs[i].bytes, .shape = {B * TT, H}, .dtype_size = buf.saved_inputs[i].dtype_size};
+        puf_mm_tn(gc_flat, inp_flat, buf.wgrad_scratch[i], stream);
+        puf_mm_nn(gc_flat, m->weights[i], buf.grad_input_buf, stream);
+        grad = {.bytes = buf.grad_input_buf.bytes, .shape = {B, TT, H}, .dtype_size = buf.grad_input_buf.dtype_size};
+    }
+    return grad;
+}
+
+struct PolicyRolloutBuffer {
+    EncoderRolloutBuffer enc;
+    DecoderRolloutBuffer dec;
+    MinGRURolloutBuffer rnn;
+};
+
+struct PolicyTrainBuffer {
+    EncoderTrainBuffer enc;
+    DecoderTrainBuffer dec;
+    MinGRUTrainBuffer rnn;
 };
 
 struct Policy {
-    NativeEncoder encoder;
-    NativeDecoder decoder;
+    Encoder encoder;
+    Decoder decoder;
     MinGRU rnn;
     int num_atns;
-    PolicyActivations act;
-
-    Policy() : num_atns(0) {}
-    Policy(AllocSet& alloc, int input, int hidden, int output, int num_layers, int num_atns, bool continuous)
-        : encoder(alloc, input, hidden),
-          decoder(alloc, hidden, output, continuous),
-          rnn(alloc, hidden, num_layers),
-          num_atns(num_atns),
-          act(num_layers) {}
-    void register_activations(Allocator& alloc, int B, int TT) {
-        register_activations(alloc, act, B, TT);
-    }
-    void register_activations(Allocator& alloc, PolicyActivations& a, int B, int TT) {
-        encoder.register_activations(alloc, a.enc, B * TT);
-        decoder.register_activations(alloc, a.dec, B * TT);
-        rnn.register_activations(alloc, a.rnn, B, TT);
-    }
-    void register_inference(Allocator& alloc, PolicyActivations& a, int B_inf) {
-        encoder.register_inference(alloc, a.enc, B_inf);
-        decoder.register_inference(alloc, a.dec, B_inf);
-        rnn.register_inference(alloc, a.rnn, B_inf);
-    }
-    void init_weights(cudaStream_t stream, uint64_t seed = 42) {
-        encoder.init_weights(seed, stream);
-        decoder.init_weights(seed, stream);
-        rnn.init_weights(seed, stream);
-    }
-    PufTensor forward(PufTensor obs, PufTensor state, PolicyActivations& a, cudaStream_t stream) {
-        puf_mm(obs, encoder.weight, a.enc.inf_out, stream);
-        PufTensor h = rnn.forward(a.enc.inf_out, state, a.rnn, stream);
-        puf_mm(h, decoder.weight, a.dec.inf_out, stream);
-        return a.dec.inf_out;
-    }
-    PufTensor forward_train(PufTensor x, PufTensor state, PolicyActivations& a, cudaStream_t stream) {
-        int B = x.size(0), TT = x.size(1);
-        PufTensor x_flat = {.bytes = x.bytes, .shape = {B * TT, encoder.in_dim}, .dtype_size = x.dtype_size};
-        puf_copy(a.enc.saved_input, x_flat, stream);
-        puf_mm(a.enc.saved_input, encoder.weight, a.enc.out, stream);
-        PufTensor h = {.bytes = a.enc.out.bytes, .shape = {B, TT, encoder.out_dim}, .dtype_size = a.enc.out.dtype_size};
-        h = rnn.forward_train(h, state, a.rnn, stream);
-        PufTensor flat_h = {.bytes = h.bytes, .shape = {B * TT, encoder.out_dim}, .dtype_size = h.dtype_size};
-        puf_copy(a.dec.saved_input, flat_h, stream);
-        puf_mm(flat_h, decoder.weight, a.dec.out, stream);
-        PufTensor result = {.bytes = a.dec.out.bytes, .shape = {B, TT, decoder.output_dim + 1}, .dtype_size = a.dec.out.dtype_size};
-        return result;
-    }
-    void backward(PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value,
-                  PolicyActivations& a, Policy* target, cudaStream_t stream) {
-        int B_TT = a.dec.saved_input.size(0);
-        int B = grad_logits.size(0), TT = grad_logits.size(1);
-        PufTensor gl_flat = {.bytes = grad_logits.bytes, .shape = {B_TT, decoder.output_dim}, .dtype_size = grad_logits.dtype_size};
-        PufTensor gv_flat = {.bytes = grad_value.bytes, .shape = {B_TT}, .dtype_size = grad_value.dtype_size};
-        {
-            int od = decoder.output_dim, od1 = od + 1;
-            assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
-                (__nv_bfloat16*)a.dec.grad_out.bytes, (const float*)gl_flat.bytes,
-                (const float*)gv_flat.bytes, B_TT, od, od1);
-        }
-        puf_mm_tn(a.dec.grad_out, a.dec.saved_input, a.dec.wgrad_scratch, stream);
-        puf_add(target->decoder.weight_grad, a.dec.wgrad_scratch, stream);
-        if (decoder.continuous && grad_logstd.bytes != nullptr) {
-            PufTensor gls_flat = {.bytes = grad_logstd.bytes, .shape = {B_TT, decoder.output_dim}, .dtype_size = grad_logstd.dtype_size};
-            sum_rows_add_kernel<<<grid_size(decoder.output_dim), BLOCK_SIZE, 0, stream>>>(
-                (float*)target->decoder.logstd_grad.bytes, (const float*)gls_flat.bytes,
-                B_TT, decoder.output_dim);
-        }
-        puf_mm_nn(a.dec.grad_out, decoder.weight, a.enc.out, stream);
-        PufTensor grad_h = {.bytes = a.enc.out.bytes, .shape = {B, TT, encoder.out_dim}, .dtype_size = a.enc.out.dtype_size};
-        grad_h = rnn.backward(grad_h, a.rnn, &target->rnn, stream);
-        PufTensor grad_enc = {.bytes = grad_h.bytes, .shape = {B_TT, encoder.out_dim}, .dtype_size = grad_h.dtype_size};
-        puf_mm_tn(grad_enc, a.enc.saved_input, a.enc.wgrad_scratch, stream);
-        puf_add(target->encoder.weight_grad, a.enc.wgrad_scratch, stream);
-    }
-    vector<ParamShape> param_shapes() {
-        vector<ParamShape> shapes;
-        auto push = [&](PufTensor& p) {
-            vector<int64_t> s(p.shape, p.shape + p.ndim());
-            shapes.push_back({p.numel(), s});
-        };
-        push(encoder.weight);
-        push(decoder.weight);
-        if (decoder.continuous) push(decoder.logstd);
-        rnn.append_param_shapes(shapes);
-        return shapes;
-    }
+    PolicyTrainBuffer train;
 };
+
+
+PufTensor policy_forward(Policy* p, PufTensor obs, PufTensor state, PolicyRolloutBuffer& buf, cudaStream_t stream) {
+    p->encoder.forward(&p->encoder, obs, buf.enc.out, stream);
+    PufTensor h = mingru_forward(&p->rnn, buf.enc.out, state, buf.rnn, stream);
+    p->decoder.forward(&p->decoder, h, buf.dec.out, stream);
+    return buf.dec.out;
+}
+
+PufTensor policy_forward_train(Policy* p, PufTensor x, PufTensor state, PolicyTrainBuffer& buf, cudaStream_t stream) {
+    int B = x.shape[0], TT = x.shape[1];
+    PufTensor x_flat = {.bytes = x.bytes, .shape = {B * TT, p->encoder.in_dim}, .dtype_size = x.dtype_size};
+    puf_copy(buf.enc.saved_input, x_flat, stream);
+    p->encoder.forward(&p->encoder, buf.enc.saved_input, buf.enc.out, stream);
+    PufTensor h = {.bytes = buf.enc.out.bytes, .shape = {B, TT, p->encoder.out_dim}, .dtype_size = buf.enc.out.dtype_size};
+    h = mingru_forward_train(&p->rnn, h, state, buf.rnn, stream);
+    PufTensor flat_h = {.bytes = h.bytes, .shape = {B * TT, p->encoder.out_dim}, .dtype_size = h.dtype_size};
+    puf_copy(buf.dec.saved_input, flat_h, stream);
+    p->decoder.forward(&p->decoder, flat_h, buf.dec.out, stream);
+    PufTensor result = {.bytes = buf.dec.out.bytes, .shape = {B, TT, p->decoder.output_dim + 1}, .dtype_size = buf.dec.out.dtype_size};
+    return result;
+}
+
+void policy_backward(Policy* p, PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value,
+              PolicyTrainBuffer& buf, cudaStream_t stream) {
+    int B_TT = buf.dec.saved_input.shape[0];
+    int B = grad_logits.shape[0], TT = grad_logits.shape[1];
+    PufTensor gl_flat = {.bytes = grad_logits.bytes, .shape = {B_TT, p->decoder.output_dim}, .dtype_size = grad_logits.dtype_size};
+    PufTensor gv_flat = {.bytes = grad_value.bytes, .shape = {B_TT}, .dtype_size = grad_value.dtype_size};
+    p->decoder.backward(&p->decoder, gl_flat, grad_logstd, gv_flat,
+        buf.dec.saved_input, buf.dec.grad_out, buf.dec.wgrad_scratch, buf.dec.logstd_scratch,
+        buf.enc.out, stream);
+    PufTensor grad_h = {.bytes = buf.enc.out.bytes, .shape = {B, TT, p->encoder.out_dim}, .dtype_size = buf.enc.out.dtype_size};
+    grad_h = mingru_backward(&p->rnn, grad_h, buf.rnn, stream);
+    PufTensor grad_enc = {.bytes = grad_h.bytes, .shape = {B_TT, p->encoder.out_dim}, .dtype_size = grad_h.dtype_size};
+    p->encoder.backward(&p->encoder, grad_enc, buf.enc.saved_input, buf.enc.wgrad_scratch, stream);
+}
+
 
 inline float cosine_annealing(float lr_base, float lr_min, int t, int T) {
     if (T == 0) return lr_base;
@@ -909,152 +928,148 @@ struct NSScratch {
     PufTensor result_f32;
     float* norm_ptr;
     int64_t max_M, max_N;
-    PufTensor slice(PufTensor& buf, int64_t rows, int64_t cols) {
-        return {.bytes = buf.bytes, .shape = {rows, cols}, .dtype_size = buf.dtype_size};
-    }
 };
+
+PufTensor ns_slice(PufTensor& buf, int64_t rows, int64_t cols) {
+    return {.bytes = buf.bytes, .shape = {rows, cols}, .dtype_size = buf.dtype_size};
+}
 
 struct Muon {
     double momentum, weight_decay, eps;
     float lr_val_init;
-    float* lr_ptr = nullptr;
-    float* lr_derived_ptr = nullptr;
+    float* lr_ptr;
+    float* lr_derived_ptr;
     PufTensor lr_puf, lr_derived_puf, ns_norm_puf;
-    PufTensor wb_puf, gb_puf, mb_puf, gc_puf, up_puf;
-    bool bufs_initialized = false;
+    PufTensor wb_puf, mb_puf, gc_puf, up_puf;
     NSScratch ns;
     std::vector<ParamShape> param_shapes;
-    ncclComm_t nccl_comm = nullptr;
-    int world_size = 1;
-
-    Muon(std::vector<ParamShape> param_shapes, PufTensor weight_buffer,
-             PufTensor grad_buffer, double lr_val, double momentum,
-             double eps, double weight_decay)
-            : momentum(momentum), weight_decay(weight_decay), eps(eps),
-              lr_val_init((float)lr_val),
-              wb_puf(weight_buffer), gb_puf(grad_buffer),
-              param_shapes(std::move(param_shapes)) {
-        assert(lr_val >= 0 && "Invalid learning rate");
-        assert(eps >= 0 && "Invalid epsilon value");
-        assert(weight_decay >= 0 && "Invalid weight_decay value");
-    }
-    ~Muon() {}
-    Muon(const Muon&) = delete;
-    Muon& operator=(const Muon&) = delete;
-
-    void register_buffers(Allocator& alloc) {
-        int64_t n = wb_puf.numel();
-        alloc.reg(&lr_puf, {1}, sizeof(float));
-        alloc.reg(&lr_derived_puf, {2}, sizeof(float));
-        alloc.reg(&mb_puf, {n}, sizeof(float));
-        alloc.reg(&gc_puf, {n}, sizeof(float));
-        alloc.reg(&up_puf, {n}, sizeof(float));
-        int64_t max_M = 0, max_N = 0;
-        for (auto& ps : param_shapes) {
-            if (ps.shape.size() >= 2) {
-                int64_t R = ps.shape[0], C = ps.numel / R;
-                max_M = std::max(max_M, std::min(R, C));
-                max_N = std::max(max_N, std::max(R, C));
-            }
-        }
-        if (max_M > 0) {
-            ns.max_M = max_M; ns.max_N = max_N;
-            alloc.reg(&ns.x, {max_M, max_N}, 2);
-            alloc.reg(&ns.A, {max_M, max_M}, 2);
-            alloc.reg(&ns.gram, {max_M, max_M}, 2);
-            alloc.reg(&ns.tmp, {max_M, max_N}, 2);
-            alloc.reg(&ns.result_f32, {max_M, max_N}, sizeof(float));
-            alloc.reg(&ns_norm_puf, {1}, sizeof(float));
-        }
-        bufs_initialized = true;
-    }
-    void post_create() {
-        lr_ptr = (float*)lr_puf.bytes;
-        lr_derived_ptr = (float*)lr_derived_puf.bytes;
-        if (ns_norm_puf.bytes) ns.norm_ptr = (float*)ns_norm_puf.bytes;
-        cudaMemcpy(lr_ptr, &lr_val_init, sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemset(lr_derived_ptr, 0, 2 * sizeof(float));
-        cudaMemset(mb_puf.bytes, 0, mb_puf.numel() * sizeof(float));
-    }
-    void step(cudaStream_t stream = 0) {
-        if (wb_puf.bytes == nullptr) return;
-        puf_copy(gc_puf, gb_puf, stream);
-        if (nccl_comm != nullptr && world_size > 1) {
-            ncclAllReduce(gc_puf.bytes, gc_puf.bytes, gc_puf.numel(),
-                          ncclFloat, ncclAvg, nccl_comm, stream);
-        }
-        nesterov_f32_kernel<<<grid_size(mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-            (float*)mb_puf.bytes, (float*)gc_puf.bytes, (float)momentum, mb_puf.numel());
-        puf_zero(up_puf, stream);
-        int64_t offset = 0;
-        for (auto& ps : param_shapes) {
-            float* gc_ptr = (float*)gc_puf.bytes + offset;
-            float* up_ptr = (float*)up_puf.bytes + offset;
-            if (ps.shape.size() >= 2) {
-                int64_t R = ps.shape[0], C = ps.numel / R;
-                bool transposed = R > C;
-                int64_t M = transposed ? C : R, N = transposed ? R : C;
-                PufTensor G_f32 = {.bytes = (char*)gc_ptr, .shape = {R, C}, .dtype_size = 4};
-                PufTensor x = ns.slice(ns.x, M, N);
-                PufTensor A = ns.slice(ns.A, M, M);
-                PufTensor gram = ns.slice(ns.gram, M, M);
-                PufTensor tmp = ns.slice(ns.tmp, M, N);
-                if (transposed) {
-                    cast_f32_to_bf16_transpose_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
-                        (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, (int)R, (int)C);
-                } else {
-                    cast_f32_to_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
-                        (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, x.numel());
-                }
-                ensure_norm_partials();
-                {
-                    int nblk = std::min((int)grid_size(x.numel()), 256);
-                    norm_bf16_kernel<<<nblk, 256, 0, stream>>>(
-                        norm_partials_buf, (const __nv_bfloat16*)x.bytes, x.numel());
-                    norm_reduce_kernel<<<1, 256, 0, stream>>>(ns.norm_ptr, norm_partials_buf, nblk);
-                }
-                normalize_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (__nv_bfloat16*)x.bytes, ns.norm_ptr, 1e-7f, x.numel());
-                for (int i = 0; i < 5; ++i) {
-                    float a = (float)ns_coeffs[i][0], b = (float)ns_coeffs[i][1], c = (float)ns_coeffs[i][2];
-                    PufTensor& src = (i % 2 == 0) ? x : tmp;
-                    PufTensor& dst = (i % 2 == 0) ? tmp : x;
-                    puf_mm(src, src, A, stream);
-                    puf_copy(gram, A, stream);
-                    puf_addmm_nn(A, A, gram, c, b, stream);
-                    puf_copy(dst, src, stream);
-                    puf_addmm_nn(gram, src, dst, 1.0f, a, stream);
-                }
-                PufTensor& result_bf16 = tmp;
-                float scale = (float)std::sqrt(std::max(1.0, (double)M / (double)N));
-                PufTensor out_f32 = {.bytes = (char*)up_ptr, .shape = {R, C}, .dtype_size = 4};
-                PufTensor res_f32 = ns.slice(ns.result_f32, M, N);
-                res_f32.dtype_size = 4;
-                cast_bf16_to_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (float*)res_f32.bytes, (const __nv_bfloat16*)result_bf16.bytes, res_f32.numel());
-                if (scale != 1.0f) scale_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (float*)res_f32.bytes, scale, res_f32.numel());
-                if (transposed) {
-                    transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
-                        (float*)out_f32.bytes, (const float*)res_f32.bytes, (int)M, (int)N);
-                } else {
-                    puf_copy(out_f32, res_f32, stream);
-                }
-            } else {
-                PufTensor src_puf = {.bytes = (char*)gc_ptr, .shape = {ps.numel}, .dtype_size = 4};
-                PufTensor dst_puf = {.bytes = (char*)up_ptr, .shape = {ps.numel}, .dtype_size = 4};
-                puf_copy(dst_puf, src_puf, stream);
-            }
-            offset += ps.numel;
-        }
-        muon_weight_update_kernel<<<grid_size(wb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-            (float*)wb_puf.bytes, (const float*)up_puf.bytes, lr_ptr, (float)weight_decay, wb_puf.numel());
-    }
-    void zero_grad(cudaStream_t stream) {
-        if (gb_puf.bytes != nullptr) puf_zero(gb_puf, stream);
-    }
+    ncclComm_t nccl_comm;
+    int world_size;
 };
 
-} // namespace pufferlib
+void muon_init(Muon* m, std::vector<ParamShape> param_shapes, PufTensor weight_buffer,
+               double lr_val, double momentum, double eps, double weight_decay) {
+    m->momentum = momentum;
+    m->weight_decay = weight_decay;
+    m->eps = eps;
+    m->lr_val_init = (float)lr_val;
+    m->lr_ptr = nullptr;
+    m->lr_derived_ptr = nullptr;
+    m->wb_puf = weight_buffer;
+    m->param_shapes = std::move(param_shapes);
+    m->nccl_comm = nullptr;
+    m->world_size = 1;
+    m->ns = {};
+}
+
+void muon_register_buffers(Muon* m, Allocator& alloc) {
+    int64_t n = m->wb_puf.numel();
+    alloc.reg(&m->lr_puf, {1}, sizeof(float));
+    alloc.reg(&m->lr_derived_puf, {2}, sizeof(float));
+    alloc.reg(&m->mb_puf, {n}, sizeof(float));
+    alloc.reg(&m->gc_puf, {n}, sizeof(float));
+    alloc.reg(&m->up_puf, {n}, sizeof(float));
+    int64_t max_M = 0, max_N = 0;
+    for (auto& ps : m->param_shapes) {
+        if (ps.shape.size() >= 2) {
+            int64_t R = ps.shape[0], C = ps.numel / R;
+            max_M = std::max(max_M, std::min(R, C));
+            max_N = std::max(max_N, std::max(R, C));
+        }
+    }
+    if (max_M > 0) {
+        m->ns.max_M = max_M; m->ns.max_N = max_N;
+        alloc.reg(&m->ns.x, {max_M, max_N}, 2);
+        alloc.reg(&m->ns.A, {max_M, max_M}, 2);
+        alloc.reg(&m->ns.gram, {max_M, max_M}, 2);
+        alloc.reg(&m->ns.tmp, {max_M, max_N}, 2);
+        alloc.reg(&m->ns.result_f32, {max_M, max_N}, sizeof(float));
+        alloc.reg(&m->ns_norm_puf, {1}, sizeof(float));
+    }
+}
+
+void muon_post_create(Muon* m) {
+    m->lr_ptr = (float*)m->lr_puf.bytes;
+    m->lr_derived_ptr = (float*)m->lr_derived_puf.bytes;
+    if (m->ns_norm_puf.bytes) m->ns.norm_ptr = (float*)m->ns_norm_puf.bytes;
+    cudaMemcpy(m->lr_ptr, &m->lr_val_init, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(m->lr_derived_ptr, 0, 2 * sizeof(float));
+    cudaMemset(m->mb_puf.bytes, 0, m->mb_puf.numel() * sizeof(float));
+}
+
+void muon_step(Muon* m, cudaStream_t stream = 0) {
+    if (m->wb_puf.bytes == nullptr) return;
+    if (m->nccl_comm != nullptr && m->world_size > 1) {
+        ncclAllReduce(m->gc_puf.bytes, m->gc_puf.bytes, m->gc_puf.numel(),
+                      ncclFloat, ncclAvg, m->nccl_comm, stream);
+    }
+    nesterov_f32_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+        (float*)m->mb_puf.bytes, (float*)m->gc_puf.bytes, (float)m->momentum, m->mb_puf.numel());
+    puf_zero(m->up_puf, stream);
+    int64_t offset = 0;
+    for (auto& ps : m->param_shapes) {
+        float* gc_ptr = (float*)m->gc_puf.bytes + offset;
+        float* up_ptr = (float*)m->up_puf.bytes + offset;
+        if (ps.shape.size() >= 2) {
+            int64_t R = ps.shape[0], C = ps.numel / R;
+            bool transposed = R > C;
+            int64_t M = transposed ? C : R, N = transposed ? R : C;
+            PufTensor G_f32 = {.bytes = (char*)gc_ptr, .shape = {R, C}, .dtype_size = 4};
+            PufTensor x = ns_slice(m->ns.x, M, N);
+            PufTensor A = ns_slice(m->ns.A, M, M);
+            PufTensor gram = ns_slice(m->ns.gram, M, M);
+            PufTensor tmp = ns_slice(m->ns.tmp, M, N);
+            if (transposed) {
+                cast_f32_to_bf16_transpose_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                    (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, (int)R, (int)C);
+            } else {
+                cast_f32_to_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, x.numel());
+            }
+            ensure_norm_partials();
+            {
+                int nblk = std::min((int)grid_size(x.numel()), 256);
+                norm_bf16_kernel<<<nblk, 256, 0, stream>>>(
+                    norm_partials_buf, (const __nv_bfloat16*)x.bytes, x.numel());
+                norm_reduce_kernel<<<1, 256, 0, stream>>>(m->ns.norm_ptr, norm_partials_buf, nblk);
+            }
+            normalize_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+                (__nv_bfloat16*)x.bytes, m->ns.norm_ptr, 1e-7f, x.numel());
+            for (int i = 0; i < 5; ++i) {
+                float a = (float)ns_coeffs[i][0], b = (float)ns_coeffs[i][1], c = (float)ns_coeffs[i][2];
+                PufTensor& src = (i % 2 == 0) ? x : tmp;
+                PufTensor& dst = (i % 2 == 0) ? tmp : x;
+                puf_mm(src, src, A, stream);
+                puf_copy(gram, A, stream);
+                puf_addmm_nn(A, A, gram, c, b, stream);
+                puf_copy(dst, src, stream);
+                puf_addmm_nn(gram, src, dst, 1.0f, a, stream);
+            }
+            PufTensor& result_bf16 = tmp;
+            float scale = (float)std::sqrt(std::max(1.0, (double)M / (double)N));
+            PufTensor out_f32 = {.bytes = (char*)up_ptr, .shape = {R, C}, .dtype_size = 4};
+            PufTensor res_f32 = ns_slice(m->ns.result_f32, M, N);
+            res_f32.dtype_size = 4;
+            cast_bf16_to_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
+                (float*)res_f32.bytes, (const __nv_bfloat16*)result_bf16.bytes, res_f32.numel());
+            if (scale != 1.0f) scale_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
+                (float*)res_f32.bytes, scale, res_f32.numel());
+            if (transposed) {
+                transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                    (float*)out_f32.bytes, (const float*)res_f32.bytes, (int)M, (int)N);
+            } else {
+                puf_copy(out_f32, res_f32, stream);
+            }
+        } else {
+            PufTensor src_puf = {.bytes = (char*)gc_ptr, .shape = {ps.numel}, .dtype_size = 4};
+            PufTensor dst_puf = {.bytes = (char*)up_ptr, .shape = {ps.numel}, .dtype_size = 4};
+            puf_copy(dst_puf, src_puf, stream);
+        }
+        offset += ps.numel;
+    }
+    muon_weight_update_kernel<<<grid_size(m->wb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+        (float*)m->wb_puf.bytes, (const float*)m->up_puf.bytes, m->lr_ptr, (float)m->weight_decay, m->wb_puf.numel());
+}
+
 
 #endif // PUFFERLIB_MODELS_CU

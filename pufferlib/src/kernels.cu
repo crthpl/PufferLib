@@ -1539,6 +1539,15 @@ __global__ void sum_rows_add_kernel(float* __restrict__ dst, const float* __rest
     dst[col] += sum;
 }
 
+// Sum f32 rows → bf16 output (set, not accumulate)
+__global__ void sum_rows_to_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= C) return;
+    float sum = 0.0f;
+    for (int r = 0; r < R; r++) sum += src[r * C + col];
+    dst[col] = __float2bfloat16(sum);
+}
+
 __global__ void assemble_decoder_grad_kernel(
     __nv_bfloat16* __restrict__ dst, const float* __restrict__ grad_logits,
     const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {

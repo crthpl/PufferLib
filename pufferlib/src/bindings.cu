@@ -5,7 +5,6 @@
 #include <chrono>
 #include "pufferlib.cu"
 
-using namespace pufferlib;
 namespace py = pybind11;
 
 // Wrapper functions for Python bindings
@@ -75,7 +74,7 @@ pybind11::dict log_losses(pybind11::object pufferl_obj) {
         result["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
     }
     // Zero the accumulator
-    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.nbytes());
+    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.numel() * pufferl.losses_puf.dtype_size);
     return result;
 }
 
@@ -194,7 +193,7 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
     return c_dict;
 }
 
-std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind11::dict vec_kwargs, pybind11::dict env_kwargs, pybind11::dict policy_kwargs) {
+std::unique_ptr<PuffeRL> create_pufferl(pybind11::dict kwargs, pybind11::dict vec_kwargs, pybind11::dict env_kwargs, pybind11::dict policy_kwargs) {
     HypersT hypers;
     // Layout (total_agents and num_buffers come from vec config)
     hypers.total_agents = get_config(vec_kwargs, "total_agents");
@@ -245,7 +244,7 @@ std::unique_ptr<pufferlib::PuffeRL> create_pufferl(pybind11::dict kwargs, pybind
     Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
     Dict* env_dict = py_dict_to_c_dict(env_kwargs.cast<py::dict>());
 
-    std::unique_ptr<pufferlib::PuffeRL> pufferl;
+    std::unique_ptr<PuffeRL> pufferl;
     {
         pybind11::gil_scoped_release no_gil;
         pufferl = create_pufferl_impl(hypers, env_name, vec_dict, env_dict);
