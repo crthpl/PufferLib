@@ -1460,6 +1460,12 @@ __global__ void normalize_bf16_kernel(__nv_bfloat16* __restrict__ dst, const flo
     if (idx < n) dst[idx] = __float2bfloat16(__bfloat162float(dst[idx]) * inv_norm);
 }
 
+__global__ void normalize_f32_kernel(float* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
+    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = dst[idx] * inv_norm;
+}
+
 __global__ void fill_bf16_kernel(__nv_bfloat16* __restrict__ dst, __nv_bfloat16 val, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = val;
@@ -1473,6 +1479,11 @@ __global__ void fill_f32_kernel(float* __restrict__ dst, float val, int n) {
 __global__ void clamp_bf16_kernel(__nv_bfloat16* __restrict__ dst, float lo, float hi, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) { float v = __bfloat162float(dst[idx]); dst[idx] = __float2bfloat16(fminf(fmaxf(v, lo), hi)); }
+}
+
+__global__ void clamp_f32_kernel(float* __restrict__ dst, float lo, float hi, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) { dst[idx] = fminf(fmaxf(dst[idx], lo), hi); }
 }
 
 __global__ void scale_f32_kernel(float* __restrict__ dst, float alpha, int n) {
@@ -1529,6 +1540,11 @@ __global__ void add_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloa
     if (idx < n) dst[idx] += __bfloat162float(src[idx]);
 }
 
+__global__ void add_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += src[idx];
+}
+
 __global__ void sum_rows_add_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= C) return;
@@ -1546,13 +1562,31 @@ __global__ void sum_rows_to_bf16_kernel(__nv_bfloat16* __restrict__ dst, const f
     dst[col] = __float2bfloat16(sum);
 }
 
-__global__ void assemble_decoder_grad_kernel(
+// Sum f32 rows → f32 output (set, not accumulate)
+__global__ void sum_rows_to_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= C) return;
+    float sum = 0.0f;
+    for (int r = 0; r < R; r++) sum += src[r * C + col];
+    dst[col] = sum;
+}
+
+__global__ void assemble_decoder_grad_bf16_kernel(
     __nv_bfloat16* __restrict__ dst, const float* __restrict__ grad_logits,
     const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B_TT * od_plus_1) return;
     int row = idx / od_plus_1, col = idx % od_plus_1;
     dst[idx] = __float2bfloat16((col < od) ? grad_logits[row * od + col] : grad_value[row]);
+}
+
+__global__ void assemble_decoder_grad_f32_kernel(
+    float* __restrict__ dst, const float* __restrict__ grad_logits,
+    const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B_TT * od_plus_1) return;
+    int row = idx / od_plus_1, col = idx % od_plus_1;
+    dst[idx] = (col < od) ? grad_logits[row * od + col] : grad_value[row];
 }
 
 __global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict__ var_out,

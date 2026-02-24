@@ -296,7 +296,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, in
 #include "kernels.cu"
 
 // ============================================================================
-// cuBLAS matmuls: all row-major PufTensors, bf16 with f32 compute
+// cuBLAS matmuls: all row-major PufTensors, precision_t with f32 compute
 // ============================================================================
 
 static cublasHandle_t get_cublas_handle() {
@@ -310,6 +310,12 @@ static cublasHandle_t get_cublas_handle() {
     return handle;
 }
 
+#ifdef PRECISION_FLOAT
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
+#else
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
+#endif
+
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
 void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
     int na = a.ndim(), nb = b.ndim();
@@ -318,8 +324,8 @@ void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
-        b.bytes, CUDA_R_16BF, K, a.bytes, CUDA_R_16BF, K, &beta,
-        out.bytes, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        b.bytes, CUBLAS_PRECISION, K, a.bytes, CUBLAS_PRECISION, K, &beta,
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // out(M,N) = a(...,M)^T @ b(...,N)  — leading dims folded into K
@@ -330,8 +336,8 @@ void puf_mm_tn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) 
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha,
-        b.bytes, CUDA_R_16BF, N, a.bytes, CUDA_R_16BF, M, &beta,
-        out.bytes, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, M, &beta,
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // out(...,N) = a(...,K) @ b(K,N)  — leading dims folded into M
@@ -342,8 +348,8 @@ void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) 
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-        b.bytes, CUDA_R_16BF, N, a.bytes, CUDA_R_16BF, K, &beta,
-        out.bytes, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, K, &beta,
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta, cudaStream_t stream) {
@@ -352,8 +358,8 @@ static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-        b.bytes, CUDA_R_16BF, N, a.bytes, CUDA_R_16BF, K, &beta,
-        out.bytes, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, K, &beta,
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // ============================================================================
@@ -482,9 +488,14 @@ void puf_zero(PufTensor& dst, cudaStream_t stream) {
 
 void puf_add(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_add: size mismatch");
-    assert(dst.dtype_size == 4 && src.dtype_size == 2 && "puf_add: expected fp32 += bf16");
-    add_bf16_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)dst.bytes, (const __nv_bfloat16*)src.bytes, dst.numel());
+    assert(dst.dtype_size == 4 && "puf_add: dst must be f32");
+    if (src.dtype_size == 2) {
+        add_bf16_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
+            (float*)dst.bytes, (const __nv_bfloat16*)src.bytes, dst.numel());
+    } else {
+        add_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
+            (float*)dst.bytes, (const float*)src.bytes, dst.numel());
+    }
 }
 
 // ============================================================================
@@ -780,14 +791,26 @@ static PufTensor decoder_backward(void* w, void* activations,
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
     int od = dw->output_dim, od1 = od + 1;
-    assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
-        (__nv_bfloat16*)a->grad_out.bytes, (const float*)grad_logits.bytes,
-        (const float*)grad_value.bytes, B_TT, od, od1);
+    if (USE_BF16) {
+        assemble_decoder_grad_bf16_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+            (__nv_bfloat16*)a->grad_out.bytes, (const float*)grad_logits.bytes,
+            (const float*)grad_value.bytes, B_TT, od, od1);
+    } else {
+        assemble_decoder_grad_f32_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+            (float*)a->grad_out.bytes, (const float*)grad_logits.bytes,
+            (const float*)grad_value.bytes, B_TT, od, od1);
+    }
     puf_mm_tn(a->grad_out, a->saved_input, a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.bytes != nullptr) {
-        sum_rows_to_bf16_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
-            (__nv_bfloat16*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
-            B_TT, dw->output_dim);
+        if (USE_BF16) {
+            sum_rows_to_bf16_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
+                (__nv_bfloat16*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
+                B_TT, dw->output_dim);
+        } else {
+            sum_rows_to_f32_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
+                (float*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
+                B_TT, dw->output_dim);
+        }
     }
     puf_mm_nn(a->grad_out, dw->weight, a->grad_input, stream);
     return a->grad_input;
@@ -1057,10 +1080,11 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
     }
     if (max_M > 0) {
         m->ns.max_M = max_M; m->ns.max_N = max_N;
-        m->ns.x = {.shape = {max_M, max_N}, .dtype_size = 2};
-        m->ns.A = {.shape = {max_M, max_M}, .dtype_size = 2};
-        m->ns.gram = {.shape = {max_M, max_M}, .dtype_size = 2};
-        m->ns.tmp = {.shape = {max_M, max_N}, .dtype_size = 2};
+        int ns_esz = PRECISION_SIZE;
+        m->ns.x = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
+        m->ns.A = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
+        m->ns.gram = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
+        m->ns.tmp = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
         m->ns.result_f32 = {.shape = {max_M, max_N}, .dtype_size = f};
         m->ns_norm_puf = {.shape = {1}, .dtype_size = f};
         alloc.reg(&m->ns.x);
@@ -1103,22 +1127,41 @@ void muon_step(Muon* m, cudaStream_t stream = 0) {
             PufTensor A = ns_slice(m->ns.A, M, M);
             PufTensor gram = ns_slice(m->ns.gram, M, M);
             PufTensor tmp = ns_slice(m->ns.tmp, M, N);
-            if (transposed) {
-                cast_f32_to_bf16_transpose_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
-                    (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, (int)R, (int)C);
+            if (USE_BF16) {
+                if (transposed) {
+                    cast_f32_to_bf16_transpose_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                        (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, (int)R, (int)C);
+                } else {
+                    cast_f32_to_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+                        (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, x.numel());
+                }
+                ensure_norm_partials();
+                {
+                    int nblk = std::min((int)grid_size(x.numel()), 256);
+                    norm_bf16_kernel<<<nblk, 256, 0, stream>>>(
+                        norm_partials_buf, (const __nv_bfloat16*)x.bytes, x.numel());
+                    norm_reduce_kernel<<<1, 256, 0, stream>>>(m->ns.norm_ptr, norm_partials_buf, nblk);
+                }
+                normalize_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (__nv_bfloat16*)x.bytes, m->ns.norm_ptr, 1e-7f, x.numel());
             } else {
-                cast_f32_to_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (__nv_bfloat16*)x.bytes, (const float*)G_f32.bytes, x.numel());
+                if (transposed) {
+                    transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                        (float*)x.bytes, (const float*)G_f32.bytes, (int)R, (int)C);
+                } else {
+                    cudaMemcpyAsync(x.bytes, G_f32.bytes, x.numel() * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
+                }
+                ensure_norm_partials();
+                {
+                    int nblk = std::min((int)grid_size(x.numel()), 256);
+                    norm_f32_kernel<<<nblk, 256, 0, stream>>>(
+                        norm_partials_buf, (const float*)x.bytes, x.numel());
+                    norm_reduce_kernel<<<1, 256, 0, stream>>>(m->ns.norm_ptr, norm_partials_buf, nblk);
+                }
+                normalize_f32_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)x.bytes, m->ns.norm_ptr, 1e-7f, x.numel());
             }
-            ensure_norm_partials();
-            {
-                int nblk = std::min((int)grid_size(x.numel()), 256);
-                norm_bf16_kernel<<<nblk, 256, 0, stream>>>(
-                    norm_partials_buf, (const __nv_bfloat16*)x.bytes, x.numel());
-                norm_reduce_kernel<<<1, 256, 0, stream>>>(m->ns.norm_ptr, norm_partials_buf, nblk);
-            }
-            normalize_bf16_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
-                (__nv_bfloat16*)x.bytes, m->ns.norm_ptr, 1e-7f, x.numel());
             for (int i = 0; i < 5; ++i) {
                 float a = (float)ns_coeffs[i][0], b = (float)ns_coeffs[i][1], c = (float)ns_coeffs[i][2];
                 PufTensor& src = (i % 2 == 0) ? x : tmp;
@@ -1129,20 +1172,32 @@ void muon_step(Muon* m, cudaStream_t stream = 0) {
                 puf_copy(dst, src, stream);
                 puf_addmm_nn(gram, src, dst, 1.0f, a, stream);
             }
-            PufTensor& result_bf16 = tmp;
+            PufTensor& result_precision = tmp;
             float scale = (float)std::sqrt(std::max(1.0, (double)M / (double)N));
             PufTensor out_f32 = {.bytes = (char*)up_ptr, .shape = {R, C}, .dtype_size = 4};
-            PufTensor res_f32 = ns_slice(m->ns.result_f32, M, N);
-            res_f32.dtype_size = 4;
-            cast_bf16_to_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
-                (float*)res_f32.bytes, (const __nv_bfloat16*)result_bf16.bytes, res_f32.numel());
-            if (scale != 1.0f) scale_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
-                (float*)res_f32.bytes, scale, res_f32.numel());
-            if (transposed) {
-                transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
-                    (float*)out_f32.bytes, (const float*)res_f32.bytes, (int)M, (int)N);
+            if (USE_BF16) {
+                PufTensor res_f32 = ns_slice(m->ns.result_f32, M, N);
+                res_f32.dtype_size = 4;
+                cast_bf16_to_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)res_f32.bytes, (const __nv_bfloat16*)result_precision.bytes, res_f32.numel());
+                if (scale != 1.0f) scale_f32_kernel<<<grid_size(res_f32.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)res_f32.bytes, scale, res_f32.numel());
+                if (transposed) {
+                    transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                        (float*)out_f32.bytes, (const float*)res_f32.bytes, (int)M, (int)N);
+                } else {
+                    puf_copy(out_f32, res_f32, stream);
+                }
             } else {
-                puf_copy(out_f32, res_f32, stream);
+                // result is already f32 in tmp
+                if (scale != 1.0f) scale_f32_kernel<<<grid_size(result_precision.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)result_precision.bytes, scale, result_precision.numel());
+                if (transposed) {
+                    transpose_f32_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
+                        (float*)out_f32.bytes, (const float*)result_precision.bytes, (int)M, (int)N);
+                } else {
+                    puf_copy(out_f32, result_precision, stream);
+                }
             }
         } else {
             PufTensor src_puf = {.bytes = (char*)gc_ptr, .shape = {t->numel()}, .dtype_size = 4};

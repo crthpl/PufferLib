@@ -171,6 +171,17 @@ else:
 extnames = ["pufferlib._C"]
 
 class BuildExt(build_ext):
+    user_options = build_ext.user_options + [
+        ('precision=', None, 'Precision: float or bf16 (default: bf16)'),
+    ]
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.precision = 'bf16'
+
+    def finalize_options(self):
+        super().finalize_options()
+
     def run(self):
         # Propagate any build_ext options (e.g., --inplace, --force) to subcommands
         build_ext_opts = self.distribution.command_options.get('build_ext', {})
@@ -179,7 +190,7 @@ class BuildExt(build_ext):
 
         # Build _C.so (always torch-free)
         if not NO_TRAIN:
-            _build_notorch_C(force=self.force)
+            _build_notorch_C(force=self.force, precision=self.precision)
         self.run_command('build_c')
 
 class CBuildExt(build_ext):
@@ -428,7 +439,7 @@ _BINDINGS_CU_DEPS = [
     'pufferlib/src/puffernet.h',
 ]
 
-def _build_notorch_C(static_lib=None, force=False):
+def _build_notorch_C(static_lib=None, force=False, precision='bf16'):
     """Build _C.so via single nvcc compile (no torch dependency)."""
     import subprocess
     import sysconfig
@@ -440,6 +451,8 @@ def _build_notorch_C(static_lib=None, force=False):
 
     bindings_cu = 'pufferlib/src/bindings.cu'
     bindings_o = 'pufferlib/src/bindings.o'
+
+    precision_flag = '-DPRECISION_FLOAT' if precision == 'float' else ''
 
     # Check what needs rebuilding
     need_compile = force or _needs_rebuild(bindings_o, _BINDINGS_CU_DEPS)
@@ -465,6 +478,8 @@ def _build_notorch_C(static_lib=None, force=False):
         f'-I{RAYLIB_NAME}/include',
         '-Xcompiler=-fopenmp',
     ]
+    if precision_flag:
+        nvcc_cmd.append(precision_flag)
     if DEBUG:
         nvcc_cmd += ['-O0', '-g']
     else:
@@ -504,9 +519,20 @@ def _build_notorch_C(static_lib=None, force=False):
 def create_static_env_build_class(env_name):
     """Create a build class that compiles env with clang, then links _C.so."""
     class StaticEnvBuildExt(build_ext):
+        user_options = build_ext.user_options + [
+            ('precision=', None, 'Precision: float or bf16 (default: bf16)'),
+        ]
+
+        def initialize_options(self):
+            super().initialize_options()
+            self.precision = 'bf16'
+
+        def finalize_options(self):
+            super().finalize_options()
+
         def run(self):
             static_lib = _build_static_lib(env_name, force=self.force)
-            _build_notorch_C(static_lib, force=self.force)
+            _build_notorch_C(static_lib, force=self.force, precision=self.precision)
     return StaticEnvBuildExt
 
 # Add build_<env> for static-linked envs (always available, torch optional)

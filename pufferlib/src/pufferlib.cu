@@ -290,7 +290,11 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         cast_u8_to_precision_kernel<<<grid_size(obs_src.numel()), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)obs_dst.bytes, (const unsigned char*)obs_src.bytes, obs_src.numel());
     } else if (obs_env.dtype_size == sizeof(float)) {
-        puf_cast_f32_to_bf16(obs_dst, obs_src, stream);
+        if (USE_BF16) {
+            puf_cast_f32_to_bf16(obs_dst, obs_src, stream);
+        } else {
+            puf_copy(obs_dst, obs_src, stream);
+        }
     } else {
         assert(false && "Unsupported obs dtype: only uint8 and float32 are supported");
     }
@@ -397,10 +401,17 @@ void train_impl(PuffeRL& pufferl) {
     puf_transpose_01(rollouts.values, src.values, train_stream);
 
     // Clamp rewards and fill ratio
-    clamp_bf16_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
-        (__nv_bfloat16*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
-    fill_bf16_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
-        (__nv_bfloat16*)rollouts.ratio.bytes, __float2bfloat16(1.0f), rollouts.ratio.numel());
+    if (USE_BF16) {
+        clamp_bf16_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
+            (__nv_bfloat16*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
+        fill_bf16_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
+            (__nv_bfloat16*)rollouts.ratio.bytes, __float2bfloat16(1.0f), rollouts.ratio.numel());
+    } else {
+        clamp_f32_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
+            (float*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
+        fill_f32_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
+            (float*)rollouts.ratio.bytes, 1.0f, rollouts.ratio.numel());
+    }
 
     // old_values = values.clone() via pre-allocated PufTensor
     PufTensor& old_values_puf = pufferl.old_values_puf;
@@ -502,10 +513,15 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(pufferl.policy, pufferl.weights_bf16, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            // cast contiguous bf16 grads → f32 into muon gc_puf, then clip grad norm
-            cast_bf16_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-                (float*)pufferl.muon->gc_puf.bytes, (const __nv_bfloat16*)pufferl.grad_bf16_puf.bytes,
-                pufferl.grad_bf16_puf.numel());
+            // Cast contiguous grads → f32 into muon gc_puf, then clip grad norm
+            if (USE_BF16) {
+                cast_bf16_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (float*)pufferl.muon->gc_puf.bytes, (const __nv_bfloat16*)pufferl.grad_bf16_puf.bytes,
+                    pufferl.grad_bf16_puf.numel());
+            } else {
+                cudaMemcpyAsync(pufferl.muon->gc_puf.bytes, pufferl.grad_bf16_puf.bytes,
+                    pufferl.grad_bf16_puf.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            }
             {
                 PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;
@@ -772,6 +788,23 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
             pufferl->default_stream);
     } else {
         pufferl->weights_bf16 = pufferl->weights_fp32;
+
+        // In fp32 mode, train activations and grads use the fp32 alloc
+        pufferl->alloc_fp32.esz = esz_fp32;
+        Allocator& acts = pufferl->alloc_fp32.acts;
+        Allocator& grads = pufferl->alloc_fp32.grads;
+
+        PolicyActivations& tb = pufferl->train_activations;
+        tb.encoder = new EncoderActivations{};
+        tb.decoder = new DecoderActivations{};
+        tb.network = new MinGRUActivations{};
+        encoder.reg_train(wfp32.encoder, tb.encoder, &acts, &grads, B_TT);
+        decoder.reg_train(wfp32.decoder, tb.decoder, &acts, &grads, B_TT);
+        network.reg_train(wfp32.network, tb.network, &acts, &grads, B_TT);
+
+        pufferl->alloc_fp32.acts.create();
+        pufferl->alloc_fp32.grads.create();
+        pufferl->grad_bf16_puf = {.bytes = (char*)grads.mem, .shape = {grads.total_elems}, .dtype_size = esz_fp32};
     }
 
     // ========================================================================
@@ -969,10 +1002,10 @@ void close_impl(PuffeRL& pufferl) {
     };
     if (USE_BF16) {
         delete_weights(pufferl.weights_bf16);
-        delete (EncoderActivations*)pufferl.train_activations.encoder;
-        delete (DecoderActivations*)pufferl.train_activations.decoder;
-        delete (MinGRUActivations*)pufferl.train_activations.network;
     }
+    delete (EncoderActivations*)pufferl.train_activations.encoder;
+    delete (DecoderActivations*)pufferl.train_activations.decoder;
+    delete (MinGRUActivations*)pufferl.train_activations.network;
     delete_weights(pufferl.weights_fp32);
     for (auto& rbuf : pufferl.buffer_activations) {
         delete (EncoderActivations*)rbuf.encoder;
