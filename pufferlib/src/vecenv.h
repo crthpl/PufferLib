@@ -307,7 +307,10 @@ void static_vec_seq_step(StaticVec* vec) {
 
 // Optional: Initialize all envs at once (for shared state, variable agents per env, etc.)
 // Default implementation creates envs until total_agents is reached
-#ifndef MY_VEC_INIT
+#ifdef MY_VEC_INIT
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs);
+#else
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs) {
 

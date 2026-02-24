@@ -6,7 +6,7 @@
 #define ACT_TYPE DOUBLE
 
 #define Env MMO
-#include "env_binding.h"
+#include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
     env->width = dict_get(kwargs, "width")->value;

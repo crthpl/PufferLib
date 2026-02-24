@@ -46,8 +46,8 @@ struct Log {
 bool is_agent(int idx) {
     return idx >= AGENT && idx < AGENT + 8;
 }
-int rand_color() {
-    return AGENT + rand()%8;
+int rand_color(unsigned int* rng) {
+    return AGENT + rand_r(rng)%8;
 }
 
 // 6 unique keys and doors
@@ -95,6 +95,7 @@ struct Grid{
     int max_size;
     bool discretize;
     Log log;
+    unsigned int rng;
     Agent* agents;
     unsigned char* grid;
     int* counts;
@@ -290,7 +291,7 @@ void c_reset(Grid* env) {
     memset(env->grid, 0, env->max_size*env->max_size);
     memset(env->counts, 0, env->max_size*env->max_size*sizeof(int));
     env->tick = 0;
-    int idx = rand() % env->num_maps;
+    int idx = rand_r(&env->rng) % env->num_maps;
     set_state(env, &env->levels[idx]);
     compute_observations(env);
 }
@@ -429,7 +430,7 @@ void c_step(Grid* env) {
 
     if (done) {
         c_reset(env);
-        int idx = rand() % env->num_maps;
+        int idx = rand_r(&env->rng) % env->num_maps;
         set_state(env, &env->levels[idx]);
         compute_observations(env);
     }
@@ -637,7 +638,7 @@ void generate_locked_room(Grid* env) {
 
 void generate_growing_tree_maze(unsigned char* grid,
         int width, int height, int max_size, float difficulty, int seed) {
-    srand(seed);
+    unsigned int rng = seed;
     int dx[4] = {-1, 0, 1, 0};
     int dy[4] = {0, 1, 0, -1};
     int dirs[4] = {0, 1, 2, 3};
@@ -657,8 +658,8 @@ void generate_growing_tree_maze(unsigned char* grid,
         }
     }
 
-    int x_init = rand() % (width - 1);
-    int y_init = rand() % (height - 1);
+    int x_init = rand_r(&rng) % (width - 1);
+    int y_init = rand_r(&rng) % (height - 1);
 
     if (x_init % 2 == 0) {
         x_init++;
@@ -677,8 +678,8 @@ void generate_growing_tree_maze(unsigned char* grid,
     //SetTargetFPS(60);
 
     while (num_cells > 0) {
-        if (rand() % 1000 > 1000*difficulty) {
-            int i = rand() % num_cells;
+        if (rand_r(&rng) % 1000 > 1000*difficulty) {
+            int i = rand_r(&rng) % num_cells;
             int tmp_x = cells[2*num_cells - 2];
             int tmp_y = cells[2*num_cells - 1];
             cells[2*num_cells - 2] = cells[2*i];
@@ -695,7 +696,7 @@ void generate_growing_tree_maze(unsigned char* grid,
 
         // In-place direction shuffle
         for (int i = 0; i < 4; i++) {
-            int ii = i + rand() % (4 - i);
+            int ii = i + rand_r(&rng) % (4 - i);
             int tmp = dirs[i];
             dirs[i] = dirs[ii];
             dirs[ii] = tmp;
