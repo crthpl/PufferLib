@@ -632,7 +632,12 @@ void prio_replay_cuda(
     CHECK_LAST_KERNEL();
     int block = ((minibatch_segments + 31) / 32) * 32;
     if (block < 32) block = 32;
-    multinomial_with_replacement_kernel<<<1, block, S * (int)sizeof(float), stream>>>(
+    int shared_bytes = S * (int)sizeof(float);
+    if (shared_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(multinomial_with_replacement_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+    }
+    multinomial_with_replacement_kernel<<<1, block, shared_bytes, stream>>>(
         (int64_t*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes, S, minibatch_segments, seed, offset_ptr);
     CHECK_LAST_KERNEL();
     int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
