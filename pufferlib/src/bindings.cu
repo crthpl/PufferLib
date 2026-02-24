@@ -164,7 +164,7 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     // Copy to fp32 param buffer
     cudaMemcpy(pufferl.alloc_fp32.params.mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
     // If bf16 policy is separate, cast fp32 -> bf16
-    if (pufferl.policy_bf16 != pufferl.policy_fp32) {
+    if (USE_BF16) {
         puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, pufferl.default_stream);
     }
 }
@@ -267,15 +267,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("load_weights", &load_weights);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
-    py::class_<Policy>(m, "Policy")
-        .def("num_params", [](Policy& self) -> int64_t {
-            int64_t total = self.encoder.weight.numel() + self.decoder.weight.numel();
-            if (self.decoder.continuous) total += self.decoder.logstd.numel();
-            for (int i = 0; i < self.rnn.num_layers; i++) {
-                total += self.rnn.weights[i].numel();
-            }
-            return total;
-        });
+    py::class_<Policy>(m, "Policy");
     py::class_<Muon>(m, "Muon");
     py::class_<Allocator>(m, "Allocator")
         .def(py::init<>());
@@ -333,9 +325,11 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("create_pufferl", &create_pufferl);
     py::class_<PuffeRL, std::unique_ptr<PuffeRL>>(m, "PuffeRL")
-        .def_readwrite("policy_bf16", &PuffeRL::policy_bf16)
-        .def_readwrite("policy_fp32", &PuffeRL::policy_fp32)
+        .def_readwrite("policy", &PuffeRL::policy)
         .def_readwrite("muon", &PuffeRL::muon)
         .def_readwrite("hypers", &PuffeRL::hypers)
-        .def_readwrite("rollouts", &PuffeRL::rollouts);
+        .def_readwrite("rollouts", &PuffeRL::rollouts)
+        .def("num_params", [](PuffeRL& self) -> int64_t {
+            return self.alloc_fp32.params.total_elems;
+        });
 }

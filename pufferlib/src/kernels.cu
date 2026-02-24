@@ -181,7 +181,7 @@ inline int seq_size(int N) {
 // state is (B, 1, H)
 // out is (B, H) = sigmoid(proj) * mingru_out (final output)
 // next_state is (B, H) = mingru_out (recurrent state, without proj)
-__global__ void mingru_gate_inference_kernel(
+__global__ void mingru_gate(
     precision_t* out,
     precision_t* next_state,
     const precision_t* combined,    // (B, 3*H) = [hidden, gate, proj]
@@ -236,18 +236,16 @@ __device__ __forceinline__ double logcumsumexp_backward(double x, double* acc, d
 // Optimized forward kernel with checkpointing
 // Writes checkpoints only every CHECKPOINT_INTERVAL timesteps (vs every time)
 // Uses fast math intrinsics for better performance
-__global__ void fused_scan_forward_kernel_checkpointed(
-    precision_t* __restrict__ out,                 // (B, T, H)
-    precision_t* __restrict__ next_state,          // (B, 1, H)
-    float* __restrict__ a_star_buf,      // (B, T+1, H)
-    float* __restrict__ s_buf,           // (B, T+1, H)
-    float* __restrict__ log_values_buf,  // (B, T+1, H)
-    const precision_t* __restrict__ combined,      // (B, T, 3*H)
-    const precision_t* __restrict__ state,         // (B, 1, H)
-    int T_seq,
-    int H,
-    int B
-) {
+__global__ void fused_scan_forward(PrefixScan scan) {
+    int T_seq = scan.T, H = scan.H, B = scan.B;
+    precision_t* __restrict__ out = (precision_t*)scan.out.bytes;
+    precision_t* __restrict__ next_state = (precision_t*)scan.next_state.bytes;
+    float* __restrict__ a_star_buf = (float*)scan.a_star.bytes;
+    float* __restrict__ s_buf = (float*)scan.s_vals.bytes;
+    float* __restrict__ log_values_buf = (float*)scan.log_values_buf.bytes;
+    const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
+    const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) return;
 
@@ -322,20 +320,20 @@ __global__ void fused_scan_forward_kernel_checkpointed(
 // Optimized backward kernel with sparse checkpoint loading
 // Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
 // Uses fast math intrinsics for better performance
-__global__ void fused_scan_backward_kernel_checkpointed(
-    precision_t* __restrict__ grad_combined,         // (B, T, 3*H)
-    precision_t* __restrict__ grad_state,            // (B, 1, H)
+__global__ void fused_scan_backward(
+    PrefixScan scan,
     const precision_t* __restrict__ grad_out,        // (B, T, H)
-    const precision_t* __restrict__ grad_next_state, // (B, 1, H)
-    const precision_t* __restrict__ combined,        // (B, T, 3*H)
-    const precision_t* __restrict__ state,           // (B, 1, H)
-    const float* __restrict__ a_star_buf,  // (B, T+1, H)
-    const float* __restrict__ s_buf,       // (B, T+1, H)
-    const float* __restrict__ log_values_buf, // (B, T+1, H)
-    int T_seq,                             // (T)
-    int H,
-    int B
+    const precision_t* __restrict__ grad_next_state  // (B, 1, H)
 ) {
+    int T_seq = scan.T, H = scan.H, B = scan.B;
+    precision_t* __restrict__ grad_combined = (precision_t*)scan.grad_combined.bytes;
+    precision_t* __restrict__ grad_state = (precision_t*)scan.grad_state.bytes;
+    const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
+    const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+    const float* __restrict__ a_star_buf = (const float*)scan.a_star.bytes;
+    const float* __restrict__ s_buf = (const float*)scan.s_vals.bytes;
+    const float* __restrict__ log_values_buf = (const float*)scan.log_values_buf.bytes;
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) return;
 

@@ -85,8 +85,7 @@ class PuffeRL:
         self.losses = {}
         self.verbose = verbose
 
-        self.policy_fp32 = self.pufferl_cpp.policy_fp32
-        self.model_size = self.policy_fp32.num_params()
+        self.model_size = self.pufferl_cpp.num_params()
         self.start_time = time.time()
         self.print_dashboard(clear=True)
 
@@ -157,7 +156,6 @@ class PuffeRL:
         model_path = self.save_checkpoint()
         # Clear Python references to C++ tensors BEFORE calling C++ close
         self.rollouts = None
-        self.policy_fp32 = None
         self.observations = None
         self.actions = None
         self.rewards = None
