@@ -767,6 +767,8 @@ static void encoder_reg_rollout(void* w, void* activations, Allocator* alloc, in
     alloc->reg(&a->out);
 }
 
+#include "ocean.cu"
+
 struct DecoderWeights { PufTensor weight, logstd; int hidden_dim, output_dim; bool continuous; };
 struct DecoderActivations { PufTensor out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch; };
 

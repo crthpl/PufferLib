@@ -212,6 +212,7 @@ typedef struct {
     bool rollout_captured;
     bool train_captured;
     uint64_t rng_seed;
+    bool is_nmmo3;
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -712,7 +713,17 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->alloc_fp32.esz = esz_fp32;
     Allocator& fp32_params = pufferl->alloc_fp32.params;
 
-    Encoder encoder = {
+    bool is_nmmo3 = (env_name == "puffer_nmmo3");
+    pufferl->is_nmmo3 = is_nmmo3;
+
+    Encoder encoder = is_nmmo3 ? Encoder{
+        .forward = nmmo3_encoder_forward,
+        .backward = nmmo3_encoder_backward,
+        .init_weights = nmmo3_encoder_init_weights,
+        .reg_params = nmmo3_encoder_reg_params,
+        .reg_train = nmmo3_encoder_reg_train,
+        .reg_rollout = nmmo3_encoder_reg_rollout,
+    } : Encoder{
         .forward = encoder_forward,
         .backward = encoder_backward,
         .init_weights = encoder_init_weights,
@@ -749,7 +760,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // fp32 master weights
     auto new_weights = [&](int esz) -> PolicyWeights {
         PolicyWeights w;
-        w.encoder = new EncoderWeights{.in_dim = input_size, .out_dim = hidden_size};
+        if (is_nmmo3) {
+            w.encoder = new NMMO3EncoderWeights{.obs_size = input_size, .hidden = hidden_size};
+        } else {
+            w.encoder = new EncoderWeights{.in_dim = input_size, .out_dim = hidden_size};
+        }
         w.decoder = new DecoderWeights{.hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous};
         w.network = new MinGRUWeights{.hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon};
         ((MinGRUWeights*)w.network)->weights.resize(num_layers);
@@ -794,7 +809,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         network.reg_params(wbf16.network, &bf16_params, psz);
 
         PolicyActivations& tb = pufferl->train_activations;
-        tb.encoder = new EncoderActivations{};
+        tb.encoder = is_nmmo3 ? (void*)new NMMO3EncoderActivations{} : (void*)new EncoderActivations{};
         tb.decoder = new DecoderActivations{};
         tb.network = new MinGRUActivations{};
         encoder.reg_train(wbf16.encoder, tb.encoder, &acts, &grads, B_TT);
@@ -816,7 +831,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         Allocator& grads = pufferl->alloc_fp32.grads;
 
         PolicyActivations& tb = pufferl->train_activations;
-        tb.encoder = new EncoderActivations{};
+        tb.encoder = is_nmmo3 ? (void*)new NMMO3EncoderActivations{} : (void*)new EncoderActivations{};
         tb.decoder = new DecoderActivations{};
         tb.network = new MinGRUActivations{};
         encoder.reg_train(wfp32.encoder, tb.encoder, &acts, &grads, B_TT);
@@ -917,7 +932,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     for (int i = 0; i < num_buffers; i++) {
         PolicyActivations& rbuf = pufferl->buffer_activations[i];
         Allocator& ralloc = pufferl->buffer_allocs[i];
-        rbuf.encoder = new EncoderActivations{};
+        rbuf.encoder = is_nmmo3 ? (void*)new NMMO3EncoderActivations{} : (void*)new EncoderActivations{};
         rbuf.decoder = new DecoderActivations{};
         rbuf.network = new MinGRUActivations{};
         encoder.reg_rollout(pufferl->weights_bf16.encoder, rbuf.encoder, &ralloc, inf_batch);
@@ -1016,20 +1031,23 @@ void close_impl(PuffeRL& pufferl) {
 
     delete pufferl.muon;
 
-    auto delete_weights = [](PolicyWeights& w) {
-        delete (EncoderWeights*)w.encoder;
+    auto delete_weights = [&](PolicyWeights& w) {
+        if (pufferl.is_nmmo3) delete (NMMO3EncoderWeights*)w.encoder;
+        else delete (EncoderWeights*)w.encoder;
         delete (DecoderWeights*)w.decoder;
         delete (MinGRUWeights*)w.network;
     };
     if (USE_BF16) {
         delete_weights(pufferl.weights_bf16);
     }
-    delete (EncoderActivations*)pufferl.train_activations.encoder;
+    if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)pufferl.train_activations.encoder;
+    else delete (EncoderActivations*)pufferl.train_activations.encoder;
     delete (DecoderActivations*)pufferl.train_activations.decoder;
     delete (MinGRUActivations*)pufferl.train_activations.network;
     delete_weights(pufferl.weights_fp32);
     for (auto& rbuf : pufferl.buffer_activations) {
-        delete (EncoderActivations*)rbuf.encoder;
+        if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)rbuf.encoder;
+        else delete (EncoderActivations*)rbuf.encoder;
         delete (DecoderActivations*)rbuf.decoder;
         delete (MinGRUActivations*)rbuf.network;
     }
