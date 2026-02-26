@@ -483,7 +483,7 @@ void train_impl(PuffeRL& pufferl) {
         {
             // Build a RolloutBuf view with old_values and advantages swapped in
             RolloutBuf sel_src = rollouts;
-            sel_src.values = old_values_puf;
+            sel_src.values = rollouts.values; //old_values_puf;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
             select_copy_kernel<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, (const int64_t*)pufferl.prio_bufs.idx.bytes,
@@ -571,7 +571,6 @@ void train_impl(PuffeRL& pufferl) {
 
         // Bugged version did not have the below updates correct but worked better.
         // Keeping this version until we can resweep hypers etc
-        /*
         // mb_ratio is (S, H) precision — scatter into rollouts.ratio (S_total, H)
         {
             int num_idx = pufferl.prio_bufs.idx.numel();
@@ -589,7 +588,6 @@ void train_impl(PuffeRL& pufferl) {
                 rollouts.values.bytes, (const int64_t*)pufferl.prio_bufs.idx.bytes,
                 (const char*)graph.mb_newvalue.bytes, num_idx, row_bytes);
         }
-        */
         cudaEventRecord(pufferl.profile.events[4]);  // end forward
     }
     pufferl.epoch += 1;

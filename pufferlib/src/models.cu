@@ -579,6 +579,7 @@ void ppo_loss_fwd_bwd(
         ppo_partials_buf,
         (float*)bufs.grad_logits.bytes, is_continuous ? (float*)bufs.grad_logstd.bytes : nullptr,
         (float*)bufs.grad_values.bytes,
+        (precision_t*)graph.mb_ratio.bytes, (precision_t*)graph.mb_newvalue.bytes,
         logits_ptr, logstd_ptr,
         values_pred_ptr, (double*)graph.mb_actions.bytes,
         (const precision_t*)graph.mb_logprobs.bytes, (float*)graph.mb_advantages.bytes,

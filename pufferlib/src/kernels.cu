@@ -586,6 +586,9 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     float* __restrict__ grad_logits,     // For continuous: grad_mean
     float* __restrict__ grad_logstd,     // For continuous: grad_logstd (nullptr for discrete)
     float* __restrict__ grad_values_pred,
+    // Scatter-back outputs (written into graph buffers for index_copy)
+    precision_t* __restrict__ out_ratio,
+    precision_t* __restrict__ out_newvalue,
     // Inputs
     const precision_t* __restrict__ logits,
     const precision_t* __restrict__ logstd,       // nullptr for discrete
@@ -643,6 +646,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     float val = to_float(values[nt]);
     float ret = to_float(returns[nt]);
     float val_pred = to_float(values_pred[values_idx]);
+    out_newvalue[nt] = from_float(val_pred);
 
     float adv_std = sqrtf(float(adv_var[0]));
     float adv_normalized = (adv - float(adv_mean[0])) / (adv_std + 1e-8f);
@@ -689,6 +693,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
 
         float logratio = total_log_prob - old_logp;
         float ratio = __expf(logratio);
+        out_ratio[nt] = from_float(ratio);
         float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
         float wa = -w * adv_normalized;
         float pg_loss1 = wa * ratio;
@@ -750,6 +755,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
 
         float logratio = total_log_prob - old_logp;
         float ratio = __expf(logratio);
+        out_ratio[nt] = from_float(ratio);
         float ratio_clipped = fmaxf(1.0f - clip_coef, fminf(1.0f + clip_coef, ratio));
         float wa = -w * adv_normalized;
         float pg_loss1 = wa * ratio;
