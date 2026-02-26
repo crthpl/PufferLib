@@ -935,7 +935,7 @@ int main(void) {
         strcat(env_options, data.envs[i].key);
     }
 
-    char* clipboard = malloc(1024);
+    char* clipboard = malloc(8192);
 
     // Points
     Point* points = calloc(MAX_POINTS, sizeof(Point));

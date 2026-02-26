@@ -12,7 +12,7 @@ env_names = sorted([
     #'tetris',
     #'g2048',
     #'moba',
-    #'pong',
+    'pong',
     #'tower_climb',
     #'grid',
     #'nmmo3',
@@ -43,12 +43,14 @@ HYPERS = [
     'vec/total_agents',
 ]
 
-ALL_KEYS = [
+METRICS = [
     'agent_steps',
-    'cost',
+    'uptime',
     'environment/score',
     'environment/perf'
-] + HYPERS
+]
+
+ALL_KEYS = METRICS + HYPERS
 
 def pareto_idx(steps, costs, scores):
     idxs = []
@@ -63,7 +65,7 @@ def pareto_idx(steps, costs, scores):
 
 def load_sweep_data(path):
     data = {}
-    keys = None
+    sweep_metadata = {}
     for fpath in glob.glob(path):
         if 'cache.json' in fpath:
             continue
@@ -71,45 +73,38 @@ def load_sweep_data(path):
         with open(fpath, 'r') as f:
             exp = json.load(f)
 
-        if not data:
-            for kk in exp.keys():
-                if kk == 'data':
-                    for k, v in exp[kk][-1].items():
-                        data[k] = []
-                else:
-                    data[kk] = []
+        if not sweep_metadata:
+            for k, v in exp.items():
+                if k.startswith('sweep/'):
+                    sweep_metadata[k.replace('sweep/', '')] = v
 
-        discard = False
-        for kk in list(data.keys()):
-            if kk not in exp and kk not in exp['data'][-1]:
-                discard = True
-                break
+        for k, v in exp.items():
+            if k.startswith('sweep/'):
+                continue
 
-        if discard:
-            continue
+            if isinstance(v, dict):
+                continue
 
-        for kk in list(data.keys()):
-            if kk in exp:
-                v = exp[kk]
-                sweep_key = f'sweep/{kk}/distribution'
-                if sweep_key in data and exp[sweep_key] == 'logit_normal':
-                    v = 1 - v
-                elif kk in ('train/vtrace_rho_clip', 'train/vtrace_c_clip'):
-                    v = max(v, 0.1)
+            if k not in data:
+                data[k] = []
 
-                data[kk].append(v)
-            else:
-                data[kk].append(exp['data'][-1][kk])
+            data[k].append(v)
+
+        for k in METRICS:
+            if k not in data:
+                data[k] = []
+
+            data[k].append(exp['data'][-1][k])
 
     steps = data['agent_steps']
-    costs = data['cost']
+    costs = data['uptime']
     scores = data['environment/score']
 
     idxs = pareto_idx(steps, costs, scores)
 
     # Filter to pareto
-    for k in data:
-        data[k] = [data[k][i] for i in idxs]
+    #for k in data:
+    #    data[k] = [data[k][i] for i in idxs]
 
     # Monkey patch: Cap performance
     data['environment/perf'] = [min(e, 1.0) for e in data['environment/perf']]
@@ -119,6 +114,7 @@ def load_sweep_data(path):
         skip = data['env/frameskip']
         data['agent_steps'] = [n*m for n, m in zip(data['agent_steps'], skip)]
  
+    data['sweep'] = sweep_metadata
     return data
 
 def cached_sweep_load(path, env_name):
@@ -136,20 +132,21 @@ def cached_sweep_load(path, env_name):
 
 def compute_tsne():
     data = {name: cached_sweep_load(f'experiments/logs/puffer_{name}', name) for name in env_names}
+    sweep_metadata = {name: data[name].pop('sweep') for name in env_names}
 
     flat = []
     flat_mmin = []
     flat_mmax = []
     for env in env_names:
         flat.append(np.stack([data[env][hyper] for hyper in HYPERS], axis=1))
-        flat_mmin.append(np.stack([data[env][f'sweep/{hyper}/min'] for hyper in HYPERS], axis=1))
-        flat_mmax.append(np.stack([data[env][f'sweep/{hyper}/max'] for hyper in HYPERS], axis=1))
+        flat_mmin.append(np.stack([sweep_metadata[env][f'{hyper}/min'] for hyper in HYPERS]))
+        flat_mmax.append(np.stack([sweep_metadata[env][f'{hyper}/max'] for hyper in HYPERS]))
 
-    flat_distribution = [data[env][f'sweep/{hyper}/distribution'] for env in env_names for hyper in HYPERS]
+    flat_distribution = [sweep_metadata[env][f'{hyper}/distribution'] for env in env_names for hyper in HYPERS]
 
     flat = np.concatenate(flat, axis=0)
-    flat_mmin = np.concatenate(flat_mmin, axis=0).min(axis=0)
-    flat_mmax = np.concatenate(flat_mmax, axis=0).max(axis=0)
+    flat_mmin = np.stack(flat_mmin, axis=0).min(axis=0)
+    flat_mmax = np.stack(flat_mmax, axis=0).max(axis=0)
 
     normed = flat.copy()
     for i in range(len(HYPERS)):
@@ -178,7 +175,7 @@ def compute_tsne():
         '''
         sz = len(data[env]['agent_steps'])
 
-        data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
+        #data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
         if reduced is not None:
             data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
             data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
