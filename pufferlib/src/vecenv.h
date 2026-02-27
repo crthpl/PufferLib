@@ -355,6 +355,14 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 }
 #endif
 
+#ifdef MY_VEC_CLOSE
+void my_vec_close(Env* envs);
+#else
+void my_vec_close(Env* envs) {
+    return;
+}
+#endif
+
 StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* vec_kwargs, Dict* env_kwargs) {
     StaticVec* vec = (StaticVec*)calloc(1, sizeof(StaticVec));
     vec->total_agents = total_agents;

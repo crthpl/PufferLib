@@ -6,6 +6,7 @@
 #define ACT_TYPE DOUBLE
 
 #define MY_VEC_INIT
+#define MY_VEC_CLOSE
 #define Env Grid
 #include "vecenv.h"
 
@@ -84,6 +85,10 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 
     *num_envs_out = num_envs;
     return envs;
+}
+
+void my_vec_close(Env* envs) {
+    free(envs[0].levels);
 }
 
 void my_init(Env* env, Dict* kwargs) {

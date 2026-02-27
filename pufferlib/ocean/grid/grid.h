@@ -140,7 +140,6 @@ void c_close(Grid* env) {
     free(env->grid);
     free(env->counts);
     free(env->agents);
-    free(env);
 }
 
 void free_allocated_grid(Grid* env) {

@@ -35,6 +35,12 @@ void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
     auto t0 = std::chrono::high_resolution_clock::now();
+
+    // Zero state buffers
+    for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+        puf_zero(pufferl.buffer_states[i], pufferl.default_stream);
+    }
+
     static_vec_omp_step(pufferl.vec);
     float sec = std::chrono::duration<float>(
         std::chrono::high_resolution_clock::now() - t0).count();
