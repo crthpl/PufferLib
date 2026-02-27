@@ -47,14 +47,19 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 #import torch; torch._dynamo.config.capture_scalar_outputs = True
 
 class PuffeRL:
-    def __init__(self, config, vec_config, env_config, policy_config, logger=None, verbose=True):
+    def __init__(self, config, logger=None, verbose=True):
+        train_config = config['train']
+        vec_config = config['vec']
+        env_config = config['env']
+        policy_config = config['policy']
+
         # Reproducibility
-        seed = config['seed']
+        seed = train_config['seed']
         random.seed(seed)
         np.random.seed(seed)
 
-        minibatch_size = config['minibatch_size']
-        horizon = config['horizon']
+        minibatch_size = train_config['minibatch_size']
+        horizon = train_config['horizon']
         total_agents = vec_config['total_agents']
         batch_size = horizon * total_agents
         self.batch_size = batch_size
@@ -69,7 +74,7 @@ class PuffeRL:
 
         # Logging
         self.logger = logger
-        self.pufferl_cpp = _C.create_pufferl(config, vec_config, env_config, policy_config)
+        self.pufferl_cpp = _C.create_pufferl(config)
         self.rollouts = self.pufferl_cpp.rollouts
 
         # Initializations
@@ -115,7 +120,7 @@ class PuffeRL:
         # Rate-limit dashboard/logging to avoid overhead, but env stats
         # and display are purely cosmetic — they don't affect training state
         logs = None
-        done_training = self.global_step >= self.config['total_timesteps']
+        done_training = self.global_step >= self.config['train']['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.6:
             logs = _C.log_environments(self.pufferl_cpp)
             self.stats = logs
@@ -138,12 +143,13 @@ class PuffeRL:
             return
 
         config = self.config
-        agent_steps = int(self.global_step * config['gpus'])
+        gpus = config['train']['gpus']
+        agent_steps = int(self.global_step * gpus)
         logs = {
-            'SPS': int(self.sps * config['gpus']),
-            'agent_steps': int(agent_steps * config['gpus']),
+            'SPS': int(self.sps * gpus),
+            'agent_steps': int(agent_steps * gpus),
             'uptime': self.uptime,
-            'epoch': int(self.epoch * config['gpus']),
+            'epoch': int(self.epoch * gpus),
             **{f'environment/{k}': v for k, v in logs.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
             **{f'performance/{k}': v for k, v in self.profile.items()},
@@ -169,7 +175,7 @@ class PuffeRL:
 
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
-            self.config["env"], f'{run_id}.bin')
+            self.config["env_name"], f'{run_id}.bin')
         if model_path and os.path.exists(model_path):
             shutil.copy(model_path, path)
         return path
@@ -180,11 +186,11 @@ class PuffeRL:
 
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'],
-            self.config["env"], run_id)
+            self.config["env_name"], run_id)
         if not os.path.exists(path):
             os.makedirs(path)
 
-        model_name = f'model_{self.config["env"]}_{self.epoch:06d}.bin'
+        model_name = f'model_{self.config["env_name"]}_{self.epoch:06d}.bin'
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
@@ -211,8 +217,9 @@ class PuffeRL:
             return
 
         config = self.config
-        sps = self.sps * config['gpus']
-        agent_steps = self.global_step * config['gpus']
+        gpus = config['train']['gpus']
+        sps = self.sps * gpus
+        agent_steps = self.global_step * gpus
 
         profile = self.profile
         console = Console()
@@ -237,11 +244,11 @@ class PuffeRL:
         s = Table(box=None, expand=True)
         remaining = f'{b2}A hair past a freckle{c2}'
         if sps != 0:
-            remaining = duration((config['total_timesteps']*config['gpus'] - agent_steps)/sps, b2, c2)
+            remaining = duration((config['train']['total_timesteps']*gpus - agent_steps)/sps, b2, c2)
 
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
-        s.add_row(f'{c2}Env', f'{b2}{config["env"]}')
+        s.add_row(f'{c2}Env', f'{b2}{config["env_name"]}')
         s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
         s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
         s.add_row(f'{c2}SPS', abbreviate(sps, b2, c2))
@@ -252,7 +259,6 @@ class PuffeRL:
         delta = profile['rollout'] + profile['train']
         p = Table(box=None, expand=True, show_header=False)
         p.add_column(f"{c1}Performance", justify="left", width=10)
-        p.add_column(f"{c1}Time", justify="right", width=8)
         p.add_column(f"{c1}%", justify="right", width=4)
         p.add_row(*fmt_perf2('Evaluate', b1, delta, profile['rollout'], b2, c2))
         p.add_row(*fmt_perf2('  GPU', b2, delta, profile['eval_gpu'], b2, c2))
@@ -361,7 +367,7 @@ class Logger:
         train_args = args['train']
 
         self.run_id = str(int(1000*time.time()))
-        root = os.path.join(train_args['data_dir'], 'logs', args['env_name'])
+        root = os.path.join(args['data_dir'], 'logs', args['env_name'])
         if not os.path.exists(root):
             os.makedirs(root)
 
@@ -426,19 +432,13 @@ class Logger:
         model_file = max(os.listdir(data_dir))
         return f'{data_dir}/{model_file}'
 
-def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
-    """Worker function for multi-GPU training. Runs on each GPU."""
-    args = args or load_config(env_name)
+def _train(env_name, args, sweep_obj=None, target_key=None, result_queue=None):
+    '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
+    is_rank0 = args.get('rank', 0) == 0
+    logger = Logger(args) if is_rank0 else None
+    pufferl = PuffeRL(args, logger, verbose=is_rank0)
+    train_config = args['train']
 
-    train_config = dict(**args['train'])
-    train_config['env_name'] = args['env_name']
-
-    vec_config = args['vec']
-    env_config = args['env']
-    policy_config = args['policy']
-    pufferl = PuffeRL(train_config, vec_config, env_config, policy_config, logger, verbose)
-
-    # Sweep needs data for early stopped runs, so send data when steps > 100M
     logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
     all_logs = []
 
@@ -449,82 +449,17 @@ def _train_rank(env_name, args=None, logger=None, verbose=True, early_stop_fn=No
         if logs is None:
             continue
 
-        should_stop_early = False
-        if early_stop_fn is not None:
-            should_stop_early = early_stop_fn(logs)
-
-            # This is hacky, but need to see if threshold looks reasonable
-            if 'early_stop_threshold' in logs:
-                pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
+        if sweep_obj is not None and sweep_obj.early_stop(logs, target_key):
+            break
 
         if pufferl.global_step > logging_threshold:
             all_logs.append(logs)
 
-        if should_stop_early:
-            model_path = pufferl.close()
-            pufferl.logger.log_cost(pufferl.uptime)
-            pufferl.logger.close(model_path, early_stop=True)
-            return pufferl, all_logs
-
-    pufferl.print_dashboard()
-
-    if not logger:
-        model_path = pufferl.close()
-
-    return pufferl, all_logs
-
-
-def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
-    if args is None:
-        args = load_config(env_name)
-
-    num_gpus = args['train']['gpus']
-
-    nccl_id_path = f'/tmp/puffer_nccl_{os.getpid()}'
-    if os.path.exists(nccl_id_path):
-        os.remove(nccl_id_path)
-
-    # Set shared config
-    args['train']['world_size'] = num_gpus
-    args['train']['nccl_id_path'] = nccl_id_path
-
-    args['train']['total_timesteps'] /= num_gpus
-    args['train']['minibatch_size'] /= num_gpus
-    args['vec']['total_agents'] /= num_gpus
-    args['vec']['num_threads'] /= num_gpus
-
-    # Spawn workers for ranks 1..N-1
-    ctx = mp.get_context('spawn')
-    procs = []
-    for rank in range(1, num_gpus):
-        worker_args = deepcopy(args)
-        worker_args['train']['rank'] = rank
-        p = ctx.Process(target=_train_rank, args=(env_name, worker_args, None, False, early_stop_fn))
-        p.start()
-        procs.append(p)
-
-    # Run rank 0 on main process
-    args['train']['rank'] = 0
-
-    if logger is None:
-        logger = Logger(args)
-
-    pufferl, all_logs = _train_rank(env_name, args=args, logger=logger, verbose=True)
-
-    for p in procs:
-        p.join()
-
-    if os.path.exists(nccl_id_path):
-        os.remove(nccl_id_path)
-
-
-    # Final eval. You can reset the env here, but depending on
-    # your env, this can skew data (i.e. you only collect the shortest
-    # rollouts within a fixed number of epochs)
+    # Final eval
     uptime = pufferl.uptime
     agent_steps = pufferl.global_step
     logs = {}
-    for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
+    for i in range(128):
         pufferl.evaluate()
         if i == 0 or i % 32 != 0:
             continue
@@ -538,14 +473,145 @@ def train(env_name, args=None, logger=None, verbose=True, early_stop_fn=None):
     logs['uptime'] = uptime
     logs['agent_steps'] = agent_steps
     logs = pufferl.write_logs(logs)
-
     all_logs.append(logs)
 
     pufferl.print_dashboard()
     model_path = pufferl.close()
-    pufferl.logger.log_cost(uptime)
-    pufferl.logger.close(model_path, early_stop=False)
+    if logger:
+        pufferl.logger.log_cost(uptime)
+        pufferl.logger.close(model_path, early_stop=False)
+
+    if result_queue is not None:
+        result_queue.put((args.get('gpu_id', 0), all_logs))
     return all_logs
+
+def train(env_name, args=None, sweep_mode=False):
+    '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
+    if args is None:
+        args = load_config(env_name)
+
+    if not sweep_mode:
+        num_gpus = args['train']['gpus']
+        if num_gpus == 1:
+            return _train(env_name, args)
+
+        # Multi-GPU DDP: split work, spawn workers, run rank 0 inline
+        nccl_id_path = f'/tmp/puffer_nccl_{os.getpid()}'
+        if os.path.exists(nccl_id_path):
+            os.remove(nccl_id_path)
+
+        args['world_size'] = num_gpus
+        args['nccl_id_path'] = nccl_id_path
+        args['train']['total_timesteps'] /= num_gpus
+        args['train']['minibatch_size'] /= num_gpus
+        args['vec']['total_agents'] /= num_gpus
+        args['vec']['num_threads'] /= num_gpus
+
+        ctx = mp.get_context('spawn')
+        procs = []
+        for rank in range(1, num_gpus):
+            worker_args = deepcopy(args)
+            worker_args['rank'] = rank
+            worker_args['gpu_id'] = rank
+            p = ctx.Process(target=_train, args=(env_name, worker_args))
+            p.start()
+            procs.append(p)
+
+        args['rank'] = 0
+        args['gpu_id'] = 0
+        all_logs = _train(env_name, args)
+
+        for p in procs:
+            p.join()
+
+        if os.path.exists(nccl_id_path):
+            os.remove(nccl_id_path)
+
+        return all_logs
+
+    # === Sweep mode ===
+    is_pareto = (sweep_mode == 'pareto')
+    args['no_model_upload'] = True
+    sweep_config = args['sweep']
+    method = sweep_config.pop('method')
+    try:
+        sweep_cls = getattr(pufferlib.sweep, method)
+    except:
+        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
+
+    sweep_obj = sweep_cls(sweep_config)
+    points_per_run = sweep_config['downsample']
+    target_key = f'environment/{sweep_config["metric"]}'
+
+    sweep_gpus = args['sweep_gpus']
+    if sweep_gpus == -1:
+        sweep_gpus = 1
+
+    all_timesteps = None
+    if is_pareto:
+        ts_config = sweep_config['train']['total_timesteps']
+        all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
+
+    result_queue = mp.Queue() if sweep_gpus > 1 else None
+    active = {}
+    launched = 0
+
+    while launched < args['max_runs'] or active:
+        # Collect a completed result if GPUs are full or done launching
+        if active and (len(active) >= sweep_gpus or launched >= args['max_runs']):
+            if result_queue:
+                gpu_id, all_logs = result_queue.get()
+                done_args = active.pop(gpu_id)
+            else:
+                _, (done_args, all_logs) = active.popitem()
+
+            filtered = [e for e in all_logs if target_key in e]
+            if not filtered:
+                sweep_obj.observe(done_args, 0, 0, is_failure=True)
+            else:
+                total_ts = done_args['train']['total_timesteps']
+                scores = downsample([log[target_key] for log in filtered], points_per_run)
+                costs = downsample([log['uptime'] for log in filtered], points_per_run)
+                timesteps = downsample([log['agent_steps'] for log in filtered], points_per_run)
+                if filtered[-1].get('is_loss_nan', False):
+                    s, c = scores.pop(), costs.pop()
+                    done_args['train']['total_timesteps'] = timesteps.pop()
+                    sweep_obj.observe(done_args, s, c, is_failure=True)
+                for score, cost, timestep in zip(scores, costs, timesteps):
+                    done_args['train']['total_timesteps'] = timestep
+                    sweep_obj.observe(done_args, score, cost)
+                done_args['train']['total_timesteps'] = total_ts
+            continue
+
+        if launched >= args['max_runs']:
+            break
+
+        # Determine GPU and fixed timestep budget (pareto mode)
+        if sweep_gpus > 1:
+            gpu_id = next(i for i in range(sweep_gpus) if i not in active)
+        else:
+            gpu_id = 0
+        fixed_ts = all_timesteps[gpu_id] if is_pareto else None
+
+        # Suggest and launch new run
+        run_args = deepcopy(args)
+        if launched > 0:
+            sweep_obj.suggest(run_args, fixed_total_timesteps=fixed_ts)
+        if fixed_ts is not None:
+            run_args['train']['total_timesteps'] = fixed_ts
+
+        if sweep_gpus > 1:
+            run_args['gpu_id'] = gpu_id
+            mp.Process(target=_train, args=(env_name, run_args),
+                       kwargs={'result_queue': result_queue}).start()
+            active[gpu_id] = run_args
+        else:
+            if hasattr(sweep_obj, '_running_target_buffer'):
+                sweep_obj._running_target_buffer.clear()
+            all_logs = _train(env_name, run_args, sweep_obj=sweep_obj, target_key=target_key)
+            active[0] = (run_args, all_logs)
+
+        launched += 1
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy using the native pipeline.
@@ -553,22 +619,12 @@ def eval(env_name, args=None, load_path=None):
     runs rollouts in a loop with rendering on env 0.'''
     args = args or load_config(env_name)
 
-    train_config = dict(**args['train'])
-    train_config['env_name'] = args['env_name']
-    train_config.setdefault('world_size', 1)
-    train_config.setdefault('rank', 0)
-    train_config.setdefault('nccl_id_path', '')
-
-    vec_config = args['vec']
-    env_config = args['env']
-    policy_config = args['policy']
-
-    pufferl_cpp = _C.create_pufferl(train_config, vec_config, env_config, policy_config)
+    pufferl_cpp = _C.create_pufferl(args)
 
     # Resolve load path
     load_path = load_path or args.get('load_model_path')
     if load_path == 'latest':
-        data_dir = train_config.get('data_dir', 'experiments')
+        data_dir = args['data_dir']
         pattern = os.path.join(data_dir, args['env_name'], '**', '*.bin')
         candidates = glob.glob(pattern, recursive=True)
         if not candidates:
@@ -604,261 +660,6 @@ def export(env_name, args=None, vecenv=None, policy=None):
     weights = np.concatenate(weights)
     weights.tofile(path)
     print(f'Saved {len(weights)} weights to {path}')
-
-def _sweep_worker(env_name, q_host, q_worker, device):
-    while True:
-        args = q_worker.get()
-        args['train']['device'] = device
-        seed = time.time_ns() & 0xFFFFFFFF
-        random.seed(seed)
-        np.random.seed(seed)
-        try:
-            import torch
-            torch.manual_seed(seed)
-        except ImportError:
-            pass
-        try:
-            all_logs = train(env_name, args=args, verbose=False)
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-        q_host.put(all_logs)
-
-def multisweep(args=None, env_name=None):
-    args = args or load_config(env_name)
-    sweep_gpus = args['sweep_gpus']
-    if sweep_gpus == -1:
-        import torch
-        sweep_gpus = torch.cuda.device_count()
-
-    method = args['sweep'].pop('method')
-    try:
-        sweep_cls = getattr(pufferlib.sweep, method)
-    except:
-        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
-
-    sweep = sweep_cls(args['sweep'])
-    points_per_run = args['sweep']['downsample']
-    target_key = f'environment/{args["sweep"]["metric"]}'
-
-    from multiprocessing import Process, Queue, set_start_method
-    from copy import deepcopy
-
-    host_queues = []
-    worker_queues = []
-    workers = []
-    worker_args = []
-    set_start_method('spawn')
-    for i in range(sweep_gpus):
-        q_host = Queue()
-        q_worker = Queue()
-        w = Process(
-            target=_sweep_worker,
-            args=(env_name, q_host, q_worker, f'cuda:{i}')
-        )
-        w.start()
-        host_queues.append(q_host)
-        worker_queues.append(q_worker)
-        args = deepcopy(args)
-        worker_args.append(args)
-
-    for w in range(sweep_gpus):
-        args = worker_args[w]
-        sweep.suggest(args)
-        total_timesteps = args['train']['total_timesteps']
-        worker_queues[w].put(args)
-
-    runs = 0
-
-    suggestion = deepcopy(args)
-    while runs < args['max_runs']:
-        for w in range(sweep_gpus):
-            args = worker_args[w]
-            if host_queues[w].empty():
-                continue
-
-            all_logs = host_queues[w].get(timeout=0)
-            if not all_logs:
-                continue
-
-            all_logs = [e for e in all_logs if target_key in e]
-            scores = downsample([log[target_key] for log in all_logs], points_per_run)
-            times = downsample([log['uptime'] for log in all_logs], points_per_run)
-            steps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
-            #costs = np.stack([times, steps], axis=1)
-            costs = times
-            timesteps = [log['agent_steps'] for log in all_logs]
-            timesteps = downsample(timesteps, points_per_run)
-            for score, cost, timestep in zip(scores, costs, timesteps):
-                args['train']['total_timesteps'] = timestep
-                sweep.observe(args, score, cost)
-
-            runs += 1
-
-            sweep.suggest(args)
-            worker_queues[w].put(args)
-
-def paretosweep(args=None, env_name=None):
-    args = args or load_config(env_name)
-    sweep_gpus = args['sweep_gpus']
-    if sweep_gpus == -1:
-        import torch
-        sweep_gpus = torch.cuda.device_count()
-
-    method = args['sweep'].pop('method')
-    try:
-        sweep_cls = getattr(pufferlib.sweep, method)
-    except:
-        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
-
-    total_timesteps = args['sweep']['train'].pop('total_timesteps')
-    mmin = total_timesteps['min']
-    mmax = total_timesteps['max']
-    all_timesteps = np.geomspace(mmin, mmax, sweep_gpus)
-    # You hardcoded buffer size to 5 instead of 10 for this
-    sweeps = [sweep_cls(args['sweep']) for _ in range(sweep_gpus)]
-    points_per_run = args['sweep']['downsample']
-    target_key = f'environment/{args["sweep"]["metric"]}'
-
-    from multiprocessing import Process, Queue, set_start_method
-    from copy import deepcopy
-
-    host_queues = []
-    worker_queues = []
-    workers = []
-    worker_args = []
-    set_start_method('spawn')
-    for i in range(sweep_gpus):
-        q_host = Queue()
-        q_worker = Queue()
-        w = Process(
-            target=_sweep_worker,
-            args=(env_name, q_host, q_worker, f'cuda:{i}')
-        )
-        w.start()
-        host_queues.append(q_host)
-        worker_queues.append(q_worker)
-        args = deepcopy(args)
-        worker_args.append(args)
-
-    for w in range(sweep_gpus):
-        args = worker_args[w]
-        sweeps[w].suggest(args)
-        args['train']['total_timesteps'] = all_timesteps[w]
-        worker_queues[w].put(args)
-
-    runs = 0
-
-    suggestion = deepcopy(args)
-    while runs < args['max_runs']:
-        for w in range(sweep_gpus):
-            args = worker_args[w]
-            if host_queues[w].empty():
-                continue
-
-            all_logs = host_queues[w].get(timeout=0)
-            if not all_logs:
-                continue
-
-            all_logs = [e for e in all_logs if target_key in e]
-            scores = downsample([log[target_key] for log in all_logs], points_per_run)
-            times = downsample([log['uptime'] for log in all_logs], points_per_run)
-            steps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
-            #costs = np.stack([times, steps], axis=1)
-            costs = times
-            timesteps = [log['agent_steps'] for log in all_logs]
-            timesteps = downsample(timesteps, points_per_run)
-            for score, cost, timestep in zip(scores, costs, timesteps):
-                args['train']['total_timesteps'] = timestep
-                sweeps[w].observe(args, score, cost)
-
-            runs += 1
-
-            sweeps[w].suggest(args)
-            args['train']['total_timesteps'] = all_timesteps[w]
-            worker_queues[w].put(args)
-
-    print('Done')
-
-def sweep(args=None, env_name=None):
-    args = args or load_config(env_name)
-    args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
-
-    method = args['sweep'].pop('method')
-    try:
-        sweep_cls = getattr(pufferlib.sweep, method)
-    except:
-        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
-
-    sweep_obj = sweep_cls(args['sweep'])
-    points_per_run = args['sweep']['downsample']
-    target_key = f'environment/{args["sweep"]["metric"]}'
-    running_target_buffer = deque(maxlen=30)
-
-    def stop_if_perf_below(logs):
-        if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
-            logs['is_loss_nan'] = True
-            return True
-
-        if method != 'Protein':
-            return False
-
-        if ('uptime' in logs and target_key in logs):
-            metric_val, cost = logs[target_key], logs['uptime']
-            running_target_buffer.append(metric_val)
-            target_running_mean = np.mean(running_target_buffer)
-
-            # If metric distribution is percentile, threshold is also logit transformed
-            threshold = sweep_obj.get_early_stop_threshold(cost)
-            print(f'Threshold: {threshold} at cost {cost}')
-            logs['early_stop_threshold'] = max(threshold, -5)  # clipping for visualization
-
-            if sweep_obj.should_stop(max(target_running_mean, metric_val), cost):
-                logs['is_loss_nan'] = False
-                return True
-        return False
-
-    for i in range(args['max_runs']):
-        seed = time.time_ns() & 0xFFFFFFFF
-        random.seed(seed)
-        np.random.seed(seed)
-        try:
-            import torch
-            torch.manual_seed(seed)
-        except ImportError:
-            pass
-
-        # In the first run, skip sweep and use the train args specified in the config
-        if i > 0:
-            sweep_obj.suggest(args)
-
-        all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
-        all_logs = [e for e in all_logs if target_key in e]
-
-        if not all_logs:
-            sweep_obj.observe(args, 0, 0, is_failure=True)
-            continue
-
-        total_timesteps = args['train']['total_timesteps']
-
-        scores = downsample([log[target_key] for log in all_logs], points_per_run)
-        costs = downsample([log['uptime'] for log in all_logs], points_per_run)
-        timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
-
-        is_final_loss_nan = all_logs[-1].get('is_loss_nan', False)
-        if is_final_loss_nan:
-            s = scores.pop()
-            c = costs.pop()
-            args['train']['total_timesteps'] = timesteps.pop()
-            sweep_obj.observe(args, s, c, is_failure=True)
-
-        for score, cost, timestep in zip(scores, costs, timesteps):
-            args['train']['total_timesteps'] = timestep
-            sweep_obj.observe(args, score, cost)
-
-        # Prevent logging final eval steps as training steps
-        args['train']['total_timesteps'] = total_timesteps
 
 def load_env(env_name, args):
     package = args['package']
@@ -952,7 +753,6 @@ def make_parser():
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--sweep-gpus', type=int, default=-1, help='multigpu sweeps')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    parser.add_argument('--profile', action='store_true', help='Enable nsys profiling (use with nsys --capture-range=cudaProfilerApi)')
     return parser
 
 def process_config(config, parser=None):
@@ -998,10 +798,10 @@ def process_config(config, parser=None):
 
     args['train']['env'] = args['env_name'] or ''  # for trainer dashboard
     args['train']['use_rnn'] = args['rnn_name'] is not None
-    return args
+    return dict(args)
 
 def main():
-    err = 'Usage: puffer [train, eval, sweep, autotune, export] [env_name] [optional args]. --help for more info'
+    err = 'Usage: puffer [train, eval, sweep, paretosweep, export] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
         raise pufferlib.APIUsageError(err)
 
@@ -1012,11 +812,9 @@ def main():
     elif mode == 'eval':
         eval(env_name=env_name)
     elif mode == 'sweep':
-        sweep(env_name=env_name)
-    elif mode == 'multisweep':
-        multisweep(env_name=env_name)
+        train(env_name=env_name, sweep_mode=True)
     elif mode == 'paretosweep':
-        paretosweep(env_name=env_name)
+        train(env_name=env_name, sweep_mode='pareto')
     elif mode == 'export':
         export(env_name=env_name)
     else:

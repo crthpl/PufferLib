@@ -199,54 +199,60 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
     return c_dict;
 }
 
-std::unique_ptr<PuffeRL> create_pufferl(pybind11::dict kwargs, pybind11::dict vec_kwargs, pybind11::dict env_kwargs, pybind11::dict policy_kwargs) {
+std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
+    py::dict train_kwargs = args["train"].cast<py::dict>();
+    py::dict vec_kwargs = args["vec"].cast<py::dict>();
+    py::dict env_kwargs = args["env"].cast<py::dict>();
+    py::dict policy_kwargs = args["policy"].cast<py::dict>();
+
     HypersT hypers;
     // Layout (total_agents and num_buffers come from vec config)
     hypers.total_agents = get_config(vec_kwargs, "total_agents");
     hypers.num_buffers = get_config(vec_kwargs, "num_buffers");
     hypers.num_threads = get_config(vec_kwargs, "num_threads");
-    hypers.horizon = get_config(kwargs, "horizon");
+    hypers.horizon = get_config(train_kwargs, "horizon");
     // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
     hypers.num_layers = get_config(policy_kwargs, "num_layers");
     // Learning rate
-    hypers.lr = get_config(kwargs, "learning_rate");
-    hypers.min_lr_ratio = get_config(kwargs, "min_lr_ratio");
-    hypers.anneal_lr = get_config(kwargs, "anneal_lr");
+    hypers.lr = get_config(train_kwargs, "learning_rate");
+    hypers.min_lr_ratio = get_config(train_kwargs, "min_lr_ratio");
+    hypers.anneal_lr = get_config(train_kwargs, "anneal_lr");
     // Optimizer
-    hypers.beta1 = get_config(kwargs, "beta1");
-    hypers.beta2 = get_config(kwargs, "beta2");
-    hypers.eps = get_config(kwargs, "eps");
+    hypers.beta1 = get_config(train_kwargs, "beta1");
+    hypers.beta2 = get_config(train_kwargs, "beta2");
+    hypers.eps = get_config(train_kwargs, "eps");
     // Training
-    hypers.minibatch_size = get_config(kwargs, "minibatch_size");
-    hypers.replay_ratio = get_config(kwargs, "replay_ratio");
-    hypers.total_timesteps = get_config(kwargs, "total_timesteps");
-    hypers.max_grad_norm = get_config(kwargs, "max_grad_norm");
+    hypers.minibatch_size = get_config(train_kwargs, "minibatch_size");
+    hypers.replay_ratio = get_config(train_kwargs, "replay_ratio");
+    hypers.total_timesteps = get_config(train_kwargs, "total_timesteps");
+    hypers.max_grad_norm = get_config(train_kwargs, "max_grad_norm");
     // PPO
-    hypers.clip_coef = get_config(kwargs, "clip_coef");
-    hypers.vf_clip_coef = get_config(kwargs, "vf_clip_coef");
-    hypers.vf_coef = get_config(kwargs, "vf_coef");
-    hypers.ent_coef = get_config(kwargs, "ent_coef");
+    hypers.clip_coef = get_config(train_kwargs, "clip_coef");
+    hypers.vf_clip_coef = get_config(train_kwargs, "vf_clip_coef");
+    hypers.vf_coef = get_config(train_kwargs, "vf_coef");
+    hypers.ent_coef = get_config(train_kwargs, "ent_coef");
     // GAE
-    hypers.gamma = get_config(kwargs, "gamma");
-    hypers.gae_lambda = get_config(kwargs, "gae_lambda");
+    hypers.gamma = get_config(train_kwargs, "gamma");
+    hypers.gae_lambda = get_config(train_kwargs, "gae_lambda");
     // VTrace
-    hypers.vtrace_rho_clip = get_config(kwargs, "vtrace_rho_clip");
-    hypers.vtrace_c_clip = get_config(kwargs, "vtrace_c_clip");
+    hypers.vtrace_rho_clip = get_config(train_kwargs, "vtrace_rho_clip");
+    hypers.vtrace_c_clip = get_config(train_kwargs, "vtrace_c_clip");
     // Priority
-    hypers.prio_alpha = get_config(kwargs, "prio_alpha");
-    hypers.prio_beta0 = get_config(kwargs, "prio_beta0");
-    // Flags
-    hypers.use_rnn = get_config(kwargs, "use_rnn");
-    hypers.cudagraphs = get_config(kwargs, "cudagraphs");
-    hypers.kernels = get_config(kwargs, "kernels");
-    hypers.profile = get_config(kwargs, "profile");
-    // Multi-GPU
-    hypers.rank = get_config(kwargs, "rank");
-    hypers.world_size = get_config(kwargs, "world_size");
-    hypers.nccl_id_path = kwargs["nccl_id_path"].cast<std::string>();
+    hypers.prio_alpha = get_config(train_kwargs, "prio_alpha");
+    hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
+    // Flags (use_rnn injected into train by Python)
+    hypers.use_rnn = get_config(train_kwargs, "use_rnn");
+    // Base-level config ([base] section becomes top-level in args)
+    hypers.cudagraphs = get_config(args, "cudagraphs");
+    hypers.profile = get_config(args, "profile");
+    // Multi-GPU / device selection
+    hypers.rank = get_config(args, "rank");
+    hypers.world_size = get_config(args, "world_size");
+    hypers.gpu_id = get_config(args, "gpu_id");
+    hypers.nccl_id_path = args["nccl_id_path"].cast<std::string>();
 
-    std::string env_name = kwargs["env_name"].cast<std::string>();
+    std::string env_name = args["env_name"].cast<std::string>();
     Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
     Dict* env_dict = py_dict_to_c_dict(env_kwargs.cast<py::dict>());
 
@@ -307,10 +313,10 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("prio_beta0", &HypersT::prio_beta0)
         .def_readwrite("use_rnn", &HypersT::use_rnn)
         .def_readwrite("cudagraphs", &HypersT::cudagraphs)
-        .def_readwrite("kernels", &HypersT::kernels)
         .def_readwrite("profile", &HypersT::profile)
         .def_readwrite("rank", &HypersT::rank)
         .def_readwrite("world_size", &HypersT::world_size)
+        .def_readwrite("gpu_id", &HypersT::gpu_id)
         .def_readwrite("nccl_id_path", &HypersT::nccl_id_path);
 
     py::class_<PufTensor>(m, "PufTensor")

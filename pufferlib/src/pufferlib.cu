@@ -137,11 +137,11 @@ typedef struct {
     // Flags
     bool use_rnn;
     int cudagraphs;  // epoch at which to capture graph, -1 to disable
-    bool kernels;
     bool profile;
     // Multi-GPU
     int rank;
     int world_size;
+    int gpu_id;
     std::string nccl_id_path;
     // Threading
     int num_threads;
@@ -615,7 +615,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->hypers = hypers;
     pufferl->nccl_comm = nullptr;
 
-    // Multi-GPU: initialize NCCL (device already set by Python)
+    cudaSetDevice(hypers.gpu_id);
+
+    // Multi-GPU: initialize NCCL
     if (hypers.world_size > 1) {
         ncclUniqueId nccl_id;
         if (hypers.rank == 0) {
@@ -669,7 +671,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
 
     nvmlInit();
-    nvmlDeviceGetHandleByIndex(hypers.rank, &pufferl->nvml_device);
+    nvmlDeviceGetHandleByIndex(hypers.gpu_id, &pufferl->nvml_device);
 
     // Determine action space type
     int* act_sizes_ptr = get_act_sizes();
@@ -694,7 +696,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int input_size = pufferl->env.obs.shape[1];
     int hidden_size = hypers.hidden_size;
     int num_layers = hypers.num_layers;
-    bool kernels = hypers.kernels;
 
     // Decoder output size: discrete = act_n (sum of action sizes), continuous = num_action_heads
     bool is_continuous = pufferl->is_continuous;
