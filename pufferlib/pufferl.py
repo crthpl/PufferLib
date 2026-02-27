@@ -552,7 +552,8 @@ def train(env_name, args=None, sweep_mode=False):
         ts_config = sweep_config['train']['total_timesteps']
         all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
 
-    result_queue = mp.Queue() if sweep_gpus > 1 else None
+    ctx = mp.get_context('spawn')
+    result_queue = ctx.Queue() if sweep_gpus > 1 else None
     active = {}
     launched = 0
 
@@ -602,8 +603,8 @@ def train(env_name, args=None, sweep_mode=False):
 
         if sweep_gpus > 1:
             run_args['gpu_id'] = gpu_id
-            mp.Process(target=_train, args=(env_name, run_args),
-                       kwargs={'result_queue': result_queue}).start()
+            ctx.Process(target=_train, args=(env_name, run_args),
+                        kwargs={'result_queue': result_queue}).start()
             active[gpu_id] = run_args
         else:
             if hasattr(sweep_obj, '_running_target_buffer'):
