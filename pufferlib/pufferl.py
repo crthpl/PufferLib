@@ -367,7 +367,7 @@ class Logger:
 
         self.path = os.path.join(root, self.run_id + '.json')
         self.logs = {'data': []}
-        for k, v in pufferlib.unroll_nested_dict(train_args):
+        for k, v in pufferlib.unroll_nested_dict(args):
             self.logs[k] = v
 
         self.wandb = None
