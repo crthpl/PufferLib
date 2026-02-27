@@ -435,8 +435,9 @@ class Logger:
 def _train(env_name, args, sweep_obj=None, target_key=None, result_queue=None):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     is_rank0 = args.get('rank', 0) == 0
+    verbose = is_rank0 and result_queue is None
     logger = Logger(args) if is_rank0 else None
-    pufferl = PuffeRL(args, logger, verbose=is_rank0)
+    pufferl = PuffeRL(args, logger, verbose=verbose)
     train_config = args['train']
 
     logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
@@ -551,6 +552,9 @@ def train(env_name, args=None, sweep_mode=False):
     if is_pareto:
         ts_config = sweep_config['train']['total_timesteps']
         all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
+
+    if sweep_gpus > 1:
+        args['vec']['num_threads'] //= sweep_gpus
 
     ctx = mp.get_context('spawn')
     result_queue = ctx.Queue() if sweep_gpus > 1 else None
