@@ -484,6 +484,7 @@ def _train(env_name, args, sweep_obj=None, target_key=None, result_queue=None):
 
     if result_queue is not None:
         result_queue.put((args.get('gpu_id', 0), all_logs))
+
     return all_logs
 
 def train(env_name, args=None, sweep_mode=False):
