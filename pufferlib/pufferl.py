@@ -373,6 +373,7 @@ class Logger:
 
         self.path = os.path.join(root, self.run_id + '.json')
         self.logs = {'data': []}
+
         for k, v in pufferlib.unroll_nested_dict(args):
             self.logs[k] = v
 
@@ -434,7 +435,7 @@ class Logger:
 
 def _train(env_name, args, sweep_obj=None, target_key=None, result_queue=None):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
-    is_rank0 = args.get('rank', 0) == 0
+    is_rank0 = args['rank'] == 0
     verbose = is_rank0 and result_queue is None
     logger = Logger(args) if is_rank0 else None
     pufferl = PuffeRL(args, logger, verbose=verbose)
@@ -479,11 +480,11 @@ def _train(env_name, args, sweep_obj=None, target_key=None, result_queue=None):
     pufferl.print_dashboard()
     model_path = pufferl.close()
     if logger:
-        pufferl.logger.log_cost(uptime)
-        pufferl.logger.close(model_path, early_stop=False)
+        logger.log_cost(uptime)
+        logger.close(model_path, early_stop=False)
 
     if result_queue is not None:
-        result_queue.put((args.get('gpu_id', 0), all_logs))
+        result_queue.put((args['gpu_id'], all_logs))
     return all_logs
 
 def train(env_name, args=None, sweep_mode=False):
@@ -543,21 +544,19 @@ def train(env_name, args=None, sweep_mode=False):
     sweep_obj = sweep_cls(sweep_config)
     points_per_run = sweep_config['downsample']
     target_key = f'environment/{sweep_config["metric"]}'
-
-    sweep_gpus = args['sweep_gpus']
-    if sweep_gpus == -1:
-        sweep_gpus = 1
+    sweep_gpus = max(args['sweep_gpus'], 1)
 
     all_timesteps = None
     if is_pareto:
         ts_config = sweep_config['train']['total_timesteps']
         all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
 
+    ctx, result_queue = None, None
     if sweep_gpus > 1:
         args['vec']['num_threads'] //= sweep_gpus
+        ctx = mp.get_context('spawn')
+        result_queue = ctx.Queue()
 
-    ctx = mp.get_context('spawn')
-    result_queue = ctx.Queue() if sweep_gpus > 1 else None
     active = {}
     launched = 0
 
@@ -574,28 +573,22 @@ def train(env_name, args=None, sweep_mode=False):
             if not filtered:
                 sweep_obj.observe(done_args, 0, 0, is_failure=True)
             else:
-                total_ts = done_args['train']['total_timesteps']
                 scores = downsample([log[target_key] for log in filtered], points_per_run)
                 costs = downsample([log['uptime'] for log in filtered], points_per_run)
                 timesteps = downsample([log['agent_steps'] for log in filtered], points_per_run)
                 if filtered[-1].get('is_loss_nan', False):
-                    s, c = scores.pop(), costs.pop()
                     done_args['train']['total_timesteps'] = timesteps.pop()
-                    sweep_obj.observe(done_args, s, c, is_failure=True)
+                    sweep_obj.observe(done_args, scores.pop(), costs.pop(), is_failure=True)
                 for score, cost, timestep in zip(scores, costs, timesteps):
                     done_args['train']['total_timesteps'] = timestep
                     sweep_obj.observe(done_args, score, cost)
-                done_args['train']['total_timesteps'] = total_ts
             continue
 
         if launched >= args['max_runs']:
             break
 
         # Determine GPU and fixed timestep budget (pareto mode)
-        if sweep_gpus > 1:
-            gpu_id = next(i for i in range(sweep_gpus) if i not in active)
-        else:
-            gpu_id = 0
+        gpu_id = next(i for i in range(sweep_gpus) if i not in active)
         fixed_ts = all_timesteps[gpu_id] if is_pareto else None
 
         # Suggest and launch new run
@@ -605,14 +598,13 @@ def train(env_name, args=None, sweep_mode=False):
         if fixed_ts is not None:
             run_args['train']['total_timesteps'] = fixed_ts
 
-        if sweep_gpus > 1:
+        if ctx:
             run_args['gpu_id'] = gpu_id
             ctx.Process(target=_train, args=(env_name, run_args),
                         kwargs={'result_queue': result_queue}).start()
             active[gpu_id] = run_args
         else:
-            if hasattr(sweep_obj, '_running_target_buffer'):
-                sweep_obj._running_target_buffer.clear()
+            sweep_obj._running_target_buffer.clear()
             all_logs = _train(env_name, run_args, sweep_obj=sweep_obj, target_key=target_key)
             active[0] = (run_args, all_logs)
 
