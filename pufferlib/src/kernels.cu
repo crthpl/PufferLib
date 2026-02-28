@@ -176,16 +176,18 @@ inline int seq_size(int N) {
 #endif
 
 
-// Fused kernel: chunk + mingru_gate + sigmoid(proj) * out
+// Fused kernel: chunk + mingru_gate + highway gate output
 // combined is (B, 1, 3*H) containing [hidden, gate, proj] concatenated on last dim
 // state is (B, 1, H)
-// out is (B, H) = sigmoid(proj) * mingru_out (final output)
+// x_in is (B, H) = original input before the h->3h projection
+// out is (B, H) = sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x_in (highway gate)
 // next_state is (B, H) = mingru_out (recurrent state, without proj)
 __global__ void mingru_gate(
     precision_t* out,
     precision_t* next_state,
     const precision_t* combined,    // (B, 3*H) = [hidden, gate, proj]
     const precision_t* state_in,    // (B, H)
+    const precision_t* x_in,       // (B, H) = input before projection
     int H,
     int B
 ) {
@@ -202,6 +204,7 @@ __global__ void mingru_gate(
     float gate = to_float(combined[combined_base + H + h]);
     float proj = to_float(combined[combined_base + 2 * H + h]);
     float state = to_float(state_in[idx]);
+    float x = to_float(x_in[idx]);
 
     // mingru_gate computation
     float gate_sigmoid = sigmoid(gate);
@@ -211,9 +214,13 @@ __global__ void mingru_gate(
     // next_state is mingru_out (for recurrence)
     next_state[idx] = from_float(mingru_out);
 
-    // out is sigmoid(proj) * mingru_out (final output)
+    // // out is sigmoid(proj) * mingru_out (multiplicative output gate)
+    // float proj_sigmoid = sigmoid(proj);
+    // out[idx] = from_float(proj_sigmoid * mingru_out);
+
+    // out is sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x (highway gate)
     float proj_sigmoid = sigmoid(proj);
-    out[idx] = from_float(proj_sigmoid * mingru_out);
+    out[idx] = from_float(proj_sigmoid * mingru_out + (1.0f - proj_sigmoid) * x);
 }
 
 
@@ -245,6 +252,7 @@ __global__ void fused_scan_forward(PrefixScan scan) {
     float* __restrict__ log_values_buf = (float*)scan.log_values_buf.bytes;
     const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
     const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+    const precision_t* __restrict__ input = (const precision_t*)scan.input_ptr;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) return;
@@ -286,6 +294,7 @@ __global__ void fused_scan_forward(PrefixScan scan) {
         float hidden_val = to_float(combined_h_base[t_offset]);
         float gate_val = to_float(combined_g_base[t_offset]);
         float proj_val = to_float(combined_p_base[t_offset]);
+        float x_val = to_float(input[out_base + (t - 1) * H]);
 
         float log_coeff_val;
         log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value);
@@ -300,7 +309,11 @@ __global__ void fused_scan_forward(PrefixScan scan) {
         scan_result = __expf(a_star + s);
         float proj_sigmoid = sigmoid(proj_val);
 
-        out[out_curr] = from_float(proj_sigmoid * scan_result);
+        // // out = sigmoid(proj) * scan_result (multiplicative output gate)
+        // out[out_curr] = from_float(proj_sigmoid * scan_result);
+
+        // out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x (highway gate)
+        out[out_curr] = from_float(proj_sigmoid * scan_result + (1.0f - proj_sigmoid) * x_val);
 
         buf_curr += H;
         out_curr += H;
@@ -328,8 +341,10 @@ __global__ void fused_scan_backward(
     int T_seq = scan.T, H = scan.H, B = scan.B;
     precision_t* __restrict__ grad_combined = (precision_t*)scan.grad_combined.bytes;
     precision_t* __restrict__ grad_state = (precision_t*)scan.grad_state.bytes;
+    precision_t* __restrict__ grad_input = (precision_t*)scan.grad_input.bytes;
     const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
     const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+    const precision_t* __restrict__ input = (const precision_t*)scan.input_ptr;
     const float* __restrict__ a_star_buf = (const float*)scan.a_star.bytes;
     const float* __restrict__ s_buf = (const float*)scan.s_vals.bytes;
     const float* __restrict__ log_values_buf = (const float*)scan.log_values_buf.bytes;
@@ -412,17 +427,25 @@ __global__ void fused_scan_backward(
             float gate_val = chunk_gate[i];
 
             float proj_val = to_float(combined_p_base[t_offset]);
+            int input_idx = out_base + (t - 1) * H;
+            float x_val = to_float(input[input_idx]);
 
             float scan_result = __expf(a_star_t + s_t);
             float z = log_value_t - a_star_t;
 
-            float grad_out_val = to_float(grad_out[out_base + (t - 1) * H]);
+            float grad_out_val = to_float(grad_out[input_idx]);
 
             float grad_scan_from_next = (t == T_seq) ? to_float(grad_next_state[state_idx]) : 0.0f;
 
             float proj_sigmoid = sigmoid(proj_val);
+            // // Multiplicative output gate gradients:
+            // float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
+            // float grad_proj = grad_out_val * scan_result * proj_sigmoid * (1.0f - proj_sigmoid);
+
+            // Highway gate gradients: out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x
             float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
-            float grad_proj = grad_out_val * scan_result * proj_sigmoid * (1.0f - proj_sigmoid);
+            float grad_proj = grad_out_val * (scan_result - x_val) * proj_sigmoid * (1.0f - proj_sigmoid);
+            grad_input[input_idx] = from_float(grad_out_val * (1.0f - proj_sigmoid));
 
             float grad_log_h = grad_scan_result * scan_result;
             float grad_s = grad_log_h;
@@ -1544,6 +1567,11 @@ __global__ void muon_weight_update_kernel(float* __restrict__ wb, const float* _
 __global__ void add_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] += __bfloat162float(src[idx]);
+}
+
+__global__ void add_precision_kernel(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
 }
 
 __global__ void add_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int n) {

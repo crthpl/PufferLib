@@ -141,10 +141,12 @@ enum LossIdx {
 struct PrefixScan {
     void* combined_ptr = nullptr;
     void* state_ptr = nullptr;
+    void* input_ptr = nullptr;      // (B, T, H) original input before projection (for highway gate)
     int B = 0, T = 0, H = 0;
     PufTensor a_star, s_vals, log_values_buf;
     PufTensor out, next_state;
     PufTensor grad_combined, grad_state;
+    PufTensor grad_input;           // (B, T, H) highway gate gradient w.r.t. input
 };
 
 // ============================================================================
@@ -934,6 +936,7 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
             .next_state = {.shape = {B, 1, H}, .dtype_size = p},
             .grad_combined = {.shape = {B, TT, 3 * H}, .dtype_size = p},
             .grad_state = {.shape = {B, 1, H}, .dtype_size = p},
+            .grad_input = {.shape = {B, TT, H}, .dtype_size = p},
         };
         a->saved_inputs[i] = {.shape = {B, TT, H}, .dtype_size = p};
         a->combined_bufs[i] = {.shape = {B_TT, 3 * H}, .dtype_size = p};
@@ -947,6 +950,7 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
         acts->reg(&a->scan_bufs[i].log_values_buf);
         acts->reg(&a->scan_bufs[i].grad_combined);
         acts->reg(&a->scan_bufs[i].grad_state);
+        acts->reg(&a->scan_bufs[i].grad_input);
         grads->reg(&a->wgrad_scratch[i]);
     }
 }
@@ -977,7 +981,8 @@ static PufTensor mingru_forward(void* w, PufTensor x, PufTensor state, void* act
         puf_mm(x, m->weights[i], a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)a->out.bytes, (precision_t*)a->next_state.bytes,
-            (const precision_t*)a->combined[i].bytes, (const precision_t*)state_i.bytes, H, B);
+            (const precision_t*)a->combined[i].bytes, (const precision_t*)state_i.bytes,
+            (const precision_t*)x.bytes, H, B);
         CHECK_LAST_KERNEL();
         puf_copy(state_i, a->next_state, stream);
         x = a->out;
@@ -996,6 +1001,7 @@ static PufTensor mingru_forward_train(void* w, PufTensor x, PufTensor state, voi
         puf_mm(x, m->weights[i], a->combined_bufs[i], stream);
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].bytes;
         a->scan_bufs[i].state_ptr = state_i.bytes;
+        a->scan_bufs[i].input_ptr = a->saved_inputs[i].bytes;
         fused_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
         CHECK_LAST_KERNEL();
         x = a->scan_bufs[i].out;
@@ -1013,6 +1019,10 @@ static PufTensor mingru_backward(void* w, PufTensor grad, void* activations, cud
         CHECK_LAST_KERNEL();
         puf_mm_tn(scan.grad_combined, a->saved_inputs[i], a->wgrad_scratch[i], stream);
         puf_mm_nn(scan.grad_combined, m->weights[i], a->grad_input_buf, stream);
+        // Add highway gate gradient: grad_input += grad_out * (1 - sigmoid(proj))
+        int n = scan.grad_input.numel();
+        add_precision_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)a->grad_input_buf.bytes, (const precision_t*)scan.grad_input.bytes, n);
         grad = a->grad_input_buf;
     }
     return grad;
