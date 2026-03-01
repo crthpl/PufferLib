@@ -946,7 +946,6 @@ class Protein:
         self._running_target_buffer.append(metric_val)
         target_running_mean = np.mean(self._running_target_buffer)
         threshold = self.get_early_stop_threshold(cost)
-        print(f'Threshold: {threshold} at cost {cost}')
         logs['early_stop_threshold'] = max(threshold, -5)
         if self.should_stop(max(target_running_mean, metric_val), cost):
             logs['is_loss_nan'] = False

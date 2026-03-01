@@ -208,6 +208,10 @@ typedef struct {
     ProfileT profile;
     nvmlDevice_t nvml_device;
     int epoch;
+    int global_step;
+    double start_time;
+    double last_log_time;
+    int last_log_step;
     int train_warmup;
     bool rollout_captured;
     bool train_captured;
@@ -993,6 +997,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
 
         pufferl->epoch = 0;
+        pufferl->global_step = 0;
     }
 
     // Create per-buffer streams
@@ -1011,6 +1016,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaDeviceSynchronize();
         cudaProfilerStart();
     }
+
+    double now = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    pufferl->start_time = now;
+    pufferl->last_log_time = now;
+    pufferl->last_log_step = 0;
 
     return pufferl;
 }

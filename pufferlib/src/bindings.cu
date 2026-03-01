@@ -8,14 +8,92 @@
 namespace py = pybind11;
 
 // Wrapper functions for Python bindings
-pybind11::dict log_environments(pybind11::object pufferl_obj) {
+pybind11::dict puf_log(pybind11::object pufferl_obj) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    Dict* out = log_environments_impl(pufferl);
-    pybind11::dict py_out;
-    for (int i = 0; i < out->size; i++) {
-        py_out[out->items[i].key] = out->items[i].value;
+    pybind11::dict result;
+
+    // Summary
+    int gpus = pufferl.hypers.world_size;
+    int global_step = pufferl.global_step;
+    int epoch = pufferl.epoch;
+    double now = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    double dt = now - pufferl.last_log_time;
+    int sps = dt > 0 ? (int)((global_step - pufferl.last_log_step) / dt) : 0;
+    pufferl.last_log_time = now;
+    pufferl.last_log_step = global_step;
+
+    result["SPS"] = sps * gpus;
+    result["agent_steps"] = global_step * gpus;
+    result["uptime"] = now - pufferl.start_time;
+    result["epoch"] = epoch * gpus;
+
+    // Environment stats
+    pybind11::dict env_dict;
+    Dict* env_out = log_environments_impl(pufferl);
+    for (int i = 0; i < env_out->size; i++) {
+        env_dict[env_out->items[i].key] = env_out->items[i].value;
     }
-    return py_out;
+    result["environment"] = env_dict;
+
+    // Losses
+    pybind11::dict losses_dict;
+    float losses_host[NUM_LOSSES];
+    cudaMemcpy(losses_host, pufferl.losses_puf.bytes, sizeof(losses_host), cudaMemcpyDeviceToHost);
+    float n = losses_host[LOSS_N];
+    if (n > 0) {
+        float inv_n = 1.0f / n;
+        losses_dict["pg_loss"] = losses_host[LOSS_PG] * inv_n;
+        losses_dict["vf_loss"] = losses_host[LOSS_VF] * inv_n;
+        losses_dict["entropy"] = losses_host[LOSS_ENT] * inv_n;
+        losses_dict["total_loss"] = losses_host[LOSS_TOTAL] * inv_n;
+        losses_dict["old_approx_kl"] = losses_host[LOSS_OLD_APPROX_KL] * inv_n;
+        losses_dict["approx_kl"] = losses_host[LOSS_APPROX_KL] * inv_n;
+        losses_dict["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
+    }
+    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.numel() * pufferl.losses_puf.dtype_size);
+    result["losses"] = losses_dict;
+
+    // Profile
+    pybind11::dict perf_dict;
+    float train_total = 0;
+    for (int i = 0; i < NUM_PROF; i++) {
+        float sec = pufferl.profile.accum[i] / 1000.0f;
+        perf_dict[PROF_NAMES[i]] = sec;
+        if (i >= PROF_TRAIN_MISC) train_total += sec;
+    }
+    perf_dict["train"] = train_total;
+    memset(pufferl.profile.accum, 0, sizeof(pufferl.profile.accum));
+    result["performance"] = perf_dict;
+
+    // Utilization
+    pybind11::dict util_dict;
+    nvmlUtilization_t util;
+    nvmlDeviceGetUtilizationRates(pufferl.nvml_device, &util);
+    util_dict["gpu_util"] = (float)util.gpu;
+
+    nvmlMemory_t mem;
+    nvmlDeviceGetMemoryInfo(pufferl.nvml_device, &mem);
+    util_dict["gpu_mem"] = 100.0f * (float)mem.used / (float)mem.total;
+
+    size_t cuda_free, cuda_total;
+    cudaMemGetInfo(&cuda_free, &cuda_total);
+    util_dict["vram_used_gb"] = (float)(cuda_total - cuda_free) / (1024.0f * 1024.0f * 1024.0f);
+    util_dict["vram_total_gb"] = (float)cuda_total / (1024.0f * 1024.0f * 1024.0f);
+
+    long rss_kb = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "VmRSS: %ld", &rss_kb) == 1) break;
+        }
+        fclose(f);
+    }
+    util_dict["cpu_mem_gb"] = (float)rss_kb / (1024.0f * 1024.0f);
+    result["utilization"] = util_dict;
+
+    return result;
 }
 
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
@@ -50,6 +128,7 @@ void rollouts(pybind11::object pufferl_obj) {
     static_vec_read_profile(pufferl.vec, eval_prof);
     pufferl.profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
     pufferl.profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
+    pufferl.global_step += pufferl.hypers.horizon * pufferl.hypers.total_agents;
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {
@@ -60,74 +139,6 @@ pybind11::dict train(pybind11::object pufferl_obj) {
     }
     pybind11::dict losses;
     return losses;
-}
-
-pybind11::dict log_losses(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    // Copy losses from device to host via cudaMemcpy (no torch dependency)
-    float losses_host[NUM_LOSSES];
-    cudaMemcpy(losses_host, pufferl.losses_puf.bytes, sizeof(losses_host), cudaMemcpyDeviceToHost);
-    float n = losses_host[LOSS_N];
-    pybind11::dict result;
-    if (n > 0) {
-        float inv_n = 1.0f / n;
-        result["pg_loss"] = losses_host[LOSS_PG] * inv_n;
-        result["vf_loss"] = losses_host[LOSS_VF] * inv_n;
-        result["entropy"] = losses_host[LOSS_ENT] * inv_n;
-        result["total_loss"] = losses_host[LOSS_TOTAL] * inv_n;
-        result["old_approx_kl"] = losses_host[LOSS_OLD_APPROX_KL] * inv_n;
-        result["approx_kl"] = losses_host[LOSS_APPROX_KL] * inv_n;
-        result["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
-    }
-    // Zero the accumulator
-    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.numel() * pufferl.losses_puf.dtype_size);
-    return result;
-}
-
-pybind11::dict log_profile(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    pybind11::dict result;
-    float train_total = 0;
-    for (int i = 0; i < NUM_PROF; i++) {
-        float sec = pufferl.profile.accum[i] / 1000.0f;  // ms -> seconds
-        result[PROF_NAMES[i]] = sec;
-        if (i >= PROF_TRAIN_MISC) train_total += sec;
-    }
-    result["train"] = train_total;
-    memset(pufferl.profile.accum, 0, sizeof(pufferl.profile.accum));
-    return result;
-}
-
-pybind11::dict log_utilization(pybind11::object pufferl_obj) {
-    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
-    pybind11::dict result;
-
-    nvmlUtilization_t util;
-    nvmlDeviceGetUtilizationRates(pufferl.nvml_device, &util);
-    result["gpu_util"] = (float)util.gpu;
-
-    nvmlMemory_t mem;
-    nvmlDeviceGetMemoryInfo(pufferl.nvml_device, &mem);
-    result["gpu_mem"] = 100.0f * (float)mem.used / (float)mem.total;
-
-    size_t cuda_free, cuda_total;
-    cudaMemGetInfo(&cuda_free, &cuda_total);
-    result["vram_used_gb"] = (float)(cuda_total - cuda_free) / (1024.0f * 1024.0f * 1024.0f);
-    result["vram_total_gb"] = (float)cuda_total / (1024.0f * 1024.0f * 1024.0f);
-
-    // CPU memory from /proc/self/status
-    long rss_kb = 0;
-    FILE* f = fopen("/proc/self/status", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "VmRSS: %ld", &rss_kb) == 1) break;
-        }
-        fclose(f);
-    }
-    result["cpu_mem_gb"] = (float)rss_kb / (1024.0f * 1024.0f);
-
-    return result;
 }
 
 void puf_close(pybind11::object pufferl_obj) {
@@ -267,10 +278,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
 
 PYBIND11_MODULE(_C, m) {
     // Core functions
-    m.def("log_environments", &log_environments);
-    m.def("log_losses", &log_losses);
-    m.def("log_profile", &log_profile);
-    m.def("log_utilization", &log_utilization);
+    m.def("log", &puf_log);
     m.def("render", &render);
     m.def("rollouts", &rollouts);
     m.def("train", &train);
@@ -341,6 +349,9 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("muon", &PuffeRL::muon)
         .def_readwrite("hypers", &PuffeRL::hypers)
         .def_readwrite("rollouts", &PuffeRL::rollouts)
+        .def_readonly("epoch", &PuffeRL::epoch)
+        .def_readonly("global_step", &PuffeRL::global_step)
+        .def_readonly("last_log_time", &PuffeRL::last_log_time)
         .def("num_params", [](PuffeRL& self) -> int64_t {
             return self.alloc_fp32.params.total_elems;
         });
