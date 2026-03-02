@@ -12,9 +12,9 @@ env_names = sorted([
     #'tetris',
     #'g2048',
     #'moba',
-    'pong',
+    #'pong',
     #'tower_climb',
-    #'grid',
+    'grid',
     #'nmmo3',
     #'snake',
     #'tripletriad'
@@ -36,7 +36,7 @@ HYPERS = [
     'train/eps',
     'train/prio_alpha',
     'train/prio_beta0',
-    'train/horizon',
+    #'train/horizon',
     'train/replay_ratio',
     'train/minibatch_size',
     'policy/hidden_size',
@@ -79,7 +79,10 @@ def load_sweep_data(path):
                     sweep_metadata[k.replace('sweep/', '')] = v
 
         for k, v in exp.items():
-            if k.startswith('sweep/'):
+            if (not k.startswith('train/')
+                    and not k.startswith('policy/')
+                    and not k.startswith('vec/')
+                    and not k.startswith('env/')):
                 continue
 
             if isinstance(v, dict):
