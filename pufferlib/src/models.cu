@@ -392,6 +392,39 @@ static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha
 }
 
 // ============================================================================
+// Kaiming init (fan-in, normal)
+// ============================================================================
+
+void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t stream) {
+    assert(dst.ndim() == 2);
+    int64_t rows = dst.shape[0], cols = dst.shape[1];
+    assert(rows > 0 && cols > 0);
+    int64_t n = rows * cols;
+
+    float std = gain / std::sqrt((float)cols);  // fan_in = cols for (out, in) layout
+
+    int64_t rand_count = (n % 2 == 0) ? n : n + 1;
+    float* buf;
+    cudaMalloc(&buf, rand_count * sizeof(float));
+
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, seed);
+    curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
+    curandDestroyGenerator(gen);
+
+    if (dst.dtype_size == 2) {
+        cast_f32_to_bf16_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            (__nv_bfloat16*)dst.bytes, buf, n);
+    } else {
+        cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+    }
+
+    cudaFree(buf);
+}
+
+// ============================================================================
 // Orthogonal init (cuSOLVER + cuRAND)
 // ============================================================================
 
@@ -542,21 +575,11 @@ void ppo_loss_fwd_bwd(
     cudaStream_t stream
 ) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
-    int num_atns = act_sizes.numel();
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
 
-    // Strides for fused (N, T, logits|value) layout
-    int logits_stride_n = T * fused_cols;
-    int logits_stride_t = fused_cols;
-    int logits_stride_a = 1;
-    int values_stride_n = T * fused_cols;
-    int values_stride_t = fused_cols;
-
     // Pointers into fused decoder output
     const precision_t* logits_ptr = (const precision_t*)dec_out.bytes;
-    const precision_t* values_pred_ptr = logits_ptr + A_total;
-    const precision_t* logstd_ptr = is_continuous ? (const precision_t*)logstd.bytes : nullptr;
 
     float* adv_var_ptr = (float*)bufs.adv_scratch.bytes;
     float* adv_mean_ptr = adv_var_ptr + 1;
@@ -577,18 +600,37 @@ void ppo_loss_fwd_bwd(
 
     cudaMemsetAsync((float*)bufs.loss_output.bytes, 0, sizeof(float), stream);
 
-    ppo_loss_fwd_bwd_kernel<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-        ppo_partials_buf,
-        (float*)bufs.grad_logits.bytes, is_continuous ? (float*)bufs.grad_logstd.bytes : nullptr,
-        (float*)bufs.grad_values.bytes,
-        (precision_t*)graph.mb_ratio.bytes, (precision_t*)graph.mb_newvalue.bytes,
-        logits_ptr, logstd_ptr,
-        values_pred_ptr, (double*)graph.mb_actions.bytes,
-        (const precision_t*)graph.mb_logprobs.bytes, (float*)graph.mb_advantages.bytes,
-        (const precision_t*)graph.mb_prio.bytes, (const precision_t*)graph.mb_values.bytes, (const precision_t*)graph.mb_returns.bytes,
-        adv_mean_ptr, adv_var_ptr, (int*)act_sizes.bytes, num_atns,
-        clip_coef, vf_clip_coef, vf_coef, ent_coef, T, A_total, N,
-        logits_stride_n, logits_stride_t, logits_stride_a, values_stride_n, values_stride_t, is_continuous);
+    PPOGraphArgs graph_args = {
+        .out_ratio = (precision_t*)graph.mb_ratio.bytes,
+        .out_newvalue = (precision_t*)graph.mb_newvalue.bytes,
+        .actions = (const double*)graph.mb_actions.bytes,
+        .old_logprobs = (const precision_t*)graph.mb_logprobs.bytes,
+        .advantages = (const float*)graph.mb_advantages.bytes,
+        .prio = (const precision_t*)graph.mb_prio.bytes,
+        .values = (const precision_t*)graph.mb_values.bytes,
+        .returns = (const precision_t*)graph.mb_returns.bytes,
+    };
+
+    PPOKernelArgs args = {
+        .grad_logits = (float*)bufs.grad_logits.bytes,
+        .grad_logstd = is_continuous ? (float*)bufs.grad_logstd.bytes : nullptr,
+        .grad_values_pred = (float*)bufs.grad_values.bytes,
+        .logits = logits_ptr,
+        .logstd = is_continuous ? (const precision_t*)logstd.bytes : nullptr,
+        .values_pred = logits_ptr + A_total,
+        .adv_mean = adv_mean_ptr,
+        .adv_var = adv_var_ptr,
+        .act_sizes = (const int*)act_sizes.bytes,
+        .num_atns = act_sizes.numel(),
+        .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
+        .vf_coef = vf_coef, .ent_coef = ent_coef,
+        .T_seq = T, .A_total = A_total, .N = N,
+        .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
+        .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
+        .is_continuous = is_continuous,
+    };
+
+    ppo_loss_fwd_bwd_kernel<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
     CHECK_LAST_KERNEL();
 
     ppo_loss_reduce_kernel<<<1, LOSS_N + 1, 0, stream>>>(
@@ -740,7 +782,7 @@ static void encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
         .shape = {ew->out_dim, ew->in_dim},
         .dtype_size = ew->weight.dtype_size
     };
-    puf_orthogonal_init(wt, std::sqrt(2.0f), (*seed)++, stream);
+    puf_kaiming_init(wt, std::sqrt(2.0f), (*seed)++, stream);
 }
 
 static void encoder_reg_params(void* w, Allocator* alloc, int esz) {
@@ -790,7 +832,7 @@ static void decoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
         .shape = {dw->output_dim + 1, dw->hidden_dim},
         .dtype_size = dw->weight.dtype_size
     };
-    puf_orthogonal_init(wt, 0.01f, (*seed)++, stream);
+    puf_kaiming_init(wt, 0.01f, (*seed)++, stream);
 }
 
 static void decoder_reg_params(void* w, Allocator* alloc, int esz) {
@@ -901,7 +943,7 @@ static void mingru_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
             .shape = {3 * m->hidden, m->hidden},
             .dtype_size = m->weights[i].dtype_size
         };
-        puf_orthogonal_init(w2d, 1.0f, (*seed)++, stream);
+        puf_kaiming_init(w2d, 1.0f, (*seed)++, stream);
     }
 }
 
