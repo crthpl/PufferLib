@@ -330,7 +330,8 @@ def sweep(env_name, args=None, pareto=False):
         if idx >= num_experiments:
             break # All experiments launched
 
-        gpu_id = idx % sweep_gpus
+        # TODO: only 1 per sweep etc
+        gpu_id = next(i for i in range(sweep_gpus) if i not in active)
         timestep_total = all_timesteps[gpu_id] if pareto else None
         if idx > 1: # First experiment uses defaults
             sweep_obj.suggest(args, fixed_total_timesteps=timestep_total)
