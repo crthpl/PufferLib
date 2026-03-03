@@ -338,9 +338,10 @@ def sweep(env_name, args=None, pareto=False):
             sweep_obj.observe(args, 0, 0, is_failure=True)
             continue
 
-        train(env_name, args, range(gpu_id, gpu_id + exp_gpus),
+        exp_args = deepcopy(args)
+        active[gpu_id] = exp_args
+        train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
             sweep_obj=sweep_obj, result_queue=result_queue)
-        active[gpu_id] = deepcopy(args)
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy using the native pipeline.
