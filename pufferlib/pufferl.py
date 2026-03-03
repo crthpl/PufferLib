@@ -19,6 +19,7 @@ from copy import deepcopy
 
 import numpy as np
 
+import torch
 import pufferlib
 try:
     from pufferlib import _C
