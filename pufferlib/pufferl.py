@@ -274,12 +274,15 @@ def train(env_name, args=None, gpus=None, **kwargs):
     args['world_size'] = len(gpus)
     args['nccl_id_path'] = f'/tmp/puffer_nccl_{os.getpid()}_{gpus[0]}'
 
+    if not subprocess:
+        gpus = gpus[-1:] + gpus[:-1]  # Main process gets rank 0
+
     ctx = mp.get_context('spawn')
-    for rank, gpu_id in enumerate(gpus):
+    for rank, gpu_id in reversed(list(enumerate(gpus))):
         worker_args = deepcopy(args)
         worker_args['rank'] = rank
         worker_args['gpu_id'] = gpu_id
-        if rank == len(gpus) - 1 and not subprocess:
+        if rank == 0 and not subprocess:
             _train(env_name, worker_args, verbose=True)
         else:
             ctx.Process(target=_train, args=(env_name, worker_args), kwargs=kwargs).start()
