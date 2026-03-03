@@ -311,24 +311,28 @@ def sweep(env_name, args=None, pareto=False):
     result_queue = mp.get_context('spawn').Queue()
 
     active = {}
-    for exp in range(num_experiments + sweep_gpus//exp_gpus):
-        if exp >= sweep_gpus//exp_gpus: # Collect completed runs
+    completed = 0
+    while completed < num_experiments:
+        if len(active) >= sweep_gpus//exp_gpus: # Collect completed runs
             gpu_id, scores, costs, timesteps = result_queue.get()
             done_args = active.pop(gpu_id)
 
             if not scores:
                 sweep_obj.observe(done_args, 0, 0, is_failure=True)
+            else:
+                completed += 1
 
             for s, c, t in zip(scores, costs, timesteps):
                 done_args['train']['total_timesteps'] = t
                 sweep_obj.observe(done_args, s, c, is_failure=False)
 
-        if exp >= num_experiments:
-            continue # All experiments launched
+        idx = completed + len(active)
+        if idx >= num_experiments:
+            break # All experiments launched
 
-        gpu_id = exp % sweep_gpus
+        gpu_id = idx % sweep_gpus
         timestep_total = all_timesteps[gpu_id] if pareto else None
-        if exp > 1: # First experiment uses defaults
+        if idx > 1: # First experiment uses defaults
             sweep_obj.suggest(args, fixed_total_timesteps=timestep_total)
 
         try:
