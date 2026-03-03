@@ -264,32 +264,33 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if result_queue is not None:
         result_queue.put((args['gpu_id'], scores, costs, timesteps))
 
-def spawn_ddp(env_name, args, gpus, **kwargs):
+def train(env_name, args=None, gpus=None, **kwargs):
+    args = args or load_config(env_name)
+    validate_config(args)
+
+    subprocess = gpus is not None
+    gpus = list(gpus or range(args['train']['gpus']))
+    args['vec']['num_threads'] //= len(gpus)
+    args['world_size'] = len(gpus)
+    args['nccl_id_path'] = f'/tmp/puffer_nccl_{os.getpid()}_{gpus[0]}'
+
     ctx = mp.get_context('spawn')
     for rank, gpu_id in enumerate(gpus):
-        args['nccl_id_path'] = f'/tmp/puffer_nccl_{os.getpid()}_{gpus[0]}'
-        rank_args = deepcopy(args)
-        rank_args['rank'] = rank
-        rank_args['gpu_id'] = gpu_id
-        ctx.Process(target=_train, args=(env_name, rank_args), kwargs=kwargs).start()
-       
-def train(env_name, args=None):
-    args = args or load_config(env_name)
-    gpus = args['train']['gpus']
-    args['vec']['num_threads'] //= gpus
-    validate_config(args)
-    args['world_size'] = gpus
-    spawn_ddp(env_name, args, range(1, gpus))
-    _train(env_name, args, verbose=True) # Rank 1 on main process
+        worker_args = deepcopy(args)
+        worker_args['rank'] = rank
+        worker_args['gpu_id'] = gpu_id
+        if rank == len(gpus) - 1 and not subprocess:
+            _train(env_name, worker_args, verbose=True)
+        else:
+            ctx.Process(target=_train, args=(env_name, worker_args), kwargs=kwargs).start()
 
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
     sweep_gpus = args['sweep']['gpus'] or len(os.listdir('/proc/driver/nvidia/gpus'))
-    args['vec']['num_threads'] //= max(exp_gpus, sweep_gpus)
+    args['vec']['num_threads'] //= (sweep_gpus // exp_gpus)
     args['no_model_upload'] = True
-    args['world_size'] = exp_gpus
 
     sweep_config = args['sweep']
     method = sweep_config.pop('method')
@@ -333,9 +334,8 @@ def sweep(env_name, args=None, pareto=False):
             sweep_obj.observe(args, 0, 0, is_failure=True)
             continue
 
-        spawn_ddp(env_name, args, range(gpu_id, gpu_id + exp_gpus),
+        train(env_name, args, range(gpu_id, gpu_id + exp_gpus),
             sweep_obj=sweep_obj, result_queue=result_queue)
-
         active[gpu_id] = deepcopy(args)
 
 def eval(env_name, args=None, load_path=None):
