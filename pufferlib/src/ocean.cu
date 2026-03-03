@@ -193,7 +193,7 @@ void nmmo3_encoder_forward(
 // ============================================================================
 // Integrated build — included by models.cu, uses precision_t / PufTensor / puf_mm
 // Requires: precision_t, to_float, from_float, PufTensor, Allocator, puf_mm,
-//           puf_mm_tn, puf_copy, puf_orthogonal_init, grid_size, BLOCK_SIZE,
+//           puf_mm_tn, puf_copy, puf_kaiming_init, grid_size, BLOCK_SIZE,
 //           PRECISION_SIZE, CHECK_CUDA (all from kernels.cu / models.cu)
 // ============================================================================
 
@@ -438,7 +438,7 @@ static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t str
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     auto init2d = [&](PufTensor& t, int rows, int cols, float gain) {
         PufTensor wt = {.bytes = t.bytes, .shape = {rows, cols}, .dtype_size = t.dtype_size};
-        puf_orthogonal_init(wt, gain, (*seed)++, stream);
+        puf_kaiming_init(wt, gain, (*seed)++, stream);
     };
     float g = std::sqrt(2.0f);
     init2d(ew->conv1_w, N3_C1_OC, N3_C1_K2, g);

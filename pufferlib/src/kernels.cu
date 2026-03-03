@@ -1661,29 +1661,4 @@ __global__ void cast_u8_to_precision_kernel(precision_t* __restrict__ dst,
     if (idx < n) dst[idx] = from_float((float)src[idx]);
 }
 
-// Orthogonal init helpers (used by puf_orthogonal_init in models.cu)
-__global__ void sign_correct_columns_kernel(float* Q, const float* diag_signs, int m, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * n) return;
-    Q[idx] *= diag_signs[idx / m];
-}
-
-__global__ void extract_diag_sign_kernel(float* signs, const float* A, int m, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    signs[i] = (A[i + (int64_t)i * m] >= 0.0f) ? 1.0f : -1.0f;
-}
-
-__global__ void colmaj_to_rowmaj_scale_f32_kernel(float* dst, const float* Q, float gain, int m, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * n) return;
-    dst[idx] = Q[(idx / n) + (int64_t)(idx % n) * m] * gain;
-}
-
-__global__ void colmaj_to_rowmaj_scale_bf16_kernel(__nv_bfloat16* dst, const float* Q, float gain, int m, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * n) return;
-    dst[idx] = __float2bfloat16(Q[(idx / n) + (int64_t)(idx % n) * m] * gain);
-}
-
 #endif // PUFFERLIB_KERNELS_CU

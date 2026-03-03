@@ -5,7 +5,6 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include <cusolverDn.h>
 #include <curand.h>
 #include <cassert>
 #include <vector>
@@ -422,85 +421,6 @@ void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t st
     }
 
     cudaFree(buf);
-}
-
-// ============================================================================
-// Orthogonal init (cuSOLVER + cuRAND)
-// ============================================================================
-
-void puf_orthogonal_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t stream) {
-    assert(dst.ndim() == 2);
-    int64_t rows = dst.shape[0], cols = dst.shape[1];
-    assert(rows > 0 && cols > 0);
-
-    bool transposed = rows < cols;
-    int m = transposed ? (int)cols : (int)rows;
-    int n = transposed ? (int)rows : (int)cols;
-
-    float *A, *tau, *signs;
-    int *devInfo;
-    int64_t mn = (int64_t)m * n;
-    int64_t rand_count = (mn % 2 == 0) ? mn : mn + 1;
-    cudaMalloc(&A, rand_count * sizeof(float));
-    cudaMalloc(&tau, n * sizeof(float));
-    cudaMalloc(&signs, n * sizeof(float));
-    cudaMalloc(&devInfo, sizeof(int));
-
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, seed);
-    curandGenerateNormal(gen, A, rand_count, 0.0f, 1.0f);
-    curandDestroyGenerator(gen);
-
-    cusolverDnHandle_t solver;
-    cusolverDnCreate(&solver);
-
-    int lwork;
-    cusolverDnSgeqrf_bufferSize(solver, m, n, A, m, &lwork);
-    float* work;
-    cudaMalloc(&work, lwork * sizeof(float));
-    cusolverDnSgeqrf(solver, m, n, A, m, tau, work, lwork, devInfo);
-
-    extract_diag_sign_kernel<<<grid_size(n), BLOCK_SIZE>>>(signs, A, m, n);
-
-    int lwork2;
-    cusolverDnSorgqr_bufferSize(solver, m, n, n, A, m, tau, &lwork2);
-    if (lwork2 > lwork) {
-        cudaFree(work);
-        cudaMalloc(&work, lwork2 * sizeof(float));
-    }
-    cusolverDnSorgqr(solver, m, n, n, A, m, tau, work, lwork2, devInfo);
-
-    sign_correct_columns_kernel<<<grid_size(mn), BLOCK_SIZE>>>(A, signs, m, n);
-
-    if (transposed) {
-        if (dst.dtype_size == 2) {
-            cast_f32_to_bf16_kernel<<<grid_size(rows * cols), BLOCK_SIZE, 0, stream>>>(
-                (__nv_bfloat16*)dst.bytes, A, rows * cols);
-        } else {
-            cudaMemcpyAsync(dst.bytes, A, rows * cols * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream);
-        }
-        if (gain != 1.0f) {
-            scale_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-                (float*)dst.bytes, gain, dst.numel());
-        }
-    } else {
-        if (dst.dtype_size == 2) {
-            colmaj_to_rowmaj_scale_bf16_kernel<<<grid_size(rows * cols), BLOCK_SIZE, 0, stream>>>(
-                (__nv_bfloat16*)dst.bytes, A, gain, rows, cols);
-        } else {
-            colmaj_to_rowmaj_scale_f32_kernel<<<grid_size(rows * cols), BLOCK_SIZE, 0, stream>>>(
-                (float*)dst.bytes, A, gain, rows, cols);
-        }
-    }
-
-    cudaFree(A);
-    cudaFree(tau);
-    cudaFree(signs);
-    cudaFree(work);
-    cudaFree(devInfo);
-    cusolverDnDestroy(solver);
 }
 
 // ============================================================================
