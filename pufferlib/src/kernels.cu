@@ -1432,6 +1432,17 @@ __global__ void transpose_f32_kernel(float* __restrict__ dst, const float* __res
     dst[(idx % C) * R + idx / C] = src[idx];
 }
 
+__global__ void cast_f32_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float(src[idx]);
+}
+
+__global__ void cast_f32_transpose_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    dst[(idx % C) * R + idx / C] = from_float(src[idx]);
+}
+
 template <typename T>
 __global__ void transpose_01_kernel(T* __restrict__ dst, const T* __restrict__ src, int A, int B, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1492,6 +1503,58 @@ __global__ void normalize_f32_kernel(float* __restrict__ dst, const float* __res
     float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = dst[idx] * inv_norm;
+}
+
+__global__ void norm_precision_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
+        float v = to_float(src[i]);
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    if (tid == 0) partials[blockIdx.x] = sdata[0];
+}
+
+__global__ void normalize_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
+    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
+}
+
+__global__ void cast_precision_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = to_float(src[idx]);
+}
+
+__global__ void cast_precision_scale_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = to_float(src[idx]) * scale;
+}
+
+__global__ void cast_precision_scale_transpose_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    dst[(idx % C) * R + idx / C] = to_float(src[idx]) * scale;
+}
+
+// Input: (R, C) f32 → (M, N) precision_t, optionally transposing
+__global__ void cast_f32_to_precision_2d_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, bool do_transpose, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * C) return;
+    int out_idx = do_transpose ? (idx % C) * R + idx / C : idx;
+    dst[out_idx] = from_float(src[idx]);
+}
+
+// Output: (M, N) precision_t → (R, C) f32, with scale, optionally transposing back
+__global__ void cast_precision_scale_to_f32_2d_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, bool do_transpose, int M, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int out_idx = do_transpose ? (idx % N) * M + idx / N : idx;
+    dst[out_idx] = to_float(src[idx]) * scale;
 }
 
 __global__ void fill_bf16_kernel(__nv_bfloat16* __restrict__ dst, __nv_bfloat16 val, int n) {

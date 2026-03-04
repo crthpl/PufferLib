@@ -204,6 +204,7 @@ typedef struct {
     PufTensor param_bf16_puf;    // cached PufTensor view of alloc_bf16.param_buffer
     PufTensor grad_bf16_puf;     // cached PufTensor view of alloc_bf16.grads (contiguous bf16 weight grads)
     PufTensor grad_norm_puf;     // (1,) f32 scratch for clip_grad_norm
+    PufTensor grad_norm_partials_puf; // (256,) f32 partials for norm reduction
     PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
     nvmlDevice_t nvml_device;
@@ -546,11 +547,11 @@ void train_impl(PuffeRL& pufferl) {
             {
                 PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;
-                ensure_norm_partials();
+                float* partials = (float*)pufferl.grad_norm_partials_puf.bytes;
                 int blocks = std::min((int)grid_size(grad.numel()), 256);
-                norm_f32_kernel<<<blocks, 256, 0, stream>>>(norm_partials_buf, (float*)grad.bytes, grad.numel());
+                norm_f32_kernel<<<blocks, 256, 0, stream>>>(partials, (float*)grad.bytes, grad.numel());
                 CHECK_LAST_KERNEL();
-                norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, norm_partials_buf, blocks);
+                norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, partials, blocks);
                 CHECK_LAST_KERNEL();
                 clip_by_norm_f32_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
                     (float*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
@@ -877,10 +878,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->act_sizes_puf = {.shape = {num_action_heads}, .dtype_size = (int)sizeof(int32_t)};
     pufferl->losses_puf = {.shape = {NUM_LOSSES}, .dtype_size = (int)sizeof(float)};
     pufferl->grad_norm_puf = {.shape = {1}, .dtype_size = (int)sizeof(float)};
+    pufferl->grad_norm_partials_puf = {.shape = {256}, .dtype_size = (int)sizeof(float)};
     alloc.reg(&pufferl->rng_offset_puf);
     alloc.reg(&pufferl->act_sizes_puf);
     alloc.reg(&pufferl->losses_puf);
     alloc.reg(&pufferl->grad_norm_puf);
+    alloc.reg(&pufferl->grad_norm_partials_puf);
 
     // Per-buffer RNN states
     pufferl->buffer_states.resize(num_buffers);
