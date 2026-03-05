@@ -57,8 +57,9 @@ def fmt_perf(name, color, delta_ref, elapsed, b2, c2):
     percent = 0 if delta_ref == 0 else int(100*elapsed/delta_ref - 1e-5)
     return f'{color}{name}', duration(elapsed, b2, c2), f'{b2}{percent:2d}{c2}%'
 
-def print_dashboard(args, model_size, logs, clear=False, idx=[0],
+def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
         c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
+    g = lambda k, d=0: flat_logs.get(k, d)
     console = rich.console.Console()
     dashboard = Table(box=rich.box.ROUNDED, expand=True,
         show_header=False, border_style='bright_cyan')
@@ -70,48 +71,49 @@ def print_dashboard(args, model_size, logs, clear=False, idx=[0],
     table.add_column(justify="center", width=18)
     table.add_column(justify="right", width=12)
 
-    util = logs['utilization']
     table.add_row(
         f'{b1}PufferLib {b2}4.0 {idx[0]*" "}:blowfish:',
-        f'{c1}GPU: {b2}{util.get("gpu_util", 0):.0f}{c2}%',
-        f'{c1}VRAM: {b2}{util.get("vram_used_gb", 0):.1f}{c2}/{b2}{util.get("vram_total_gb", 0):.0f}{c2}G',
-        f'{c1}RAM: {b2}{util.get("cpu_mem_gb", 0):.1f}{c2}G',
+        f'{c1}GPU: {b2}{g("utilization/gpu_util"):.0f}{c2}%',
+        f'{c1}VRAM: {b2}{g("utilization/vram_used_gb"):.1f}{c2}/{b2}{g("utilization/vram_total_gb"):.0f}{c2}G',
+        f'{c1}RAM: {b2}{g("utilization/cpu_mem_gb"):.1f}{c2}G',
     )
     idx[0] = (idx[0] - 1) % 10
 
     s = Table(box=None, expand=True)
     remaining = f'{b2}A hair past a freckle{c2}'
-    agent_steps = logs['agent_steps']
-    if logs['SPS'] != 0:
-        remaining = duration((args['train']['total_timesteps']*args['train']['gpus'] - agent_steps)/logs['SPS'], b2, c2)
+    agent_steps = g('agent_steps')
+    if g('SPS') != 0:
+        remaining = duration((args['train']['total_timesteps']*args['train']['gpus'] - agent_steps)/g('SPS'), b2, c2)
 
     s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
     s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
     s.add_row(f'{c2}Env', f'{b2}{args["env_name"]}')
     s.add_row(f'{c2}Params', abbreviate(model_size, b2, c2))
     s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
-    s.add_row(f'{c2}SPS', abbreviate(logs['SPS'], b2, c2))
-    s.add_row(f'{c2}Epoch', f'{b2}{logs['epoch']}')
-    s.add_row(f'{c2}Uptime', duration(logs['uptime'], b2, c2))
+    s.add_row(f'{c2}SPS', abbreviate(g('SPS'), b2, c2))
+    s.add_row(f'{c2}Epoch', f'{b2}{g("epoch")}')
+    s.add_row(f'{c2}Uptime', duration(g('uptime'), b2, c2))
     s.add_row(f'{c2}Remaining', remaining)
 
-    perf = logs['performance']
-    delta = perf.get('rollout', 0) + perf.get('train', 0)
+    rollout = g('performance/rollout')
+    train = g('performance/train')
+    delta = rollout + train
     p = Table(box=None, expand=True, show_header=False)
     p.add_column(f"{c1}Performance", justify="left", width=10)
     p.add_column(f"{c1}%", justify="right", width=4)
-    p.add_row(*fmt_perf('Evaluate', b1, delta, perf.get('rollout', 0), b2, c2))
-    p.add_row(*fmt_perf('  GPU', b2, delta, perf.get('eval_gpu', 0), b2, c2))
-    p.add_row(*fmt_perf('  Env', b2, delta, perf.get('eval_env', 0), b2, c2))
-    p.add_row(*fmt_perf('Train', b1, delta, perf.get('train', 0), b2, c2))
-    p.add_row(*fmt_perf('  Misc', b2, delta, perf.get('train_misc', 0), b2, c2))
-    p.add_row(*fmt_perf('  Forward', b2, delta, perf.get('train_forward', 0), b2, c2))
+    p.add_row(*fmt_perf('Evaluate', b1, delta, rollout, b2, c2))
+    p.add_row(*fmt_perf('  GPU', b2, delta, g('performance/eval_gpu'), b2, c2))
+    p.add_row(*fmt_perf('  Env', b2, delta, g('performance/eval_env'), b2, c2))
+    p.add_row(*fmt_perf('Train', b1, delta, train, b2, c2))
+    p.add_row(*fmt_perf('  Misc', b2, delta, g('performance/train_misc'), b2, c2))
+    p.add_row(*fmt_perf('  Forward', b2, delta, g('performance/train_forward'), b2, c2))
 
     l = Table(box=None, expand=True)
     l.add_column(f'{c1}Losses', justify="left", width=16)
     l.add_column(f'{c1}Value', justify="right", width=8)
-    for metric, value in logs['losses'].items():
-        l.add_row(f'{b2}{metric}', f'{b2}{value:.3f}')
+    for k, v in flat_logs.items():
+        if k.startswith('losses/'):
+            l.add_row(f'{b2}{k[7:]}', f'{b2}{v:.3f}')
 
     monitor = Table(box=None, expand=True, pad_edge=False)
     monitor.add_row(s, p, l)
@@ -127,11 +129,14 @@ def print_dashboard(args, model_size, logs, clear=False, idx=[0],
     right.add_column(f"{c1}User Stats", justify="left", width=20)
     right.add_column(f"{c1}Value", justify="right", width=10)
 
-    for i, (metric, value) in enumerate(logs['environment'].items()):
-        u = left if i % 2 == 0 else right
-        u.add_row(f'{b2}{metric}', f'{b2}{value:.3f}')
-        if i == 30:
-            break
+    i = 0
+    for k, v in flat_logs.items():
+        if k.startswith('environment/') and k != 'environment/n':
+            u = left if i % 2 == 0 else right
+            u.add_row(f'{b2}{k[12:]}', f'{b2}{v:.3f}')
+            i += 1
+            if i == 30:
+                break
 
     if clear:
         console.clear()
@@ -161,11 +166,19 @@ def downsample(ary, n):
     ary = ary[-n_trunc:] if n_trunc > 0 else ary
     return ary.reshape(n-1, -1).mean(axis=1).tolist() + [last]
 
+def _train_worker(args):
+    pufferl = _C.create_pufferl(args)
+    while pufferl.global_step < args['train']['total_timesteps']:
+        _C.rollouts(pufferl)
+        _C.train(pufferl)
+
+    _C.close(pufferl)
+
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     rank = args['rank']
     run_id = str(int(1000*time.time()))
-    if rank == 0 and args['wandb']:
+    if args['wandb']:
         import wandb
         run_id = wandb.util.generate_id()
         wandb.init(id=run_id, config=args,
@@ -174,88 +187,100 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             settings=wandb.Settings(console="off"),
         )
 
-    checkpoint_dir = os.path.join(args['data_dir'], args['env_name'], run_id)
-    os.makedirs(checkpoint_dir, exist_ok=True)
     target_key = f'environment/{args["sweep"]["metric"]}'
     total_timesteps = args['train']['total_timesteps']
     all_logs = []
 
+    checkpoint_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    log_dir = os.path.join(args['log_dir'], args['env_name'], run_id)
+    os.makedirs(log_dir, exist_ok=True)
+
     pufferl = _C.create_pufferl(args)
     model_size = pufferl.num_params()
-
     if verbose:
-        print_dashboard(args, model_size, _C.log(pufferl), clear=True)
+        flat_logs = dict(pufferlib.unroll_nested_dict(_C.log(pufferl)))
+        print_dashboard(args, model_size, flat_logs, clear=True)
 
-    while pufferl.global_step < total_timesteps:
+    model_path = ''
+    flat_logs = {}
+    train_epochs = total_timesteps // (args['vec']['total_agents'] * args['train']['horizon'])
+    eval_epochs = train_epochs // 2
+    for epoch in range(train_epochs + eval_epochs):
         _C.rollouts(pufferl)
-        _C.train(pufferl)
 
-        if rank != 0:
-            continue
+        if epoch < train_epochs:
+            _C.train(pufferl)
 
-        # Rate-limit dashboard/logging to avoid overhead
-        done_training = pufferl.global_step >= total_timesteps
-
-        if pufferl.epoch % args['checkpoint_interval'] == 0 or done_training:
-            model_path = os.path.join(checkpoint_dir, f'model_{args["env_name"]}_{pufferl.epoch:06d}.bin')
+        if epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1:
+            model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:16d}.bin')
             _C.save_weights(pufferl, model_path)
 
-        if done_training or time.time() > pufferl.last_log_time + 0.6:
-            logs = _C.log(pufferl)
-            flat_logs = dict(pufferlib.unroll_nested_dict(logs))
+        # Rate-limit dashboard/logging to avoid overhead
+        if time.time() < pufferl.last_log_time + 0.6 and epoch != train_epochs - 1:
+            continue
 
-            if target_key in flat_logs and pufferl.global_step > min(0.20*total_timesteps, 100_000_000):
-                all_logs.append(flat_logs)
-                if sweep_obj is not None and sweep_obj.early_stop(flat_logs, target_key):
-                    break
+        logs = _C.eval_log(pufferl) if epoch >= train_epochs else _C.log(pufferl)
+        flat_logs = {**flat_logs, **dict(pufferlib.unroll_nested_dict(logs))}
 
-            if verbose:
-                print_dashboard(args, model_size, logs)
+        if verbose:
+            print_dashboard(args, model_size, flat_logs)
 
-            if args['wandb']:
-                wandb.log(flat_logs, step=flat_logs['agent_steps'])
+        if target_key not in flat_logs:
+            continue
 
-    if rank != 0:
-        return _C.close(pufferl)
+        if args['wandb']:
+            wandb.log(flat_logs, step=flat_logs['agent_steps'])
 
-    for i in range(128): # Accurate eval for final log point
-        _C.rollouts(pufferl)
-        if i == 0 or i % 32 != 0: continue
-        logs = _C.log(pufferl)
-        if logs['environment']:
+        if epoch < train_epochs:
+            all_logs.append(flat_logs)
+
+            if (sweep_obj is not None
+                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
+                    sweep_obj.early_stop(logs, target_key)):
+                break
+        elif flat_logs['environment/n'] > args['eval_episodes']:
             break
-
-    flat_logs = dict(pufferlib.unroll_nested_dict(logs))
-    if target_key in flat_logs:
-        all_logs.append(flat_logs)
-
-    if args['wandb']:
-        wandb.log(flat_logs, step=flat_logs['agent_steps'])
-
-    if verbose:
-        print_dashboard(args, model_size, logs)
 
     _C.close(pufferl)
 
+    if target_key not in flat_logs:
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], None, None, None))
+        return
+
+    # This version has the training perf logs and eval env logs
+    all_logs.append(flat_logs)
+
     # Downsample results
-    points_per_run = args['sweep']['downsample']
-    scores = downsample([log[target_key] for log in all_logs], points_per_run)
-    costs = downsample([log['uptime'] for log in all_logs], points_per_run)
-    timesteps = downsample([log['agent_steps'] for log in all_logs], points_per_run)
+    n = args['sweep']['downsample']
+    metrics = {k: [[]] for k in all_logs[0]}
+    next_bin = total_timesteps / (n-1)
+    for log in all_logs:
+        for k, v in log.items():
+            metrics[k][-1].append(v)
+
+        if log['agent_steps'] < next_bin:
+            continue
+
+        next_bin += total_timesteps / (n-1)
+        for k in metrics:
+            metrics[k][-1] = np.mean(metrics[k][-1])
+            metrics[k].append([])
+
+    for k in metrics:
+        metrics[k][-1] = all_logs[-1][k]
 
     # Save own log: config + downsampled results
-    log_dir = os.path.join(args['data_dir'], 'logs', args['env_name'])
+    log_dir = os.path.join(args['log_dir'], 'logs', args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
-    log_data = {
-        **dict(pufferlib.unroll_nested_dict(args)),
-        'uptime': flat_logs['uptime'],
-        'scores': scores, 'costs': costs, 'timesteps': timesteps,
-    }
+    log_data = {**dict(pufferlib.unroll_nested_dict(args)), **metrics}
     with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
         json.dump(log_data, f)
 
     if args['wandb']:
-        if sweep_obj is None: # Don't spam uploads during sweeps
+        if sweep_obj is None and model_path: # Don't spam uploads during sweeps
             artifact = wandb.Artifact(run_id, type='model')
             artifact.add_file(model_path)
             wandb.run.log_artifact(artifact)
@@ -263,7 +288,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.run.finish()
 
     if result_queue is not None:
-        result_queue.put((args['gpu_id'], scores, costs, timesteps))
+        result_queue.put((args['gpu_id'], metrics['score'], metrics['cost'], metrics['timesteps']))
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
@@ -456,3 +481,60 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+"""
+    model_path = ''
+    while pufferl.global_step < total_timesteps:
+        _C.rollouts(pufferl)
+        _C.train(pufferl)
+
+        if pufferl.epoch % args['checkpoint_interval'] == 0 or pufferl.global_step >= total_timesteps:
+            model_path = os.path.join(checkpoint_dir, f'model_{args["env_name"]}_{pufferl.epoch:06d}.bin')
+            _C.save_weights(pufferl, model_path)
+
+        # Rate-limit dashboard/logging to avoid overhead
+        if time.time() < pufferl.last_log_time + 0.6:
+            continue
+
+        logs = _C.log(pufferl)
+        flat_logs = pufferl.unroll_nested_dict(logs)
+        if verbose:
+            print_dashboard(args, model_size, flat_logs)
+
+        if target_key in logs['environment']:
+            all_logs.append(logs)
+
+            if (sweep_obj is not None
+                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
+                    sweep_obj.early_stop(logs, target_key)):
+                break
+
+        if args['wandb'] and pufferl.global_step < total_timesteps:
+            wandb.log(pufferl.unroll_nested_dict(logs), step=logs['agent_steps'])
+
+    uptime = _C.uptime(pufferl)
+    while True:
+        _C.rollouts(pufferl)
+        if time.time() < pufferl.last_log_time + 0.6:
+            continue
+
+        eval_log = _C.log(pufferl, clear=False)
+
+        env_logs = eval_log['environment']
+        if env_logs:
+            logs['environment'] = env_logs
+
+        if verbose:
+            print_dashboard(args, model_size, pufferl.unroll_nested_dict(eval_log))
+
+        if 'n' in env_logs and env_logs['n'] > 4*args['vec']['total_agents']:
+            break
+
+        if _C.uptime(pufferl) < 1.25*uptime:
+            break
+
+    if args['wandb']:
+        wandb.log(pufferl.unroll_nested_dict(logs), step=logs['agent_steps'])
+"""
+
+

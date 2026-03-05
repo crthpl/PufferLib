@@ -96,6 +96,21 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     return result;
 }
 
+pybind11::dict puf_eval_log(pybind11::object pufferl_obj) {
+    auto& pufferl = pufferl_obj.cast<PuffeRL&>();
+    pybind11::dict result;
+
+    pybind11::dict env_dict;
+    Dict* env_out = create_dict(32);
+    static_vec_eval_log(pufferl.vec, env_out);
+    for (int i = 0; i < env_out->size; i++) {
+        env_dict[env_out->items[i].key] = env_out->items[i].value;
+    }
+    result["environment"] = env_dict;
+
+    return result;
+}
+
 void python_vec_recv(pybind11::object pufferl_obj, int buf) {
     // Not used in static/OMP path
 }
@@ -279,6 +294,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
 PYBIND11_MODULE(_C, m) {
     // Core functions
     m.def("log", &puf_log);
+    m.def("eval_log", &puf_eval_log);
     m.def("render", &render);
     m.def("rollouts", &rollouts);
     m.def("train", &train);
@@ -343,6 +359,12 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("ratio", &RolloutBuf::ratio)
         .def_readwrite("importance", &RolloutBuf::importance);
 
+    m.def("uptime", [](py::object pufferl_obj) -> double {
+        PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+        double now = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return now - pufferl.start_time;
+    });
     m.def("create_pufferl", &create_pufferl);
     py::class_<PuffeRL, std::unique_ptr<PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &PuffeRL::policy)

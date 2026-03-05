@@ -937,12 +937,15 @@ class Protein:
         return score < threshold
 
     def early_stop(self, logs, target_key):
-        if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
-            logs['is_loss_nan'] = True
-            return True
+        for k, v in logs['losses'].items():
+            if np.isnan(v):
+                logs['is_loss_nan'] = True
+                return True
+
         if 'uptime' not in logs or target_key not in logs:
             return False
-        metric_val, cost = logs[target_key], logs['uptime']
+
+        metric_val, cost = logs['environment'][target_key], logs['uptime']
         self._running_target_buffer.append(metric_val)
         target_running_mean = np.mean(self._running_target_buffer)
         threshold = self.get_early_stop_threshold(cost)
