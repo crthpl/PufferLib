@@ -4,6 +4,8 @@ import json
 import glob
 import os
 
+import pufferlib
+
 
 env_names = sorted([
     'breakout',
@@ -14,7 +16,7 @@ env_names = sorted([
     #'moba',
     #'pong',
     #'tower_climb',
-    'grid',
+    #'grid',
     #'nmmo3',
     #'snake',
     #'tripletriad'
@@ -46,11 +48,11 @@ HYPERS = [
 METRICS = [
     'agent_steps',
     'uptime',
-    'environment/score',
-    'environment/perf'
+    'env/score',
+    'env/perf',
 ]
 
-ALL_KEYS = METRICS + HYPERS
+ALL_KEYS = HYPERS + METRICS
 
 def pareto_idx(steps, costs, scores):
     idxs = []
@@ -73,50 +75,33 @@ def load_sweep_data(path):
         with open(fpath, 'r') as f:
             exp = json.load(f)
 
-        if not sweep_metadata:
-            for k, v in exp.items():
-                if k.startswith('sweep/'):
-                    sweep_metadata[k.replace('sweep/', '')] = v
+        sweep_metadata = exp.pop('sweep')
 
-        for k, v in exp.items():
-            if (not k.startswith('train/')
-                    and not k.startswith('policy/')
-                    and not k.startswith('vec/')
-                    and not k.startswith('env/')):
-                continue
-
-            if isinstance(v, dict):
-                continue
-
+        n = 0
+        for k, v in exp.pop('metrics').items():
+            n = len(v)
             if k not in data:
                 data[k] = []
 
             data[k].append(v)
 
-        for k in METRICS:
+        for k, v in pufferlib.unroll_nested_dict(exp):
             if k not in data:
                 data[k] = []
 
-            data[k].append(exp['data'][-1][k])
+            data[k].append([v]*n)
 
-    steps = data['agent_steps']
-    costs = data['uptime']
-    scores = data['environment/score']
+    for k, v in data.items():
+        data[k] = [item for sublist in v for item in sublist]
 
-    idxs = pareto_idx(steps, costs, scores)
-
+    #steps = data['agent_steps']
+    #costs = data['uptime']
+    #scores = data['env/score']
+    #idxs = pareto_idx(steps, costs, scores)
     # Filter to pareto
     #for k in data:
     #    data[k] = [data[k][i] for i in idxs]
 
-    # Monkey patch: Cap performance
-    data['environment/perf'] = [min(e, 1.0) for e in data['environment/perf']]
-    
-    # Monkey patch: Adjust steps by frameskip if present
-    if 'env/frameskip' in data:
-        skip = data['env/frameskip']
-        data['agent_steps'] = [n*m for n, m in zip(data['agent_steps'], skip)]
- 
     data['sweep'] = sweep_metadata
     return data
 
@@ -134,32 +119,29 @@ def cached_sweep_load(path, env_name):
     return data
 
 def compute_tsne():
-    data = {name: cached_sweep_load(f'experiments/logs/puffer_{name}', name) for name in env_names}
-    sweep_metadata = {name: data[name].pop('sweep') for name in env_names}
+    data = {}
+    for name in env_names:
+        env_data = cached_sweep_load(f'logs/puffer_{name}', name)
+        data[name] = env_data
+        sweep_metadata = env_data.pop('sweep')
 
-    flat = []
-    flat_mmin = []
-    flat_mmax = []
-    for env in env_names:
-        flat.append(np.stack([data[env][hyper] for hyper in HYPERS], axis=1))
-        flat_mmin.append(np.stack([sweep_metadata[env][f'{hyper}/min'] for hyper in HYPERS]))
-        flat_mmax.append(np.stack([sweep_metadata[env][f'{hyper}/max'] for hyper in HYPERS]))
+        normed_env_data = []
+        for key in HYPERS:
+            prefix, suffix = key.split('/')
+            mmin = sweep_metadata[prefix][suffix]['min']
+            mmax = sweep_metadata[prefix][suffix]['max']
+            dat = np.array(env_data[key])
 
-    flat_distribution = [sweep_metadata[env][f'{hyper}/distribution'] for env in env_names for hyper in HYPERS]
+            dist = sweep_metadata[prefix][suffix]['distribution']
+            if 'log' in dist or 'pow2' in dist:
+                mmin = np.log(mmin)
+                mmax = np.log(mmax)
+                dat = np.log(dat)
 
-    flat = np.concatenate(flat, axis=0)
-    flat_mmin = np.stack(flat_mmin, axis=0).min(axis=0)
-    flat_mmax = np.stack(flat_mmax, axis=0).max(axis=0)
+            normed = (dat - mmin) / (mmax - mmin)
+            normed_env_data.append(normed)
 
-    normed = flat.copy()
-    for i in range(len(HYPERS)):
-        dist = flat_distribution[i]
-        if 'log' in dist or 'pow2' in dist:
-            flat_mmin[i] = np.log(flat_mmin[i])
-            flat_mmax[i] = np.log(flat_mmax[i])
-            normed[:, i] = np.log(flat[:, i])
-
-        normed[:, i] = (normed[:, i] - flat_mmin[i]) / (flat_mmax[i] - flat_mmin[i])
+        normed = np.stack(normed_env_data, axis=1)
 
     from sklearn.manifold import TSNE
     proj = TSNE(n_components=2)
@@ -168,17 +150,17 @@ def compute_tsne():
         reduced = proj.fit_transform(normed)
     except ValueError:
         print('Warning: TSNE failed. Skipping TSNE')
+        sz = len(normed)
 
     row = 0
     for env in env_names:
-        '''
-        for i, hyper in enumerate(HYPERS):
-            sz = len(data[env][hyper])
-            data[env][hyper] = normed[row:row+sz, i].tolist()
-        '''
-        sz = len(data[env]['agent_steps'])
+        #for i, hyper in enumerate(HYPERS):
+        #    sz = len(data[env][hyper])
+        #    data[env][hyper] = normed[row:row+sz, i].tolist()
 
-        #data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
+        #sz = len(data[env]['agent_steps'])
+
+        data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
         if reduced is not None:
             data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
             data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()

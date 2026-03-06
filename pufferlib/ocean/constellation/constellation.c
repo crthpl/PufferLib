@@ -776,7 +776,7 @@ void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
         float env_perf, float perf_threshold, Vector2 tsne, float tsne_thresh) {
     for (int i=0; i<data->n; i++) {
         Env* env = &data->envs[i];
-        Hyper* perf = get_hyper(data, env->key, "environment/perf");
+        Hyper* perf = get_hyper(data, env->key, "env/perf");
         Hyper* tsne1 = get_hyper(data, env->key, "tsne1");
         Hyper* tsne2 = get_hyper(data, env->key, "tsne2");
         for (int j=0; j<tsne1->n; j++) {
@@ -873,12 +873,12 @@ int main(void) {
         }
     }
 
-    int hyper_count = 24;
-    char *hyper_key[24] = {
+    int hyper_count = 23;
+    char *hyper_key[23] = {
         "agent_steps",
         "uptime",
-        "environment/perf",
-        "environment/score",
+        "env/perf",
+        "env/score",
         "train/learning_rate",
         "train/ent_coef",
         "train/gamma",
@@ -894,7 +894,7 @@ int main(void) {
         "train/eps",
         "train/prio_alpha",
         "train/prio_beta0",
-        "train/horizon",
+        //"train/horizon",
         "train/replay_ratio",
         "train/minibatch_size",
         "policy/hidden_size",
@@ -1112,7 +1112,7 @@ int main(void) {
     memset(best_srci, 0, sizeof(int)*4);
     for (int env_i=0; env_i<data.n; env_i++) {
         Env* src = &data.envs[env_i];
-        Hyper* src_perf = get_hyper(&data, src->key, "environment/perf");
+        Hyper* src_perf = get_hyper(&data, src->key, "env/perf");
         Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
         Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
         for (int i=0; i<src_tsne1->n; i++) {
@@ -1620,9 +1620,9 @@ int main(void) {
         char* env_key = env->key;
 
         float cost = get_hyper(&data, env_key, "uptime")->ary[ary_idx];
-        float score = get_hyper(&data, env_key, "environment/score")->ary[ary_idx];
+        float score = get_hyper(&data, env_key, "env/score")->ary[ary_idx];
         float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
-        float perf = get_hyper(&data, env_key, "environment/perf")->ary[ary_idx];
+        float perf = get_hyper(&data, env_key, "env/perf")->ary[ary_idx];
         float tsne1 = get_hyper(&data, env_key, "tsne1")->ary[ary_idx];
         float tsne2 = get_hyper(&data, env_key, "tsne2")->ary[ary_idx];
         Vector2 tsne = (Vector2){tsne1, tsne2};

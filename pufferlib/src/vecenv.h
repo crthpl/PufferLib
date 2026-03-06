@@ -113,6 +113,7 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, Dict* vec_kwargs
 void static_vec_reset(StaticVec* vec);
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
+void static_vec_eval_log(StaticVec* vec, Dict* out);
 void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     void* ctx, net_callback_fn net_callback, thread_init_fn thread_init);
 void static_vec_omp_step(StaticVec* vec);
@@ -512,6 +513,30 @@ void static_vec_log(StaticVec* vec, Dict* out) {
             ((float*)&aggregate)[j] += ((float*)&env->log)[j];
         }
         memset(&env->log, 0, sizeof(Log));
+    }
+    float n = aggregate.n;
+    if (n == 0.0f) {
+        return;
+    }
+    for (int i = 0; i < num_keys; i++) {
+        ((float*)&aggregate)[i] /= n;
+    }
+    my_log(&aggregate, out);
+    dict_set(out, "n", n);
+}
+
+void static_vec_eval_log(StaticVec* vec, Dict* out) {
+    Env* envs = (Env*)vec->envs;
+    Log aggregate = {0};
+    int num_keys = sizeof(Log) / sizeof(float);
+    for (int i = 0; i < vec->size; i++) {
+        Env* env = &envs[i];
+        if (env->log.n == 0) {
+            continue;
+        }
+        for (int j = 0; j < num_keys; j++) {
+            ((float*)&aggregate)[j] += ((float*)&env->log)[j];
+        }
     }
     float n = aggregate.n;
     if (n == 0.0f) {
