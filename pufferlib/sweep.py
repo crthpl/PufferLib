@@ -324,7 +324,7 @@ class Random:
         ))
 
     def early_stop(self, logs, target_key):
-        if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
+        if any("loss/" in k and np.isnan(v) for k, v in logs.items()):
             logs['is_loss_nan'] = True
             return True
         return False
@@ -381,7 +381,7 @@ class ParetoGenetic:
         ))
 
     def early_stop(self, logs, target_key):
-        if any("losses/" in k and np.isnan(v) for k, v in logs.items()):
+        if any("loss/" in k and np.isnan(v) for k, v in logs.items()):
             logs['is_loss_nan'] = True
             return True
         return False
@@ -937,7 +937,7 @@ class Protein:
         return score < threshold
 
     def early_stop(self, logs, target_key):
-        for k, v in logs['losses'].items():
+        for k, v in logs['loss'].items():
             if np.isnan(v):
                 logs['is_loss_nan'] = True
                 return True
@@ -945,7 +945,7 @@ class Protein:
         if 'uptime' not in logs or target_key not in logs:
             return False
 
-        metric_val, cost = logs['environment'][target_key], logs['uptime']
+        metric_val, cost = logs['env'][target_key], logs['uptime']
         self._running_target_buffer.append(metric_val)
         target_running_mean = np.mean(self._running_target_buffer)
         threshold = self.get_early_stop_threshold(cost)
