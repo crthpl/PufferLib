@@ -119,13 +119,15 @@ def cached_sweep_load(path, env_name):
     return data
 
 def compute_tsne():
-    data = {}
-    for name in env_names:
-        env_data = cached_sweep_load(f'logs/puffer_{name}', name)
-        data[name] = env_data
-        sweep_metadata = env_data.pop('sweep')
+    all_data = {}
+    normed = {}
 
-        normed_env_data = []
+    for env in env_names:
+        env_data = cached_sweep_load(f'logs/puffer_{env}', env)
+        sweep_metadata = env_data.pop('sweep')
+        all_data[env] = env_data
+
+        normed_env = []
         for key in HYPERS:
             prefix, suffix = key.split('/')
             mmin = sweep_metadata[prefix][suffix]['min']
@@ -138,10 +140,11 @@ def compute_tsne():
                 mmax = np.log(mmax)
                 dat = np.log(dat)
 
-            normed = (dat - mmin) / (mmax - mmin)
-            normed_env_data.append(normed)
+            normed_env.append((dat - mmin) / (mmax - mmin))
 
-        normed = np.stack(normed_env_data, axis=1)
+        normed[env] = np.stack(normed_env, axis=1)
+
+    normed = np.concatenate(list(normed.values()), axis=0)
 
     from sklearn.manifold import TSNE
     proj = TSNE(n_components=2)
@@ -150,28 +153,25 @@ def compute_tsne():
         reduced = proj.fit_transform(normed)
     except ValueError:
         print('Warning: TSNE failed. Skipping TSNE')
-        sz = len(normed)
 
     row = 0
     for env in env_names:
-        #for i, hyper in enumerate(HYPERS):
-        #    sz = len(data[env][hyper])
-        #    data[env][hyper] = normed[row:row+sz, i].tolist()
+        for i, hyper in enumerate(HYPERS):
+            sz = len(all_data[env][hyper])
+            all_data[env][hyper] = normed[row:row+sz, i].tolist()
 
-        #sz = len(data[env]['agent_steps'])
-
-        data[env] = {k: v for k, v in data[env].items() if k in ALL_KEYS}
+        all_data[env] = {k: v for k, v in all_data[env].items() if k in ALL_KEYS}
         if reduced is not None:
-            data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
-            data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
+            all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
+            all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
         else:
-            data[env]['tsne1'] = np.random.rand(sz).tolist()
-            data[env]['tsne2'] = np.random.rand(sz).tolist()
+            all_data[env]['tsne1'] = np.random.rand(sz).tolist()
+            all_data[env]['tsne2'] = np.random.rand(sz).tolist()
 
         row += sz
         print(f'Env {env} has {sz} points')
 
-    json.dump(data, open('all_cache.json', 'w'))
+    json.dump(all_data, open('all_cache.json', 'w'))
 
 if __name__ == '__main__':
     compute_tsne()
