@@ -118,9 +118,7 @@ class Logit(Space):
         super().__init__(min, max, scale, is_integer)
 
     def normalize(self, value):
-        #assert isinstance(value, (int, float))
-        #assert value != 0.0
-        #assert value != 1.0
+        value = max(self.min, min(value, self.max))
         zero_one = (math.log(1-value, self.base) - math.log(1-self.min, self.base))/(math.log(1-self.max, self.base) - math.log(1-self.min, self.base))
         return 2*zero_one - 1
 
