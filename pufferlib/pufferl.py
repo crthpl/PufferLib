@@ -205,7 +205,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     model_path = ''
     flat_logs = {}
-    train_epochs = total_timesteps // (args['vec']['total_agents'] * args['train']['horizon'])
+    train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
         _C.rollouts(pufferl)
