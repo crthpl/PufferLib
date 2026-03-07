@@ -1640,9 +1640,17 @@ int main(void) {
 
             char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
-            DrawRectangle(tooltip.x, tooltip.y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
+            float x = tooltip.x;
+            float y = tooltip.y;
+            if (x + text_size.x + 4 > GetScreenWidth()) {
+                x = x - text_size.x - 4;
+            }
+            if (y + text_size.y + 4 > GetScreenHeight()) {
+                y = y - text_size.y - 4;
+            }
+            DrawRectangle(x, y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
             DrawCircle(tooltip.x, tooltip.y, 2, PUFF_CYAN);
-            DrawTextEx(args1.font_small, text, (Vector2){tooltip.x + 2, tooltip.y + 2}, args1.axis_tick_font_size, 0, WHITE);
+            DrawTextEx(args1.font_small, text, (Vector2){x + 2, y + 2}, args1.axis_tick_font_size, 0, WHITE);
         }
         //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
