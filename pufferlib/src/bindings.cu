@@ -14,12 +14,12 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
 
     // Summary
     int gpus = pufferl.hypers.world_size;
-    int global_step = pufferl.global_step;
-    int epoch = pufferl.epoch;
+    long global_step = pufferl.global_step;
+    long epoch = pufferl.epoch;
     double now = std::chrono::duration<double>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     double dt = now - pufferl.last_log_time;
-    int sps = dt > 0 ? (int)((global_step - pufferl.last_log_step) / dt) : 0;
+    long sps = dt > 0 ? (long)((global_step - pufferl.last_log_step) / dt) : 0;
     pufferl.last_log_time = now;
     pufferl.last_log_step = global_step;
 
