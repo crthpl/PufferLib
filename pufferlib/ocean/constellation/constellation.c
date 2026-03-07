@@ -49,8 +49,10 @@ void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
 }
 
 #define SETTINGS_HEIGHT 20
-#define TOGGLE_WIDTH 60
-#define DROPDOWN_WIDTH 136
+#define SEP 8
+#define SPACER 30
+#define TOGGLE_WIDTH 70
+#define DROPDOWN_WIDTH 140
 
 #define LINEAR 0
 #define LOG 1
@@ -945,6 +947,7 @@ int main(void) {
     // Initialize Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
+    Texture2D puffer = LoadTexture("resources/shared/puffers.png");
 
     DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
@@ -1169,6 +1172,17 @@ int main(void) {
                 c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
             }
             for (int j=0; j<x->n; j++) {
+                filter[j] = true;
+            }
+            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
+            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
+            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+ 
+            for (int j=0; j<x->n; j++) {
+                if (!filter[j]) {
+                    continue;
+                }
                 points[size] = (Point){
                     x->ary[j],
                     y->ary[j],
@@ -1214,7 +1228,15 @@ int main(void) {
             if (fig_color_idx != 0) {
                 c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
             }
+            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
+            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
+            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+ 
             for (int j=0; j<x->n; j++) {
+                if (!filter[j]) {
+                    continue;
+                }
                 points[size] = (Point){
                     x->ary[j],
                     y->ary[j],
@@ -1487,58 +1509,104 @@ int main(void) {
         }
 
         // UI
-        Rectangle fig_env_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        float y = SEP + SETTINGS_HEIGHT/2.0f - MeasureTextEx(args1.font_small, "Env", args1.axis_tick_font_size, 0).y/2.0f;
+        float x = SEP;
+        DrawTextEx(args1.font_small, "Env", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "Env", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_env_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH + SPACER;
         if (GuiDropdownBox(fig_env_rect, env_options, &fig_env_idx, fig_env_active)){
             fig_env_active = !fig_env_active;
         }
 
         // X axis
-        Rectangle fig_x_rect = {DROPDOWN_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        DrawTextEx(args1.font_small, "X", (Vector2){x, y}, args1.axis_tick_font_size, 0, RED);
+        x += MeasureTextEx(args1.font_small, "X", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_x_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
         if (GuiDropdownBox(fig_x_rect, options, &fig_x_idx, fig_x_active)){
             fig_x_active = !fig_x_active;
         }
-        Rectangle fig_xscale_rect = {2*DROPDOWN_WIDTH, 0, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig_xscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
         if (GuiDropdownBox(fig_xscale_rect, scale_options, &args1.x_scale, fig_xscale_active)){
             fig_xscale_active = !fig_xscale_active;
         }
 
         // Y axis
-        Rectangle fig_y_rect = {2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        DrawTextEx(args1.font_small, "Y", (Vector2){x, y}, args1.axis_tick_font_size, 0, GREEN);
+        x += MeasureTextEx(args1.font_small, "Y", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_y_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
         if (GuiDropdownBox(fig_y_rect, options, &fig_y_idx, fig_y_active)){
             fig_y_active = !fig_y_active;
         }
-        Rectangle fig_yscale_rect = {3*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig_yscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
         if (GuiDropdownBox(fig_yscale_rect, scale_options, &args1.y_scale, fig_yscale_active)){
             fig_yscale_active = !fig_yscale_active;
         }
 
         // Z axis
-        Rectangle fig_z_rect = {3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        DrawTextEx(args1.font_small, "Z", (Vector2){x, y}, args1.axis_tick_font_size, 0, BLUE);
+        x += MeasureTextEx(args1.font_small, "Z", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_z_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
         if (GuiDropdownBox(fig_z_rect, options, &fig_z_idx, fig_z_active)){
             fig_z_active = !fig_z_active;
         }
-        Rectangle fig_zscale_rect = {4*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig_zscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
         if (GuiDropdownBox(fig_zscale_rect, scale_options, &args1.z_scale, fig_zscale_active)){
             fig_zscale_active = !fig_zscale_active;
         }
 
         // Color
-        Rectangle fig_color_rect = {4*DROPDOWN_WIDTH + 3*TOGGLE_WIDTH, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        DrawTextEx(args1.font_small, "C", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "C", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_color_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
         if (GuiDropdownBox(fig_color_rect, env_hyper_options, &fig_color_idx, fig_color_active)){
             fig_color_active = !fig_color_active;
         }
-        Rectangle fig_colorscale_rect = {5*DROPDOWN_WIDTH + 3*TOGGLE_WIDTH, 0, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        Rectangle fig_colorscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
         if (GuiDropdownBox(fig_colorscale_rect, scale_options, &args1.c_scale, fig_colorscale_active)){
             fig_colorscale_active = !fig_colorscale_active;
         }
 
         // Filters
-        GuiDropdownFilter(5*DROPDOWN_WIDTH + 4*TOGGLE_WIDTH, 0, options,
+        DrawTextEx(args1.font_small, "F1", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "F1", args1.axis_tick_font_size, 0).x + SEP;
+
+        GuiDropdownFilter(x, SEP, options,
                 &fig_range1_idx, &fig_range1_active, focus, fig_range1_min,
                 &fig_range1_min_val, fig_range1_max, &fig_range1_max_val);
-        GuiDropdownFilter(7*DROPDOWN_WIDTH + 4*TOGGLE_WIDTH, 0, options,
+        x += DROPDOWN_WIDTH + 2*TOGGLE_WIDTH + SPACER;
+
+        DrawTextEx(args1.font_small, "F2", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "F2", args1.axis_tick_font_size, 0).x + SEP;
+
+        GuiDropdownFilter(x, SEP, options,
             &fig_range2_idx, &fig_range2_active, focus, fig_range2_min,
             &fig_range2_min_val, fig_range2_max, &fig_range2_max_val);
+
+        // Puffer
+        float width = GetScreenWidth();
+        float height = GetScreenHeight();
+        DrawTexturePro(
+            puffer,
+            (Rectangle){0, 128, 128, 128},
+            (Rectangle){width - 48, -8, 48, 48},
+            (Vector2){0, 0},
+            0,
+            WHITE
+        );
 
         // Tooltip
         int env_idx = tooltip.env_idx;
