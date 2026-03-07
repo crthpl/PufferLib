@@ -157,15 +157,6 @@ def validate_config(args):
         raise pufferlib.APIUsageError(
             f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}')
 
-def downsample(ary, n):
-    if not ary or n <= 0: return []
-    if n == 1: return ary[-1:]
-    if len(ary) <= n: return ary
-    ary, last = np.array(ary[:-1]), ary[-1]
-    n_trunc = (n-1) * (len(ary) // (n-1))
-    ary = ary[-n_trunc:] if n_trunc > 0 else ary
-    return ary.reshape(n-1, -1).mean(axis=1).tolist() + [last]
-
 def _train_worker(args):
     pufferl = _C.create_pufferl(args)
     while pufferl.global_step < args['train']['total_timesteps']:
@@ -213,7 +204,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if epoch < train_epochs:
             _C.train(pufferl)
 
-        if epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1:
+        if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:16d}.bin')
             _C.save_weights(pufferl, model_path)
 

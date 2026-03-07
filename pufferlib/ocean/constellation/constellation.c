@@ -61,8 +61,8 @@ const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 const Color CONSTELLATION = (Color){255, 255, 255, 128};
 
-#define MAX_PARTICLES 10000
-#define MAX_POINTS 10000
+#define MAX_PARTICLES 50000
+#define MAX_POINTS 50000
 
 typedef struct Glyph {
     float x;
@@ -815,7 +815,7 @@ int main(void) {
     fclose(file);
     cJSON *root = cJSON_Parse(json_str);
     if (!root) {
-        printf("JSON parse error: %s\n", cJSON_GetErrorPtr());
+        printf("JSON parse error: %.100s\n", cJSON_GetErrorPtr());
         free(json_str);
         return 1;
     }

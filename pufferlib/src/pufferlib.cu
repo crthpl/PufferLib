@@ -208,11 +208,11 @@ typedef struct {
     PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
     nvmlDevice_t nvml_device;
-    int epoch;
-    int global_step;
+    long epoch;
+    long global_step;
     double start_time;
     double last_log_time;
-    int last_log_step;
+    long last_log_step;
     int train_warmup;
     bool rollout_captured;
     bool train_captured;
@@ -717,7 +717,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->alloc_fp32.esz = esz_fp32;
     Allocator& fp32_params = pufferl->alloc_fp32.params;
 
-    bool is_nmmo3 = (env_name == "puffer_nmmo3");
+    //bool is_nmmo3 = (env_name == "puffer_nmmo3");
+    bool is_nmmo3 = false;
     pufferl->is_nmmo3 = is_nmmo3;
 
     Encoder encoder = is_nmmo3 ? Encoder{

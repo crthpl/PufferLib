@@ -12,11 +12,11 @@ env_names = sorted([
     #'impulse_wars',
     #'pacman',
     #'tetris',
-    #'g2048',
+    'g2048',
     #'moba',
     #'pong',
     #'tower_climb',
-    #'grid',
+    'grid',
     #'nmmo3',
     #'snake',
     #'tripletriad'
@@ -68,22 +68,57 @@ def pareto_idx(steps, costs, scores):
 def load_sweep_data(path):
     data = {}
     sweep_metadata = {}
+    num_metrics = 0
     for fpath in glob.glob(path):
         if 'cache.json' in fpath:
             continue
 
         with open(fpath, 'r') as f:
-            exp = json.load(f)
+            try:
+                exp = json.load(f)
+            except json.decoder.JSONDecodeError:
+                print(f'Skipping {fpath}')
+                continue
 
         sweep_metadata = exp.pop('sweep')
 
-        n = 0
-        for k, v in exp.pop('metrics').items():
-            n = len(v)
+        data_len = len(exp['metrics']['agent_steps'])
+        if data_len > 100:
+            print(f'Skipping {fpath} (len={data_len})')
+            continue
+
+        if num_metrics == 0:
+            num_metrics = len(exp['metrics'])
+
+        skip = False
+        metrics = exp.pop('metrics')
+
+        if len(metrics) != num_metrics:
+            print(f'Skipping {fpath} (num_metrics={len(metrics)} != {num_metrics})')
+            continue
+
+        n = len(metrics['agent_steps'])
+        for k, v in metrics.items():
+            if len(v) != n:
+                skip = True
+                break
+
             if k not in data:
                 data[k] = []
 
+            if np.isnan(v).any():
+                skip = True
+                break
+
+        if skip:
+            print(f'Skipping {fpath} (bad data)')
+            continue
+
+        for k, v in metrics.items():
             data[k].append(v)
+            if len(data[k]) != len(data['SPS']):
+                breakpoint()
+                pass
 
         for k, v in pufferlib.unroll_nested_dict(exp):
             if k not in data:
@@ -107,10 +142,10 @@ def load_sweep_data(path):
 
 def cached_sweep_load(path, env_name):
     cache_file = os.path.join(path, 'c_cache.json')
-    if not os.path.exists(cache_file):
-        data = load_sweep_data(os.path.join(path, '*.json'))
-        with open(cache_file, 'w') as f:
-            json.dump(data, f)
+    #if not os.path.exists(cache_file):
+    data = load_sweep_data(os.path.join(path, '*.json'))
+    with open(cache_file, 'w') as f:
+        json.dump(data, f)
 
     with open(cache_file, 'r') as f:
         data = json.load(f)
@@ -156,11 +191,8 @@ def compute_tsne():
 
     row = 0
     for env in env_names:
-        for i, hyper in enumerate(HYPERS):
-            sz = len(all_data[env][hyper])
-            all_data[env][hyper] = normed[row:row+sz, i].tolist()
-
-        all_data[env] = {k: v for k, v in all_data[env].items() if k in ALL_KEYS}
+        sz = len(all_data[env]['agent_steps'])
+        #all_data[env] = {k: v for k, v in all_data[env].items()}
         if reduced is not None:
             all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
             all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
