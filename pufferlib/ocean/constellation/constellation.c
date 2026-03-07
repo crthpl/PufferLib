@@ -50,9 +50,9 @@ void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
 
 #define SETTINGS_HEIGHT 20
 #define SEP 8
-#define SPACER 30
+#define SPACER 25
 #define TOGGLE_WIDTH 70
-#define DROPDOWN_WIDTH 140
+#define DROPDOWN_WIDTH 125
 
 #define LINEAR 0
 #define LOG 1
@@ -227,17 +227,16 @@ PlotArgs DEFAULT_PLOT_ARGS = {
 
 const char* format_tick_label(double value) {
     static char buffer[32];
-    int precision = 2;
 
     if (fabs(value) < 1e-10) {
         strcpy(buffer, "0");
         return buffer;
     }
 
-    if (fabs(value) < 0.01 || fabs(value) > 10000) {
-        snprintf(buffer, sizeof(buffer), "%.2e\0", value);
+    if (fabs(value) < 0.001 || fabs(value) > 10000) {
+        snprintf(buffer, sizeof(buffer), "%.3e\0", value);
     } else {
-        snprintf(buffer, sizeof(buffer), "%.2f\0", value);
+        snprintf(buffer, sizeof(buffer), "%.3f\0", value);
         //char *end = buffer + strlen(buffer) - 1;
         //while (end > buffer && *end == '0') *end-- = '\0';
         //if (end > buffer && *end == '.') *end = '\0';
@@ -390,15 +389,18 @@ void draw_all_ticks(PlotArgs args) {
 
 void draw_box_ticks(char* hypers[], int hyper_count, PlotArgs args) {
     Vector2 tick_n = compute_ticks(args);
+    float x_min = scale_val(args.x_scale, args.x_min);
+    float x_max = scale_val(args.x_scale, args.x_max);
     char x_ticks[(int)tick_n.x][32];
     for (int i=0; i<tick_n.x; i++) {
-        float val = args.x_min + i*(args.x_max - args.x_min)/(tick_n.x - 1.0f);
+        float val = x_min + i*(x_max - x_min)/(tick_n.x - 1.0f);
+        val = unscale_val(args.x_scale, val);
         char* label = format_tick_label(val);
         strcpy(x_ticks[i], label);
     }
     char fixed_hypers[hyper_count][32];
     for (int i=0; i<hyper_count; i++) {
-        strncpy(fixed_hypers[i], hypers[i], 32);
+        strncpy(fixed_hypers[hyper_count - i - 1], hypers[i], 32);
     }
 
     draw_ticks(x_ticks, tick_n.x, fixed_hypers, hyper_count, args);
@@ -466,21 +468,12 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
     int width = args.width;
     int height = args.height;
 
-    float x_min = args.x_min;
-    float x_max = args.x_max;
-
     float plot_width = width - args.left_margin - args.right_margin;
     float plot_height = height - args.top_margin - args.bottom_margin;
 
-    if (x_scale) {
-        x_min = x_min<=1e-8 ? -8 : log10(x_min);
-        x_max = x_max<=1e-8 ? -8 : log10(x_max);
-    }
-
-    float dx = x_max - x_min;
-    if (dx == 0) dx = 1.0f;
-    x_min -= 0.1f * dx; x_max += 0.1f * dx;
-    dx = x_max - x_min;
+    float x_min = scale_val(x_scale, args.x_min);
+    float x_max = scale_val(x_scale, args.x_max);
+ 
     float dy = plot_height/((float)hyper_count);
 
     Color faded = Fade(color, 0.15f);
@@ -496,17 +489,17 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
         mmax = fmax(mmax, ary[j]);
     }
 
-    if (x_scale) {
-        mmin = mmin <= 0 ? 0 : log10(mmin);
-        mmax = mmax <= 0 ? 0 : log10(mmax);
-    }
+    mmin = scale_val(x_scale, mmin);
+    mmax = scale_val(x_scale, mmax);
+    //printf("mmin %f mmax %f, x_scale %d, x_min %f, x_max %f\n", mmin, mmax, x_scale, x_min, x_max);
+    //printf("Hyper %s mmin %f mmax %f, xmin %f xmax %f, left_perc %f right_perc %f\n", hyper->key, mmin, mmax, x_min, x_max, (mmin-x_min)/(x_max - x_min), (mmax-x_min)/(x_max - x_min));
 
     float left = args.left_margin + (mmin - x_min)/(x_max - x_min)*plot_width;
     float right = args.left_margin + (mmax - x_min)/(x_max - x_min)*plot_width;
 
     // TODO - rough patch
-    left = fmax(left, args.left_margin);
-    right = fmin(right, width - args.right_margin);
+    left = fminf(fmax(left, args.left_margin), width - args.right_margin);
+    right = fmaxf(fmin(right, width - args.right_margin), 0);
     DrawRectangle(left, args.top_margin + i*dy, right - left, dy, faded);
 }
 
@@ -593,12 +586,12 @@ void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdo
     if (GuiDropdownBox(rect, options, selection, *dropdown_active)) {
         *dropdown_active = !*dropdown_active;
     }
-    Rectangle text1_rect = {x + rect.width, y, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+    Rectangle text1_rect = {x + DROPDOWN_WIDTH, y, TOGGLE_WIDTH, SETTINGS_HEIGHT};
     bool text1_active = CheckCollisionPointRec(focus, text1_rect);
     if (GuiTextBox(text1_rect, text1, 32, text1_active)) {
         *text1_val = atof(text1);
     }
-    Rectangle text2_rect = {x + 1.5*DROPDOWN_WIDTH, y, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+    Rectangle text2_rect = {x + DROPDOWN_WIDTH + TOGGLE_WIDTH, y, TOGGLE_WIDTH, SETTINGS_HEIGHT};
     bool text2_active = CheckCollisionPointRec(focus, text2_rect);
     if (GuiTextBox(text2_rect, text2, 32, text2_active)) {
         *text2_val = atof(text2);
@@ -1011,6 +1004,8 @@ int main(void) {
     char fig_range2_max[32];
     float fig_range2_min_val = 0;
     float fig_range2_max_val = 10000;
+    int fig_box_idx = 2;
+    bool fig_box_active = false;
 
     char* scale_options = "linear;log;logit";
 
@@ -1054,8 +1049,6 @@ int main(void) {
     args4.right_margin = 50;
     args4.top_margin = 10;
     args4.bottom_margin = 50;
-    args4.x_min = 1e-8;
-    args4.x_max = 1e8;
 
     float perf_thresholds[4] = {0.5f, 0.75f, 0.9f, 0.95f};
     int best_srci[4];
@@ -1295,6 +1288,17 @@ int main(void) {
         EndTextureMode();
 
         // Figure 4
+        args4.x_scale = fig_box_idx;
+        if (args4.x_scale == LINEAR) {
+            args4.x_min = 0.0f;
+            args4.x_max = 5.0f;
+        } else if (args4.x_scale == LOG) {
+            args4.x_min = 1.0e-5f;
+            args4.x_max = 1.0e5f;
+        } else if (args4.x_scale == LOGIT) {
+            args4.x_min = 0.5f;
+            args4.x_max = 0.999f;
+        }
         BeginTextureMode(fig4);
         ClearBackground(PUFF_BACKGROUND);
         rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
@@ -1308,9 +1312,9 @@ int main(void) {
                 for (int k=0; k<hyper->n; k++) {
                     filter[k] = true;
                 }
-                apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-                apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
-                boxplot(hyper, fig_xscale_idx, j, hyper_count, args4, PUFF_CYAN, filter);
+                //apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+                //apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+                boxplot(hyper, args4.x_scale, j, hyper_count, args4, PUFF_CYAN, filter);
             }
         }
         EndBlendMode();
@@ -1595,6 +1599,16 @@ int main(void) {
         GuiDropdownFilter(x, SEP, options,
             &fig_range2_idx, &fig_range2_active, focus, fig_range2_min,
             &fig_range2_min_val, fig_range2_max, &fig_range2_max_val);
+        x += DROPDOWN_WIDTH + 2*TOGGLE_WIDTH + SPACER;
+
+        // Box
+        DrawTextEx(args1.font_small, "Box", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "Box", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle box_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(box_rect, scale_options, &fig_box_idx, fig_box_active)) {
+            fig_box_active = !fig_box_active;
+        }
 
         // Puffer
         float width = GetScreenWidth();
