@@ -413,21 +413,12 @@ void train_impl(PuffeRL& pufferl) {
     puf_transpose_01(rollouts.values, src.values, train_stream);
 
     // Clamp rewards and fill ratio
-    if (USE_BF16) {
-        clamp_bf16_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
-            (__nv_bfloat16*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
-        CHECK_LAST_KERNEL();
-        fill_bf16_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
-            (__nv_bfloat16*)rollouts.ratio.bytes, __float2bfloat16(1.0f), rollouts.ratio.numel());
-        CHECK_LAST_KERNEL();
-    } else {
-        clamp_f32_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
-            (float*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
-        CHECK_LAST_KERNEL();
-        fill_f32_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
-            (float*)rollouts.ratio.bytes, 1.0f, rollouts.ratio.numel());
-        CHECK_LAST_KERNEL();
-    }
+    clamp_precision_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
+    CHECK_LAST_KERNEL();
+    fill_precision_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.ratio.bytes, from_float(1.0f), rollouts.ratio.numel());
+    CHECK_LAST_KERNEL();
 
     // old_values = values.clone() via pre-allocated PufTensor
     PufTensor& old_values_puf = pufferl.old_values_puf;
@@ -535,15 +526,10 @@ void train_impl(PuffeRL& pufferl) {
             CHECK_LAST_KERNEL();
 
             // Cast contiguous grads → f32 into muon gc_puf, then clip grad norm
-            if (USE_BF16) {
-                cast_bf16_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (float*)pufferl.muon->gc_puf.bytes, (const __nv_bfloat16*)pufferl.grad_bf16_puf.bytes,
-                    pufferl.grad_bf16_puf.numel());
-                CHECK_LAST_KERNEL();
-            } else {
-                cudaMemcpyAsync(pufferl.muon->gc_puf.bytes, pufferl.grad_bf16_puf.bytes,
-                    pufferl.grad_bf16_puf.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            }
+            cast_precision_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+                (float*)pufferl.muon->gc_puf.bytes, (const precision_t*)pufferl.grad_bf16_puf.bytes,
+                pufferl.grad_bf16_puf.numel());
+            CHECK_LAST_KERNEL();
             {
                 PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;

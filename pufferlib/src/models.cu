@@ -412,13 +412,9 @@ void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t st
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
     curandDestroyGenerator(gen);
 
-    if (dst.dtype_size == 2) {
-        cast_f32_to_bf16_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (__nv_bfloat16*)dst.bytes, buf, n);
-    } else {
-        cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream);
-    }
+    assert(dst.dtype_size == 4 && "puf_kaiming_init: always called on f32 master weights");
+    cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream);
 
     cudaFree(buf);
 }
@@ -432,9 +428,9 @@ void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t st
 
 void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_cast_f32_to_bf16: size mismatch");
-    assert(dst.dtype_size == 2 && src.dtype_size == 4);
-    cast_f32_to_bf16_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-        (__nv_bfloat16*)dst.bytes, (const float*)src.bytes, dst.numel());
+    assert(dst.dtype_size == PRECISION_SIZE && src.dtype_size == 4);
+    cast_f32_to_precision_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
+        (precision_t*)dst.bytes, (const float*)src.bytes, dst.numel());
     CHECK_LAST_KERNEL();
 }
 
@@ -468,13 +464,8 @@ void puf_zero(PufTensor& dst, cudaStream_t stream) {
 void puf_add(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_add: size mismatch");
     assert(dst.dtype_size == 4 && "puf_add: dst must be f32");
-    if (src.dtype_size == 2) {
-        add_bf16_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-            (float*)dst.bytes, (const __nv_bfloat16*)src.bytes, dst.numel());
-    } else {
-        add_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-            (float*)dst.bytes, (const float*)src.bytes, dst.numel());
-    }
+    add_precision_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.bytes, (const precision_t*)src.bytes, dst.numel());
 }
 
 // ============================================================================
@@ -795,28 +786,15 @@ static PufTensor decoder_backward(void* w, void* activations,
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
     int od = dw->output_dim, od1 = od + 1;
-    if (USE_BF16) {
-        assemble_decoder_grad_bf16_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
-            (__nv_bfloat16*)a->grad_out.bytes, (const float*)grad_logits.bytes,
-            (const float*)grad_value.bytes, B_TT, od, od1);
-        CHECK_LAST_KERNEL();
-    } else {
-        assemble_decoder_grad_f32_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
-            (float*)a->grad_out.bytes, (const float*)grad_logits.bytes,
-            (const float*)grad_value.bytes, B_TT, od, od1);
-        CHECK_LAST_KERNEL();
-    }
+    assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+        (precision_t*)a->grad_out.bytes, (const float*)grad_logits.bytes,
+        (const float*)grad_value.bytes, B_TT, od, od1);
+    CHECK_LAST_KERNEL();
     puf_mm_tn(a->grad_out, a->saved_input, a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.bytes != nullptr) {
-        if (USE_BF16) {
-            sum_rows_to_bf16_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
-                (__nv_bfloat16*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
-                B_TT, dw->output_dim);
-        } else {
-            sum_rows_to_f32_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
-                (float*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
-                B_TT, dw->output_dim);
-        }
+        sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
+            B_TT, dw->output_dim);
     }
     puf_mm_nn(a->grad_out, dw->weight, a->grad_input, stream);
     return a->grad_input;

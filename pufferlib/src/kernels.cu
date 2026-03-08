@@ -1023,122 +1023,6 @@ __global__ void sample_logits_kernel(
 
 
 
-// =============================================================================
-// FCMax: Fused FC -> Max kernel
-// Input: x (B, N, D_in), W (D_out, D_in), b (D_out)
-// Output: out (B, D_out) = max_over_N(x @ W.T + b)
-// Each thread computes one (b, d_out) output element
-// N-fold memory bandwidth reduction vs separate FC + Max kernels
-// W and b are always float32 (mixed precision for bf16 activations)
-// =============================================================================
-
-__global__ void fc_max_forward_kernel(
-    precision_t* __restrict__ out,                // (B, D_out)
-    int* __restrict__ argmax_indices,   // (B, D_out) - which N produced the max
-    const precision_t* __restrict__ x,            // (B, N, D_in)
-    const float* __restrict__ W,        // (D_out, D_in) - always float32
-    const float* __restrict__ b,        // (D_out) - always float32
-    int B, int N, int D_in, int D_out
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * D_out) return;
-
-    int batch = idx / D_out;
-    int d_out = idx % D_out;
-
-    float bias = b[d_out];
-    float max_val = -INFINITY;
-    int argmax_n = 0;
-
-    // Iterate over all N points, compute FC output, track max
-    for (int n = 0; n < N; n++) {
-        float val = bias;
-        for (int di = 0; di < D_in; di++) {
-            val += to_float(x[batch * N * D_in + n * D_in + di]) * W[d_out * D_in + di];
-        }
-        if (val > max_val) {
-            max_val = val;
-            argmax_n = n;
-        }
-    }
-
-    out[idx] = from_float(max_val);
-    argmax_indices[idx] = argmax_n;
-}
-
-// Deterministic backward: three separate kernels with no atomicAdd
-// Each kernel assigns threads so that each output element is written by exactly one thread.
-
-// grad_b[d_out] = sum over batch,t of grad_out[batch*D_out + d_out]
-// One thread per d_out, serial sum over batch dimension
-__global__ void fc_max_backward_grad_b_kernel(
-    float* __restrict__ grad_b,             // (D_out)
-    const precision_t* __restrict__ grad_out,         // (B, D_out)
-    int B, int D_out
-) {
-    int d_out = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d_out >= D_out) return;
-
-    float sum = 0.0f;
-    for (int b = 0; b < B; b++) {
-        sum += to_float(grad_out[b * D_out + d_out]);
-    }
-    grad_b[d_out] = sum;
-}
-
-// grad_W[d_out, d_in] = sum over batch of grad_out[batch, d_out] * x[batch, argmax[batch, d_out], d_in]
-// One thread per (d_out, d_in) pair, serial sum over batch dimension
-__global__ void fc_max_backward_grad_W_kernel(
-    float* __restrict__ grad_W,             // (D_out, D_in)
-    const precision_t* __restrict__ grad_out,         // (B, D_out)
-    const precision_t* __restrict__ x,                // (B, N, D_in)
-    const int* __restrict__ argmax_indices, // (B, D_out)
-    int B, int N, int D_in, int D_out
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= D_out * D_in) return;
-
-    int d_out = idx / D_in;
-    int d_in = idx % D_in;
-
-    float sum = 0.0f;
-    for (int b = 0; b < B; b++) {
-        float g_out = to_float(grad_out[b * D_out + d_out]);
-        int argmax_n = argmax_indices[b * D_out + d_out];
-        float x_val = to_float(x[b * N * D_in + argmax_n * D_in + d_in]);
-        sum += g_out * x_val;
-    }
-    grad_W[idx] = sum;
-}
-
-// grad_x[batch, n, d_in] = sum over d_out where argmax[batch, d_out]==n of grad_out[batch, d_out] * W[d_out, d_in]
-// One thread per (batch, d_in) pair, serial loop over d_out
-// Each thread writes to its own batch's grad_x — no cross-thread contention
-__global__ void fc_max_backward_grad_x_kernel(
-    float* __restrict__ grad_x,             // (B, N, D_in)
-    const precision_t* __restrict__ grad_out,         // (B, D_out)
-    const float* __restrict__ W,            // (D_out, D_in)
-    const int* __restrict__ argmax_indices, // (B, D_out)
-    int B, int N, int D_in, int D_out
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * D_in) return;
-
-    int batch = idx / D_in;
-    int d_in = idx % D_in;
-
-    // Zero this batch's grad_x column first
-    for (int n = 0; n < N; n++) {
-        grad_x[batch * N * D_in + n * D_in + d_in] = 0.0f;
-    }
-
-    // Accumulate: for each d_out, add grad_out * W to the argmax position
-    for (int d_out = 0; d_out < D_out; d_out++) {
-        float g_out = to_float(grad_out[batch * D_out + d_out]);
-        int argmax_n = argmax_indices[batch * D_out + d_out];
-        grad_x[batch * N * D_in + argmax_n * D_in + d_in] += g_out * W[d_out * D_in + d_in];
-    }
-}
 
 
 #define SELECT_COPY_THREADS 256
@@ -1410,37 +1294,9 @@ __global__ void puff_advantage_kernel_scalar(const precision_t* values, const pr
 // Host wrappers live in models.cu
 // ============================================================================
 
-__global__ void cast_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __bfloat162float(src[idx]);
-}
-
-__global__ void cast_f32_to_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __float2bfloat16(src[idx]);
-}
-
-__global__ void cast_f32_to_bf16_transpose_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int R, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) return;
-    dst[(idx % C) * R + idx / C] = __float2bfloat16(src[idx]);
-}
-
-__global__ void transpose_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) return;
-    dst[(idx % C) * R + idx / C] = src[idx];
-}
-
 __global__ void cast_f32_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = from_float(src[idx]);
-}
-
-__global__ void cast_f32_transpose_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int R, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) return;
-    dst[(idx % C) * R + idx / C] = from_float(src[idx]);
 }
 
 template <typename T>
@@ -1450,20 +1306,6 @@ __global__ void transpose_01_kernel(T* __restrict__ dst, const T* __restrict__ s
     if (idx >= total) return;
     int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
-}
-
-__global__ void norm_bf16_kernel(float* __restrict__ partials, const __nv_bfloat16* __restrict__ src, int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
-        float v = __bfloat162float(src[i]);
-        sum += v * v;
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
-    if (tid == 0) partials[blockIdx.x] = sdata[0];
 }
 
 __global__ void norm_f32_kernel(float* __restrict__ partials, const float* __restrict__ src, int n) {
@@ -1493,18 +1335,6 @@ __global__ void clip_by_norm_f32_kernel(float* __restrict__ dst, const float* __
     if (idx < n) dst[idx] *= clip_coef;
 }
 
-__global__ void normalize_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
-    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __float2bfloat16(__bfloat162float(dst[idx]) * inv_norm);
-}
-
-__global__ void normalize_f32_kernel(float* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
-    float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = dst[idx] * inv_norm;
-}
-
 __global__ void norm_precision_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
@@ -1530,17 +1360,6 @@ __global__ void cast_precision_to_f32_kernel(float* __restrict__ dst, const prec
     if (idx < n) dst[idx] = to_float(src[idx]);
 }
 
-__global__ void cast_precision_scale_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = to_float(src[idx]) * scale;
-}
-
-__global__ void cast_precision_scale_transpose_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, int R, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) return;
-    dst[(idx % C) * R + idx / C] = to_float(src[idx]) * scale;
-}
-
 // Input: (R, C) f32 → (M, N) precision_t, optionally transposing
 __global__ void cast_f32_to_precision_2d_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, bool do_transpose, int R, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1557,34 +1376,14 @@ __global__ void cast_precision_scale_to_f32_2d_kernel(float* __restrict__ dst, c
     dst[out_idx] = to_float(src[idx]) * scale;
 }
 
-__global__ void fill_bf16_kernel(__nv_bfloat16* __restrict__ dst, __nv_bfloat16 val, int n) {
+__global__ void fill_precision_kernel(precision_t* __restrict__ dst, precision_t val, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = val;
 }
 
-__global__ void fill_f32_kernel(float* __restrict__ dst, float val, int n) {
+__global__ void clamp_precision_kernel(precision_t* __restrict__ dst, float lo, float hi, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = val;
-}
-
-__global__ void clamp_bf16_kernel(__nv_bfloat16* __restrict__ dst, float lo, float hi, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) { float v = __bfloat162float(dst[idx]); dst[idx] = __float2bfloat16(fminf(fmaxf(v, lo), hi)); }
-}
-
-__global__ void clamp_f32_kernel(float* __restrict__ dst, float lo, float hi, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) { dst[idx] = fminf(fmaxf(dst[idx], lo), hi); }
-}
-
-__global__ void scale_f32_kernel(float* __restrict__ dst, float alpha, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] *= alpha;
-}
-
-__global__ void axpy_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, float alpha, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] += alpha * src[idx];
+    if (idx < n) { float v = to_float(dst[idx]); dst[idx] = from_float(fminf(fmaxf(v, lo), hi)); }
 }
 
 // Fused Nesterov momentum: mb = mu*mb + gc; gc = gc + mu*mb
@@ -1595,24 +1394,6 @@ __global__ void nesterov_f32_kernel(float* __restrict__ mb, float* __restrict__ 
         mb[idx] = m;
         gc[idx] += mu * m;
     }
-}
-
-__global__ void scale_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ alpha_ptr, int n) {
-    float alpha = *alpha_ptr;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] *= alpha;
-}
-
-__global__ void axpy_f32_dev_kernel(float* __restrict__ dst, const float* __restrict__ src, const float* __restrict__ alpha_ptr, int n) {
-    float alpha = *alpha_ptr;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] += alpha * src[idx];
-}
-
-__global__ void compute_lr_scalars_kernel(const float* __restrict__ lr, float wd,
-                                           float* __restrict__ neg_lr, float* __restrict__ wd_scale) {
-    *neg_lr = -(*lr);
-    *wd_scale = 1.0f - (*lr) * wd;
 }
 
 // Fused weight update: wb = wb * (1 - lr*wd) - lr * up
@@ -1626,9 +1407,9 @@ __global__ void muon_weight_update_kernel(float* __restrict__ wb, const float* _
     }
 }
 
-__global__ void add_bf16_to_f32_kernel(float* __restrict__ dst, const __nv_bfloat16* __restrict__ src, int n) {
+__global__ void add_precision_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] += __bfloat162float(src[idx]);
+    if (idx < n) dst[idx] += to_float(src[idx]);
 }
 
 __global__ void add_precision_kernel(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int n) {
@@ -1636,53 +1417,22 @@ __global__ void add_precision_kernel(precision_t* __restrict__ dst, const precis
     if (idx < n) dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
 }
 
-__global__ void add_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] += src[idx];
-}
-
-__global__ void sum_rows_add_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= C) return;
-    float sum = 0.0f;
-    for (int r = 0; r < R; r++) sum += src[r * C + col];
-    dst[col] += sum;
-}
-
 // Sum f32 rows → bf16 output (set, not accumulate)
-__global__ void sum_rows_to_bf16_kernel(__nv_bfloat16* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+__global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int R, int C) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= C) return;
     float sum = 0.0f;
     for (int r = 0; r < R; r++) sum += src[r * C + col];
-    dst[col] = __float2bfloat16(sum);
+    dst[col] = from_float(sum);
 }
 
-// Sum f32 rows → f32 output (set, not accumulate)
-__global__ void sum_rows_to_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int R, int C) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= C) return;
-    float sum = 0.0f;
-    for (int r = 0; r < R; r++) sum += src[r * C + col];
-    dst[col] = sum;
-}
-
-__global__ void assemble_decoder_grad_bf16_kernel(
-    __nv_bfloat16* __restrict__ dst, const float* __restrict__ grad_logits,
+__global__ void assemble_decoder_grad_kernel(
+    precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
     const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B_TT * od_plus_1) return;
     int row = idx / od_plus_1, col = idx % od_plus_1;
-    dst[idx] = __float2bfloat16((col < od) ? grad_logits[row * od + col] : grad_value[row]);
-}
-
-__global__ void assemble_decoder_grad_f32_kernel(
-    float* __restrict__ dst, const float* __restrict__ grad_logits,
-    const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B_TT * od_plus_1) return;
-    int row = idx / od_plus_1, col = idx % od_plus_1;
-    dst[idx] = (col < od) ? grad_logits[row * od + col] : grad_value[row];
+    dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
 }
 
 __global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict__ var_out,
@@ -1703,10 +1453,6 @@ __global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
     if (tid == 0) *var_out = sdata[0] / (float)(n - 1);
-}
-
-__global__ void add_scalar_kernel(float* __restrict__ ptr, float val) {
-    *ptr += val;
 }
 
 __global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restrict__ idx,
