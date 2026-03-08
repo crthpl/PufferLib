@@ -1584,6 +1584,11 @@ int main(void) {
             fig_colorscale_active = !fig_colorscale_active;
         }
 
+        // Temp hack
+        args2.c_scale = args1.c_scale;
+        args3.c_scale = args1.c_scale;
+        args4.c_scale = args1.c_scale;
+
         // Filters
         DrawTextEx(args1.font_small, "F1", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
         x += MeasureTextEx(args1.font_small, "F1", args1.axis_tick_font_size, 0).x + SEP;
