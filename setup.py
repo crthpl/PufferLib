@@ -503,7 +503,7 @@ def _build_notorch_C(static_lib=None, force=False, precision='bf16'):
     link_cmd += [RAYLIB_A]
     link_cmd += [
         f'-L{cuda_home}/lib64',
-        '-lcudart', '-lnccl', '-lnvidia-ml', '-lcublas', '-lcusolver', '-lcurand',
+        '-lcudart', '-lnccl', '-lnvidia-ml', '-lcublas', '-lcusolver', '-lcurand', '-lcudnn',
         '-lnvToolsExt', '-lomp5',
     ]
     if DEBUG:

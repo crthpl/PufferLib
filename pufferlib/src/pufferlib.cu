@@ -695,8 +695,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->alloc_fp32.esz = esz_fp32;
     Allocator& fp32_params = pufferl->alloc_fp32.params;
 
-    //bool is_nmmo3 = (env_name == "puffer_nmmo3");
-    bool is_nmmo3 = false;
+    bool is_nmmo3 = (env_name == "puffer_nmmo3");
     pufferl->is_nmmo3 = is_nmmo3;
 
     Encoder encoder = is_nmmo3 ? Encoder{
@@ -744,7 +743,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     auto new_weights = [&](int esz) -> PolicyWeights {
         PolicyWeights w;
         if (is_nmmo3) {
-            w.encoder = new NMMO3EncoderWeights{.obs_size = input_size, .hidden = hidden_size};
+            w.encoder = nmmo3_encoder_create(input_size, hidden_size);
         } else {
             w.encoder = new EncoderWeights{.in_dim = input_size, .out_dim = hidden_size};
         }

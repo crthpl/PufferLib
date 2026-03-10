@@ -1478,4 +1478,28 @@ __global__ void cast_u8_to_precision_kernel(precision_t* __restrict__ dst,
     if (idx < n) dst[idx] = from_float((float)src[idx]);
 }
 
+// Multinomial with replacement (uses cuRAND)
+__global__ void multinomial_with_replacement_kernel(
+        int64_t* __restrict__ out_idx, const float* __restrict__ probs,
+        float* __restrict__ cdf, int S, int num_samples,
+        uint64_t seed, int64_t* __restrict__ offset_ptr) {
+    int tid = threadIdx.x;
+    if (tid == 0) {
+        float cum = 0.0f;
+        for (int i = 0; i < S; i++) { cum += probs[i]; cdf[i] = cum; }
+    }
+    __syncthreads();
+    if (tid < num_samples) {
+        uint64_t base_off = *offset_ptr;
+        curandStatePhilox4_32_10_t rng_state;
+        curand_init(seed, base_off + tid, 0, &rng_state);
+        float u = curand_uniform(&rng_state);
+        int lo = 0, hi = S - 1;
+        while (lo < hi) { int mid = (lo + hi) / 2; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
+        out_idx[tid] = lo;
+    }
+    if (tid == 0) atomicAdd((unsigned long long*)offset_ptr, (unsigned long long)num_samples);
+}
+
+
 #endif // PUFFERLIB_KERNELS_CU
