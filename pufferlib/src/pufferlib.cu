@@ -295,11 +295,9 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     if (obs_env.dtype_size == sizeof(char)) {
         cast_u8_to_precision_kernel<<<grid_size(obs_src.numel()), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)obs_dst.bytes, (const unsigned char*)obs_src.bytes, obs_src.numel());
-        CHECK_LAST_KERNEL();
     } else if (obs_env.dtype_size == sizeof(float)) {
         if (USE_BF16) {
             puf_cast_f32_to_bf16(obs_dst, obs_src, stream);
-            CHECK_LAST_KERNEL();
         } else {
             puf_copy(obs_dst, obs_src, stream);
         }
@@ -317,7 +315,6 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     if (USE_BF16) {
         puf_cast_f32_to_bf16(rew_dst, rew_src, stream);
-        CHECK_LAST_KERNEL();
     } else {
         puf_copy(rew_dst, rew_src, stream);
     }
@@ -330,7 +327,6 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     };
     if (USE_BF16) {
         puf_cast_f32_to_bf16(term_dst, term_src, stream);
-        CHECK_LAST_KERNEL();
     } else {
         puf_copy(term_dst, term_src, stream);
     }
@@ -357,7 +353,6 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         dec_puf, p_logstd, pufferl->act_sizes_puf,
         (double*)act_slice.bytes, (precision_t*)lp_slice.bytes, (precision_t*)val_slice.bytes,
         buf_rng_seed, buf_rng_offset);
-    CHECK_LAST_KERNEL();
 
     // Copy actions to env
     int64_t act_cols = env.actions.shape[1];
@@ -386,8 +381,7 @@ void rollouts_impl(PuffeRL& pufferl) {
         int h = i / num_buffers;
 
         net_callback_wrapper(&pufferl, buf, h);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        CHECK_LAST_KERNEL();
+        cudaDeviceSynchronize();
     }
 }
 
@@ -415,10 +409,8 @@ void train_impl(PuffeRL& pufferl) {
     // Clamp rewards and fill ratio
     clamp_precision_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(
         (precision_t*)rollouts.rewards.bytes, -1.0f, 1.0f, rollouts.rewards.numel());
-    CHECK_LAST_KERNEL();
     fill_precision_kernel<<<grid_size(rollouts.ratio.numel()), BLOCK_SIZE, 0, train_stream>>>(
         (precision_t*)rollouts.ratio.bytes, from_float(1.0f), rollouts.ratio.numel());
-    CHECK_LAST_KERNEL();
 
     // old_values = values.clone() via pre-allocated PufTensor
     PufTensor& old_values_puf = pufferl.old_values_puf;
@@ -462,7 +454,6 @@ void train_impl(PuffeRL& pufferl) {
         puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
             rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
             hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
-        CHECK_LAST_KERNEL();
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
@@ -471,7 +462,6 @@ void train_impl(PuffeRL& pufferl) {
         prio_replay_cuda(advantages_puf, prio_alpha, minibatch_segments,
             hypers.total_agents, anneal_beta,
             pufferl.prio_bufs, pufferl.rng_seed, train_rng_offset, train_stream);
-        CHECK_LAST_KERNEL();
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
@@ -484,7 +474,6 @@ void train_impl(PuffeRL& pufferl) {
             select_copy_kernel<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, (const int64_t*)pufferl.prio_bufs.idx.bytes,
                 (const float*)advantages_puf.bytes, (const float*)pufferl.prio_bufs.mb_prio.bytes);
-            CHECK_LAST_KERNEL();
         }
         profile_end(hypers.profile);
 
@@ -516,38 +505,30 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.act_sizes_puf, pufferl.losses_puf,
                 hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
-            CHECK_LAST_KERNEL();
 
             PufTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
             PufTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : PufTensor();
             PufTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
             policy_backward(pufferl.policy, pufferl.weights_bf16, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
-            CHECK_LAST_KERNEL();
 
             // Cast contiguous grads → f32 into muon gc_puf, then clip grad norm
             cast_precision_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
                 (float*)pufferl.muon->gc_puf.bytes, (const precision_t*)pufferl.grad_bf16_puf.bytes,
                 pufferl.grad_bf16_puf.numel());
-            CHECK_LAST_KERNEL();
             {
                 PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;
                 float* partials = (float*)pufferl.grad_norm_partials_puf.bytes;
                 int blocks = std::min((int)grid_size(grad.numel()), 256);
                 norm_f32_kernel<<<blocks, 256, 0, stream>>>(partials, (float*)grad.bytes, grad.numel());
-                CHECK_LAST_KERNEL();
                 norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, partials, blocks);
-                CHECK_LAST_KERNEL();
                 clip_by_norm_f32_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
                     (float*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
-                CHECK_LAST_KERNEL();
             }
             muon_step(pufferl.muon, stream);
-            CHECK_LAST_KERNEL();
             if (USE_BF16) {
                 puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, stream);
-                CHECK_LAST_KERNEL();
             }
 
             if (capturing) {

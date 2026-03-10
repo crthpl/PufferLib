@@ -17,30 +17,6 @@
 
 using std::vector;
 
-#define CHECK_CUDA(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while(0)
-
-#define CHECK_LAST_KERNEL() do { \
-    cudaError_t err = cudaGetLastError(); \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "Kernel launch error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while(0)
-
-#define CHECK_CUBLAS(call) do { \
-    cublasStatus_t status = (call); \
-    if (status != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: status=%d\n", __FILE__, __LINE__, (int)status); \
-        exit(1); \
-    } \
-} while(0)
-
 // Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
 #ifdef PRECISION_FLOAT
 constexpr bool USE_BF16 = false;
@@ -351,9 +327,9 @@ void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
     float alpha = 1.0f, beta = 0.0f;
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
-    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
         b.bytes, CUBLAS_PRECISION, K, a.bytes, CUBLAS_PRECISION, K, &beta,
-        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // out(M,N) = a(...,M)^T @ b(...,N)  — leading dims folded into K
@@ -363,9 +339,9 @@ void puf_mm_tn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) 
     float alpha = 1.0f, beta = 0.0f;
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
-    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha,
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha,
         b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, M, &beta,
-        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // out(...,N) = a(...,K) @ b(K,N)  — leading dims folded into M
@@ -375,9 +351,9 @@ void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) 
     float alpha = 1.0f, beta = 0.0f;
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
-    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
         b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, K, &beta,
-        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta, cudaStream_t stream) {
@@ -385,9 +361,9 @@ static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha
     int M = a.batch_size() * a.shape[na-2], K = a.shape[na-1], N = b.shape[nb-1];
     cublasHandle_t handle = get_cublas_handle();
     cublasSetStream(handle, stream);
-    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
         b.bytes, CUBLAS_PRECISION, N, a.bytes, CUBLAS_PRECISION, K, &beta,
-        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // ============================================================================
@@ -431,7 +407,6 @@ void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src, cudaStream_t str
     assert(dst.dtype_size == PRECISION_SIZE && src.dtype_size == 4);
     cast_f32_to_precision_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)dst.bytes, (const float*)src.bytes, dst.numel());
-    CHECK_LAST_KERNEL();
 }
 
 void puf_transpose_01(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
@@ -442,11 +417,11 @@ void puf_transpose_01(PufTensor& dst, const PufTensor& src, cudaStream_t stream)
     int n = A * B * C;
     switch (src.dtype_size) {
         case 2: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint16_t*)dst.bytes, (const uint16_t*)src.bytes, A, B, C); CHECK_LAST_KERNEL(); break;
+            (uint16_t*)dst.bytes, (const uint16_t*)src.bytes, A, B, C); break;
         case 4: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint32_t*)dst.bytes, (const uint32_t*)src.bytes, A, B, C); CHECK_LAST_KERNEL(); break;
+            (uint32_t*)dst.bytes, (const uint32_t*)src.bytes, A, B, C); break;
         case 8: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint64_t*)dst.bytes, (const uint64_t*)src.bytes, A, B, C); CHECK_LAST_KERNEL(); break;
+            (uint64_t*)dst.bytes, (const uint64_t*)src.bytes, A, B, C); break;
         default: assert(false && "puf_transpose_01: unsupported dtype_size");
     }
 }
@@ -492,7 +467,6 @@ void ppo_loss_fwd_bwd(
     float* adv_mean_ptr = adv_var_ptr + 1;
     var_mean_kernel<<<1, 256, 0, stream>>>(
         (const float*)graph.mb_advantages.bytes, adv_var_ptr, adv_mean_ptr, graph.mb_advantages.numel());
-    CHECK_LAST_KERNEL();
 
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
 
@@ -538,11 +512,9 @@ void ppo_loss_fwd_bwd(
     };
 
     ppo_loss_fwd_bwd_kernel<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
-    CHECK_LAST_KERNEL();
 
     ppo_loss_reduce_kernel<<<1, LOSS_N + 1, 0, stream>>>(
         (float*)bufs.loss_output.bytes, (float*)losses_acc.bytes, ppo_partials_buf, ppo_grid);
-    CHECK_LAST_KERNEL();
 }
 
 
@@ -578,10 +550,8 @@ void prio_replay_cuda(
     int S = advantages.shape[0], T = advantages.shape[1];
     compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE, 0, stream>>>(
         (float*)advantages.bytes, (float*)bufs.prio_probs.bytes, prio_alpha, T);
-    CHECK_LAST_KERNEL();
     compute_prio_normalize<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
         (float*)bufs.prio_probs.bytes, S);
-    CHECK_LAST_KERNEL();
     int block = ((minibatch_segments + 31) / 32) * 32;
     if (block < 32) block = 32;
     int shared_bytes = S * (int)sizeof(float);
@@ -591,12 +561,10 @@ void prio_replay_cuda(
     }
     multinomial_with_replacement_kernel<<<1, block, shared_bytes, stream>>>(
         (int64_t*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes, S, minibatch_segments, seed, offset_ptr);
-    CHECK_LAST_KERNEL();
     int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
     compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
         (int64_t*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
         (float*)bufs.mb_prio.bytes, total_agents, anneal_beta, minibatch_segments);
-    CHECK_LAST_KERNEL();
 }
 
 void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
@@ -611,7 +579,6 @@ void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
         (precision_t*)values.bytes, (precision_t*)rewards.bytes,
         (precision_t*)dones.bytes, (precision_t*)importance.bytes,
         (float*)advantages.bytes, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
-    CHECK_LAST_KERNEL();
 }
 
 // ============================================================================
@@ -789,7 +756,6 @@ static PufTensor decoder_backward(void* w, void* activations,
     assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)a->grad_out.bytes, (const float*)grad_logits.bytes,
         (const float*)grad_value.bytes, B_TT, od, od1);
-    CHECK_LAST_KERNEL();
     puf_mm_tn(a->grad_out, a->saved_input, a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.bytes != nullptr) {
         sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
@@ -919,7 +885,6 @@ static PufTensor mingru_forward(void* w, PufTensor x, PufTensor state, void* act
             (precision_t*)a->out.bytes, (precision_t*)a->next_state.bytes,
             (const precision_t*)a->combined[i].bytes, (const precision_t*)state_i.bytes,
             (const precision_t*)x.bytes, H, B);
-        CHECK_LAST_KERNEL();
         puf_copy(state_i, a->next_state, stream);
         x = a->out;
     }
@@ -939,7 +904,6 @@ static PufTensor mingru_forward_train(void* w, PufTensor x, PufTensor state, voi
         a->scan_bufs[i].state_ptr = state_i.bytes;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].bytes;
         fused_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
-        CHECK_LAST_KERNEL();
         x = a->scan_bufs[i].out;
     }
     return x;
@@ -952,7 +916,6 @@ static PufTensor mingru_backward(void* w, PufTensor grad, void* activations, cud
         PrefixScan& scan = a->scan_bufs[i];
         fused_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
             scan, (const precision_t*)grad.bytes, (const precision_t*)a->grad_next_state.bytes);
-        CHECK_LAST_KERNEL();
         puf_mm_tn(scan.grad_combined, a->saved_inputs[i], a->wgrad_scratch[i], stream);
         puf_mm_nn(scan.grad_combined, m->weights[i], a->grad_input_buf, stream);
         // Add highway gate gradient: grad_input += grad_out * (1 - sigmoid(proj))
@@ -1106,7 +1069,6 @@ void muon_step(Muon* m, cudaStream_t stream = 0) {
     }
     nesterov_f32_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
         (float*)m->mb_puf.bytes, (float*)m->gc_puf.bytes, (float)m->momentum, m->mb_puf.numel());
-    CHECK_LAST_KERNEL();
     int64_t offset = 0;
     for (auto* t : m->param_alloc->regs) {
         float* gc_ptr = (float*)m->gc_puf.bytes + offset;
@@ -1151,7 +1113,6 @@ void muon_step(Muon* m, cudaStream_t stream = 0) {
     }
     muon_weight_update_kernel<<<grid_size(m->wb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
         (float*)m->wb_puf.bytes, (const float*)m->up_puf.bytes, m->lr_ptr, (float)m->weight_decay, m->wb_puf.numel());
-    CHECK_LAST_KERNEL();
 }
 
 

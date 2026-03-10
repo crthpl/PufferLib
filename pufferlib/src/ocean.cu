@@ -14,20 +14,6 @@
 #include <cstdio>
 #include <cstdint>
 
-#define CHECK_CUDA(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-    } \
-} while(0)
-
-#define CHECK_CUBLAS(call) do { \
-    cublasStatus_t status = (call); \
-    if (status != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: status=%d\n", __FILE__, __LINE__, (int)status); \
-    } \
-} while(0)
-
 __constant__ int NMMO3_OFFSETS[10] = {0, 4, 8, 25, 30, 33, 38, 43, 48, 55};
 
 static const int MAP_H = 11, MAP_W = 15, NUM_FEATURES = 10;
@@ -134,15 +120,15 @@ static inline int div_ceil(int a, int b) { return (a + b - 1) / b; }
 
 static cublasHandle_t get_nmmo3_cublas_handle() {
     static cublasHandle_t handle = nullptr;
-    if (!handle) CHECK_CUBLAS(cublasCreate(&handle));
+    if (!handle) cublasCreate(&handle);
     return handle;
 }
 
 static void sgemm_nt(cublasHandle_t h, float* C, const float* A, const float* B,
                      int M, int N, int K, cudaStream_t s) {
     float alpha = 1.0f, beta = 0.0f;
-    CHECK_CUBLAS(cublasSetStream(h, s));
-    CHECK_CUBLAS(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B, K, A, K, &beta, C, N));
+    cublasSetStream(h, s);
+    cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B, K, A, K, &beta, C, N);
 }
 
 extern "C" {
@@ -169,7 +155,7 @@ void nmmo3_encoder_forward(
     float* embed_out = conv2_out + B * C2_M * C2_OC;
     float* concat    = embed_out + B * PLAYER_EMBED_OUT;
 
-    CHECK_CUDA(cudaMemsetAsync(multihot, 0, B * MULTIHOT_DIM * MAP_H * MAP_W * sizeof(float), stream));
+    cudaMemsetAsync(multihot, 0, B * MULTIHOT_DIM * MAP_H * MAP_W * sizeof(float), stream);
     nmmo3_multihot_kernel<<<div_ceil(B * MAP_H * MAP_W, BLK), BLK, 0, stream>>>(multihot, obs, B);
     { int M = B * C1_M;
       nmmo3_im2col_conv1<<<div_ceil(M, BLK), BLK, 0, stream>>>(im2col1, multihot, B);
@@ -194,7 +180,7 @@ void nmmo3_encoder_forward(
 // Integrated build — included by models.cu, uses precision_t / PufTensor / puf_mm
 // Requires: precision_t, to_float, from_float, PufTensor, Allocator, puf_mm,
 //           puf_mm_tn, puf_copy, puf_kaiming_init, grid_size, BLOCK_SIZE,
-//           PRECISION_SIZE, CHECK_CUDA (all from kernels.cu / models.cu)
+//           PRECISION_SIZE (all from kernels.cu / models.cu)
 // ============================================================================
 
 // NMMO3 constants
@@ -374,7 +360,7 @@ static PufTensor nmmo3_encoder_forward(void* w, void* activations, PufTensor inp
 
     if (a->saved_obs.bytes) puf_copy(a->saved_obs, input, stream);
 
-    CHECK_CUDA(cudaMemsetAsync(a->multihot.bytes, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * p, stream));
+    cudaMemsetAsync(a->multihot.bytes, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * p, stream);
     n3_multihot_kernel<<<grid_size(B * N3_MAP_H * N3_MAP_W), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)a->multihot.bytes, obs, B, obs_size);
 
@@ -427,11 +413,11 @@ static void nmmo3_encoder_backward(void* w, void* activations, PufTensor grad, c
     puf_mm_tn(grad, a->concat, a->proj_wgrad, stream);
 
     // Zero conv/embed gradients (backward not yet implemented)
-    CHECK_CUDA(cudaMemsetAsync(a->conv1_wgrad.bytes, 0, a->conv1_wgrad.numel() * p, stream));
-    CHECK_CUDA(cudaMemsetAsync(a->conv1_bgrad.bytes, 0, a->conv1_bgrad.numel() * p, stream));
-    CHECK_CUDA(cudaMemsetAsync(a->conv2_wgrad.bytes, 0, a->conv2_wgrad.numel() * p, stream));
-    CHECK_CUDA(cudaMemsetAsync(a->conv2_bgrad.bytes, 0, a->conv2_bgrad.numel() * p, stream));
-    CHECK_CUDA(cudaMemsetAsync(a->embed_wgrad.bytes, 0, a->embed_wgrad.numel() * p, stream));
+    cudaMemsetAsync(a->conv1_wgrad.bytes, 0, a->conv1_wgrad.numel() * p, stream);
+    cudaMemsetAsync(a->conv1_bgrad.bytes, 0, a->conv1_bgrad.numel() * p, stream);
+    cudaMemsetAsync(a->conv2_wgrad.bytes, 0, a->conv2_wgrad.numel() * p, stream);
+    cudaMemsetAsync(a->conv2_bgrad.bytes, 0, a->conv2_bgrad.numel() * p, stream);
+    cudaMemsetAsync(a->embed_wgrad.bytes, 0, a->embed_wgrad.numel() * p, stream);
 }
 
 static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
@@ -442,12 +428,12 @@ static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t str
     };
     float g = std::sqrt(2.0f);
     init2d(ew->conv1_w, N3_C1_OC, N3_C1_K2, g);
-    CHECK_CUDA(cudaMemsetAsync(ew->conv1_b.bytes, 0, ew->conv1_b.numel() * ew->conv1_b.dtype_size, stream));
+    cudaMemsetAsync(ew->conv1_b.bytes, 0, ew->conv1_b.numel() * ew->conv1_b.dtype_size, stream);
     init2d(ew->conv2_w, N3_C2_OC, N3_C2_K2, g);
-    CHECK_CUDA(cudaMemsetAsync(ew->conv2_b.bytes, 0, ew->conv2_b.numel() * ew->conv2_b.dtype_size, stream));
+    cudaMemsetAsync(ew->conv2_b.bytes, 0, ew->conv2_b.numel() * ew->conv2_b.dtype_size, stream);
     init2d(ew->embed_w, N3_EMBED_VOCAB, N3_EMBED_DIM, 1.0f);
     init2d(ew->proj_w, ew->hidden, N3_CONCAT, g);
-    CHECK_CUDA(cudaMemsetAsync(ew->proj_b.bytes, 0, ew->proj_b.numel() * ew->proj_b.dtype_size, stream));
+    cudaMemsetAsync(ew->proj_b.bytes, 0, ew->proj_b.numel() * ew->proj_b.dtype_size, stream);
 }
 
 static void nmmo3_encoder_reg_params(void* w, Allocator* alloc, int esz) {
