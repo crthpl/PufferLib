@@ -21,9 +21,11 @@ using std::vector;
 #ifdef PRECISION_FLOAT
 constexpr bool USE_BF16 = false;
 constexpr int PRECISION_SIZE = 4;   // bytes per element
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
 #else
 constexpr bool USE_BF16 = true;
 constexpr int PRECISION_SIZE = 2;   // bytes per element
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
 #endif
 
 // ============================================================================
@@ -68,7 +70,9 @@ struct PufTensor {
     PufTensor unsqueeze(int dim, int64_t d0, int64_t d1) {
         assert(d0 * d1 == shape[dim] && "unsqueeze: d0 * d1 must equal shape[dim]");
         int n = ndim();
-        for (int i = n; i > dim; i--) shape[i] = shape[i - 1];
+        for (int i = n; i > dim; i--) {
+            shape[i] = shape[i - 1];
+        }
         shape[dim] = d0;
         shape[dim + 1] = d1;
         return *this;
@@ -78,7 +82,9 @@ struct PufTensor {
     int64_t batch_size() const {
         int n = ndim();
         int64_t b = 1;
-        for (int i = 0; i < n - 2; i++) b *= shape[i];
+        for (int i = 0; i < n - 2; i++) {
+            b *= shape[i];
+        }
         return b;
     }
 
@@ -95,7 +101,10 @@ struct PufTensor {
 
     const char* repr() const {
         static char buf[256];
-        if (!bytes) { snprintf(buf, sizeof(buf), "PufTensor(empty)"); return buf; }
+        if (!bytes) {
+            snprintf(buf, sizeof(buf), "PufTensor(empty)");
+            return buf;
+        }
         int pos = snprintf(buf, sizeof(buf), "PufTensor(%s, [", dtype_name());
         for (int i = 0; i < ndim() && pos < (int)sizeof(buf) - 32; i++) {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
@@ -144,7 +153,9 @@ struct Allocator {
     void dangerously_register(T* s) {
         int n = sizeof(T) / sizeof(PufTensor);
         PufTensor* first = (PufTensor*)s;
-        for (int i = 0; i < n; i++) regs.push_back(&first[i]);
+        for (int i = 0; i < n; i++) {
+            regs.push_back(&first[i]);
+        }
     }
 
     void create() {
@@ -174,6 +185,7 @@ struct Allocator {
 };
 
 // Groups 3 allocators for policy: params, grads, activations
+// TODO: Move out of a cpp class. No create, destroy, etc.
 struct AllocSet {
     Allocator params, grads, acts;
     int esz = 0;  // element size for params/grads
@@ -314,12 +326,6 @@ static cublasHandle_t get_cublas_handle() {
     return handle;
 }
 
-#ifdef PRECISION_FLOAT
-static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
-#else
-static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
-#endif
-
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
 void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
     int na = a.ndim(), nb = b.ndim();
@@ -366,10 +372,6 @@ static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha
         out.bytes, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-// ============================================================================
-// Kaiming init (fan-in, normal)
-// ============================================================================
-
 void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t stream) {
     assert(dst.ndim() == 2);
     int64_t rows = dst.shape[0], cols = dst.shape[1];
@@ -395,13 +397,6 @@ void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t st
     cudaFree(buf);
 }
 
-// ============================================================================
-// PufTensor wrappers that dispatch to kernels
-// ============================================================================
-
-// Scratch buffer for partial sums in vector norm kernels (clip_grad_norm + Muon NS)
-
-
 void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_cast_f32_to_bf16: size mismatch");
     assert(dst.dtype_size == PRECISION_SIZE && src.dtype_size == 4);
@@ -409,22 +404,6 @@ void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src, cudaStream_t str
         (precision_t*)dst.bytes, (const float*)src.bytes, dst.numel());
 }
 
-void puf_transpose_01(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
-    int A = src.shape[0], B = src.shape[1];
-    int C = (src.ndim() >= 3) ? src.shape[2] : 1;
-    assert(dst.shape[0] == B && dst.shape[1] == A);
-    assert(dst.dtype_size == src.dtype_size);
-    int n = A * B * C;
-    switch (src.dtype_size) {
-        case 2: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint16_t*)dst.bytes, (const uint16_t*)src.bytes, A, B, C); break;
-        case 4: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint32_t*)dst.bytes, (const uint32_t*)src.bytes, A, B, C); break;
-        case 8: transpose_01_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            (uint64_t*)dst.bytes, (const uint64_t*)src.bytes, A, B, C); break;
-        default: assert(false && "puf_transpose_01: unsupported dtype_size");
-    }
-}
 
 void puf_copy(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     assert(dst.numel() == src.numel() && "puf_copy: size mismatch");

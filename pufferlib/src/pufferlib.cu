@@ -398,13 +398,24 @@ void train_impl(PuffeRL& pufferl) {
     RolloutBuf& src = pufferl.rollouts;
     RolloutBuf& rollouts = pufferl.train_rollouts;
 
-    puf_transpose_01(rollouts.observations, src.observations, train_stream);
-    puf_transpose_01(rollouts.actions, src.actions, train_stream);
-    puf_transpose_01(rollouts.logprobs, src.logprobs, train_stream);
-    puf_transpose_01(rollouts.rewards, src.rewards, train_stream);
-    puf_transpose_01(rollouts.terminals, src.terminals, train_stream);
-    puf_transpose_01(rollouts.ratio, src.ratio, train_stream);
-    puf_transpose_01(rollouts.values, src.values, train_stream);
+    int H = src.observations.shape[0], S = src.observations.shape[1];
+    int obs_size = (src.observations.ndim() >= 3) ? src.observations.shape[2] : 1;
+    int num_atns = (src.actions.ndim() >= 3) ? src.actions.shape[2] : 1;
+
+    transpose_102<<<grid_size(H*S*obs_size), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.observations.bytes, (precision_t*)src.observations.bytes, H, S, obs_size);
+    transpose_102<<<grid_size(H*S*num_atns), BLOCK_SIZE, 0, train_stream>>>(
+        (double*)rollouts.actions.bytes, (double*)src.actions.bytes, H, S, num_atns);
+    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.logprobs.bytes, (precision_t*)src.logprobs.bytes, H, S, 1);
+    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.rewards.bytes, (precision_t*)src.rewards.bytes, H, S, 1);
+    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.terminals.bytes, (precision_t*)src.terminals.bytes, H, S, 1);
+    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.ratio.bytes, (precision_t*)src.ratio.bytes, H, S, 1);
+    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
+        (precision_t*)rollouts.values.bytes, (precision_t*)src.values.bytes, H, S, 1);
 
     // Clamp rewards and fill ratio
     clamp_precision_kernel<<<grid_size(rollouts.rewards.numel()), BLOCK_SIZE, 0, train_stream>>>(

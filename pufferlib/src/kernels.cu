@@ -1299,8 +1299,16 @@ __global__ void cast_f32_to_precision_kernel(precision_t* __restrict__ dst, cons
     if (idx < n) dst[idx] = from_float(src[idx]);
 }
 
-template <typename T>
-__global__ void transpose_01_kernel(T* __restrict__ dst, const T* __restrict__ src, int A, int B, int C) {
+// Transpose dims 0,1: [A, B, C] -> [B, A, C]. For 2D, pass C=1.
+__global__ void transpose_102(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int A, int B, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B * C;
+    if (idx >= total) return;
+    int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
+    dst[b * A * C + a * C + c] = src[idx];
+}
+
+__global__ void transpose_102(double* __restrict__ dst, const double* __restrict__ src, int A, int B, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = A * B * C;
     if (idx >= total) return;
