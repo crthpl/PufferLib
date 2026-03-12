@@ -203,8 +203,6 @@ typedef struct {
     PufTensor param_fp32_puf;    // cached PufTensor view of alloc_fp32.param_buffer
     PufTensor param_bf16_puf;    // cached PufTensor view of alloc_bf16.param_buffer
     PufTensor grad_bf16_puf;     // cached PufTensor view of alloc_bf16.grads (contiguous bf16 weight grads)
-    PufTensor grad_norm_puf;     // (1,) f32 scratch for clip_grad_norm
-    PufTensor grad_norm_partials_puf; // (256,) f32 partials for norm reduction
     PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
     nvmlDevice_t nvml_device;
@@ -523,18 +521,7 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(pufferl.policy, pufferl.weights_bf16, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            // gc_puf aliases grad_bf16_puf — clip grad norm in place
-            {
-                PufTensor& grad = pufferl.muon->gc_puf;
-                float* scratch = (float*)pufferl.grad_norm_puf.bytes;
-                float* partials = (float*)pufferl.grad_norm_partials_puf.bytes;
-                int blocks = std::min((int)grid_size(grad.numel()), 256);
-                norm_partials_kernel<<<blocks, 256, 0, stream>>>(partials, (const precision_t*)grad.bytes, grad.numel());
-                norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, partials, blocks);
-                clip_by_norm_partials_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (precision_t*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
-            }
-            muon_step(pufferl.muon, stream);
+            muon_step(pufferl.muon, pufferl.grad_bf16_puf, hypers.max_grad_norm, stream);
             if (USE_BF16) {
                 puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, stream);
             }
@@ -832,7 +819,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     float beta1 = hypers.beta1;
     float eps = hypers.eps;
     pufferl->muon = new Muon{};
-    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel());
+    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weights.numel());
 
     int horizon = hypers.horizon;
     int total_agents = vec->total_agents;
@@ -852,13 +839,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->rng_offset_puf = {.shape = {num_buffers + 1}, .dtype_size = (int)sizeof(int64_t)};
     pufferl->act_sizes_puf = {.shape = {num_action_heads}, .dtype_size = (int)sizeof(int32_t)};
     pufferl->losses_puf = {.shape = {NUM_LOSSES}, .dtype_size = (int)sizeof(float)};
-    pufferl->grad_norm_puf = {.shape = {1}, .dtype_size = (int)sizeof(float)};
-    pufferl->grad_norm_partials_puf = {.shape = {256}, .dtype_size = (int)sizeof(float)};
     alloc.reg(&pufferl->rng_offset_puf);
     alloc.reg(&pufferl->act_sizes_puf);
     alloc.reg(&pufferl->losses_puf);
-    alloc.reg(&pufferl->grad_norm_puf);
-    alloc.reg(&pufferl->grad_norm_partials_puf);
 
     // Per-buffer RNN states
     pufferl->buffer_states.resize(num_buffers);
@@ -892,10 +875,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // Muon optimizer (init + register buffers)
     muon_init(pufferl->muon, &fp32_params,
         pufferl->param_fp32_puf, lr, beta1, eps, 0.0, alloc);
-    pufferl->muon->gc_puf = pufferl->grad_bf16_puf;  // alias: no copy needed
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
-    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel());
+    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weights.numel());
 
     // Single allocation for all registered buffers
     alloc.create();
@@ -933,10 +915,10 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
 
         // Snapshot weights + optimizer state before init-time capture
-        int64_t wb_bytes = pufferl->muon->wb_puf.numel() * sizeof(float);
+        int64_t wb_bytes = pufferl->muon->weights.numel() * sizeof(float);
         void* saved_weights;
         cudaMalloc(&saved_weights, wb_bytes);
-        cudaMemcpy(saved_weights, pufferl->muon->wb_puf.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(saved_weights, pufferl->muon->weights.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
         void* saved_momentum;
         cudaMalloc(&saved_momentum, wb_bytes);
         cudaMemcpy(saved_momentum, pufferl->muon->mb_puf.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
@@ -966,7 +948,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaStreamDestroy(warmup_stream);
 
         // Restore weights + optimizer state corrupted by warmup/capture
-        cudaMemcpy(pufferl->muon->wb_puf.bytes, saved_weights, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pufferl->muon->weights.bytes, saved_weights, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_weights);
         cudaMemcpy(pufferl->muon->mb_puf.bytes, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_momentum);

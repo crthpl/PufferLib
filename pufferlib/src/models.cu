@@ -779,8 +779,9 @@ struct Muon {
     float* lr_ptr;
     float* lr_derived_ptr;
     float* norm_ptr;
-    PufTensor lr_puf, lr_derived_puf, ns_norm_puf;
-    PufTensor wb_puf, mb_puf, gc_puf;
+    float* grad_norm_ptr;
+    PufTensor lr_puf, lr_derived_puf, ns_norm_puf, grad_norm_puf;
+    PufTensor weights, mb_puf;
     PufTensor gram, gram_buf, x_buf, norm_partials;
     long max_M, max_N;
     Allocator* param_alloc;  // fp32 params allocator — shapes used by muon_step
@@ -797,20 +798,23 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
     m->lr_val_init = (float)lr_val;
     m->lr_ptr = nullptr;
     m->lr_derived_ptr = nullptr;
-    m->wb_puf = weight_buffer;
+    m->weights = weight_buffer;
     m->param_alloc = param_alloc;
     m->nccl_comm = nullptr;
     m->world_size = 1;
     m->max_M = 0; m->max_N = 0;
-    long n = m->wb_puf.numel();
+    long n = m->weights.numel();
     int f = sizeof(float);
     m->lr_puf = {.shape = {1}, .dtype_size = f};
     m->lr_derived_puf = {.shape = {2}, .dtype_size = f};
     m->mb_puf = {.shape = {n}, .dtype_size = f};
-    m->gc_puf = {};  // aliased to grad buffer by caller after init
+    m->norm_partials = {.shape = {256}, .dtype_size = f};
+    m->grad_norm_puf = {.shape = {1}, .dtype_size = f};
     alloc.reg(&m->lr_puf);
     alloc.reg(&m->lr_derived_puf);
     alloc.reg(&m->mb_puf);
+    alloc.reg(&m->norm_partials);
+    alloc.reg(&m->grad_norm_puf);
     long max_M = 0, max_N = 0;
     for (auto* t : param_alloc->regs) {
         if (t->ndim() >= 2) {
@@ -825,12 +829,10 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
         m->gram = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
         m->gram_buf = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
         m->x_buf = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
-        m->norm_partials = {.shape = {256}, .dtype_size = f};
         m->ns_norm_puf = {.shape = {1}, .dtype_size = f};
         alloc.reg(&m->gram);
         alloc.reg(&m->gram_buf);
         alloc.reg(&m->x_buf);
-        alloc.reg(&m->norm_partials);
         alloc.reg(&m->ns_norm_puf);
     }
 }
@@ -838,23 +840,36 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
 void muon_post_create(Muon* m) {
     m->lr_ptr = (float*)m->lr_puf.bytes;
     m->lr_derived_ptr = (float*)m->lr_derived_puf.bytes;
+    m->grad_norm_ptr = (float*)m->grad_norm_puf.bytes;
     if (m->ns_norm_puf.bytes) m->norm_ptr = (float*)m->ns_norm_puf.bytes;
     cudaMemcpy(m->lr_ptr, &m->lr_val_init, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(m->lr_derived_ptr, 0, 2 * sizeof(float));
     cudaMemset(m->mb_puf.bytes, 0, m->mb_puf.numel() * sizeof(float));
 }
 
-void muon_step(Muon* m, cudaStream_t stream = 0) {
+void muon_step(Muon* m, PufTensor grads, float max_grad_norm, cudaStream_t stream = 0) {
+    // Multi-GPU support: simple all-reduce over a contiguous grad buffer
     if (m->nccl_comm != nullptr && m->world_size > 1) {
-        ncclAllReduce(m->gc_puf.bytes, m->gc_puf.bytes, m->gc_puf.numel(),
+        ncclAllReduce(grads.bytes, grads.bytes, grads.numel(),
             NCCL_PRECISION, ncclAvg, m->nccl_comm, stream);
     }
+
+    // Clip gradients by norm
+    int clip_blocks = min((int)grid_size(grads.numel()), 256);
+    norm_partials_kernel<<<clip_blocks, 256, 0, stream>>>(
+        (float*)m->norm_partials.bytes, (const precision_t*)grads.bytes, grads.numel());
+    norm_reduce_kernel<<<1, 256, 0, stream>>>(m->grad_norm_ptr, (float*)m->norm_partials.bytes, clip_blocks);
+    clip_by_norm_partials_kernel<<<grid_size(grads.numel()), BLOCK_SIZE, 0, stream>>>(
+        (precision_t*)grads.bytes, m->grad_norm_ptr, max_grad_norm, 1e-6f, grads.numel());
+
+    // Nesterov momentum works better than Nesterov EMA in our experiments
     nesterov_momentum_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)m->mb_puf.bytes, (precision_t*)m->gc_puf.bytes, (float)m->momentum, m->mb_puf.numel());
+        (float*)m->mb_puf.bytes, (precision_t*)grads.bytes, (float)m->momentum, m->mb_puf.numel());
+
     long offset = 0;
     for (auto* t : m->param_alloc->regs) {
-        precision_t* gc_ptr = (precision_t*)m->gc_puf.bytes + offset;
-        float* wb_ptr = (float*)m->wb_puf.bytes + offset;
+        precision_t* gc_ptr = (precision_t*)grads.bytes + offset;
+        float* wb_ptr = (float*)m->weights.bytes + offset;
         long numel = t->numel();
         const precision_t* update_ptr = gc_ptr;
         float scale = 1.0f;
@@ -892,14 +907,17 @@ void muon_step(Muon* m, cudaStream_t stream = 0) {
                     tall ? src.bytes : gram_buf.bytes, tall ? gram_buf.bytes : src.bytes, dst.bytes,
                     stream, 1.0f, ns_coeffs[i][0]);
             }
+
+            // Scaling matches Keller
             update_ptr = (const precision_t*)x_buf.bytes;
             scale = sqrtf(fmaxf(1.0f, (float)M / (float)N));
         }
+        
+        // Orthogonalized for 2D+, simple SGD + Nesterov momentum for 1D
         muon_weight_update_kernel<<<grid_size(numel), BLOCK_SIZE, 0, stream>>>(
             wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)numel);
         offset += numel;
     }
 }
-
 
 #endif // PUFFERLIB_MODELS_CU
