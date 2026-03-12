@@ -13,6 +13,8 @@ typedef float precision_t;
 constexpr bool USE_BF16 = false;
 constexpr int PRECISION_SIZE = 4;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
+static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F;
+#define NCCL_PRECISION ncclFloat
 #define to_float(x) (x)
 #define from_float(x) (x)
 #else
@@ -20,6 +22,8 @@ typedef __nv_bfloat16 precision_t;
 constexpr bool USE_BF16 = true;
 constexpr int PRECISION_SIZE = 2;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
+static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F_FAST_16BF;
+#define NCCL_PRECISION ncclBfloat16
 #define to_float(x) __bfloat162float(x)
 #define from_float(x) __float2bfloat16(x)
 #endif
@@ -1180,26 +1184,6 @@ __global__ void transpose_102(double* __restrict__ dst,
     dst[b * A * C + a * C + c] = src[idx];
 }
 
-__global__ void norm_f32_kernel(float* __restrict__ partials, const float* __restrict__ src, int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
-        sum += src[i] * src[i];
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        partials[blockIdx.x] = sdata[0];
-    }
-}
-
 __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
@@ -1216,16 +1200,7 @@ __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restr
     }
 }
 
-__global__ void clip_by_norm_f32_kernel(float* __restrict__ dst, const float* __restrict__ sum_sq_ptr,
-                                         float max_norm, float eps, int n) {
-    float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] *= clip_coef;
-    }
-}
-
-__global__ void norm_precision_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
+__global__ void norm_partials_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -1246,39 +1221,12 @@ __global__ void norm_precision_kernel(float* __restrict__ partials, const precis
     }
 }
 
-__global__ void normalize_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
+__global__ void norm_apply_kernel(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
     float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
     }
-}
-
-__global__ void cast_precision_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = to_float(src[idx]);
-    }
-}
-
-// Input: (R, C) f32 → (M, N) precision_t, optionally transposing
-__global__ void cast_f32_to_precision_2d_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, bool do_transpose, int R, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) {
-        return;
-    }
-    int out_idx = do_transpose ? (idx % C) * R + idx / C : idx;
-    dst[out_idx] = from_float(src[idx]);
-}
-
-// Output: (M, N) precision_t → (R, C) f32, with scale, optionally transposing back
-__global__ void cast_precision_scale_to_f32_2d_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, bool do_transpose, int M, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * N) {
-        return;
-    }
-    int out_idx = do_transpose ? (idx % N) * M + idx / N : idx;
-    dst[out_idx] = to_float(src[idx]) * scale;
 }
 
 __global__ void fill_precision_kernel(precision_t* __restrict__ dst, precision_t val, int n) {
@@ -1296,24 +1244,33 @@ __global__ void clamp_precision_kernel(precision_t* __restrict__ dst, float lo, 
     }
 }
 
-// Fused Nesterov momentum: mb = mu*mb + gc; gc = gc + mu*mb
-__global__ void nesterov_f32_kernel(float* __restrict__ mb, float* __restrict__ gc, float mu, int n) {
+// Nesterov with f32 momentum accumulator and precision_t gradients
+__global__ void nesterov_momentum_kernel(float* __restrict__ mb, precision_t* __restrict__ gc, float mu, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float m = mu * mb[idx] + gc[idx];
+        float m = mu * mb[idx] + to_float(gc[idx]);
         mb[idx] = m;
-        gc[idx] += mu * m;
+        gc[idx] = from_float(to_float(gc[idx]) + mu * m);
     }
 }
 
-// Fused weight update: wb = wb * (1 - lr*wd) - lr * up
-__global__ void muon_weight_update_kernel(float* __restrict__ wb, const float* __restrict__ up,
-                                           const float* __restrict__ lr_ptr, float wd, int n) {
+// Fused weight update: wb = wb * (1 - lr*wd) - lr * scale * update
+__global__ void muon_weight_update_kernel(float* __restrict__ wb, const precision_t* __restrict__ update,
+                                           const float* __restrict__ lr_ptr, float wd, float scale, int n) {
     float lr = *lr_ptr;
     float wd_scale = 1.0f - lr * wd;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        wb[idx] = wb[idx] * wd_scale - lr * up[idx];
+        wb[idx] = wb[idx] * wd_scale - lr * scale * to_float(update[idx]);
+    }
+}
+
+__global__ void clip_by_norm_partials_kernel(precision_t* __restrict__ dst, const float* __restrict__ sum_sq_ptr,
+                                               float max_norm, float eps, int n) {
+    float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = from_float(to_float(dst[idx]) * clip_coef);
     }
 }
 

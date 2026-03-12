@@ -523,19 +523,16 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(pufferl.policy, pufferl.weights_bf16, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            // Cast contiguous grads → f32 into muon gc_puf, then clip grad norm
-            cast_precision_to_f32_kernel<<<grid_size(pufferl.grad_bf16_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-                (float*)pufferl.muon->gc_puf.bytes, (const precision_t*)pufferl.grad_bf16_puf.bytes,
-                pufferl.grad_bf16_puf.numel());
+            // gc_puf aliases grad_bf16_puf — clip grad norm in place
             {
                 PufTensor& grad = pufferl.muon->gc_puf;
                 float* scratch = (float*)pufferl.grad_norm_puf.bytes;
                 float* partials = (float*)pufferl.grad_norm_partials_puf.bytes;
                 int blocks = std::min((int)grid_size(grad.numel()), 256);
-                norm_f32_kernel<<<blocks, 256, 0, stream>>>(partials, (float*)grad.bytes, grad.numel());
+                norm_partials_kernel<<<blocks, 256, 0, stream>>>(partials, (const precision_t*)grad.bytes, grad.numel());
                 norm_reduce_kernel<<<1, 256, 0, stream>>>(scratch, partials, blocks);
-                clip_by_norm_f32_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
-                    (float*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
+                clip_by_norm_partials_kernel<<<grid_size(grad.numel()), BLOCK_SIZE, 0, stream>>>(
+                    (precision_t*)grad.bytes, scratch, hypers.max_grad_norm, 1e-6f, grad.numel());
             }
             muon_step(pufferl.muon, stream);
             if (USE_BF16) {
@@ -895,6 +892,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // Muon optimizer (init + register buffers)
     muon_init(pufferl->muon, &fp32_params,
         pufferl->param_fp32_puf, lr, beta1, eps, 0.0, alloc);
+    pufferl->muon->gc_puf = pufferl->grad_bf16_puf;  // alias: no copy needed
     pufferl->muon->nccl_comm = pufferl->nccl_comm;
     pufferl->muon->world_size = hypers.world_size;
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->wb_puf.numel());

@@ -26,7 +26,7 @@ using std::vector;
 struct Allocator {
     std::vector<PufTensor*> regs;
     void* mem = nullptr;
-    int64_t total_elems = 0;
+    long total_elems = 0;
 
     void reg(PufTensor* ptr) {
         regs.push_back(ptr);
@@ -34,7 +34,7 @@ struct Allocator {
 
     void create() {
         // First pass: compute total with 16-byte alignment padding
-        int64_t total_bytes = 0;
+        long total_bytes = 0;
         total_elems = 0;
         for (auto* t : regs) {
             total_bytes = (total_bytes + 15) & ~15;  // align each tensor to 16 bytes
@@ -44,7 +44,7 @@ struct Allocator {
         if (total_bytes > 0) {
             cudaMalloc(&mem, total_bytes);
             cudaMemset(mem, 0, total_bytes);
-            int64_t offset = 0;
+            long offset = 0;
             for (auto* t : regs) {
                 offset = (offset + 15) & ~15;  // align each tensor to 16 bytes
                 t->bytes = (char*)mem + offset;
@@ -76,7 +76,7 @@ void register_prio_buffers(PrioBuffers& bufs, Allocator& alloc, int S, int minib
     bufs = (PrioBuffers){
         .prio_probs = {.shape = {S}, .dtype_size = sizeof(float)},
         .cdf = {.shape = {S}, .dtype_size = sizeof(float)},
-        .idx = {.shape = {minibatch_segments}, .dtype_size = sizeof(int64_t)},
+        .idx = {.shape = {minibatch_segments}, .dtype_size = sizeof(long)},
         .mb_prio = {.shape = {minibatch_segments, 1}, .dtype_size = sizeof(float)},
     };
     alloc.reg(&bufs.prio_probs);
@@ -92,7 +92,7 @@ struct PPOBuffersPuf {
 };
 
 void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
-    int64_t total = (int64_t)N * T;
+    long total = (long)N * T;
     int f = sizeof(float);
     bufs = (PPOBuffersPuf){
         .loss_output = {.shape = {1}, .dtype_size = f},
@@ -167,7 +167,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, in
 }
 
 // ============================================================================
-// cuBLAS matmuls: all row-major PufTensors, precision_t with f32 compute
+// cuBLAS matmuls: all row-major PufTensors, precision_t data with CUBLAS_COMPUTE_PRECISION
 // ============================================================================
 
 static cublasHandle_t get_cublas_handle() {
@@ -175,8 +175,8 @@ static cublasHandle_t get_cublas_handle() {
     if (!handle) {
         cublasCreate(&handle);
         void* workspace = nullptr;
-        cudaMalloc(&workspace, 4096 * 8);
-        cublasSetWorkspace(handle, workspace, 4096 * 8);
+        cudaMalloc(&workspace, 32 * 1024 * 1024);
+        cublasSetWorkspace(handle, workspace, 32 * 1024 * 1024);
     }
     return handle;
 }
@@ -193,7 +193,7 @@ static inline void cublasGemmExDense(
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
         B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
-        C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
 }
 
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
@@ -251,15 +251,15 @@ void puf_add(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
         (float*)dst.bytes, (const precision_t*)src.bytes, dst.numel());
 }
 
-void puf_kaiming_init(PufTensor& dst, float gain, uint64_t seed, cudaStream_t stream) {
+void puf_kaiming_init(PufTensor& dst, float gain, ulong seed, cudaStream_t stream) {
     assert(dst.ndim() == 2);
-    int64_t rows = dst.shape[0], cols = dst.shape[1];
+    long rows = dst.shape[0], cols = dst.shape[1];
     assert(rows > 0 && cols > 0);
-    int64_t n = rows * cols;
+    long n = rows * cols;
 
     float std = gain / std::sqrt((float)cols);  // fan_in = cols for (out, in) layout
 
-    int64_t rand_count = (n % 2 == 0) ? n : n + 1;
+    long rand_count = (n % 2 == 0) ? n : n + 1;
     float* buf;
     cudaMalloc(&buf, rand_count * sizeof(float));
 
@@ -352,7 +352,7 @@ void ppo_loss_fwd_bwd(
 
 void prio_replay_cuda(PufTensor& advantages, float prio_alpha,
         int minibatch_segments, int total_agents, float anneal_beta,
-        PrioBuffers& bufs, uint64_t seed, int64_t* offset_ptr, cudaStream_t stream) {
+        PrioBuffers& bufs, ulong seed, long* offset_ptr, cudaStream_t stream) {
     int S = advantages.shape[0], T = advantages.shape[1];
     compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE, 0, stream>>>(
         (float*)advantages.bytes, (float*)bufs.prio_probs.bytes, prio_alpha, T);
@@ -360,11 +360,11 @@ void prio_replay_cuda(PufTensor& advantages, float prio_alpha,
         (float*)bufs.prio_probs.bytes, S);
     int block = fmaxf(((minibatch_segments + 31) / 32) * 32, 32);
     multinomial_with_replacement_kernel<<<1, block, 0, stream>>>(
-        (int64_t*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
+        (long*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
         (float*)bufs.cdf.bytes, S, minibatch_segments, seed, offset_ptr);
     int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
     compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
-        (int64_t*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
+        (long*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
         (float*)bufs.mb_prio.bytes, total_agents, anneal_beta, minibatch_segments);
 }
 
@@ -383,7 +383,7 @@ void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
 }
 
 // Shared function pointer types (same signature for encoder and decoder)
-typedef void (*init_weights_fn)(void* weights, uint64_t* seed, cudaStream_t stream);
+typedef void (*init_weights_fn)(void* weights, ulong* seed, cudaStream_t stream);
 typedef void (*reg_params_fn)(void* weights, Allocator* alloc, int esz);
 typedef void (*reg_train_fn)(void* weights, void* buf, Allocator* acts, Allocator* grads, int B_TT);
 typedef void (*reg_rollout_fn)(void* weights, void* buf, Allocator* alloc, int B);
@@ -444,7 +444,7 @@ static void encoder_backward(void* w, void* activations, PufTensor grad, cudaStr
     puf_mm_tn(grad, a->saved_input, a->wgrad_scratch, stream);
 }
 
-static void encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+static void encoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
     EncoderWeights* ew = (EncoderWeights*)w;
     PufTensor wt = {
         .bytes = ew->weight.bytes,
@@ -494,7 +494,7 @@ static PufTensor decoder_forward(void* w, void* activations, PufTensor input, cu
     return a->out;
 }
 
-static void decoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+static void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
     PufTensor wt = {
         .bytes = dw->weight.bytes,
@@ -582,7 +582,7 @@ struct MinGRUWeights {
 };
 
 static PufTensor mingru_state_layer(MinGRUWeights* m, PufTensor& state, int i) {
-    int64_t B = state.shape[1], H = state.shape[2];
+    long B = state.shape[1], H = state.shape[2];
     return {
         .bytes = state.bytes + i * B * H * state.dtype_size,
         .shape = {B, H},
@@ -590,7 +590,7 @@ static PufTensor mingru_state_layer(MinGRUWeights* m, PufTensor& state, int i) {
     };
 }
 
-static void mingru_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+static void mingru_init_weights(void* w, ulong* seed, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     for (int i = 0; i < m->num_layers; i++) {
         PufTensor w2d = {
@@ -773,10 +773,6 @@ static constexpr double ns_coeffs[5][3] = {
     {2.8366, -3.0525, 1.2012},
 };
 
-PufTensor ns_slice(PufTensor& buf, int64_t rows, int64_t cols) {
-    return {.bytes = buf.bytes, .shape = {rows, cols}, .dtype_size = buf.dtype_size};
-}
-
 struct Muon {
     double momentum, weight_decay, eps;
     float lr_val_init;
@@ -784,9 +780,9 @@ struct Muon {
     float* lr_derived_ptr;
     float* norm_ptr;
     PufTensor lr_puf, lr_derived_puf, ns_norm_puf;
-    PufTensor wb_puf, mb_puf, gc_puf, up_puf;
-    PufTensor x, A, gram, tmp, norm_partials;
-    int64_t max_M, max_N;
+    PufTensor wb_puf, mb_puf, gc_puf;
+    PufTensor gram, gram_buf, x_buf, norm_partials;
+    long max_M, max_N;
     Allocator* param_alloc;  // fp32 params allocator — shapes used by muon_step
     ncclComm_t nccl_comm;
     int world_size;
@@ -806,39 +802,34 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
     m->nccl_comm = nullptr;
     m->world_size = 1;
     m->max_M = 0; m->max_N = 0;
-    int64_t n = m->wb_puf.numel();
+    long n = m->wb_puf.numel();
     int f = sizeof(float);
     m->lr_puf = {.shape = {1}, .dtype_size = f};
     m->lr_derived_puf = {.shape = {2}, .dtype_size = f};
     m->mb_puf = {.shape = {n}, .dtype_size = f};
-    m->gc_puf = {.shape = {n}, .dtype_size = f};
-    m->up_puf = {.shape = {n}, .dtype_size = f};
+    m->gc_puf = {};  // aliased to grad buffer by caller after init
     alloc.reg(&m->lr_puf);
     alloc.reg(&m->lr_derived_puf);
     alloc.reg(&m->mb_puf);
-    alloc.reg(&m->gc_puf);
-    alloc.reg(&m->up_puf);
-    int64_t max_M = 0, max_N = 0;
+    long max_M = 0, max_N = 0;
     for (auto* t : param_alloc->regs) {
         if (t->ndim() >= 2) {
-            int64_t R = t->shape[0], C = t->numel() / R;
-            max_M = std::max(max_M, std::min(R, C));
-            max_N = std::max(max_N, std::max(R, C));
+            long R = t->shape[0], C = t->numel() / R;
+            max_M = max(max_M, min(R, C));
+            max_N = max(max_N, max(R, C));
         }
     }
     if (max_M > 0) {
         m->max_M = max_M; m->max_N = max_N;
         int ns_esz = PRECISION_SIZE;
-        m->x = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
-        m->A = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
         m->gram = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
-        m->tmp = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
+        m->gram_buf = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
+        m->x_buf = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
         m->norm_partials = {.shape = {256}, .dtype_size = f};
         m->ns_norm_puf = {.shape = {1}, .dtype_size = f};
-        alloc.reg(&m->x);
-        alloc.reg(&m->A);
         alloc.reg(&m->gram);
-        alloc.reg(&m->tmp);
+        alloc.reg(&m->gram_buf);
+        alloc.reg(&m->x_buf);
         alloc.reg(&m->norm_partials);
         alloc.reg(&m->ns_norm_puf);
     }
@@ -856,55 +847,58 @@ void muon_post_create(Muon* m) {
 void muon_step(Muon* m, cudaStream_t stream = 0) {
     if (m->nccl_comm != nullptr && m->world_size > 1) {
         ncclAllReduce(m->gc_puf.bytes, m->gc_puf.bytes, m->gc_puf.numel(),
-                      ncclFloat, ncclAvg, m->nccl_comm, stream);
+            NCCL_PRECISION, ncclAvg, m->nccl_comm, stream);
     }
-    nesterov_f32_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)m->mb_puf.bytes, (float*)m->gc_puf.bytes, (float)m->momentum, m->mb_puf.numel());
-    int64_t offset = 0;
+    nesterov_momentum_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
+        (float*)m->mb_puf.bytes, (precision_t*)m->gc_puf.bytes, (float)m->momentum, m->mb_puf.numel());
+    long offset = 0;
     for (auto* t : m->param_alloc->regs) {
-        float* gc_ptr = (float*)m->gc_puf.bytes + offset;
-        float* up_ptr = (float*)m->up_puf.bytes + offset;
+        precision_t* gc_ptr = (precision_t*)m->gc_puf.bytes + offset;
+        float* wb_ptr = (float*)m->wb_puf.bytes + offset;
+        long numel = t->numel();
+        const precision_t* update_ptr = gc_ptr;
+        float scale = 1.0f;
+
+        // Orthogonalize the update
         if (t->ndim() >= 2) {
-            // TODO: You can eliminate the transpose by instead flipping the matmul depending on the shape
-            // It does change numerics though, so do it in a stable commit.
-            int64_t R = t->shape[0], C = t->numel() / R;
-            bool transposed = R > C;
-            int64_t M = transposed ? C : R, N = transposed ? R : C;
-            PufTensor x = ns_slice(m->x, M, N);
-            PufTensor A = ns_slice(m->A, M, M);
-            PufTensor gram = ns_slice(m->gram, M, M);
-            PufTensor tmp = ns_slice(m->tmp, M, N);
-            cast_f32_to_precision_2d_kernel<<<grid_size(R * C), BLOCK_SIZE, 0, stream>>>(
-                (precision_t*)x.bytes, (const float*)gc_ptr, transposed, (int)R, (int)C);
-            int nblk = std::min((int)grid_size(x.numel()), 256);
-            norm_precision_kernel<<<nblk, 256, 0, stream>>>(
+            long R = t->shape[0], C = numel / R;
+            long M = min(R, C), N = max(R, C);
+            bool tall = R > C;
+            PufTensor x = {.bytes = (char*)gc_ptr, .shape = {R, C}, .dtype_size = PRECISION_SIZE};
+            PufTensor x_buf = {.bytes = m->x_buf.bytes, .shape = {R, C}, .dtype_size = PRECISION_SIZE};
+            PufTensor gram = {.bytes = m->gram.bytes, .shape = {M, M}, .dtype_size = PRECISION_SIZE};
+            PufTensor gram_buf = {.bytes = m->gram_buf.bytes, .shape = {M, M}, .dtype_size = PRECISION_SIZE};
+
+            //x = x / clamp(x.norm(dim=(-2, -1)), min=eps)
+            int nblk = min((int)grid_size(x.numel()), 256);
+            norm_partials_kernel<<<nblk, 256, 0, stream>>>(
                 (float*)m->norm_partials.bytes, (const precision_t*)x.bytes, x.numel());
             norm_reduce_kernel<<<1, 256, 0, stream>>>(m->norm_ptr, (float*)m->norm_partials.bytes, nblk);
-            normalize_precision_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
+            norm_apply_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
                 (precision_t*)x.bytes, m->norm_ptr, 1e-7f, x.numel());
+
+            // Gram matrix is symmetric -> we can skip tranposing x
+            cublasOperation_t gram_op_a = tall ? CUBLAS_OP_T : CUBLAS_OP_N;
+            cublasOperation_t gram_op_b = tall ? CUBLAS_OP_N : CUBLAS_OP_T;
             for (int i = 0; i < 5; ++i) {
-                float a = (float)ns_coeffs[i][0], b = (float)ns_coeffs[i][1], c = (float)ns_coeffs[i][2];
-                PufTensor& src = (i % 2 == 0) ? x : tmp;
-                PufTensor& dst = (i % 2 == 0) ? tmp : x;
-                puf_mm(src, src, A, stream);
-                puf_copy(gram, A, stream);
-                puf_addmm_nn(A, A, gram, c, b, stream);
+                PufTensor& src = (i % 2 == 0) ? x : x_buf;
+                PufTensor& dst = (i % 2 == 0) ? x_buf : x;
+                cublasGemmExDense(gram_op_a, gram_op_b, (int)M, (int)M, (int)N,
+                    src.bytes, src.bytes, gram.bytes, stream);
+                puf_copy(gram_buf, gram, stream);
+                puf_addmm_nn(gram, gram, gram_buf, ns_coeffs[i][2], ns_coeffs[i][1], stream);
                 puf_copy(dst, src, stream);
-                puf_addmm_nn(gram, src, dst, 1.0f, a, stream);
+                cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
+                    tall ? src.bytes : gram_buf.bytes, tall ? gram_buf.bytes : src.bytes, dst.bytes,
+                    stream, 1.0f, ns_coeffs[i][0]);
             }
-            float scale = (float)std::sqrt(std::max(1.0, (double)M / (double)N));
-            cast_precision_scale_to_f32_2d_kernel<<<grid_size(M * N), BLOCK_SIZE, 0, stream>>>(
-                (float*)up_ptr, (const precision_t*)tmp.bytes, scale, transposed, (int)M, (int)N);
-        } else {
-            // TODO: Do we use this path?
-            PufTensor src_puf = {.bytes = (char*)gc_ptr, .shape = {t->numel()}, .dtype_size = 4};
-            PufTensor dst_puf = {.bytes = (char*)up_ptr, .shape = {t->numel()}, .dtype_size = 4};
-            puf_copy(dst_puf, src_puf, stream);
+            update_ptr = (const precision_t*)x_buf.bytes;
+            scale = sqrtf(fmaxf(1.0f, (float)M / (float)N));
         }
-        offset += t->numel();
+        muon_weight_update_kernel<<<grid_size(numel), BLOCK_SIZE, 0, stream>>>(
+            wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)numel);
+        offset += numel;
     }
-    muon_weight_update_kernel<<<grid_size(m->wb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)m->wb_puf.bytes, (const float*)m->up_puf.bytes, m->lr_ptr, (float)m->weight_decay, m->wb_puf.numel());
 }
 
 
