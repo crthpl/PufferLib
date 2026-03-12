@@ -209,13 +209,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             _C.save_weights(pufferl, model_path)
 
         # Rate-limit dashboard/logging to avoid overhead
-        if time.time() < pufferl.last_log_time + 0.6 and epoch != train_epochs - 1:
-            continue
+        #if time.time() < pufferl.last_log_time + 0.6 and epoch != train_epochs - 1:
+        #    continue
 
         logs = _C.eval_log(pufferl) if epoch >= train_epochs else _C.log(pufferl)
         flat_logs = {**flat_logs, **dict(pufferlib.unroll_nested_dict(logs))}
 
-        if verbose:
+        # TODO: determ without logging every epoch
+        if verbose and epoch % 20 == 0:
             print_dashboard(args, model_size, flat_logs)
 
         if target_key not in flat_logs:
@@ -234,6 +235,8 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         elif flat_logs['env/n'] > args['eval_episodes']:
             break
 
+
+    print_dashboard(args, model_size, flat_logs)
     _C.close(pufferl)
 
     if target_key not in flat_logs:
