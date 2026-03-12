@@ -17,121 +17,7 @@
 
 using std::vector;
 
-// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
-#ifdef PRECISION_FLOAT
-constexpr bool USE_BF16 = false;
-constexpr int PRECISION_SIZE = 4;   // bytes per element
-static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
-#else
-constexpr bool USE_BF16 = true;
-constexpr int PRECISION_SIZE = 2;   // bytes per element
-static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
-#endif
-
-// ============================================================================
-// PufTensor — minimal tensor view (no torch dependency)
-// ============================================================================
-
-#define PUF_MAX_DIMS 8
-
-// Minimal tensor: raw pointer + shape, no torch dependency in the struct itself.
-// Memory is owned by an Allocator buffer — PufTensor is just a view.
-struct PufTensor {
-    char* bytes = nullptr;
-    int64_t shape[PUF_MAX_DIMS] = {};
-    int dtype_size = 0;      // bytes per element (2 for bf16/f16, 4 for f32, 8 for f64)
-
-    __host__ __device__ int ndim() const {
-        int n = 0;
-        while (n < PUF_MAX_DIMS && shape[n] != 0) {
-            n++;
-        }
-        return n;
-    }
-
-    __host__ __device__ int64_t numel() const {
-        int64_t n = 1;
-        for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) {
-            n *= shape[i];
-        }
-        return n;
-    }
-
-    // Merge shape[dim] into shape[dim+1]: {B, TT, H} -> {B*TT, H}
-    PufTensor squeeze(int dim) {
-        int n = ndim();
-        shape[dim + 1] *= shape[dim];
-        for (int i = dim; i < n - 1; i++) shape[i] = shape[i + 1];
-        shape[n - 1] = 0;
-        return *this;
-    }
-
-    // Split shape[dim] into two: {B*TT, H} with unsqueeze(0, B, TT) -> {B, TT, H}
-    PufTensor unsqueeze(int dim, int64_t d0, int64_t d1) {
-        assert(d0 * d1 == shape[dim] && "unsqueeze: d0 * d1 must equal shape[dim]");
-        int n = ndim();
-        for (int i = n; i > dim; i--) {
-            shape[i] = shape[i - 1];
-        }
-        shape[dim] = d0;
-        shape[dim + 1] = d1;
-        return *this;
-    }
-
-    // Product of all dims except the last two (1 if ndim <= 2)
-    int64_t batch_size() const {
-        int n = ndim();
-        int64_t b = 1;
-        for (int i = 0; i < n - 2; i++) {
-            b *= shape[i];
-        }
-        return b;
-    }
-
-
-    const char* dtype_name() const {
-        switch (dtype_size) {
-            case 1: return "i8";
-            case 2: return "bf16";
-            case 4: return "f32";
-            case 8: return "f64";
-            default: return "?";
-        }
-    }
-
-    const char* repr() const {
-        static char buf[256];
-        if (!bytes) {
-            snprintf(buf, sizeof(buf), "PufTensor(empty)");
-            return buf;
-        }
-        int pos = snprintf(buf, sizeof(buf), "PufTensor(%s, [", dtype_name());
-        for (int i = 0; i < ndim() && pos < (int)sizeof(buf) - 32; i++) {
-            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
-        }
-        snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)numel());
-        return buf;
-    }
-};
-
-// Loss component indices
-enum LossIdx {
-    LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
-    LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
-    LOSS_N = 7, NUM_LOSSES = 8,
-};
-
-// Prefix scan buffers
-struct PrefixScan {
-    void* combined_ptr = nullptr;
-    void* state_ptr = nullptr;
-    void* input_ptr = nullptr;      // (B, T, H) original input before projection (for highway gate)
-    int B = 0, T = 0, H = 0;
-    PufTensor a_star, s_vals, log_values_buf;
-    PufTensor out, next_state;
-    PufTensor grad_combined, grad_state;
-    PufTensor grad_input;           // (B, T, H) highway gate gradient w.r.t. input
-};
+#include "kernels.cu"
 
 // ============================================================================
 // Allocator — single contiguous GPU buffer with PufTensor views
@@ -231,18 +117,6 @@ void post_create_ppo_buffers(PPOBuffersPuf& bufs) {
     cudaMemcpy(bufs.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
 }
 
-struct RolloutBuf {
-    PufTensor observations;  // (horizon, segments, input_size) PRECISION
-    PufTensor actions;       // (horizon, segments, num_atns) f64
-    PufTensor values;        // (horizon, segments) PRECISION
-    PufTensor logprobs;      // (horizon, segments) PRECISION
-    PufTensor rewards;       // (horizon, segments) PRECISION
-    PufTensor terminals;     // (horizon, segments) PRECISION
-    PufTensor ratio;         // (horizon, segments) PRECISION
-    PufTensor importance;    // (horizon, segments) PRECISION
-
-};
-
 void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int H, int S, int input_size, int num_atns) {
     int p = PRECISION_SIZE;
     bufs = (RolloutBuf){
@@ -264,20 +138,6 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int H, int S, 
     alloc.reg(&bufs.ratio);
     alloc.reg(&bufs.importance);
 }
-
-struct TrainGraph {
-    PufTensor mb_obs;         // (S, H, input_size) PRECISION
-    PufTensor mb_state;       // (L, S, 1, hidden) PRECISION
-    PufTensor mb_actions;     // (S, H, num_atns) f64
-    PufTensor mb_logprobs;    // (S, H) PRECISION
-    PufTensor mb_advantages;  // (S, H) f32
-    PufTensor mb_prio;        // (S, 1) PRECISION
-    PufTensor mb_values;      // (S, H) PRECISION
-    PufTensor mb_returns;     // (S, H) PRECISION
-    PufTensor mb_ratio;       // (S, H) PRECISION
-    PufTensor mb_newvalue;    // (S, H, 1) PRECISION
-
-};
 
 void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, int input_size,
         int hidden_size, int num_atns, int num_layers) {
@@ -305,8 +165,6 @@ void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, in
     alloc.reg(&bufs.mb_ratio);
     alloc.reg(&bufs.mb_newvalue);
 }
-
-#include "kernels.cu"
 
 // ============================================================================
 // cuBLAS matmuls: all row-major PufTensors, precision_t with f32 compute

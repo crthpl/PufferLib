@@ -1,24 +1,53 @@
 #ifndef PUFFERLIB_KERNELS_CU
 #define PUFFERLIB_KERNELS_CU
 
-/* Kernels must launch on the current torch stream to be traced by cudagraphs.
- * This file is included by models.cu which calls kernels directly with <<<>>>.
- * Callers should use at::cuda::getCurrentCUDAStream() when using with torch.
- */
-
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-// ============================================================================
-// Device math ops (formerly ops.cuh)
-// ============================================================================
+#include <curand_kernel.h>
+#include <cstdio>
+#include <cstdint>
+
+// PufferLib defaults to bf16, but float32 is supported with the --precision compile-time flag
+#ifdef PRECISION_FLOAT
+typedef float precision_t;
+constexpr bool USE_BF16 = false;
+constexpr int PRECISION_SIZE = 4;
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
+#define to_float(x) (x)
+#define from_float(x) (x)
+#else
+typedef __nv_bfloat16 precision_t;
+constexpr bool USE_BF16 = true;
+constexpr int PRECISION_SIZE = 2;
+static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
+#define to_float(x) __bfloat162float(x)
+#define from_float(x) __float2bfloat16(x)
+#endif
+
+#include "structs.h"
 
 #ifndef CUDART_INF_F
 #define CUDART_INF_F __int_as_float(0x7f800000)
 #endif
 
+#define PPO_THREADS 256
+#define SELECT_COPY_THREADS 256
+#define MAX_ATN_HEADS 16
+
+
+#define BLOCK_SIZE 256
+inline int grid_size(int N) {
+    return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+}
+
+#define SEQ_SIZE 256
+inline int seq_size(int N) {
+    return (N + SEQ_SIZE - 1) / SEQ_SIZE;
+}
+
+
 #define SOFTPLUS_BETA 1.0f
 #define SOFTPLUS_THRESHOLD 20.0f
-
 __device__ __forceinline__ float softplus_fwd(float x) {
     float x_scaled = x * SOFTPLUS_BETA;
     return (x_scaled > SOFTPLUS_THRESHOLD) ? x : log1pf(expf(x_scaled)) / SOFTPLUS_BETA;
@@ -26,13 +55,20 @@ __device__ __forceinline__ float softplus_fwd(float x) {
 
 __device__ __forceinline__ float softplus_bwd(float grad_output, float x) {
     float beta_x = SOFTPLUS_BETA * x;
-    if (beta_x > SOFTPLUS_THRESHOLD) return grad_output;
+    if (beta_x > SOFTPLUS_THRESHOLD) {
+        return grad_output;
+    }
     float exp_beta_x = expf(beta_x);
     return grad_output * (exp_beta_x / (1.0f + exp_beta_x));
 }
 
-__device__ __forceinline__ float relu(float x) { return fmaxf(0.0f, x); }
-__device__ __forceinline__ float relu_backward(float x, float grad_output) { return (x > 0.0f) ? grad_output : 0.0f; }
+__device__ __forceinline__ float relu(float x) {
+    return fmaxf(0.0f, x);
+}
+
+__device__ __forceinline__ float relu_backward(float x, float grad_output) {
+    return (x > 0.0f) ? grad_output : 0.0f;
+}
 
 __device__ __forceinline__ float sigmoid(float x) {
     float z = expf(-fabsf(x));
@@ -64,61 +100,15 @@ __device__ __inline__ float fast_sigmoid(float x) {
     return fminf(1.0f, fmaxf(0.0f, (fast_tanh(x * 0.5f) + 1.0f) * 0.5f));
 }
 
-__device__ __forceinline__ float tilde_relu_fwd(float x) {
-    return (x >= 0.0f) ? x + 0.5f : fast_sigmoid(x);
-}
-
-__device__ __forceinline__ float tilde_relu_bwd(float x, float grad_output) {
-    if (x >= 0.0f) return grad_output;
-    float sig = fast_sigmoid(x);
-    return grad_output * sig * (1.0f - sig);
-}
 
 __device__ __forceinline__ float lerp(float a, float b, float w) {
     float diff = b - a;
     return (fabsf(w) < 0.5f) ? a + w * diff : b - diff * (1.0f - w);
 }
-__device__ __forceinline__ float lerp_backward_a(float a, float b, float w, float grad_output) { return grad_output * (1.0f - w); }
-__device__ __forceinline__ float lerp_backward_b(float a, float b, float w, float grad_output) { return grad_output * w; }
-__device__ __forceinline__ float lerp_backward_w(float a, float b, float w, float grad_output) {
-    float diff = b - a;
-    return (fabsf(w) < 0.5f) ? grad_output * diff : grad_output * diff;
-}
-
-__device__ __forceinline__ float mingru_gate(float h) { return h >= 0.0f ? h + 0.5f : sigmoid(h); }
-__device__ __forceinline__ float mingru_gate_backward(float h, float grad_output) {
-    if (h > 0.0f) return grad_output;
-    float sig = sigmoid(h);
-    return grad_output * sig * (1.0f - sig);
-}
 
 __device__ __forceinline__ float logaddexp(float a, float b) {
     float m = fmaxf(a, b), diff = fminf(a, b) - m;
-    return (diff < -88.0f) ? m : m + log1pf(expf(diff));
-}
-
-__device__ __forceinline__ float exp_safe(float x) {
-    return (x > 88.0f) ? 1.651e38f : ((x < -88.0f) ? 0.0f : expf(x));
-}
-
-__device__ __forceinline__ void cumsum_forward(const float* x, float* y, int T) {
-    float sum = 0.0f;
-    for (int t = 0; t < T; t++) { sum += x[t]; y[t] = sum; }
-}
-
-__device__ __forceinline__ void cumsum_backward(const float* grad_y, float* grad_x, int T) {
-    float running = 0.0f;
-    for (int t = T - 1; t >= 0; t--) { running += grad_y[t]; grad_x[t] = running; }
-}
-
-__device__ __forceinline__ void logcumsumexp_forward(const float* x, float* y, int T) {
-    float lse = -CUDART_INF_F;
-    for (int t = 0; t < T; t++) { lse = (lse == -CUDART_INF_F) ? x[t] : logaddexp(lse, x[t]); y[t] = lse; }
-}
-
-__device__ __forceinline__ void logcumsumexp_backward(const float* x, const float* y, const float* grad_y, float* grad_x, int T) {
-    float running = 0.0f;
-    for (int t = T - 1; t >= 0; t--) { running += grad_y[t] * exp_safe(x[t] - y[t]); grad_x[t] = running; }
+    return (diff < -88.0f) ? m : m + log1pf(__expf(diff));
 }
 
 __device__ __forceinline__ void log_coeffs_and_values_fwd(float gate, float hidden, float* log_coeff_out, float* log_value_out) {
@@ -136,45 +126,6 @@ __device__ __forceinline__ void log_coeffs_and_values_bwd(float grad_log_coeffs,
     *grad_gate_out = -grad_log_coeffs * sig_gate + grad_log_values * (1.0f - sig_gate);
     *grad_hidden_out = (hidden >= 0.0f) ? grad_log_values / (hidden + 0.5f) : grad_log_values * sigmoid(-hidden);
 }
-#include <curand_kernel.h>
-
-#include <cstdio>
-#include <cstdint>
-
-// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
-#ifdef PRECISION_FLOAT
-typedef float precision_t;
-#else
-typedef __nv_bfloat16 precision_t;
-#endif
-
-#define PPO_THREADS 256
-
-#define SEQ_SIZE 256
-#define BLOCK_SIZE 256
-#define CHECKPOINT_INTERVAL 4  // Sparse checkpoint interval for optimized kernels
-
-// Maximum number of action heads supported for MultiDiscrete
-// Using register arrays to avoid dynamic allocation
-#define MAX_ATN_HEADS 16
-
-
-inline int grid_size(int N) {
-    return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-}
-inline int seq_size(int N) {
-    return (N + SEQ_SIZE - 1) / SEQ_SIZE;
-}
-
-// Compile-time precision conversion macros
-#ifdef PRECISION_FLOAT
-#define to_float(x) (x)
-#define from_float(x) (x)
-#else
-#define to_float(x) __bfloat162float(x)
-#define from_float(x) __float2bfloat16(x)
-#endif
-
 
 // Fused kernel: chunk + mingru_gate + highway gate output
 // combined is (B, 1, 3*H) containing [hidden, gate, proj] concatenated on last dim
@@ -193,7 +144,9 @@ __global__ void mingru_gate(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * H;
-    if (idx >= N) return;
+    if (idx >= N) {
+        return;
+    }
 
     int b = idx / H;
     int h = idx % H;
@@ -202,47 +155,27 @@ __global__ void mingru_gate(
     int combined_base = b * 3 * H;
     float hidden = to_float(combined[combined_base + h]);
     float gate = to_float(combined[combined_base + H + h]);
-    float proj = to_float(combined[combined_base + 2 * H + h]);
+    float proj = to_float(combined[combined_base + 2*H + h]);
     float state = to_float(state_in[idx]);
     float x = to_float(x_in[idx]);
 
     // mingru_gate computation
     float gate_sigmoid = sigmoid(gate);
-    float hidden_tilde = tilde_relu_fwd(hidden);
+    float hidden_tilde = (hidden >= 0.0f) ? hidden + 0.5f : fast_sigmoid(hidden);
     float mingru_out = lerp(state, hidden_tilde, gate_sigmoid);
 
     // next_state is mingru_out (for recurrence)
     next_state[idx] = from_float(mingru_out);
 
-    // // out is sigmoid(proj) * mingru_out (multiplicative output gate)
-    // float proj_sigmoid = sigmoid(proj);
-    // out[idx] = from_float(proj_sigmoid * mingru_out);
-
-    // out is sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x (highway gate)
+    // Highway connection: sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x (highway gate)
     float proj_sigmoid = sigmoid(proj);
     out[idx] = from_float(proj_sigmoid * mingru_out + (1.0f - proj_sigmoid) * x);
-}
-
-
-__device__ __forceinline__ double logcumsumexp_forward(double x, double acc) {
-    if (acc == -INFINITY) {
-        return x;
-    } else {
-        double min_val = fmin(acc, x);
-        double max_val = fmax(acc, x);
-        return max_val + log1pf(expf(min_val - max_val));
-    }
-}
-
-__device__ __forceinline__ double logcumsumexp_backward(double x, double* acc, double grad, double s, double* s_nxt) {
-    *acc = grad + *acc * exp(s - *s_nxt);
-    *s_nxt = s;
-    return *acc * exp(x - s);
 }
 
 // Optimized forward kernel with checkpointing
 // Writes checkpoints only every CHECKPOINT_INTERVAL timesteps (vs every time)
 // Uses fast math intrinsics for better performance
+#define CHECKPOINT_INTERVAL 4
 __global__ void fused_scan_forward(PrefixScan scan) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
     precision_t* __restrict__ out = (precision_t*)scan.out.bytes;
@@ -255,7 +188,9 @@ __global__ void fused_scan_forward(PrefixScan scan) {
     const precision_t* __restrict__ input = (const precision_t*)scan.input_ptr;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H) return;
+    if (idx >= B * H) {
+        return;
+    }
 
     int b = idx / H;
     int h = idx % H;
@@ -303,14 +238,10 @@ __global__ void fused_scan_forward(PrefixScan scan) {
         a_star += log_coeff_val;
 
         float z = log_value - a_star;
-        float max_val = fmaxf(s, z);
-        s = max_val + log1pf(__expf(-fabsf(s - z)));
+        s = logaddexp(s, z);
 
         scan_result = __expf(a_star + s);
         float proj_sigmoid = sigmoid(proj_val);
-
-        // // out = sigmoid(proj) * scan_result (multiplicative output gate)
-        // out[out_curr] = from_float(proj_sigmoid * scan_result);
 
         // out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x (highway gate)
         out[out_curr] = from_float(proj_sigmoid * scan_result + (1.0f - proj_sigmoid) * x_val);
@@ -350,7 +281,9 @@ __global__ void fused_scan_backward(
     const float* __restrict__ log_values_buf = (const float*)scan.log_values_buf.bytes;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H) return;
+    if (idx >= B * H) {
+        return;
+    }
 
     int b = idx / H;
     int h = idx % H;
@@ -406,8 +339,7 @@ __global__ void fused_scan_backward(
             recomp_a_star += lc;
 
             float z = recomp_log_value - recomp_a_star;
-            float mv = fmaxf(recomp_s, z);
-            recomp_s = mv + log1pf(__expf(-fabsf(recomp_s - z)));
+            recomp_s = logaddexp(recomp_s, z);
 
             chunk_a_star[i] = recomp_a_star;
             chunk_s[i] = recomp_s;
@@ -434,13 +366,8 @@ __global__ void fused_scan_backward(
             float z = log_value_t - a_star_t;
 
             float grad_out_val = to_float(grad_out[input_idx]);
-
             float grad_scan_from_next = (t == T_seq) ? to_float(grad_next_state[state_idx]) : 0.0f;
-
             float proj_sigmoid = sigmoid(proj_val);
-            // // Multiplicative output gate gradients:
-            // float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
-            // float grad_proj = grad_out_val * scan_result * proj_sigmoid * (1.0f - proj_sigmoid);
 
             // Highway gate gradients: out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x
             float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
@@ -488,71 +415,6 @@ __global__ void fused_scan_backward(
     grad_state[state_idx] = from_float(grad_z_0 / to_float(state[state_idx]));
 }
 
-
-
-// This exactly matches pytorch in double, but not in float
-__global__ void logcumsumexp_forward_kernel(
-    precision_t* __restrict__ out,           // exp(s[t])
-    double* __restrict__ s_buf,     // s[t] = logcumsumexp(x[0..t])
-    const precision_t* __restrict__ x,       // input: log_values
-    int T_total,
-    int H,
-    int B
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H) return;
-
-    int b = idx / H;
-    int h = idx % H;
-
-    int base = b * T_total * H + h;
-
-    double s = -INFINITY;
-
-    for (int t = 0; t < T_total; t++) {
-        int curr = base + t * H;
-        double x_val = (double)to_float(x[curr]);
-        s = logcumsumexp_forward(x_val, s);
-        out[curr] = from_float((float)s);
-        s_buf[curr] = s;
-    }
-}
-__global__ void logcumsumexp_backward_kernel(
-    precision_t* __restrict__ grad_x,
-    const precision_t* __restrict__ grad_out,
-    const precision_t* __restrict__ x,
-    const double* __restrict__ s_buf,
-    int T_total,
-    int H,
-    int B
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * H) return;
-
-    int b = idx / H;
-    int h = idx % H;
-
-    int base = b * T_total * H + h;
-
-    double acc = 0.0;
-    double s_val_next = 0.0;
-
-    for (int t = T_total - 1; t >= 0; --t) {
-        int curr = base + t * H;
-
-        double x_val = (double)to_float(x[curr]);
-        double s_val = double(s_buf[curr]);
-        double g_val = (double)to_float(grad_out[curr]);
-        grad_x[curr] = from_float((float)logcumsumexp_backward(x_val, &acc, g_val, s_val, &s_val_next));
-    }
-}
-
-
-// ============================================================================
-// PPO shared device helpers (used by both forward and backward kernels)
-// ============================================================================
-
-// Compute log-probability, entropy, and logsumexp for a single discrete action head.
 __device__ __forceinline__ void ppo_discrete_head(
     const precision_t* __restrict__ logits,
     int logits_base, int logits_stride_a, int logits_offset,
@@ -565,7 +427,9 @@ __device__ __forceinline__ void ppo_discrete_head(
 
     for (int a = 0; a < A; ++a) {
         float l = to_float(logits[logits_base + (logits_offset + a) * logits_stride_a]);
-        if (a == act) act_logit = l;
+        if (a == act) {
+            act_logit = l;
+        }
         if (l > max_logit) {
             sum *= __expf(max_logit - l);
             max_logit = l;
@@ -599,7 +463,6 @@ __device__ __forceinline__ void ppo_continuous_head(
     *out_logp = -0.5f * normalized * normalized - HALF_LOG_2PI - log_std;
     *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
 }
-
 
 // Fused PPO forward + backward kernel: computes loss partials AND gradients in one pass.
 // Avoids redundant recomputation of logits, logsumexp, ratio, advantage normalization.
@@ -649,7 +512,9 @@ __global__ void ppo_loss_fwd_bwd_kernel(
         block_losses[c][tid] = 0.0f;
     }
 
-    if (idx >= total_elements) goto reduce;
+    if (idx >= total_elements) {
+        goto reduce;
+    }
 
     {
     int n = idx / a.T_seq;
@@ -698,70 +563,19 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     }
     a.grad_values_pred[nt] = dL * a.vf_coef * d_val_pred;
 
-    // --- Policy loss + gradients (branch on continuous/discrete) ---
+    // --- Policy loss + gradients ---
 
-    if (a.is_continuous) {
-        float total_log_prob = 0.0f;
-        float total_entropy = 0.0f;
-        for (int h = 0; h < a.num_atns; ++h) {
-            float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
-            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
-            float action = float(g.actions[nt * a.num_atns + h]);
-            float lp, ent;
-            ppo_continuous_head(mean, log_std, action, &lp, &ent);
-            total_log_prob += lp;
-            total_entropy += ent;
-        }
+    float pg_loss, total_entropy, logratio, ratio;
+    float total_log_prob = 0.0f;
+    total_entropy = 0.0f;
 
-        float logratio = total_log_prob - old_logp;
-        float ratio = __expf(logratio);
-        g.out_ratio[nt] = from_float(ratio);
-        float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
-        float wa = -w * adv_normalized;
-        float pg_loss1 = wa * ratio;
-        float pg_loss2 = wa * ratio_clipped;
-        float pg_loss = fmaxf(pg_loss1, pg_loss2);
+    // Discrete-only: per-head arrays needed across forward + backward
+    float head_logsumexp[MAX_ATN_HEADS];
+    float head_entropy[MAX_ATN_HEADS];
+    int head_act[MAX_ATN_HEADS];
 
-        // Backward: policy gradient
-        float d_ratio = wa * d_pg_loss;
-        if (pg_loss2 > pg_loss1) {
-            if (ratio <= (1.0f - a.clip_coef) || ratio >= (1.0f + a.clip_coef)) {
-                d_ratio = 0.0f;
-            }
-        }
-        float d_new_logp = d_ratio * ratio;
-
-        for (int h = 0; h < a.num_atns; ++h) {
-            float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
-            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
-            float std = __expf(log_std);
-            float var = std * std;
-            float action = float(g.actions[nt * a.num_atns + h]);
-            float diff = action - mean;
-
-            a.grad_logits[grad_logits_base + h] = d_new_logp * diff / var;
-            a.grad_logstd[grad_logits_base + h] = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
-        }
-
-        // Forward: loss partials
-        float thread_loss = (pg_loss + a.vf_coef * v_loss - a.ent_coef * total_entropy) * inv_NT;
-        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-        block_losses[LOSS_TOTAL][tid] = thread_loss;
-        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
-        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
-        block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
-    } else {
-        // Discrete: compute per-head logsumexp, entropy, log_prob in one pass
-        float head_logsumexp[MAX_ATN_HEADS];
-        float head_entropy[MAX_ATN_HEADS];
-        int head_act[MAX_ATN_HEADS];
-
+    if (!a.is_continuous) {
         int logits_offset = 0;
-        float total_log_prob = 0.0f;
-        float total_entropy = 0.0f;
-
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
             int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
@@ -774,27 +588,38 @@ __global__ void ppo_loss_fwd_bwd_kernel(
             total_entropy += ent;
             logits_offset += A;
         }
-
-        float logratio = total_log_prob - old_logp;
-        float ratio = __expf(logratio);
-        g.out_ratio[nt] = from_float(ratio);
-        float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
-        float wa = -w * adv_normalized;
-        float pg_loss1 = wa * ratio;
-        float pg_loss2 = wa * ratio_clipped;
-        float pg_loss = fmaxf(pg_loss1, pg_loss2);
-
-        // Backward: policy gradient
-        float d_ratio = wa * d_pg_loss;
-        if (pg_loss2 > pg_loss1) {
-            if (ratio <= (1.0f - a.clip_coef) || ratio >= (1.0f + a.clip_coef)) {
-                d_ratio = 0.0f;
-            }
+    } else {
+        for (int h = 0; h < a.num_atns; ++h) {
+            float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
+            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
+            float action = float(g.actions[nt * a.num_atns + h]);
+            float lp, ent;
+            ppo_continuous_head(mean, log_std, action, &lp, &ent);
+            total_log_prob += lp;
+            total_entropy += ent;
         }
-        float d_new_logp = d_ratio * ratio;
+    }
 
-        // Gradient pass over logits (reuses head_logsumexp, head_entropy)
-        logits_offset = 0;
+    // Shared pg loss computation
+    logratio = total_log_prob - old_logp;
+    ratio = __expf(logratio);
+    g.out_ratio[nt] = from_float(ratio);
+    float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
+    float wa = -w * adv_normalized;
+    float pg_loss1 = wa * ratio;
+    float pg_loss2 = wa * ratio_clipped;
+    pg_loss = fmaxf(pg_loss1, pg_loss2);
+
+    float d_ratio = wa * d_pg_loss;
+    if (pg_loss2 > pg_loss1) {
+        if (ratio <= (1.0f - a.clip_coef) || ratio >= (1.0f + a.clip_coef)) {
+            d_ratio = 0.0f;
+        }
+    }
+    float d_new_logp = d_ratio * ratio;
+
+    if (!a.is_continuous) {
+        int logits_offset = 0;
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
             int act = head_act[h];
@@ -812,17 +637,29 @@ __global__ void ppo_loss_fwd_bwd_kernel(
             }
             logits_offset += A;
         }
+    } else {
+        for (int h = 0; h < a.num_atns; ++h) {
+            float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
+            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
+            float std = __expf(log_std);
+            float var = std * std;
+            float action = float(g.actions[nt * a.num_atns + h]);
+            float diff = action - mean;
 
-        // Forward: loss partials
-        float thread_loss = (pg_loss + a.vf_coef * v_loss - a.ent_coef * total_entropy) * inv_NT;
-        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-        block_losses[LOSS_TOTAL][tid] = thread_loss;
-        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
-        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
-        block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
+            a.grad_logits[grad_logits_base + h] = d_new_logp * diff / var;
+            a.grad_logstd[grad_logits_base + h] = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
+        }
     }
+
+    // Forward: loss partials
+    float thread_loss = (pg_loss + a.vf_coef * v_loss - a.ent_coef * total_entropy) * inv_NT;
+    block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+    block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+    block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
+    block_losses[LOSS_TOTAL][tid] = thread_loss;
+    block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
+    block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
+    block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
     } // end if (idx < total_elements)
 
 reduce:
@@ -854,7 +691,9 @@ __global__ void ppo_loss_reduce_kernel(
     int num_blocks
 ) {
     int tid = threadIdx.x;
-    if (tid > LOSS_N) return;
+    if (tid > LOSS_N) {
+        return;
+    }
 
     float sum = 0.0f;
     for (int b = 0; b < num_blocks; b++) {
@@ -872,8 +711,6 @@ __global__ void ppo_loss_reduce_kernel(
         losses_acc[LOSS_N] += 1.0f;
     }
 }
-
-
 
 // ============================================================================
 // Fused sample_logits kernel: nan_to_num + log_softmax + multinomial + gather + value copy
@@ -916,7 +753,9 @@ __global__ void sample_logits_kernel(
     const precision_t* value = logits + (fused_cols - 1);  // last column
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B) return;
+    if (idx >= B) {
+        return;
+    }
 
     // Read offset at execution time (important for CUDA graph replay)
     uint64_t offset = static_cast<uint64_t>(*offset_ptr);
@@ -960,8 +799,12 @@ __global__ void sample_logits_kernel(
             float max_val = -INFINITY;
             for (int a = 0; a < A; ++a) {
                 float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) l = 0.0f;
-                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                if (isnan(l)) {
+                    l = 0.0f;
+                }
+                if (isinf(l)) {
+                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                }
                 max_val = fmaxf(max_val, l);
             }
 
@@ -969,8 +812,12 @@ __global__ void sample_logits_kernel(
             float sum_exp = 0.0f;
             for (int a = 0; a < A; ++a) {
                 float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) l = 0.0f;
-                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                if (isnan(l)) {
+                    l = 0.0f;
+                }
+                if (isinf(l)) {
+                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                }
                 sum_exp += expf(l - max_val);
             }
             float logsumexp = max_val + logf(sum_exp);
@@ -984,8 +831,12 @@ __global__ void sample_logits_kernel(
 
             for (int a = 0; a < A; ++a) {
                 float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) l = 0.0f;
-                if (isinf(l)) l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                if (isnan(l)) {
+                    l = 0.0f;
+                }
+                if (isinf(l)) {
+                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                }
                 float prob = expf(l - logsumexp);
                 cumsum += prob;
                 if (rand_val < cumsum) {
@@ -996,8 +847,12 @@ __global__ void sample_logits_kernel(
 
             // Step 5: Gather log probability of sampled action
             float sampled_logit = to_float(logits[logits_base + logits_offset + sampled_action]);
-            if (isnan(sampled_logit)) sampled_logit = 0.0f;
-            if (isinf(sampled_logit)) sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
+            if (isnan(sampled_logit)) {
+                sampled_logit = 0.0f;
+            }
+            if (isinf(sampled_logit)) {
+                sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
+            }
             float log_prob = sampled_logit - logsumexp;
 
             // Write action for this head
@@ -1021,20 +876,15 @@ __global__ void sample_logits_kernel(
     }
 }
 
-
-
-
-
-#define SELECT_COPY_THREADS 256
-
 __device__ __forceinline__ void copy_bytes(
     const char* __restrict__ src, char* __restrict__ dst,
     int src_row, int dst_row, int row_bytes
 ) {
     const int* soffset = (const int*)(src + (int64_t)src_row * row_bytes);
     int* doffset = (int*)(dst + (int64_t)dst_row * row_bytes);
-    for (int i = threadIdx.x; i < row_bytes / 4; i += blockDim.x)
+    for (int i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
         doffset[i] = soffset[i];
+    }
 }
 
 __device__ __forceinline__ void copy_values_adv_returns(
@@ -1122,7 +972,9 @@ __global__ void compute_prio_adv_reduction(
     }
     if (tx == 0) {
         float pw = __powf(local_sum, prio_alpha);
-        if (isnan(pw) || isinf(pw)) pw = 0.0f;
+        if (isnan(pw) || isinf(pw)) {
+            pw = 0.0f;
+        }
         prio_weights[row] = pw;
     }
 }
@@ -1146,7 +998,9 @@ __global__ void compute_prio_normalize(
     for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
         local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s);
     }
-    if (lane == 0) shmem[warp_id] = local_sum;
+    if (lane == 0) {
+        shmem[warp_id] = local_sum;
+    }
     __syncthreads();
 
     if (warp_id == 0) {
@@ -1154,7 +1008,9 @@ __global__ void compute_prio_normalize(
         for (int s = PRIO_NUM_WARPS / 2; s >= 1; s /= 2) {
             val += __shfl_down_sync(PRIO_FULL_MASK, val, s);
         }
-        if (tx == 0) block_sum = val + eps;
+        if (tx == 0) {
+            block_sum = val + eps;
+        }
     }
     __syncthreads();
 
@@ -1180,16 +1036,6 @@ __global__ void compute_prio_imp_weights(
     }
 }
 
-
-// =============================================================================
-// Puff Advantage kernels (moved from cuda/advantage.cu)
-// =============================================================================
-
-// Advantage kernels: precision_t input, float output (advantages always f32)
-
-__device__ __forceinline__ float p2f(float x) { return x; }
-__device__ __forceinline__ float p2f(__nv_bfloat16 x) { return __bfloat162float(x); }
-
 __device__ void puff_advantage_row_scalar(
     const precision_t* values, const precision_t* rewards, const precision_t* dones,
     const precision_t* importance, float* advantages, float gamma, float lambda,
@@ -1198,11 +1044,14 @@ __device__ void puff_advantage_row_scalar(
     float lastpufferlam = 0;
     for (int t = horizon-2; t >= 0; t--) {
         int t_next = t + 1;
-        float nextnonterminal = 1.0f - p2f(dones[t_next]);
-        float imp = p2f(importance[t]);
+        float nextnonterminal = 1.0f - to_float(dones[t_next]);
+        float imp = to_float(importance[t]);
         float rho_t = fminf(imp, rho_clip);
         float c_t = fminf(imp, c_clip);
-        float delta = rho_t*(p2f(rewards[t_next]) + gamma*p2f(values[t_next])*nextnonterminal - p2f(values[t]));
+        float r_nxt = to_float(rewards[t_next]);
+        float v = to_float(values[t]);
+        float v_nxt = to_float(values[t_next]);
+        float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
         advantages[t] = lastpufferlam;
     }
@@ -1217,7 +1066,9 @@ __device__ __forceinline__ void adv_vec_load(const __nv_bfloat16* ptr, float* ou
     uint4 raw = *reinterpret_cast<const uint4*>(ptr);
     const __nv_bfloat16* bf = reinterpret_cast<const __nv_bfloat16*>(&raw);
     #pragma unroll
-    for (int i = 0; i < 8; i++) out[i] = __bfloat162float(bf[i]);
+    for (int i = 0; i < 8; i++) {
+        out[i] = __bfloat162float(bf[i]);
+    }
 }
 
 __device__ __forceinline__ void puff_advantage_row_vec(
@@ -1230,9 +1081,9 @@ __device__ __forceinline__ void puff_advantage_row_vec(
     float lastpufferlam = 0.0f;
     int num_chunks = horizon / N;
 
-    float next_value = p2f(values[horizon - 1]);
-    float next_done = p2f(dones[horizon - 1]);
-    float next_reward = p2f(rewards[horizon - 1]);
+    float next_value = to_float(values[horizon - 1]);
+    float next_done = to_float(dones[horizon - 1]);
+    float next_reward = to_float(rewards[horizon - 1]);
 
     for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
         int base = chunk * N;
@@ -1272,7 +1123,9 @@ __global__ void puff_advantage_kernel(const precision_t* values, const precision
         const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= num_steps) return;
+    if (row >= num_steps) {
+        return;
+    }
     int offset = row*horizon;
     puff_advantage_row_vec(values + offset, rewards + offset, dones + offset,
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
@@ -1282,36 +1135,47 @@ __global__ void puff_advantage_kernel_scalar(const precision_t* values, const pr
         const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= num_steps) return;
+    if (row >= num_steps) {
+        return;
+    }
     int offset = row*horizon;
     puff_advantage_row_scalar(values + offset, rewards + offset, dones + offset,
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
-
 
 // ============================================================================
 // Element-wise kernels (cast, fill, scale, norm, etc.)
 // Host wrappers live in models.cu
 // ============================================================================
 
-__global__ void cast_f32_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
+__global__ void cast_f32_to_precision_kernel(precision_t* __restrict__ dst,
+        const float* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = from_float(src[idx]);
+    if (idx < n) {
+        dst[idx] = from_float(src[idx]);
+    }
 }
 
 // Transpose dims 0,1: [A, B, C] -> [B, A, C]. For 2D, pass C=1.
-__global__ void transpose_102(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int A, int B, int C) {
+__global__ void transpose_102(precision_t* __restrict__ dst,
+        const precision_t* __restrict__ src, int A, int B, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = A * B * C;
-    if (idx >= total) return;
+    if (idx >= total) {
+        return;
+    }
     int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
 
-__global__ void transpose_102(double* __restrict__ dst, const double* __restrict__ src, int A, int B, int C) {
+// This exists for actions (currently fp64)
+__global__ void transpose_102(double* __restrict__ dst,
+        const double* __restrict__ src, int A, int B, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = A * B * C;
-    if (idx >= total) return;
+    if (idx >= total) {
+        return;
+    }
     int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
@@ -1320,11 +1184,20 @@ __global__ void norm_f32_kernel(float* __restrict__ partials, const float* __res
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) sum += src[i] * src[i];
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
+        sum += src[i] * src[i];
+    }
     sdata[tid] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
-    if (tid == 0) partials[blockIdx.x] = sdata[0];
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partials[blockIdx.x] = sdata[0];
+    }
 }
 
 __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
@@ -1332,15 +1205,24 @@ __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restr
     int tid = threadIdx.x;
     sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
-    if (tid == 0) *out = sdata[0];
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *out = sdata[0];
+    }
 }
 
 __global__ void clip_by_norm_f32_kernel(float* __restrict__ dst, const float* __restrict__ sum_sq_ptr,
                                          float max_norm, float eps, int n) {
     float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] *= clip_coef;
+    if (idx < n) {
+        dst[idx] *= clip_coef;
+    }
 }
 
 __global__ void norm_precision_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
@@ -1353,25 +1235,38 @@ __global__ void norm_precision_kernel(float* __restrict__ partials, const precis
     }
     sdata[tid] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
-    if (tid == 0) partials[blockIdx.x] = sdata[0];
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partials[blockIdx.x] = sdata[0];
+    }
 }
 
 __global__ void normalize_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
     float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
+    if (idx < n) {
+        dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
+    }
 }
 
 __global__ void cast_precision_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = to_float(src[idx]);
+    if (idx < n) {
+        dst[idx] = to_float(src[idx]);
+    }
 }
 
 // Input: (R, C) f32 → (M, N) precision_t, optionally transposing
 __global__ void cast_f32_to_precision_2d_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, bool do_transpose, int R, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= R * C) return;
+    if (idx >= R * C) {
+        return;
+    }
     int out_idx = do_transpose ? (idx % C) * R + idx / C : idx;
     dst[out_idx] = from_float(src[idx]);
 }
@@ -1379,19 +1274,26 @@ __global__ void cast_f32_to_precision_2d_kernel(precision_t* __restrict__ dst, c
 // Output: (M, N) precision_t → (R, C) f32, with scale, optionally transposing back
 __global__ void cast_precision_scale_to_f32_2d_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, float scale, bool do_transpose, int M, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * N) return;
+    if (idx >= M * N) {
+        return;
+    }
     int out_idx = do_transpose ? (idx % N) * M + idx / N : idx;
     dst[out_idx] = to_float(src[idx]) * scale;
 }
 
 __global__ void fill_precision_kernel(precision_t* __restrict__ dst, precision_t val, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = val;
+    if (idx < n) {
+        dst[idx] = val;
+    }
 }
 
 __global__ void clamp_precision_kernel(precision_t* __restrict__ dst, float lo, float hi, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) { float v = to_float(dst[idx]); dst[idx] = from_float(fminf(fmaxf(v, lo), hi)); }
+    if (idx < n) {
+        float v = to_float(dst[idx]);
+        dst[idx] = from_float(fminf(fmaxf(v, lo), hi));
+    }
 }
 
 // Fused Nesterov momentum: mb = mu*mb + gc; gc = gc + mu*mb
@@ -1417,20 +1319,28 @@ __global__ void muon_weight_update_kernel(float* __restrict__ wb, const float* _
 
 __global__ void add_precision_to_f32_kernel(float* __restrict__ dst, const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] += to_float(src[idx]);
+    if (idx < n) {
+        dst[idx] += to_float(src[idx]);
+    }
 }
 
 __global__ void add_precision_kernel(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
+    if (idx < n) {
+        dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
+    }
 }
 
 // Sum f32 rows → bf16 output (set, not accumulate)
 __global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int R, int C) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= C) return;
+    if (col >= C) {
+        return;
+    }
     float sum = 0.0f;
-    for (int r = 0; r < R; r++) sum += src[r * C + col];
+    for (int r = 0; r < R; r++) {
+        sum += src[r * C + col];
+    }
     dst[col] = from_float(sum);
 }
 
@@ -1438,7 +1348,9 @@ __global__ void assemble_decoder_grad_kernel(
     precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
     const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B_TT * od_plus_1) return;
+    if (idx >= B_TT * od_plus_1) {
+        return;
+    }
     int row = idx / od_plus_1, col = idx % od_plus_1;
     dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
 }
@@ -1448,19 +1360,38 @@ __global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) sum += src[i];
+    for (int i = tid; i < n; i += blockDim.x) {
+        sum += src[i];
+    }
     sdata[tid] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
     float mean = sdata[0] / (float)n;
-    if (tid == 0) *mean_out = mean;
+    if (tid == 0) {
+        *mean_out = mean;
+    }
     __syncthreads();
     float ss = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) { float d = src[i] - mean; ss += d * d; }
+    for (int i = tid; i < n; i += blockDim.x) {
+        float d = src[i] - mean;
+        ss += d * d;
+    }
     sdata[tid] = ss;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
-    if (tid == 0) *var_out = sdata[0] / (float)(n - 1);
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *var_out = sdata[0] / (float)(n - 1);
+    }
 }
 
 __global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restrict__ idx,
@@ -1475,7 +1406,9 @@ __global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restr
 __global__ void cast_u8_to_precision_kernel(precision_t* __restrict__ dst,
         const unsigned char* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = from_float((float)src[idx]);
+    if (idx < n) {
+        dst[idx] = from_float((float)src[idx]);
+    }
 }
 
 // Multinomial with replacement (uses cuRAND)
@@ -1486,7 +1419,10 @@ __global__ void multinomial_with_replacement_kernel(
     int tid = threadIdx.x;
     if (tid == 0) {
         float cum = 0.0f;
-        for (int i = 0; i < S; i++) { cum += probs[i]; cdf[i] = cum; }
+        for (int i = 0; i < S; i++) {
+            cum += probs[i];
+            cdf[i] = cum;
+        }
     }
     __syncthreads();
     if (tid < num_samples) {
@@ -1495,11 +1431,19 @@ __global__ void multinomial_with_replacement_kernel(
         curand_init(seed, base_off + tid, 0, &rng_state);
         float u = curand_uniform(&rng_state);
         int lo = 0, hi = S - 1;
-        while (lo < hi) { int mid = (lo + hi) / 2; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (cdf[mid] < u) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
         out_idx[tid] = lo;
     }
-    if (tid == 0) atomicAdd((unsigned long long*)offset_ptr, (unsigned long long)num_samples);
+    if (tid == 0) {
+        atomicAdd((unsigned long long*)offset_ptr, (unsigned long long)num_samples);
+    }
 }
-
 
 #endif // PUFFERLIB_KERNELS_CU
