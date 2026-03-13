@@ -293,3 +293,26 @@ static void* nmmo3_encoder_create_weights(void* self, int esz) {
     return nmmo3_encoder_create(e->in_dim, e->out_dim);
 }
 static void nmmo3_encoder_free_weights(void* weights) { free(weights); }
+
+// Override encoder vtable for known ocean environments. No-op for unknown envs.
+static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
+    if (env_name == "puffer_nmmo3") {
+        *enc = Encoder{
+            .forward = nmmo3_encoder_forward,
+            .backward = nmmo3_encoder_backward,
+            .init_weights = nmmo3_encoder_init_weights,
+            .reg_params = nmmo3_encoder_reg_params,
+            .reg_train = nmmo3_encoder_reg_train,
+            .reg_rollout = nmmo3_encoder_reg_rollout,
+            .create_weights = nmmo3_encoder_create_weights,
+            .free_weights = nmmo3_encoder_free_weights,
+            .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+        };
+    }
+}
+
+static void* alloc_encoder_activations(const Encoder& enc) {
+    return (enc.forward == nmmo3_encoder_forward)
+        ? calloc(1, sizeof(NMMO3EncoderActivations))
+        : calloc(1, sizeof(EncoderActivations));
+}

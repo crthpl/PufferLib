@@ -94,7 +94,7 @@ struct Muon {
     float* norm_ptr;
     float* grad_norm_ptr;
     PufTensor lr_puf, lr_derived_puf, ns_norm_puf, grad_norm_puf;
-    PufTensor weights, mb_puf;
+    PufTensor mb_puf;
     PufTensor gram, gram_buf, x_buf, norm_partials;
     long max_M, max_N;
     Allocator* param_alloc;  // fp32 params allocator — shapes used by muon_step
@@ -102,32 +102,31 @@ struct Muon {
     int world_size;
 };
 
-void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
+void muon_init(Muon* m, Allocator* param_alloc,
                double lr_val, double momentum, double eps, double weight_decay,
-               Allocator& alloc) {
+               Allocator* alloc) {
     m->momentum = momentum;
     m->weight_decay = weight_decay;
     m->eps = eps;
     m->lr_val_init = (float)lr_val;
     m->lr_ptr = nullptr;
     m->lr_derived_ptr = nullptr;
-    m->weights = weight_buffer;
     m->param_alloc = param_alloc;
     m->nccl_comm = nullptr;
     m->world_size = 1;
     m->max_M = 0; m->max_N = 0;
-    long n = m->weights.numel();
+    long n = param_alloc->total_elems;
     int f = sizeof(float);
     m->lr_puf = {.shape = {1}, .dtype_size = f};
     m->lr_derived_puf = {.shape = {2}, .dtype_size = f};
     m->mb_puf = {.shape = {n}, .dtype_size = f};
     m->norm_partials = {.shape = {256}, .dtype_size = f};
     m->grad_norm_puf = {.shape = {1}, .dtype_size = f};
-    alloc_register(&alloc,&m->lr_puf);
-    alloc_register(&alloc,&m->lr_derived_puf);
-    alloc_register(&alloc,&m->mb_puf);
-    alloc_register(&alloc,&m->norm_partials);
-    alloc_register(&alloc,&m->grad_norm_puf);
+    alloc_register(alloc, &m->lr_puf);
+    alloc_register(alloc, &m->lr_derived_puf);
+    alloc_register(alloc, &m->mb_puf);
+    alloc_register(alloc, &m->norm_partials);
+    alloc_register(alloc, &m->grad_norm_puf);
     long max_M = 0, max_N = 0;
     for (int _i = 0; _i < param_alloc->num_regs; _i++) {
         PufTensor* t = param_alloc->regs[_i];
@@ -144,10 +143,10 @@ void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
         m->gram_buf = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
         m->x_buf = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
         m->ns_norm_puf = {.shape = {1}, .dtype_size = f};
-        alloc_register(&alloc,&m->gram);
-        alloc_register(&alloc,&m->gram_buf);
-        alloc_register(&alloc,&m->x_buf);
-        alloc_register(&alloc,&m->ns_norm_puf);
+        alloc_register(alloc, &m->gram);
+        alloc_register(alloc, &m->gram_buf);
+        alloc_register(alloc, &m->x_buf);
+        alloc_register(alloc, &m->ns_norm_puf);
     }
 }
 
@@ -161,7 +160,7 @@ void muon_post_create(Muon* m) {
     cudaMemset(m->mb_puf.bytes, 0, m->mb_puf.numel() * sizeof(float));
 }
 
-void muon_step(Muon* m, PufTensor grads, float max_grad_norm, cudaStream_t stream = 0) {
+void muon_step(Muon* m, PufTensor weights, PufTensor grads, float max_grad_norm, cudaStream_t stream = 0) {
     // Multi-GPU support: simple all-reduce over a contiguous grad buffer
     if (m->nccl_comm != nullptr && m->world_size > 1) {
         ncclAllReduce(grads.bytes, grads.bytes, grads.numel(),
@@ -184,7 +183,7 @@ void muon_step(Muon* m, PufTensor grads, float max_grad_norm, cudaStream_t strea
     for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
         PufTensor* t = m->param_alloc->regs[_i];
         precision_t* gc_ptr = (precision_t*)grads.bytes + offset;
-        float* wb_ptr = (float*)m->weights.bytes + offset;
+        float* wb_ptr = (float*)weights.bytes + offset;
         long numel = t->numel();
         const precision_t* update_ptr = gc_ptr;
         float scale = 1.0f;

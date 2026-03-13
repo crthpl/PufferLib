@@ -407,6 +407,13 @@ struct Policy {
 struct PolicyActivations { void* encoder; void* decoder; void* network; };
 struct PolicyWeights { void* encoder; void* decoder; void* network; };
 
+static void policy_activations_free(PolicyActivations& a) {
+    free(a.encoder);
+    free(a.decoder);
+    ((MinGRUActivations*)a.network)->~MinGRUActivations();
+    free(a.network);
+}
+
 PufTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& activations,
         PufTensor obs, PufTensor state, cudaStream_t stream) {
     PufTensor enc_out = p->encoder.forward(w.encoder, activations.encoder, obs, stream);
@@ -432,11 +439,42 @@ void policy_backward(Policy* p, PolicyWeights& w, PolicyActivations& activations
     p->encoder.backward(w.encoder, activations.encoder, grad_h, stream);
 }
 
-PolicyWeights policy_weights_create(Policy* p, int esz) {
+PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w, Allocator* acts, Allocator* grads, int B_TT) {
+    PolicyActivations a;
+    a.encoder = alloc_encoder_activations(p->encoder);
+    a.decoder = calloc(1, sizeof(DecoderActivations));
+    a.network = calloc(1, sizeof(MinGRUActivations));
+    p->encoder.reg_train(w.encoder, a.encoder, acts, grads, B_TT);
+    p->decoder.reg_train(w.decoder, a.decoder, acts, grads, B_TT);
+    p->network.reg_train(w.network, a.network, acts, grads, B_TT);
+    return a;
+}
+
+PolicyActivations policy_reg_rollout(Policy* p, PolicyWeights& w, Allocator* acts, int B_inf) {
+    PolicyActivations a;
+    a.encoder = alloc_encoder_activations(p->encoder);
+    a.decoder = calloc(1, sizeof(DecoderActivations));
+    a.network = calloc(1, sizeof(MinGRUActivations));
+    p->encoder.reg_rollout(w.encoder, a.encoder, acts, B_inf);
+    p->decoder.reg_rollout(w.decoder, a.decoder, acts, B_inf);
+    p->network.reg_rollout(w.network, a.network, acts, B_inf);
+    return a;
+}
+
+void policy_init_weights(Policy* p, PolicyWeights& w, uint64_t* seed, cudaStream_t stream) {
+    p->encoder.init_weights(w.encoder, seed, stream);
+    p->decoder.init_weights(w.decoder, seed, stream);
+    p->network.init_weights(w.network, seed, stream);
+}
+
+PolicyWeights policy_weights_create(Policy* p, int esz, Allocator* params) {
     PolicyWeights w;
     w.encoder = p->encoder.create_weights(&p->encoder, esz);
     w.decoder = p->decoder.create_weights(&p->decoder, esz);
     w.network = p->network.create_weights(&p->network, esz);
+    p->encoder.reg_params(w.encoder, params, esz);
+    p->decoder.reg_params(w.decoder, params, esz);
+    p->network.reg_params(w.network, params, esz);
     return w;
 }
 

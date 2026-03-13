@@ -1341,32 +1341,29 @@ struct Allocator {
     int num_regs = 0;
     void* mem = nullptr;
     long total_elems = 0;
+    long total_bytes = 0;
 };
 
 void alloc_register(Allocator* alloc, PufTensor* ptr) {
     alloc->regs = (PufTensor**)realloc(alloc->regs, (alloc->num_regs + 1) * sizeof(PufTensor*));
     alloc->regs[alloc->num_regs++] = ptr;
+    alloc->total_elems += ptr->numel();
+    alloc->total_bytes = (alloc->total_bytes + 15) & ~15;
+    alloc->total_bytes += ptr->numel() * ptr->dtype_size;
 }
 
 void alloc_create(Allocator* alloc) {
-    long total_bytes = 0;
-    alloc->total_elems = 0;
+    if (alloc->total_bytes == 0) {
+        return;
+    }
+    cudaMalloc(&alloc->mem, alloc->total_bytes);
+    cudaMemset(alloc->mem, 0, alloc->total_bytes);
+    long offset = 0;
     for (int i = 0; i < alloc->num_regs; i++) {
         PufTensor* t = alloc->regs[i];
-        total_bytes = (total_bytes + 15) & ~15;  // align each tensor to 16 bytes
-        total_bytes += t->numel() * t->dtype_size;
-        alloc->total_elems += t->numel();
-    }
-    if (total_bytes > 0) {
-        cudaMalloc(&alloc->mem, total_bytes);
-        cudaMemset(alloc->mem, 0, total_bytes);
-        long offset = 0;
-        for (int i = 0; i < alloc->num_regs; i++) {
-            PufTensor* t = alloc->regs[i];
-            offset = (offset + 15) & ~15;  // align each tensor to 16 bytes
-            t->bytes = (char*)alloc->mem + offset;
-            offset += t->numel() * t->dtype_size;
-        }
+        offset = (offset + 15) & ~15;
+        t->bytes = (char*)alloc->mem + offset;
+        offset += t->numel() * t->dtype_size;
     }
 }
 
@@ -1377,31 +1374,23 @@ void alloc_free(Allocator* alloc) {
     alloc->total_elems = 0;
 }
 
-// Groups 3 allocators for policy: params, grads, activations
-struct AllocSet {
-    Allocator params, grads, acts;
-    int esz = 0;  // element size for params/grads
-};
-
-void allocset_create(AllocSet* a) { alloc_create(&a->params); alloc_create(&a->grads); alloc_create(&a->acts); }
-void allocset_free(AllocSet* a) { alloc_free(&a->params); alloc_free(&a->grads); alloc_free(&a->acts); }
 
 // Pre-allocated buffers for prio_replay
 struct PrioBuffers {
     PufTensor prio_probs, cdf, idx, mb_prio;
 };
 
-void register_prio_buffers(PrioBuffers& bufs, Allocator& alloc, int S, int minibatch_segments) {
+void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minibatch_segments) {
     bufs = (PrioBuffers){
         .prio_probs = {.shape = {S}, .dtype_size = sizeof(float)},
         .cdf = {.shape = {S}, .dtype_size = sizeof(float)},
         .idx = {.shape = {minibatch_segments}, .dtype_size = sizeof(long)},
         .mb_prio = {.shape = {minibatch_segments, 1}, .dtype_size = sizeof(float)},
     };
-    alloc_register(&alloc,&bufs.prio_probs);
-    alloc_register(&alloc,&bufs.cdf);
-    alloc_register(&alloc,&bufs.idx);
-    alloc_register(&alloc,&bufs.mb_prio);
+    alloc_register(alloc, &bufs.prio_probs);
+    alloc_register(alloc, &bufs.cdf);
+    alloc_register(alloc, &bufs.idx);
+    alloc_register(alloc, &bufs.mb_prio);
 }
 
 // Pre-allocated buffers for PPO loss
@@ -1410,7 +1399,7 @@ struct PPOBuffersPuf {
     PufTensor grad_logits, grad_values, grad_logstd, adv_scratch;
 };
 
-void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
+void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
     long total = (long)N * T;
     int f = sizeof(float);
     bufs = (PPOBuffersPuf){
@@ -1422,21 +1411,16 @@ void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator& alloc, int N, int T, i
         .grad_logstd = {.shape = {N, T, A_total}, .dtype_size = f},
         .adv_scratch = {.shape = {2}, .dtype_size = f},
     };
-    alloc_register(&alloc,&bufs.loss_output);
-    alloc_register(&alloc,&bufs.saved_for_bwd);
-    alloc_register(&alloc,&bufs.grad_loss);
-    alloc_register(&alloc,&bufs.grad_logits);
-    alloc_register(&alloc,&bufs.grad_values);
-    if (is_continuous) alloc_register(&alloc,&bufs.grad_logstd);
-    alloc_register(&alloc,&bufs.adv_scratch);
+    alloc_register(alloc, &bufs.loss_output);
+    alloc_register(alloc, &bufs.saved_for_bwd);
+    alloc_register(alloc, &bufs.grad_loss);
+    alloc_register(alloc, &bufs.grad_logits);
+    alloc_register(alloc, &bufs.grad_values);
+    if (is_continuous) alloc_register(alloc, &bufs.grad_logstd);
+    alloc_register(alloc, &bufs.adv_scratch);
 }
 
-void post_create_ppo_buffers(PPOBuffersPuf& bufs) {
-    float one = 1.0f;
-    cudaMemcpy(bufs.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
-}
-
-void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int H, int S, int input_size, int num_atns) {
+void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, int input_size, int num_atns) {
     int p = PRECISION_SIZE;
     bufs = (RolloutBuf){
         .observations = {.shape = {H, S, input_size}, .dtype_size = p},
@@ -1448,17 +1432,17 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int H, int S, 
         .ratio = {.shape = {H, S}, .dtype_size = p},
         .importance = {.shape = {H, S}, .dtype_size = p},
     };
-    alloc_register(&alloc,&bufs.observations);
-    alloc_register(&alloc,&bufs.actions);
-    alloc_register(&alloc,&bufs.values);
-    alloc_register(&alloc,&bufs.logprobs);
-    alloc_register(&alloc,&bufs.rewards);
-    alloc_register(&alloc,&bufs.terminals);
-    alloc_register(&alloc,&bufs.ratio);
-    alloc_register(&alloc,&bufs.importance);
+    alloc_register(alloc, &bufs.observations);
+    alloc_register(alloc, &bufs.actions);
+    alloc_register(alloc, &bufs.values);
+    alloc_register(alloc, &bufs.logprobs);
+    alloc_register(alloc, &bufs.rewards);
+    alloc_register(alloc, &bufs.terminals);
+    alloc_register(alloc, &bufs.ratio);
+    alloc_register(alloc, &bufs.importance);
 }
 
-void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, int input_size,
+void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int S, int H, int input_size,
         int hidden_size, int num_atns, int num_layers) {
     int p = PRECISION_SIZE;
     bufs = (TrainGraph){
@@ -1473,16 +1457,16 @@ void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, in
         .mb_ratio = {.shape = {S, H}, .dtype_size = p},
         .mb_newvalue = {.shape = {S, H, 1}, .dtype_size = p},
     };
-    alloc_register(&alloc,&bufs.mb_obs);
-    alloc_register(&alloc,&bufs.mb_state);
-    alloc_register(&alloc,&bufs.mb_actions);
-    alloc_register(&alloc,&bufs.mb_logprobs);
-    alloc_register(&alloc,&bufs.mb_advantages);
-    alloc_register(&alloc,&bufs.mb_prio);
-    alloc_register(&alloc,&bufs.mb_values);
-    alloc_register(&alloc,&bufs.mb_returns);
-    alloc_register(&alloc,&bufs.mb_ratio);
-    alloc_register(&alloc,&bufs.mb_newvalue);
+    alloc_register(alloc, &bufs.mb_obs);
+    alloc_register(alloc, &bufs.mb_state);
+    alloc_register(alloc, &bufs.mb_actions);
+    alloc_register(alloc, &bufs.mb_logprobs);
+    alloc_register(alloc, &bufs.mb_advantages);
+    alloc_register(alloc, &bufs.mb_prio);
+    alloc_register(alloc, &bufs.mb_values);
+    alloc_register(alloc, &bufs.mb_returns);
+    alloc_register(alloc, &bufs.mb_ratio);
+    alloc_register(alloc, &bufs.mb_newvalue);
 }
 
 // ============================================================================

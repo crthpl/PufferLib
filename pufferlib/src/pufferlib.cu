@@ -10,7 +10,6 @@
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <nccl.h>
-#include <unistd.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvml.h>
 
@@ -50,11 +49,11 @@ struct RawCudaGraph {
 // For a 2D (H, S) tensor: returns a view of shape (count,) at offset t*S + start.
 inline PufTensor puf_slice(PufTensor& p, int t, int start, int count) {
     if (p.ndim() == 3) {
-        int64_t S = p.shape[1], F = p.shape[2];
+        long S = p.shape[1], F = p.shape[2];
         return {.bytes = p.bytes + (t*S + start)*F*p.dtype_size,
             .shape = {count, F}, .dtype_size = p.dtype_size};
     } else {
-        int64_t S = p.shape[1];
+        long S = p.shape[1];
         return {.bytes = p.bytes + (t*S + start)*p.dtype_size,
             .shape = {count}, .dtype_size = p.dtype_size};
     }
@@ -150,7 +149,7 @@ typedef struct {
     int rank;
     int world_size;
     int gpu_id;
-    std::string nccl_id_path;
+    std::string nccl_id;  // raw bytes of ncclUniqueId (empty for single-GPU)
     // Threading
     int num_threads;
     int seed;
@@ -180,19 +179,19 @@ typedef struct {
 } ProfileT;
 
 typedef struct {
-    Policy* policy;
+    Policy policy;
     PolicyWeights weights;       // current precision_t weights (structured)
     PolicyActivations train_activations;
-    AllocSet alloc;              // precision_t params + acts + grads
-    Allocator pufferl_alloc;
+    Allocator params_alloc;
+    Allocator grads_alloc;
+    Allocator activations_alloc;
     StaticVec* vec;
-    Muon* muon;
+    Muon muon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     PufTensor* buffer_states;  // Per-buffer states for contiguous access
     PolicyActivations* buffer_activations;  // Per-buffer inference activations
-    Allocator* buffer_allocs;        // Per-buffer allocators for inference buffers
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
@@ -207,8 +206,8 @@ typedef struct {
     PPOBuffersPuf ppo_bufs_puf; // Pre-allocated buffers for PufTensor ppo_loss_fwd_bwd (kernels path)
     PrioBuffers prio_bufs;      // Pre-allocated buffers for PufTensor prio_replay (kernels path)
     PufTensor master_weights;    // fp32 master weights (flat); same buffer as param_puf in fp32 mode
-    PufTensor param_puf;         // flat precision_t view of alloc.params
-    PufTensor grad_puf;          // flat precision_t view of alloc.grads
+    PufTensor param_puf;
+    PufTensor grad_puf;
     PufTensor rng_offset_puf;    // (num_buffers+1,) int64 CUDA device counters, one per buffer + one for training
     ProfileT profile;
     nvmlDevice_t nvml_device;
@@ -220,8 +219,7 @@ typedef struct {
     int train_warmup;
     bool rollout_captured;
     bool train_captured;
-    bool is_nmmo3;
-    uint64_t seed;
+    ulong seed;
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -284,7 +282,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     // Copy env data to rollout buffer (contiguous slices -> cudaMemcpyAsync)
     PufTensor& obs_env = env.obs;
     PufTensor obs_src = {
-        .bytes = obs_env.bytes + (int64_t)start*obs_env.shape[1]*obs_env.dtype_size,
+        .bytes = obs_env.bytes + (long)start*obs_env.shape[1]*obs_env.dtype_size,
         .shape = {block_size, obs_env.shape[1]},
         .dtype_size = obs_env.dtype_size
     };
@@ -320,7 +318,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Forward pass — obs_dst already contains the cast obs in precision_t
     PufTensor state_puf = pufferl->buffer_states[buf];
-    PufTensor dec_puf = policy_forward(pufferl->policy, pufferl->weights, pufferl->buffer_activations[buf], obs_dst, state_puf, stream);
+    PufTensor dec_puf = policy_forward(&pufferl->policy, pufferl->weights, pufferl->buffer_activations[buf], obs_dst, state_puf, stream);
 
     // Sample actions, logprobs, values into rollout buffer
     PufTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
@@ -334,15 +332,15 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     }
 
     // Each buffer uses its own RNG seed and offset slot for deterministic parallel rollouts
-    int64_t* buf_rng_offset = (int64_t*)pufferl->rng_offset_puf.bytes + buf;
-    uint64_t buf_rng_seed = pufferl->seed + buf;
+    long* buf_rng_offset = (long*)pufferl->rng_offset_puf.bytes + buf;
+    ulong buf_rng_seed = pufferl->seed + buf;
     sample_logits_kernel<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
         dec_puf, p_logstd, pufferl->act_sizes_puf,
         (double*)act_slice.bytes, (precision_t*)lp_slice.bytes, (precision_t*)val_slice.bytes,
         buf_rng_seed, buf_rng_offset);
 
     // Copy actions to env
-    int64_t act_cols = env.actions.shape[1];
+    long act_cols = env.actions.shape[1];
     cudaMemcpyAsync(
         env.actions.bytes + start * act_cols * env.actions.dtype_size,
         act_slice.bytes, act_slice.numel() * act_slice.dtype_size, cudaMemcpyDeviceToDevice, stream);
@@ -422,7 +420,7 @@ void train_impl(PuffeRL& pufferl) {
     bool anneal_lr = hypers.anneal_lr;
     int current_epoch = pufferl.epoch;
 
-    Muon* muon = pufferl.muon;
+    Muon* muon = &pufferl.muon;
 
     int total_epochs = hypers.total_timesteps / batch_size;
 
@@ -452,7 +450,7 @@ void train_impl(PuffeRL& pufferl) {
 
         profile_begin("compute_prio", hypers.profile);
         // Use the training RNG offset slot (last slot, index num_buffers)
-        int64_t* train_rng_offset = (int64_t*)pufferl.rng_offset_puf.bytes + hypers.num_buffers;
+        long* train_rng_offset = (long*)pufferl.rng_offset_puf.bytes + hypers.num_buffers;
         prio_replay_cuda(advantages_puf, prio_alpha, minibatch_segments,
             hypers.total_agents, anneal_beta,
             pufferl.prio_bufs, pufferl.seed, train_rng_offset, train_stream);
@@ -465,7 +463,7 @@ void train_impl(PuffeRL& pufferl) {
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
             select_copy_kernel<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
-                sel_src, graph, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                sel_src, graph, (const long*)pufferl.prio_bufs.idx.bytes,
                 (const float*)advantages_puf.bytes, (const float*)pufferl.prio_bufs.mb_prio.bytes);
         }
         profile_end(hypers.profile);
@@ -484,7 +482,7 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = cap_stream_raw;
             PufTensor obs_puf = graph.mb_obs;
             PufTensor state_puf = graph.mb_state;
-            PufTensor dec_puf = policy_forward_train(pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
+            PufTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             int od = dw_train->output_dim;
             int fused_cols = od + 1;
@@ -502,10 +500,10 @@ void train_impl(PuffeRL& pufferl) {
             PufTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
             PufTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : PufTensor();
             PufTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
-            policy_backward(pufferl.policy, pufferl.weights, pufferl.train_activations,
+            policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            muon_step(pufferl.muon, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
             if (USE_BF16) {
                 puf_cast_f32_to_bf16(pufferl.param_puf, pufferl.master_weights, stream);
             }
@@ -527,7 +525,7 @@ void train_impl(PuffeRL& pufferl) {
             int num_idx = pufferl.prio_bufs.idx.numel();
             int row_bytes = graph.mb_ratio.numel() / graph.mb_ratio.shape[0] * graph.mb_ratio.dtype_size;
             index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
-                rollouts.ratio.bytes, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                rollouts.ratio.bytes, (const long*)pufferl.prio_bufs.idx.bytes,
                 (const char*)graph.mb_ratio.bytes, num_idx, row_bytes);
         }
         // mb_newvalue is (S, H, 1) — treat as (S, H) for scatter into rollouts.values
@@ -536,7 +534,7 @@ void train_impl(PuffeRL& pufferl) {
             int S = graph.mb_newvalue.shape[0], H = graph.mb_newvalue.shape[1];
             int row_bytes = H * graph.mb_newvalue.dtype_size;
             index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
-                rollouts.values.bytes, (const int64_t*)pufferl.prio_bufs.idx.bytes,
+                rollouts.values.bytes, (const long*)pufferl.prio_bufs.idx.bytes,
                 (const char*)graph.mb_newvalue.bytes, num_idx, row_bytes);
         }
         cudaEventRecord(pufferl.profile.events[4]);  // end forward
@@ -570,28 +568,10 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     // Multi-GPU: initialize NCCL
     if (hypers.world_size > 1) {
+        if (hypers.nccl_id.size() != sizeof(ncclUniqueId))
+            throw std::runtime_error("nccl_id must be " + std::to_string(sizeof(ncclUniqueId)) + " bytes");
         ncclUniqueId nccl_id;
-        if (hypers.rank == 0) {
-            ncclGetUniqueId(&nccl_id);
-            FILE* f = fopen(hypers.nccl_id_path.c_str(), "wb");
-            fwrite(&nccl_id, sizeof(nccl_id), 1, f);
-            fclose(f);
-        }
-        // Wait for rank 0 to write the ID file
-        while (access(hypers.nccl_id_path.c_str(), F_OK) != 0) {
-            usleep(10000);  // 10ms
-        }
-        if (hypers.rank != 0) {
-            // Small delay to ensure file is fully written
-            usleep(50000);
-            FILE* f = fopen(hypers.nccl_id_path.c_str(), "rb");
-            if (fread(&nccl_id, sizeof(nccl_id), 1, f) != 1) {
-                fclose(f);
-                throw std::runtime_error("Failed to read NCCL ID file");
-            }
-            fclose(f);
-        }
-
+        memcpy(&nccl_id, hypers.nccl_id.data(), sizeof(nccl_id));
         ncclCommInitRank(&pufferl->nccl_comm, hypers.world_size, nccl_id, hypers.rank);
         printf("Rank %d/%d: NCCL initialized\n", hypers.rank, hypers.world_size);
     }
@@ -599,7 +579,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // Use CUDA default stream (stream 0) for main-thread work
     pufferl->default_stream = 0;
 
-    uint64_t seed = hypers.seed + hypers.rank;
+    ulong seed = hypers.seed + hypers.rank;
     pufferl->seed = seed;
 
     // Load environment first to get input_size and action info from env
@@ -611,28 +591,16 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int num_action_heads = pufferl->env.actions.shape[1];
     int* raw_act_sizes = get_act_sizes();  // CPU int32 pointer from env
     int act_n = 0;
-    for (int i = 0; i < num_action_heads; i++) {
-        act_n += raw_act_sizes[i];
-    }
-
-    for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
-        cudaEventCreate(&pufferl->profile.events[i]);
-    }
-    memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
-
-    nvmlInit();
-    nvmlDeviceGetHandleByIndex(hypers.gpu_id, &pufferl->nvml_device);
-
-    // Determine action space type
-    int* act_sizes_ptr = get_act_sizes();
     int num_continuous = 0;
     int num_discrete = 0;
     for (int i = 0; i < num_action_heads; i++) {
-        if (act_sizes_ptr[i] == 1) {
+        int val = raw_act_sizes[i];
+        if (val == 1) {
             num_continuous++;
         } else {
             num_discrete++;
         }
+        act_n += val;
     }
     assert((num_continuous == 0 || num_discrete == 0) &&
         "Mixed continuous/discrete action spaces not supported");
@@ -642,6 +610,14 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     } else {
         printf("Detected discrete action space with %d heads\n", num_action_heads);
     }
+
+    for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
+        cudaEventCreate(&pufferl->profile.events[i]);
+    }
+    memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
+
+    nvmlInit();
+    nvmlDeviceGetHandleByIndex(hypers.gpu_id, &pufferl->nvml_device);
 
     int input_size = pufferl->env.obs.shape[1];
     int hidden_size = hypers.hidden_size;
@@ -655,20 +631,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int inf_batch = vec->total_agents / hypers.num_buffers;
 
 
-    bool is_nmmo3 = (env_name == "puffer_nmmo3");
-    pufferl->is_nmmo3 = is_nmmo3;
-
-    Encoder encoder = is_nmmo3 ? Encoder{
-        .forward = nmmo3_encoder_forward,
-        .backward = nmmo3_encoder_backward,
-        .init_weights = nmmo3_encoder_init_weights,
-        .reg_params = nmmo3_encoder_reg_params,
-        .reg_train = nmmo3_encoder_reg_train,
-        .reg_rollout = nmmo3_encoder_reg_rollout,
-        .create_weights = nmmo3_encoder_create_weights,
-        .free_weights = nmmo3_encoder_free_weights,
-        .in_dim = input_size, .out_dim = hidden_size,
-    } : Encoder{
+    Encoder encoder = {
         .forward = encoder_forward,
         .backward = encoder_backward,
         .init_weights = encoder_init_weights,
@@ -679,6 +642,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .free_weights = encoder_free_weights,
         .in_dim = input_size, .out_dim = hidden_size,
     };
+    create_custom_encoder(env_name, &encoder);
     Decoder decoder = {
         .forward = decoder_forward,
         .backward = decoder_backward,
@@ -702,153 +666,91 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .free_weights = mingru_free_weights,
         .hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon,
     };
-
-    // Policy vtables (shared across fp32/bf16)
-    pufferl->policy = (Policy*)malloc(sizeof(Policy));
-    *pufferl->policy = Policy{
+    pufferl->policy = Policy{
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
         .num_atns = act_n,
     };
 
-    // ========================================================================
-    // Weights + activations + grads — single alloc in precision_t
-    // ========================================================================
-
     int B_TT = minibatch_segments * hypers.horizon;
     int psz = PRECISION_SIZE;
-
-    pufferl->alloc.esz = psz;
-    Allocator& params = pufferl->alloc.params;
-    Allocator& acts   = pufferl->alloc.acts;
-    Allocator& grads  = pufferl->alloc.grads;
-
-    pufferl->weights = policy_weights_create(pufferl->policy, psz);
-
-    encoder.reg_params(pufferl->weights.encoder, &params, psz);
-    decoder.reg_params(pufferl->weights.decoder, &params, psz);
-    network.reg_params(pufferl->weights.network, &params, psz);
-
-    PolicyActivations& tb = pufferl->train_activations;
-    tb.encoder = is_nmmo3 ? (void*)new NMMO3EncoderActivations{} : (void*)new EncoderActivations{};
-    tb.decoder = new DecoderActivations{};
-    tb.network = new MinGRUActivations{};
-    encoder.reg_train(pufferl->weights.encoder, tb.encoder, &acts, &grads, B_TT);
-    decoder.reg_train(pufferl->weights.decoder, tb.decoder, &acts, &grads, B_TT);
-    network.reg_train(pufferl->weights.network, tb.network, &acts, &grads, B_TT);
-
-    allocset_create(&pufferl->alloc);
-    pufferl->param_puf = {.bytes = (char*)params.mem, .shape = {params.total_elems}, .dtype_size = psz};
-    pufferl->grad_puf  = {.bytes = (char*)grads.mem,  .shape = {grads.total_elems},  .dtype_size = psz};
-
-    // Init weights directly in precision_t
-    encoder.init_weights(pufferl->weights.encoder, &seed, pufferl->default_stream);
-    decoder.init_weights(pufferl->weights.decoder, &seed, pufferl->default_stream);
-    network.init_weights(pufferl->weights.network, &seed, pufferl->default_stream);
-
-    // master_weights (fp32): alias param_puf in fp32 mode; separate cudaMalloc in bf16 mode
-    if (USE_BF16) {
-        float* mw;
-        cudaMalloc(&mw, params.total_elems * sizeof(float));
-        pufferl->master_weights = {.bytes = (char*)mw, .shape = {params.total_elems}, .dtype_size = 4};
-        puf_cast_precision_to_f32(pufferl->master_weights, pufferl->param_puf, pufferl->default_stream);
-    } else {
-        pufferl->master_weights = pufferl->param_puf;
-    }
-
-    // ========================================================================
-    // Optimizer (Muon) — operates on fp32 master weights
-    // ========================================================================
-
-    // Muon reads param shapes directly from alloc.params
-
-    float lr = hypers.lr;
-    float beta1 = hypers.beta1;
-    float eps = hypers.eps;
-    pufferl->muon = new Muon{};
-    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weights.numel());
-
     int horizon = hypers.horizon;
     int total_agents = vec->total_agents;
     int batch = total_agents / hypers.num_buffers;
     int num_buffers = hypers.num_buffers;
 
-    printf("DEBUG: num_envs=%d, total_agents=%d, batch=%d, num_buffers=%d\n",
-        vec->size, total_agents, batch, num_buffers);
+    // Create and allocate params
+    Allocator* params = &pufferl->params_alloc;
+    Allocator* acts = &pufferl->activations_alloc;
+    Allocator* grads = &pufferl->grads_alloc;
 
-    // ========================================================================
-    // Register all init-to-close buffers into pufferl_alloc, then create once
-    // ========================================================================
-    Allocator& alloc = pufferl->pufferl_alloc;
-
-    // Misc scalars
-    int p = PRECISION_SIZE;
-    pufferl->rng_offset_puf = {.shape = {num_buffers + 1}, .dtype_size = (int)sizeof(int64_t)};
-    pufferl->act_sizes_puf = {.shape = {num_action_heads}, .dtype_size = (int)sizeof(int32_t)};
-    pufferl->losses_puf = {.shape = {NUM_LOSSES}, .dtype_size = (int)sizeof(float)};
-    alloc_register(&alloc,&pufferl->rng_offset_puf);
-    alloc_register(&alloc,&pufferl->act_sizes_puf);
-    alloc_register(&alloc,&pufferl->losses_puf);
-
-    // Per-buffer RNN states
-    pufferl->buffer_states = (PufTensor*)calloc(num_buffers, sizeof(PufTensor));
-    for (int i = 0; i < num_buffers; i++) {
-        pufferl->buffer_states[i] = {.shape = {num_layers, batch, hidden_size}, .dtype_size = p};
-        alloc_register(&alloc,&pufferl->buffer_states[i]);
-    }
-
-    // Rollout buffers (horizon, total_agents, ...)
-    register_rollout_buffers(pufferl->rollouts, alloc, horizon, total_agents, input_size, num_action_heads);
-
-    // Train graph buffers
-    register_train_buffers(pufferl->train_buf, alloc, minibatch_segments, horizon, input_size,
-        hidden_size, num_action_heads, num_layers);
-
-    // Pre-allocated transposed rollouts for train_impl (total_agents, horizon, ...)
-    register_rollout_buffers(pufferl->train_rollouts, alloc, total_agents, horizon, input_size, num_action_heads);
-
-    // Pre-allocated train temporaries
-    pufferl->advantages_puf = {.shape = {total_agents, horizon}, .dtype_size = (int)sizeof(float)};
-    alloc_register(&alloc,&pufferl->advantages_puf);
-
-    // PPO loss buffers
-    register_ppo_buffers(pufferl->ppo_bufs_puf, alloc, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
-
-    // Priority replay buffers
-    register_prio_buffers(pufferl->prio_bufs, alloc, hypers.total_agents, minibatch_segments);
-
-    // Muon optimizer (init + register buffers)
-    muon_init(pufferl->muon, &params,
-        pufferl->master_weights, lr, beta1, eps, 0.0, alloc);
-    pufferl->muon->nccl_comm = pufferl->nccl_comm;
-    pufferl->muon->world_size = hypers.world_size;
-    printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weights.numel());
-
-    // Single allocation for all registered buffers
-    alloc_create(&alloc);
-
-    // Post-create initialization: copy data, set constants
-    cudaMemset(pufferl->rng_offset_puf.bytes, 0, (num_buffers + 1) * sizeof(int64_t));
-    cudaMemcpy(pufferl->act_sizes_puf.bytes, raw_act_sizes, num_action_heads * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemset(pufferl->losses_puf.bytes, 0, NUM_LOSSES * sizeof(float));
-    post_create_ppo_buffers(pufferl->ppo_bufs_puf);
-    muon_post_create(pufferl->muon);
-
-    // Per-buffer inference activations (separate allocators — different lifetime)
+    // Buffers for weights, grads, and activations
+    pufferl->weights = policy_weights_create(&pufferl->policy, psz, params);
+    pufferl->train_activations = policy_reg_train(&pufferl->policy, pufferl->weights, acts, grads, B_TT);
     pufferl->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
-    pufferl->buffer_allocs = (Allocator*)calloc(num_buffers, sizeof(Allocator));
-    // Register and allocate per-buffer inference activations
+    pufferl->buffer_states = (PufTensor*)calloc(num_buffers, sizeof(PufTensor));
+    int p = PRECISION_SIZE;
     for (int i = 0; i < num_buffers; i++) {
-        PolicyActivations& rbuf = pufferl->buffer_activations[i];
-        Allocator& ralloc = pufferl->buffer_allocs[i];
-        rbuf.encoder = is_nmmo3 ? (void*)new NMMO3EncoderActivations{} : (void*)new EncoderActivations{};
-        rbuf.decoder = new DecoderActivations{};
-        rbuf.network = new MinGRUActivations{};
-        encoder.reg_rollout(pufferl->weights.encoder, rbuf.encoder, &ralloc, inf_batch);
-        decoder.reg_rollout(pufferl->weights.decoder, rbuf.decoder, &ralloc, inf_batch);
-        network.reg_rollout(pufferl->weights.network, rbuf.network, &ralloc, inf_batch);
-        alloc_create(&ralloc);
+        pufferl->buffer_activations[i] = policy_reg_rollout(
+            &pufferl->policy, pufferl->weights, acts, inf_batch);
+        pufferl->buffer_states[i] = {.shape = {num_layers, batch, hidden_size}, .dtype_size = p};
+        alloc_register(acts, &pufferl->buffer_states[i]);
     }
+    register_rollout_buffers(pufferl->rollouts,
+        acts, horizon, total_agents, input_size, num_action_heads);
+    register_train_buffers(pufferl->train_buf,
+        acts, minibatch_segments, horizon, input_size,
+        hidden_size, num_action_heads, num_layers);
+    register_rollout_buffers(pufferl->train_rollouts,
+        acts, total_agents, horizon, input_size, num_action_heads);
+    register_ppo_buffers(pufferl->ppo_bufs_puf,
+        acts, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
+    register_prio_buffers(pufferl->prio_bufs,
+        acts, hypers.total_agents, minibatch_segments);
+
+    // Extra cuda buffers just reuse activ allocator
+    pufferl->rng_offset_puf = {.shape = {num_buffers + 1}, .dtype_size = (int)sizeof(long)};
+    alloc_register(acts, &pufferl->rng_offset_puf);
+
+    pufferl->act_sizes_puf  = {.shape = {num_action_heads}, .dtype_size = (int)sizeof(int)};
+    alloc_register(acts, &pufferl->act_sizes_puf);
+
+    pufferl->losses_puf = {.shape = {NUM_LOSSES}, .dtype_size = (int)sizeof(float)};
+    alloc_register(acts, &pufferl->losses_puf);
+
+    pufferl->advantages_puf = {.shape = {total_agents, horizon}, .dtype_size = (int)sizeof(float)};
+    alloc_register(acts, &pufferl->advantages_puf);
+
+    muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
+    pufferl->muon.nccl_comm = pufferl->nccl_comm;
+    pufferl->muon.world_size = hypers.world_size;
+
+    alloc_create(params);
+    alloc_create(grads);
+    alloc_create(acts);
+
+    pufferl->grad_puf = {.bytes = (char*)grads->mem,
+        .shape = {grads->total_elems}, .dtype_size = psz};
+    pufferl->param_puf = {.bytes = (char*)params->mem,
+        .shape = {params->total_elems}, .dtype_size = psz};
+
+    policy_init_weights(&pufferl->policy, pufferl->weights, &seed, pufferl->default_stream);
+    pufferl->master_weights = pufferl->param_puf;
+    if (USE_BF16) {
+        pufferl->master_weights = {.shape = {params->total_elems}, .dtype_size = 4};
+        cudaMalloc(&pufferl->master_weights.bytes, params->total_elems * sizeof(float));
+        puf_cast_precision_to_f32(pufferl->master_weights, pufferl->param_puf, pufferl->default_stream);
+    }
+
+    // Post-create initialization
+    cudaMemset(pufferl->rng_offset_puf.bytes, 0, (num_buffers + 1) * sizeof(long));
+    cudaMemcpy(pufferl->act_sizes_puf.bytes, raw_act_sizes, num_action_heads * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemset(pufferl->losses_puf.bytes, 0, NUM_LOSSES * sizeof(float));
+
+    float one = 1.0f;
+    cudaMemcpy(&pufferl->ppo_bufs_puf.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
+
+    muon_post_create(&pufferl->muon);
 
     if (hypers.cudagraphs >= 0) {
         pufferl->train_warmup = 0;
@@ -857,13 +759,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         pufferl->fused_rollout_cudagraphs = (RawCudaGraph*)calloc(horizon*num_buffers, sizeof(RawCudaGraph));
 
         // Snapshot weights + optimizer state before init-time capture
-        int64_t wb_bytes = pufferl->muon->weights.numel() * sizeof(float);
+        long wb_bytes = pufferl->master_weights.numel() * sizeof(float);
         void* saved_weights;
         cudaMalloc(&saved_weights, wb_bytes);
-        cudaMemcpy(saved_weights, pufferl->muon->weights.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(saved_weights, pufferl->master_weights.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
         void* saved_momentum;
         cudaMalloc(&saved_momentum, wb_bytes);
-        cudaMemcpy(saved_momentum, pufferl->muon->mb_puf.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(saved_momentum, pufferl->muon.mb_puf.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
 
         // Run warmup + capture on a fresh stream.
         // Swap default_stream (used by train_impl) and tl_stream (used by callback on main thread).
@@ -890,9 +792,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaStreamDestroy(warmup_stream);
 
         // Restore weights + optimizer state corrupted by warmup/capture
-        cudaMemcpy(pufferl->muon->weights.bytes, saved_weights, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pufferl->master_weights.bytes, saved_weights, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_weights);
-        cudaMemcpy(pufferl->muon->mb_puf.bytes, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pufferl->muon.mb_puf.bytes, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_momentum);
         if (USE_BF16) {
             puf_cast_f32_to_bf16(pufferl->param_puf, pufferl->master_weights,
@@ -941,26 +843,19 @@ void close_impl(PuffeRL& pufferl) {
         pufferl.fused_rollout_cudagraphs[i].reset();
     }
 
-    delete pufferl.muon;
-
-    policy_weights_free(pufferl.policy, &pufferl.weights);  // fp32 struct freed after init in bf16 mode; this handles fp32 mode
-    if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)pufferl.train_activations.encoder;
-    else delete (EncoderActivations*)pufferl.train_activations.encoder;
-    delete (DecoderActivations*)pufferl.train_activations.decoder;
-    delete (MinGRUActivations*)pufferl.train_activations.network;
+    policy_weights_free(&pufferl.policy, &pufferl.weights);
+    policy_activations_free(pufferl.train_activations);
     for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
-        PolicyActivations& rbuf = pufferl.buffer_activations[buf];
-        if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)rbuf.encoder;
-        else delete (EncoderActivations*)rbuf.encoder;
-        delete (DecoderActivations*)rbuf.decoder;
-        delete (MinGRUActivations*)rbuf.network;
+        policy_activations_free(pufferl.buffer_activations[buf]);
     }
-    free(pufferl.policy);
 
-    if (USE_BF16) cudaFree(pufferl.master_weights.bytes);
-    allocset_free(&pufferl.alloc);
-    alloc_free(&pufferl.pufferl_alloc);
-    free(pufferl.buffer_allocs);
+    if (USE_BF16) {
+        cudaFree(pufferl.master_weights.bytes);
+    }
+
+    alloc_free(&pufferl.params_alloc);
+    alloc_free(&pufferl.grads_alloc);
+    alloc_free(&pufferl.activations_alloc);
 
     for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
         cudaStreamDestroy(pufferl.streams[i]);
@@ -972,12 +867,12 @@ void close_impl(PuffeRL& pufferl) {
 
     static_vec_close(pufferl.vec);
 
-    if (pufferl.nccl_comm != nullptr) {
-        ncclCommDestroy(pufferl.nccl_comm);
-    }
-
     free(pufferl.buffer_states);
     free(pufferl.buffer_activations);
     free(pufferl.fused_rollout_cudagraphs);
     free(pufferl.streams);
+
+    if (pufferl.nccl_comm != nullptr) {
+        ncclCommDestroy(pufferl.nccl_comm);
+    }
 }
