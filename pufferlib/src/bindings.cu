@@ -279,7 +279,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.rank = get_config(args, "rank");
     hypers.world_size = get_config(args, "world_size");
     hypers.gpu_id = get_config(args, "gpu_id");
-    hypers.nccl_id_path = args["nccl_id_path"].cast<std::string>();
+    hypers.nccl_id = args["nccl_id"].cast<std::string>();
     // Seed
     hypers.seed = get_config(args, "seed");
 
@@ -297,6 +297,12 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
 }
 
 PYBIND11_MODULE(_C, m) {
+    // Multi-GPU: generate NCCL unique ID (call on rank 0, pass bytes to all ranks)
+    m.def("get_nccl_id", []() {
+        ncclUniqueId id;
+        ncclGetUniqueId(&id);
+        return py::bytes(reinterpret_cast<char*>(&id), sizeof(id));
+    });
     // Core functions
     m.def("log", &puf_log);
     m.def("eval_log", &puf_eval_log);
@@ -346,7 +352,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("rank", &HypersT::rank)
         .def_readwrite("world_size", &HypersT::world_size)
         .def_readwrite("gpu_id", &HypersT::gpu_id)
-        .def_readwrite("nccl_id_path", &HypersT::nccl_id_path);
+        .def_readwrite("nccl_id", &HypersT::nccl_id);
 
     py::class_<PufTensor>(m, "PufTensor")
         .def("__repr__", &PufTensor::repr)

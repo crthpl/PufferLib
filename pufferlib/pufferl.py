@@ -159,6 +159,7 @@ def validate_config(args):
 
 def _train_worker(args):
     pufferl = _C.create_pufferl(args)
+    args.pop('nccl_id', None)
     while pufferl.global_step < args['train']['total_timesteps']:
         _C.rollouts(pufferl)
         _C.train(pufferl)
@@ -189,6 +190,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     os.makedirs(log_dir, exist_ok=True)
 
     pufferl = _C.create_pufferl(args)
+    args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
         flat_logs = dict(pufferlib.unroll_nested_dict(_C.log(pufferl)))
@@ -292,7 +294,7 @@ def train(env_name, args=None, gpus=None, **kwargs):
     gpus = list(gpus or range(args['train']['gpus']))
     args['vec']['num_threads'] //= len(gpus)
     args['world_size'] = len(gpus)
-    args['nccl_id_path'] = f'/tmp/puffer_nccl_{os.getpid()}_{gpus[0]}'
+    args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
 
     if not subprocess:
         gpus = gpus[-1:] + gpus[:-1]  # Main process gets rank 0
