@@ -168,9 +168,9 @@ void puf_close(pybind11::object pufferl_obj) {
 
 void save_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.alloc_fp32.params.total_elems * sizeof(float);
+    int64_t nbytes = pufferl.master_weights.numel() * sizeof(float);
     std::vector<char> buf(nbytes);
-    cudaMemcpy(buf.data(), pufferl.alloc_fp32.params.mem, nbytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(buf.data(), pufferl.master_weights.bytes, nbytes, cudaMemcpyDeviceToHost);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
     fwrite(buf.data(), 1, nbytes, f);
@@ -179,7 +179,7 @@ void save_weights(pybind11::object pufferl_obj, const std::string& path) {
 
 void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.alloc_fp32.params.total_elems * sizeof(float);
+    int64_t nbytes = pufferl.master_weights.numel() * sizeof(float);
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
     // Verify file size matches
@@ -198,11 +198,9 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         throw std::runtime_error("Failed to read weight file");
     }
     fclose(f);
-    // Copy to fp32 param buffer
-    cudaMemcpy(pufferl.alloc_fp32.params.mem, buf.data(), nbytes, cudaMemcpyHostToDevice);
-    // If bf16 policy is separate, cast fp32 -> bf16
+    cudaMemcpy(pufferl.master_weights.bytes, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
-        puf_cast_f32_to_bf16(pufferl.param_bf16_puf, pufferl.param_fp32_puf, pufferl.default_stream);
+        puf_cast_f32_to_bf16(pufferl.param_puf, pufferl.master_weights, pufferl.default_stream);
     }
 }
 
@@ -282,6 +280,8 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.world_size = get_config(args, "world_size");
     hypers.gpu_id = get_config(args, "gpu_id");
     hypers.nccl_id_path = args["nccl_id_path"].cast<std::string>();
+    // Seed
+    hypers.seed = get_config(args, "seed");
 
     std::string env_name = args["env_name"].cast<std::string>();
     Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
@@ -380,6 +380,6 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("global_step", &PuffeRL::global_step)
         .def_readonly("last_log_time", &PuffeRL::last_log_time)
         .def("num_params", [](PuffeRL& self) -> int64_t {
-            return self.alloc_fp32.params.total_elems;
+            return self.master_weights.numel();
         });
 }

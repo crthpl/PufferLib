@@ -114,6 +114,9 @@ if DEBUG:
     nvcc_args += [
         '-O0',
         '-g',
+        '-fsanitize=address',
+        '-fno-omit-frame-pointer',
+        '-lineinfo',
     ]
 else:
     extra_compile_args += [

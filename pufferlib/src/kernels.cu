@@ -1559,6 +1559,27 @@ void puf_copy(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
     cudaMemcpyAsync(dst.bytes, src.bytes, dst.numel() * dst.dtype_size, cudaMemcpyDeviceToDevice, stream);
 }
 
+// Cast f32 src to precision_t dst (or plain copy in fp32 mode)
+inline void puf_f32_to_precision(PufTensor& dst, PufTensor& src, cudaStream_t stream) {
+    if (USE_BF16) {
+        puf_cast_f32_to_bf16(dst, src, stream);
+    } else {
+        puf_copy(dst, src, stream);
+    }
+}
+
+// Cast precision_t src to f32 dst (used to populate fp32 master_weights from precision_t params)
+__global__ void cast_precision_to_f32_kernel(float* dst, const precision_t* src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = to_float(src[idx]);
+}
+void puf_cast_precision_to_f32(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
+    assert(dst.numel() == src.numel() && "puf_cast_precision_to_f32: size mismatch");
+    assert(dst.dtype_size == 4 && src.dtype_size == PRECISION_SIZE);
+    cast_precision_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
+        (float*)dst.bytes, (const precision_t*)src.bytes, dst.numel());
+}
+
 void puf_zero(PufTensor& dst, cudaStream_t stream) {
     cudaMemsetAsync(dst.bytes, 0, dst.numel() * dst.dtype_size, stream);
 }
@@ -1588,9 +1609,12 @@ void puf_kaiming_init(PufTensor& dst, float gain, ulong seed, cudaStream_t strea
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
     curandDestroyGenerator(gen);
 
-    assert(dst.dtype_size == 4 && "puf_kaiming_init: always called on f32 master weights");
-    cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float),
-        cudaMemcpyDeviceToDevice, stream);
+    if (dst.dtype_size == 4) {
+        cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    } else {
+        cast_f32_to_precision_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            (precision_t*)dst.bytes, buf, n);
+    }
 
     cudaFree(buf);
 }
