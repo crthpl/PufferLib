@@ -1,16 +1,12 @@
-// Hard to eliminate cpp things: initializer_list, vector
+// Uses vector for MinGRU activations
 
 #ifndef PUFFERLIB_MODELS_CU
 #define PUFFERLIB_MODELS_CU
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <curand.h>
-#include <cassert>
 #include <vector>
 #include <string>
 #include <cstdint>
-#include <nccl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,374 +15,13 @@ using std::vector;
 
 #include "kernels.cu"
 
-// ============================================================================
-// Allocator — single contiguous GPU buffer with PufTensor views
-// ============================================================================
-
-struct Allocator {
-    std::vector<PufTensor*> regs;
-    void* mem = nullptr;
-    long total_elems = 0;
-
-    void reg(PufTensor* ptr) {
-        regs.push_back(ptr);
-    }
-
-    void create() {
-        // First pass: compute total with 16-byte alignment padding
-        long total_bytes = 0;
-        total_elems = 0;
-        for (auto* t : regs) {
-            total_bytes = (total_bytes + 15) & ~15;  // align each tensor to 16 bytes
-            total_bytes += t->numel() * t->dtype_size;
-            total_elems += t->numel();
-        }
-        if (total_bytes > 0) {
-            cudaMalloc(&mem, total_bytes);
-            cudaMemset(mem, 0, total_bytes);
-            long offset = 0;
-            for (auto* t : regs) {
-                offset = (offset + 15) & ~15;  // align each tensor to 16 bytes
-                t->bytes = (char*)mem + offset;
-                offset += t->numel() * t->dtype_size;
-            }
-        }
-    }
-
-    void destroy() {
-        if (mem) { cudaFree(mem); mem = nullptr; }
-    }
-};
-
-// Groups 3 allocators for policy: params, grads, activations
-// TODO: Move out of a cpp class. No create, destroy, etc.
-struct AllocSet {
-    Allocator params, grads, acts;
-    int esz = 0;  // element size for params/grads
-    void create() { params.create(); grads.create(); acts.create(); }
-    void destroy() { params.destroy(); grads.destroy(); acts.destroy(); }
-};
-
-// Pre-allocated buffers for prio_replay
-struct PrioBuffers {
-    PufTensor prio_probs, cdf, idx, mb_prio;
-};
-
-void register_prio_buffers(PrioBuffers& bufs, Allocator& alloc, int S, int minibatch_segments) {
-    bufs = (PrioBuffers){
-        .prio_probs = {.shape = {S}, .dtype_size = sizeof(float)},
-        .cdf = {.shape = {S}, .dtype_size = sizeof(float)},
-        .idx = {.shape = {minibatch_segments}, .dtype_size = sizeof(long)},
-        .mb_prio = {.shape = {minibatch_segments, 1}, .dtype_size = sizeof(float)},
-    };
-    alloc.reg(&bufs.prio_probs);
-    alloc.reg(&bufs.cdf);
-    alloc.reg(&bufs.idx);
-    alloc.reg(&bufs.mb_prio);
-}
-
-// Pre-allocated buffers for PPO loss
-struct PPOBuffersPuf {
-    PufTensor loss_output, saved_for_bwd, grad_loss;
-    PufTensor grad_logits, grad_values, grad_logstd, adv_scratch;
-};
-
-void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator& alloc, int N, int T, int A_total, bool is_continuous) {
-    long total = (long)N * T;
-    int f = sizeof(float);
-    bufs = (PPOBuffersPuf){
-        .loss_output = {.shape = {1}, .dtype_size = f},
-        .saved_for_bwd = {.shape = {total, 5}, .dtype_size = (int)sizeof(double)},
-        .grad_loss = {.shape = {1}, .dtype_size = f},
-        .grad_logits = {.shape = {N, T, A_total}, .dtype_size = f},
-        .grad_values = {.shape = {N, T, 1}, .dtype_size = f},
-        .grad_logstd = {.shape = {N, T, A_total}, .dtype_size = f},
-        .adv_scratch = {.shape = {2}, .dtype_size = f},
-    };
-    alloc.reg(&bufs.loss_output);
-    alloc.reg(&bufs.saved_for_bwd);
-    alloc.reg(&bufs.grad_loss);
-    alloc.reg(&bufs.grad_logits);
-    alloc.reg(&bufs.grad_values);
-    if (is_continuous) alloc.reg(&bufs.grad_logstd);
-    alloc.reg(&bufs.adv_scratch);
-}
-
-void post_create_ppo_buffers(PPOBuffersPuf& bufs) {
-    float one = 1.0f;
-    cudaMemcpy(bufs.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
-}
-
-void register_rollout_buffers(RolloutBuf& bufs, Allocator& alloc, int H, int S, int input_size, int num_atns) {
-    int p = PRECISION_SIZE;
-    bufs = (RolloutBuf){
-        .observations = {.shape = {H, S, input_size}, .dtype_size = p},
-        .actions = {.shape = {H, S, num_atns}, .dtype_size = (int)sizeof(double)},
-        .values = {.shape = {H, S}, .dtype_size = p},
-        .logprobs = {.shape = {H, S}, .dtype_size = p},
-        .rewards = {.shape = {H, S}, .dtype_size = p},
-        .terminals = {.shape = {H, S}, .dtype_size = p},
-        .ratio = {.shape = {H, S}, .dtype_size = p},
-        .importance = {.shape = {H, S}, .dtype_size = p},
-    };
-    alloc.reg(&bufs.observations);
-    alloc.reg(&bufs.actions);
-    alloc.reg(&bufs.values);
-    alloc.reg(&bufs.logprobs);
-    alloc.reg(&bufs.rewards);
-    alloc.reg(&bufs.terminals);
-    alloc.reg(&bufs.ratio);
-    alloc.reg(&bufs.importance);
-}
-
-void register_train_buffers(TrainGraph& bufs, Allocator& alloc, int S, int H, int input_size,
-        int hidden_size, int num_atns, int num_layers) {
-    int p = PRECISION_SIZE;
-    bufs = (TrainGraph){
-        .mb_obs = {.shape = {S, H, input_size}, .dtype_size = p},
-        .mb_state = {.shape = {num_layers, S, 1, hidden_size}, .dtype_size = p},
-        .mb_actions = {.shape = {S, H, num_atns}, .dtype_size = (int)sizeof(double)},
-        .mb_logprobs = {.shape = {S, H}, .dtype_size = p},
-        .mb_advantages = {.shape = {S, H}, .dtype_size = (int)sizeof(float)},
-        .mb_prio = {.shape = {S, 1}, .dtype_size = p},
-        .mb_values = {.shape = {S, H}, .dtype_size = p},
-        .mb_returns = {.shape = {S, H}, .dtype_size = p},
-        .mb_ratio = {.shape = {S, H}, .dtype_size = p},
-        .mb_newvalue = {.shape = {S, H, 1}, .dtype_size = p},
-    };
-    alloc.reg(&bufs.mb_obs);
-    alloc.reg(&bufs.mb_state);
-    alloc.reg(&bufs.mb_actions);
-    alloc.reg(&bufs.mb_logprobs);
-    alloc.reg(&bufs.mb_advantages);
-    alloc.reg(&bufs.mb_prio);
-    alloc.reg(&bufs.mb_values);
-    alloc.reg(&bufs.mb_returns);
-    alloc.reg(&bufs.mb_ratio);
-    alloc.reg(&bufs.mb_newvalue);
-}
-
-// ============================================================================
-// cuBLAS matmuls: all row-major PufTensors, precision_t data with CUBLAS_COMPUTE_PRECISION
-// ============================================================================
-
-static cublasHandle_t get_cublas_handle() {
-    static thread_local cublasHandle_t handle = nullptr;
-    if (!handle) {
-        cublasCreate(&handle);
-        void* workspace = nullptr;
-        cudaMalloc(&workspace, 32 * 1024 * 1024);
-        cublasSetWorkspace(handle, workspace, 32 * 1024 * 1024);
-    }
-    return handle;
-}
-
-// Dense row-major GEMM: C(M,N) = alpha * op_a(A) @ op_b(B) + beta * C
-// Strides derived from M, N, K assuming tightly packed row-major storage.
-static inline void cublasGemmExDense(
-        cublasOperation_t op_a, cublasOperation_t op_b,
-        int M, int N, int K, void* A, void* B, void* C,
-        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
-    int lda = (op_a == CUBLAS_OP_N) ? K : M;
-    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
-    cublasHandle_t handle = get_cublas_handle();
-    cublasSetStream(handle, stream);
-    cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
-        B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
-        C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
-}
-
-// out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
-void puf_mm(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
-    int M = a.batch_size() * a.shape[a.ndim()-2];
-    int K = a.shape[a.ndim()-1];
-    int N = b.shape[b.ndim()-2];
-    cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_T, M, N, K, a.bytes, b.bytes, out.bytes, stream);
-}
-
-// out(M,N) = a(...,M)^T @ b(...,N)  — leading dims folded into K
-void puf_mm_tn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
-    int M = a.shape[a.ndim()-1];
-    int K = a.batch_size() * a.shape[a.ndim()-2];
-    int N = b.shape[b.ndim()-1];
-    cublasGemmExDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, a.bytes, b.bytes, out.bytes, stream);
-}
-
-// out(...,N) = a(...,K) @ b(K,N)  — leading dims folded into M
-void puf_mm_nn(PufTensor& a, PufTensor& b, PufTensor& out, cudaStream_t stream) {
-    int M = a.batch_size() * a.shape[a.ndim()-2];
-    int K = a.shape[a.ndim()-1];
-    int N = b.shape[b.ndim()-1];
-    cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, a.bytes, b.bytes, out.bytes, stream);
-}
-
-static void puf_addmm_nn(PufTensor& a, PufTensor& b, PufTensor& out, float alpha, float beta, cudaStream_t stream) {
-    int M = a.batch_size() * a.shape[a.ndim()-2];
-    int K = a.shape[a.ndim()-1];
-    int N = b.shape[b.ndim()-1];
-    cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, a.bytes, b.bytes, out.bytes, stream, alpha, beta);
-}
-
-void puf_cast_f32_to_bf16(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
-    assert(dst.numel() == src.numel() && "puf_cast_f32_to_bf16: size mismatch");
-    assert(dst.dtype_size == PRECISION_SIZE && src.dtype_size == 4);
-    cast_f32_to_precision_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)dst.bytes, (const float*)src.bytes, dst.numel());
-}
-
-void puf_copy(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
-    assert(dst.numel() == src.numel() && "puf_copy: size mismatch");
-    assert(dst.dtype_size == src.dtype_size && "puf_copy: dtype mismatch");
-    cudaMemcpyAsync(dst.bytes, src.bytes, dst.numel() * dst.dtype_size, cudaMemcpyDeviceToDevice, stream);
-}
-
-void puf_zero(PufTensor& dst, cudaStream_t stream) {
-    cudaMemsetAsync(dst.bytes, 0, dst.numel() * dst.dtype_size, stream);
-}
-
-void puf_add(PufTensor& dst, const PufTensor& src, cudaStream_t stream) {
-    assert(dst.numel() == src.numel() && "puf_add: size mismatch");
-    assert(dst.dtype_size == 4 && "puf_add: dst must be f32");
-    add_precision_to_f32_kernel<<<grid_size(dst.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)dst.bytes, (const precision_t*)src.bytes, dst.numel());
-}
-
-void puf_kaiming_init(PufTensor& dst, float gain, ulong seed, cudaStream_t stream) {
-    assert(dst.ndim() == 2);
-    long rows = dst.shape[0], cols = dst.shape[1];
-    assert(rows > 0 && cols > 0);
-    long n = rows * cols;
-
-    float std = gain / std::sqrt((float)cols);  // fan_in = cols for (out, in) layout
-
-    long rand_count = (n % 2 == 0) ? n : n + 1;
-    float* buf;
-    cudaMalloc(&buf, rand_count * sizeof(float));
-
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, seed);
-    curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
-    curandDestroyGenerator(gen);
-
-    assert(dst.dtype_size == 4 && "puf_kaiming_init: always called on f32 master weights");
-    cudaMemcpyAsync(dst.bytes, buf, n * sizeof(float),
-        cudaMemcpyDeviceToDevice, stream);
-
-    cudaFree(buf);
-}
-
-// ============================================================================
-// High-level PufTensor orchestration (dispatch to kernels)
-// ============================================================================
-
-void ppo_loss_fwd_bwd(
-    PufTensor& dec_out,          // (N, T, fused_cols) — fused logits+value from decoder
-    PufTensor& logstd,           // continuous logstd or empty
-    TrainGraph& graph,
-    PufTensor& act_sizes, PufTensor& losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    PPOBuffersPuf& bufs, bool is_continuous,
-    cudaStream_t stream
-) {
-    int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
-    int A_total = fused_cols - 1;  // last column is value
-    int total = N * T;
-
-    // Pointers into fused decoder output
-    const precision_t* logits_ptr = (const precision_t*)dec_out.bytes;
-
-    float* adv_var_ptr = (float*)bufs.adv_scratch.bytes;
-    float* adv_mean_ptr = adv_var_ptr + 1;
-    var_mean_kernel<<<1, 256, 0, stream>>>(
-        (const float*)graph.mb_advantages.bytes, adv_var_ptr, adv_mean_ptr, graph.mb_advantages.numel());
-
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-
-    static float* ppo_partials_buf = nullptr;
-    static int ppo_partials_capacity = 0;
-    int ppo_partials_needed = ppo_grid * (LOSS_N + 1);
-    if (!ppo_partials_buf || ppo_partials_needed > ppo_partials_capacity) {
-        if (ppo_partials_buf) cudaFree(ppo_partials_buf);
-        ppo_partials_capacity = ppo_partials_needed;
-        cudaMalloc(&ppo_partials_buf, ppo_partials_capacity * sizeof(float));
-    }
-
-    cudaMemsetAsync((float*)bufs.loss_output.bytes, 0, sizeof(float), stream);
-
-    PPOGraphArgs graph_args = {
-        .out_ratio = (precision_t*)graph.mb_ratio.bytes,
-        .out_newvalue = (precision_t*)graph.mb_newvalue.bytes,
-        .actions = (const double*)graph.mb_actions.bytes,
-        .old_logprobs = (const precision_t*)graph.mb_logprobs.bytes,
-        .advantages = (const float*)graph.mb_advantages.bytes,
-        .prio = (const precision_t*)graph.mb_prio.bytes,
-        .values = (const precision_t*)graph.mb_values.bytes,
-        .returns = (const precision_t*)graph.mb_returns.bytes,
-    };
-
-    PPOKernelArgs args = {
-        .grad_logits = (float*)bufs.grad_logits.bytes,
-        .grad_logstd = is_continuous ? (float*)bufs.grad_logstd.bytes : nullptr,
-        .grad_values_pred = (float*)bufs.grad_values.bytes,
-        .logits = logits_ptr,
-        .logstd = is_continuous ? (const precision_t*)logstd.bytes : nullptr,
-        .values_pred = logits_ptr + A_total,
-        .adv_mean = adv_mean_ptr,
-        .adv_var = adv_var_ptr,
-        .act_sizes = (const int*)act_sizes.bytes,
-        .num_atns = act_sizes.numel(),
-        .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
-        .vf_coef = vf_coef, .ent_coef = ent_coef,
-        .T_seq = T, .A_total = A_total, .N = N,
-        .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
-        .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
-        .is_continuous = is_continuous,
-    };
-
-    ppo_loss_fwd_bwd_kernel<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
-
-    ppo_loss_reduce_kernel<<<1, LOSS_N + 1, 0, stream>>>(
-        (float*)bufs.loss_output.bytes, (float*)losses_acc.bytes, ppo_partials_buf, ppo_grid);
-}
-
-void prio_replay_cuda(PufTensor& advantages, float prio_alpha,
-        int minibatch_segments, int total_agents, float anneal_beta,
-        PrioBuffers& bufs, ulong seed, long* offset_ptr, cudaStream_t stream) {
-    int S = advantages.shape[0], T = advantages.shape[1];
-    compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE, 0, stream>>>(
-        (float*)advantages.bytes, (float*)bufs.prio_probs.bytes, prio_alpha, T);
-    compute_prio_normalize<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
-        (float*)bufs.prio_probs.bytes, S);
-    int block = fmaxf(((minibatch_segments + 31) / 32) * 32, 32);
-    multinomial_with_replacement_kernel<<<1, block, 0, stream>>>(
-        (long*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
-        (float*)bufs.cdf.bytes, S, minibatch_segments, seed, offset_ptr);
-    int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
-    compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
-        (long*)bufs.idx.bytes, (float*)bufs.prio_probs.bytes,
-        (float*)bufs.mb_prio.bytes, total_agents, anneal_beta, minibatch_segments);
-}
-
-void puff_advantage_cuda(PufTensor& values, PufTensor& rewards,
-        PufTensor& dones, PufTensor& importance, PufTensor& advantages,
-        float gamma, float lambda, float rho_clip, float c_clip, cudaStream_t stream) {
-    int num_steps = values.shape[0], horizon = values.shape[1];
-    assert(advantages.dtype_size == 4 && "advantages must be f32");
-    int blocks = grid_size(num_steps);
-    constexpr int N = 16 / sizeof(precision_t);
-    auto kernel = (horizon % N == 0) ? puff_advantage_kernel : puff_advantage_kernel_scalar;
-    kernel<<<blocks, 256, 0, stream>>>(
-        (precision_t*)values.bytes, (precision_t*)rewards.bytes,
-        (precision_t*)dones.bytes, (precision_t*)importance.bytes,
-        (float*)advantages.bytes, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
-}
-
 // Shared function pointer types (same signature for encoder and decoder)
 typedef void (*init_weights_fn)(void* weights, ulong* seed, cudaStream_t stream);
 typedef void (*reg_params_fn)(void* weights, Allocator* alloc, int esz);
 typedef void (*reg_train_fn)(void* weights, void* buf, Allocator* acts, Allocator* grads, int B_TT);
 typedef void (*reg_rollout_fn)(void* weights, void* buf, Allocator* alloc, int B);
+typedef void* (*create_weights_fn)(void* self, int esz);
+typedef void  (*free_weights_fn)(void* weights);
 typedef PufTensor (*forward_fn)(void* weights, void* activations, PufTensor input, cudaStream_t stream);
 typedef void (*encoder_backward_fn)(void* weights, void* activations,
     PufTensor grad, cudaStream_t stream);
@@ -406,6 +41,9 @@ struct Encoder {
     reg_params_fn reg_params;
     reg_train_fn reg_train;
     reg_rollout_fn reg_rollout;
+    create_weights_fn create_weights;
+    free_weights_fn free_weights;
+    int in_dim, out_dim;
 };
 
 struct Decoder {
@@ -415,6 +53,10 @@ struct Decoder {
     reg_params_fn reg_params;
     reg_train_fn reg_train;
     reg_rollout_fn reg_rollout;
+    create_weights_fn create_weights;
+    free_weights_fn free_weights;
+    int hidden_dim, output_dim;
+    bool continuous;
 };
 
 struct Network {
@@ -425,6 +67,9 @@ struct Network {
     reg_params_fn reg_params;
     reg_train_fn reg_train;
     reg_rollout_fn reg_rollout;
+    create_weights_fn create_weights;
+    free_weights_fn free_weights;
+    int hidden, num_layers, horizon;
 };
 
 
@@ -457,7 +102,7 @@ static void encoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
 static void encoder_reg_params(void* w, Allocator* alloc, int esz) {
     EncoderWeights* ew = (EncoderWeights*)w;
     ew->weight = {.shape = {ew->out_dim, ew->in_dim}, .dtype_size = esz};
-    alloc->reg(&ew->weight);
+    alloc_register(alloc,&ew->weight);
 }
 
 static void encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
@@ -469,17 +114,25 @@ static void encoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
         .saved_input = {.shape = {B_TT, ew->in_dim}, .dtype_size = p},
         .wgrad_scratch = {.shape = {ew->out_dim, ew->in_dim}, .dtype_size = p},
     };
-    acts->reg(&a->out);
-    acts->reg(&a->saved_input);
-    grads->reg(&a->wgrad_scratch);
+    alloc_register(acts,&a->out);
+    alloc_register(acts,&a->saved_input);
+    alloc_register(grads,&a->wgrad_scratch);
 }
 
 static void encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
     EncoderWeights* ew = (EncoderWeights*)w;
     EncoderActivations* a = (EncoderActivations*)activations;
     a->out = {.shape = {B, ew->out_dim}, .dtype_size = PRECISION_SIZE};
-    alloc->reg(&a->out);
+    alloc_register(alloc,&a->out);
 }
+
+static void* encoder_create_weights(void* self, int esz) {
+    Encoder* e = (Encoder*)self;
+    EncoderWeights* ew = (EncoderWeights*)calloc(1, sizeof(EncoderWeights));
+    ew->in_dim = e->in_dim; ew->out_dim = e->out_dim;
+    return ew;
+}
+static void encoder_free_weights(void* weights) { free(weights); }
 
 #include "ocean.cu"
 
@@ -507,10 +160,10 @@ static void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
 static void decoder_reg_params(void* w, Allocator* alloc, int esz) {
     DecoderWeights* dw = (DecoderWeights*)w;
     dw->weight = {.shape = {dw->output_dim + 1, dw->hidden_dim}, .dtype_size = esz};
-    alloc->reg(&dw->weight);
+    alloc_register(alloc,&dw->weight);
     if (dw->continuous) {
         dw->logstd = {.shape = {1, dw->output_dim}, .dtype_size = esz};
-        alloc->reg(&dw->logstd);
+        alloc_register(alloc,&dw->logstd);
     }
 }
 
@@ -527,20 +180,28 @@ static void decoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
         .wgrad_scratch = {.shape = {od1, dw->hidden_dim}, .dtype_size = p},
         .logstd_scratch = {.shape = {1, dw->output_dim}, .dtype_size = p},
     };
-    acts->reg(&a->out);
-    acts->reg(&a->saved_input);
-    acts->reg(&a->grad_out);
-    acts->reg(&a->grad_input);
-    grads->reg(&a->wgrad_scratch);
-    if (dw->continuous) grads->reg(&a->logstd_scratch);
+    alloc_register(acts,&a->out);
+    alloc_register(acts,&a->saved_input);
+    alloc_register(acts,&a->grad_out);
+    alloc_register(acts,&a->grad_input);
+    alloc_register(grads,&a->wgrad_scratch);
+    if (dw->continuous) alloc_register(grads,&a->logstd_scratch);
 }
 
 static void decoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
     a->out = {.shape = {B, dw->output_dim + 1}, .dtype_size = PRECISION_SIZE};
-    alloc->reg(&a->out);
+    alloc_register(alloc,&a->out);
 }
+
+static void* decoder_create_weights(void* self, int esz) {
+    Decoder* d = (Decoder*)self;
+    DecoderWeights* dw = (DecoderWeights*)calloc(1, sizeof(DecoderWeights));
+    dw->hidden_dim = d->hidden_dim; dw->output_dim = d->output_dim; dw->continuous = d->continuous;
+    return dw;
+}
+static void decoder_free_weights(void* weights) { free(weights); }
 
 static PufTensor decoder_backward(void* w, void* activations,
     PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value, cudaStream_t stream) {
@@ -578,7 +239,7 @@ struct MinGRUActivations {
 
 struct MinGRUWeights {
     int hidden, num_layers, horizon;
-    vector<PufTensor> weights;
+    PufTensor* weights;  // [num_layers], malloc'd
 };
 
 static PufTensor mingru_state_layer(MinGRUWeights* m, PufTensor& state, int i) {
@@ -606,7 +267,7 @@ static void mingru_reg_params(void* w, Allocator* alloc, int esz) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     for (int i = 0; i < m->num_layers; i++) {
         m->weights[i] = {.shape = {3 * m->hidden, m->hidden}, .dtype_size = esz};
-        alloc->reg(&m->weights[i]);
+        alloc_register(alloc,&m->weights[i]);
     }
 }
 
@@ -622,8 +283,8 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
     a->wgrad_scratch.resize(m->num_layers);
     a->grad_input_buf = {.shape = {B_TT, H}, .dtype_size = p};
     a->grad_next_state = {.shape = {B, 1, H}, .dtype_size = p};
-    acts->reg(&a->grad_input_buf);
-    acts->reg(&a->grad_next_state);
+    alloc_register(acts,&a->grad_input_buf);
+    alloc_register(acts,&a->grad_next_state);
     for (int i = 0; i < m->num_layers; i++) {
         a->scan_bufs[i] = {.B = B, .T = TT, .H = H,
             .a_star = {.shape = {B, TT + 1, H}, .dtype_size = f},
@@ -638,17 +299,17 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
         a->saved_inputs[i] = {.shape = {B, TT, H}, .dtype_size = p};
         a->combined_bufs[i] = {.shape = {B_TT, 3 * H}, .dtype_size = p};
         a->wgrad_scratch[i] = {.shape = {3 * H, H}, .dtype_size = p};
-        acts->reg(&a->saved_inputs[i]);
-        acts->reg(&a->combined_bufs[i]);
-        acts->reg(&a->scan_bufs[i].out);
-        acts->reg(&a->scan_bufs[i].next_state);
-        acts->reg(&a->scan_bufs[i].a_star);
-        acts->reg(&a->scan_bufs[i].s_vals);
-        acts->reg(&a->scan_bufs[i].log_values_buf);
-        acts->reg(&a->scan_bufs[i].grad_combined);
-        acts->reg(&a->scan_bufs[i].grad_state);
-        acts->reg(&a->scan_bufs[i].grad_input);
-        grads->reg(&a->wgrad_scratch[i]);
+        alloc_register(acts,&a->saved_inputs[i]);
+        alloc_register(acts,&a->combined_bufs[i]);
+        alloc_register(acts,&a->scan_bufs[i].out);
+        alloc_register(acts,&a->scan_bufs[i].next_state);
+        alloc_register(acts,&a->scan_bufs[i].a_star);
+        alloc_register(acts,&a->scan_bufs[i].s_vals);
+        alloc_register(acts,&a->scan_bufs[i].log_values_buf);
+        alloc_register(acts,&a->scan_bufs[i].grad_combined);
+        alloc_register(acts,&a->scan_bufs[i].grad_state);
+        alloc_register(acts,&a->scan_bufs[i].grad_input);
+        alloc_register(grads,&a->wgrad_scratch[i]);
     }
 }
 
@@ -660,12 +321,25 @@ static void mingru_reg_rollout(void* weights, void* activations, Allocator* allo
     a->combined.resize(w->num_layers);
     for (int i = 0; i < w->num_layers; i++) {
         a->combined[i] = {.shape = {B_inf, 3 * H}, .dtype_size = p};
-        alloc->reg(&a->combined[i]);
+        alloc_register(alloc,&a->combined[i]);
     }
     a->out = {.shape = {B_inf, H}, .dtype_size = p};
     a->next_state = {.shape = {B_inf, H}, .dtype_size = p};
-    alloc->reg(&a->out);
-    alloc->reg(&a->next_state);
+    alloc_register(alloc,&a->out);
+    alloc_register(alloc,&a->next_state);
+}
+
+static void* mingru_create_weights(void* self, int esz) {
+    Network* n = (Network*)self;
+    MinGRUWeights* mw = (MinGRUWeights*)calloc(1, sizeof(MinGRUWeights));
+    mw->hidden = n->hidden; mw->num_layers = n->num_layers; mw->horizon = n->horizon;
+    mw->weights = (PufTensor*)calloc(n->num_layers, sizeof(PufTensor));
+    return mw;
+}
+static void mingru_free_weights(void* weights) {
+    MinGRUWeights* mw = (MinGRUWeights*)weights;
+    free(mw->weights);
+    free(mw);
 }
 
 static PufTensor mingru_forward(void* w, PufTensor x, PufTensor state, void* activations, cudaStream_t stream) {
@@ -758,166 +432,20 @@ void policy_backward(Policy* p, PolicyWeights& w, PolicyActivations& activations
     p->encoder.backward(w.encoder, activations.encoder, grad_h, stream);
 }
 
-inline float cosine_annealing(float lr_base, float lr_min, int t, int T) {
-    if (T == 0) return lr_base;
-    float ratio = (float)t / (float)T;
-    ratio = std::max(0.0f, std::min(1.0f, ratio));
-    return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
+PolicyWeights policy_weights_create(Policy* p, int esz) {
+    PolicyWeights w;
+    w.encoder = p->encoder.create_weights(&p->encoder, esz);
+    w.decoder = p->decoder.create_weights(&p->decoder, esz);
+    w.network = p->network.create_weights(&p->network, esz);
+    return w;
 }
 
-static constexpr double ns_coeffs[5][3] = {
-    {4.0848, -6.8946, 2.9270},
-    {3.9505, -6.3029, 2.6377},
-    {3.7418, -5.5913, 2.3037},
-    {2.8769, -3.1427, 1.2046},
-    {2.8366, -3.0525, 1.2012},
-};
-
-struct Muon {
-    double momentum, weight_decay, eps;
-    float lr_val_init;
-    float* lr_ptr;
-    float* lr_derived_ptr;
-    float* norm_ptr;
-    float* grad_norm_ptr;
-    PufTensor lr_puf, lr_derived_puf, ns_norm_puf, grad_norm_puf;
-    PufTensor weights, mb_puf;
-    PufTensor gram, gram_buf, x_buf, norm_partials;
-    long max_M, max_N;
-    Allocator* param_alloc;  // fp32 params allocator — shapes used by muon_step
-    ncclComm_t nccl_comm;
-    int world_size;
-};
-
-void muon_init(Muon* m, Allocator* param_alloc, PufTensor weight_buffer,
-               double lr_val, double momentum, double eps, double weight_decay,
-               Allocator& alloc) {
-    m->momentum = momentum;
-    m->weight_decay = weight_decay;
-    m->eps = eps;
-    m->lr_val_init = (float)lr_val;
-    m->lr_ptr = nullptr;
-    m->lr_derived_ptr = nullptr;
-    m->weights = weight_buffer;
-    m->param_alloc = param_alloc;
-    m->nccl_comm = nullptr;
-    m->world_size = 1;
-    m->max_M = 0; m->max_N = 0;
-    long n = m->weights.numel();
-    int f = sizeof(float);
-    m->lr_puf = {.shape = {1}, .dtype_size = f};
-    m->lr_derived_puf = {.shape = {2}, .dtype_size = f};
-    m->mb_puf = {.shape = {n}, .dtype_size = f};
-    m->norm_partials = {.shape = {256}, .dtype_size = f};
-    m->grad_norm_puf = {.shape = {1}, .dtype_size = f};
-    alloc.reg(&m->lr_puf);
-    alloc.reg(&m->lr_derived_puf);
-    alloc.reg(&m->mb_puf);
-    alloc.reg(&m->norm_partials);
-    alloc.reg(&m->grad_norm_puf);
-    long max_M = 0, max_N = 0;
-    for (auto* t : param_alloc->regs) {
-        if (t->ndim() >= 2) {
-            long R = t->shape[0], C = t->numel() / R;
-            max_M = max(max_M, min(R, C));
-            max_N = max(max_N, max(R, C));
-        }
-    }
-    if (max_M > 0) {
-        m->max_M = max_M; m->max_N = max_N;
-        int ns_esz = PRECISION_SIZE;
-        m->gram = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
-        m->gram_buf = {.shape = {max_M, max_M}, .dtype_size = ns_esz};
-        m->x_buf = {.shape = {max_M, max_N}, .dtype_size = ns_esz};
-        m->ns_norm_puf = {.shape = {1}, .dtype_size = f};
-        alloc.reg(&m->gram);
-        alloc.reg(&m->gram_buf);
-        alloc.reg(&m->x_buf);
-        alloc.reg(&m->ns_norm_puf);
-    }
+void policy_weights_free(Policy* p, PolicyWeights* w) {
+    p->encoder.free_weights(w->encoder);
+    p->decoder.free_weights(w->decoder);
+    p->network.free_weights(w->network);
 }
 
-void muon_post_create(Muon* m) {
-    m->lr_ptr = (float*)m->lr_puf.bytes;
-    m->lr_derived_ptr = (float*)m->lr_derived_puf.bytes;
-    m->grad_norm_ptr = (float*)m->grad_norm_puf.bytes;
-    if (m->ns_norm_puf.bytes) m->norm_ptr = (float*)m->ns_norm_puf.bytes;
-    cudaMemcpy(m->lr_ptr, &m->lr_val_init, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(m->lr_derived_ptr, 0, 2 * sizeof(float));
-    cudaMemset(m->mb_puf.bytes, 0, m->mb_puf.numel() * sizeof(float));
-}
-
-void muon_step(Muon* m, PufTensor grads, float max_grad_norm, cudaStream_t stream = 0) {
-    // Multi-GPU support: simple all-reduce over a contiguous grad buffer
-    if (m->nccl_comm != nullptr && m->world_size > 1) {
-        ncclAllReduce(grads.bytes, grads.bytes, grads.numel(),
-            NCCL_PRECISION, ncclAvg, m->nccl_comm, stream);
-    }
-
-    // Clip gradients by norm
-    int clip_blocks = min((int)grid_size(grads.numel()), 256);
-    norm_partials_kernel<<<clip_blocks, 256, 0, stream>>>(
-        (float*)m->norm_partials.bytes, (const precision_t*)grads.bytes, grads.numel());
-    norm_reduce_kernel<<<1, 256, 0, stream>>>(m->grad_norm_ptr, (float*)m->norm_partials.bytes, clip_blocks);
-    clip_by_norm_partials_kernel<<<grid_size(grads.numel()), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)grads.bytes, m->grad_norm_ptr, max_grad_norm, 1e-6f, grads.numel());
-
-    // Nesterov momentum works better than Nesterov EMA in our experiments
-    nesterov_momentum_kernel<<<grid_size(m->mb_puf.numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)m->mb_puf.bytes, (precision_t*)grads.bytes, (float)m->momentum, m->mb_puf.numel());
-
-    long offset = 0;
-    for (auto* t : m->param_alloc->regs) {
-        precision_t* gc_ptr = (precision_t*)grads.bytes + offset;
-        float* wb_ptr = (float*)m->weights.bytes + offset;
-        long numel = t->numel();
-        const precision_t* update_ptr = gc_ptr;
-        float scale = 1.0f;
-
-        // Orthogonalize the update
-        if (t->ndim() >= 2) {
-            long R = t->shape[0], C = numel / R;
-            long M = min(R, C), N = max(R, C);
-            bool tall = R > C;
-            PufTensor x = {.bytes = (char*)gc_ptr, .shape = {R, C}, .dtype_size = PRECISION_SIZE};
-            PufTensor x_buf = {.bytes = m->x_buf.bytes, .shape = {R, C}, .dtype_size = PRECISION_SIZE};
-            PufTensor gram = {.bytes = m->gram.bytes, .shape = {M, M}, .dtype_size = PRECISION_SIZE};
-            PufTensor gram_buf = {.bytes = m->gram_buf.bytes, .shape = {M, M}, .dtype_size = PRECISION_SIZE};
-
-            //x = x / clamp(x.norm(dim=(-2, -1)), min=eps)
-            int nblk = min((int)grid_size(x.numel()), 256);
-            norm_partials_kernel<<<nblk, 256, 0, stream>>>(
-                (float*)m->norm_partials.bytes, (const precision_t*)x.bytes, x.numel());
-            norm_reduce_kernel<<<1, 256, 0, stream>>>(m->norm_ptr, (float*)m->norm_partials.bytes, nblk);
-            norm_apply_kernel<<<grid_size(x.numel()), BLOCK_SIZE, 0, stream>>>(
-                (precision_t*)x.bytes, m->norm_ptr, 1e-7f, x.numel());
-
-            // Gram matrix is symmetric -> we can skip tranposing x
-            cublasOperation_t gram_op_a = tall ? CUBLAS_OP_T : CUBLAS_OP_N;
-            cublasOperation_t gram_op_b = tall ? CUBLAS_OP_N : CUBLAS_OP_T;
-            for (int i = 0; i < 5; ++i) {
-                PufTensor& src = (i % 2 == 0) ? x : x_buf;
-                PufTensor& dst = (i % 2 == 0) ? x_buf : x;
-                cublasGemmExDense(gram_op_a, gram_op_b, (int)M, (int)M, (int)N,
-                    src.bytes, src.bytes, gram.bytes, stream);
-                puf_copy(gram_buf, gram, stream);
-                puf_addmm_nn(gram, gram, gram_buf, ns_coeffs[i][2], ns_coeffs[i][1], stream);
-                puf_copy(dst, src, stream);
-                cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
-                    tall ? src.bytes : gram_buf.bytes, tall ? gram_buf.bytes : src.bytes, dst.bytes,
-                    stream, 1.0f, ns_coeffs[i][0]);
-            }
-
-            // Scaling matches Keller
-            update_ptr = (const precision_t*)x_buf.bytes;
-            scale = sqrtf(fmaxf(1.0f, (float)M / (float)N));
-        }
-        
-        // Orthogonalized for 2D+, simple SGD + Nesterov momentum for 1D
-        muon_weight_update_kernel<<<grid_size(numel), BLOCK_SIZE, 0, stream>>>(
-            wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)numel);
-        offset += numel;
-    }
-}
+#include "muon.cu"
 
 #endif // PUFFERLIB_MODELS_CU

@@ -155,7 +155,7 @@ struct NMMO3EncoderActivations {
 };
 
 static NMMO3EncoderWeights* nmmo3_encoder_create(int obs_size, int hidden) {
-    auto* ew = new NMMO3EncoderWeights{};
+    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)calloc(1, sizeof(NMMO3EncoderWeights));
     ew->obs_size = obs_size; ew->hidden = hidden;
     conv_init(&ew->conv1, N3_C1_IC, N3_C1_OC, N3_C1_K, N3_C1_S, N3_MAP_H, N3_MAP_W, true);
     conv_init(&ew->conv2, N3_C2_IC, N3_C2_OC, N3_C2_K, N3_C2_S, N3_C1_OH, N3_C1_OW, false);
@@ -248,8 +248,8 @@ static void nmmo3_encoder_reg_params(void* w, Allocator* alloc, int esz) {
     ew->embed_w = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}, .dtype_size = esz};
     ew->proj_w  = {.shape = {ew->hidden, N3_CONCAT}, .dtype_size = esz};
     ew->proj_b  = {.shape = {ew->hidden}, .dtype_size = esz};
-    alloc->reg(&ew->embed_w);
-    alloc->reg(&ew->proj_w);  alloc->reg(&ew->proj_b);
+    alloc_register(alloc,&ew->embed_w);
+    alloc_register(alloc,&ew->proj_w);  alloc_register(alloc,&ew->proj_b);
 }
 
 static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
@@ -258,20 +258,20 @@ static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts,
     int p = PRECISION_SIZE;
     *a = {};
     a->multihot = {.shape = {B_TT, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}, .dtype_size = p};
-    acts->reg(&a->multihot);
+    alloc_register(acts,&a->multihot);
     conv_reg_train(&ew->conv1, &a->conv1, acts, grads, B_TT, n3_cudnn_dtype());
     conv_reg_train(&ew->conv2, &a->conv2, acts, grads, B_TT, n3_cudnn_dtype());
     a->embed_out = {.shape = {B_TT, N3_PLAYER_EMBED}, .dtype_size = p};
     a->concat    = {.shape = {B_TT, N3_CONCAT}, .dtype_size = p};
     a->out       = {.shape = {B_TT, ew->hidden}, .dtype_size = p};
     a->saved_obs = {.shape = {B_TT, ew->obs_size}, .dtype_size = p};
-    acts->reg(&a->embed_out); acts->reg(&a->concat);
-    acts->reg(&a->out);       acts->reg(&a->saved_obs);
+    alloc_register(acts,&a->embed_out); alloc_register(acts,&a->concat);
+    alloc_register(acts,&a->out);       alloc_register(acts,&a->saved_obs);
     a->embed_wgrad = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}, .dtype_size = p};
     a->proj_wgrad  = {.shape = {ew->hidden, N3_CONCAT}, .dtype_size = p};
     a->proj_bgrad  = {.shape = {ew->hidden}, .dtype_size = p};
-    grads->reg(&a->embed_wgrad);
-    grads->reg(&a->proj_wgrad);  grads->reg(&a->proj_bgrad);
+    alloc_register(grads,&a->embed_wgrad);
+    alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
 }
 
 static void nmmo3_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
@@ -279,11 +279,17 @@ static void nmmo3_encoder_reg_rollout(void* w, void* activations, Allocator* all
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
     int p = PRECISION_SIZE;
     a->multihot = {.shape = {B, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}, .dtype_size = p};
-    alloc->reg(&a->multihot);
+    alloc_register(alloc,&a->multihot);
     conv_reg_rollout(&ew->conv1, &a->conv1, alloc, B, n3_cudnn_dtype());
     conv_reg_rollout(&ew->conv2, &a->conv2, alloc, B, n3_cudnn_dtype());
     a->embed_out = {.shape = {B, N3_PLAYER_EMBED}, .dtype_size = p};
     a->concat    = {.shape = {B, N3_CONCAT}, .dtype_size = p};
     a->out       = {.shape = {B, ew->hidden}, .dtype_size = p};
-    alloc->reg(&a->embed_out); alloc->reg(&a->concat); alloc->reg(&a->out);
+    alloc_register(alloc,&a->embed_out); alloc_register(alloc,&a->concat); alloc_register(alloc,&a->out);
 }
+
+static void* nmmo3_encoder_create_weights(void* self, int esz) {
+    Encoder* e = (Encoder*)self;
+    return nmmo3_encoder_create(e->in_dim, e->out_dim);
+}
+static void nmmo3_encoder_free_weights(void* weights) { free(weights); }

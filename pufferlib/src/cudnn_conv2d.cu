@@ -111,7 +111,7 @@ static void conv_setup(ConvWeights* cw, int B, cudnnDataType_t dt) {
 static void conv_reg_params(ConvWeights* cw, Allocator* alloc, int esz) {
     cw->w = {.shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = esz};
     cw->b = {.shape = {cw->OC}, .dtype_size = esz};
-    alloc->reg(&cw->w); alloc->reg(&cw->b);
+    alloc_register(alloc,&cw->w); alloc_register(alloc,&cw->b);
 }
 
 static void conv_reg_train(ConvWeights* cw, ConvActivations* ca, Allocator* acts, Allocator* grads, int B, cudnnDataType_t dt) {
@@ -121,15 +121,15 @@ static void conv_reg_train(ConvWeights* cw, ConvActivations* ca, Allocator* acts
     ca->saved_input = {.shape = {B * cw->IC * cw->IH * cw->IW}, .dtype_size = p};
     ca->wgrad       = {.shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = p};
     ca->bgrad       = {.shape = {cw->OC}, .dtype_size = p};
-    acts->reg(&ca->out); acts->reg(&ca->grad); acts->reg(&ca->saved_input);
-    grads->reg(&ca->wgrad); grads->reg(&ca->bgrad);
+    alloc_register(acts,&ca->out); alloc_register(acts,&ca->grad); alloc_register(acts,&ca->saved_input);
+    alloc_register(grads,&ca->wgrad); alloc_register(grads,&ca->bgrad);
     conv_setup(cw, B, dt);
 }
 
 static void conv_reg_rollout(ConvWeights* cw, ConvActivations* ca, Allocator* alloc, int B, cudnnDataType_t dt) {
     int p = cw->w.dtype_size ? cw->w.dtype_size : (dt == CUDNN_DATA_BFLOAT16 ? 2 : 4);
     ca->out = {.shape = {B * cw->OC * cw->OH * cw->OW}, .dtype_size = p};
-    alloc->reg(&ca->out);
+    alloc_register(alloc,&ca->out);
     conv_setup(cw, B, dt);
 }
 

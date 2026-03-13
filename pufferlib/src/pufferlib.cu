@@ -689,6 +689,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_params = nmmo3_encoder_reg_params,
         .reg_train = nmmo3_encoder_reg_train,
         .reg_rollout = nmmo3_encoder_reg_rollout,
+        .create_weights = nmmo3_encoder_create_weights,
+        .free_weights = nmmo3_encoder_free_weights,
+        .in_dim = input_size, .out_dim = hidden_size,
     } : Encoder{
         .forward = encoder_forward,
         .backward = encoder_backward,
@@ -696,6 +699,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_params = encoder_reg_params,
         .reg_train = encoder_reg_train,
         .reg_rollout = encoder_reg_rollout,
+        .create_weights = encoder_create_weights,
+        .free_weights = encoder_free_weights,
+        .in_dim = input_size, .out_dim = hidden_size,
     };
     Decoder decoder = {
         .forward = decoder_forward,
@@ -704,6 +710,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_params = decoder_reg_params,
         .reg_train = decoder_reg_train,
         .reg_rollout = decoder_reg_rollout,
+        .create_weights = decoder_create_weights,
+        .free_weights = decoder_free_weights,
+        .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
     };
     Network network = {
         .forward = mingru_forward,
@@ -713,37 +722,27 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_params = mingru_reg_params,
         .reg_train = mingru_reg_train,
         .reg_rollout = mingru_reg_rollout,
+        .create_weights = mingru_create_weights,
+        .free_weights = mingru_free_weights,
+        .hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon,
     };
 
     // Policy vtables (shared across fp32/bf16)
-    Policy* policy = new Policy{
+    pufferl->policy = (Policy*)malloc(sizeof(Policy));
+    *pufferl->policy = Policy{
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
         .num_atns = act_n,
     };
-    pufferl->policy = policy;
 
     // fp32 master weights
-    auto new_weights = [&](int esz) -> PolicyWeights {
-        PolicyWeights w;
-        if (is_nmmo3) {
-            w.encoder = nmmo3_encoder_create(input_size, hidden_size);
-        } else {
-            w.encoder = new EncoderWeights{.in_dim = input_size, .out_dim = hidden_size};
-        }
-        w.decoder = new DecoderWeights{.hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous};
-        w.network = new MinGRUWeights{.hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon};
-        ((MinGRUWeights*)w.network)->weights.resize(num_layers);
-        return w;
-    };
-
-    pufferl->weights_fp32 = new_weights(esz_fp32);
+    pufferl->weights_fp32 = policy_weights_create(pufferl->policy, esz_fp32);
     PolicyWeights& wfp32 = pufferl->weights_fp32;
     encoder.reg_params(wfp32.encoder, &fp32_params, esz_fp32);
     decoder.reg_params(wfp32.decoder, &fp32_params, esz_fp32);
     network.reg_params(wfp32.network, &fp32_params, esz_fp32);
 
-    pufferl->alloc_fp32.create();
+    allocset_create(&pufferl->alloc_fp32);
     pufferl->param_fp32_puf = {.bytes = (char*)fp32_params.mem, .shape = {fp32_params.total_elems}, .dtype_size = esz_fp32};
 
     // Init weights on fp32 master
@@ -767,7 +766,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         Allocator& acts = pufferl->alloc_bf16.acts;
         Allocator& grads = pufferl->alloc_bf16.grads;
 
-        pufferl->weights_bf16 = new_weights(psz);
+        pufferl->weights_bf16 = policy_weights_create(pufferl->policy, psz);
         PolicyWeights& wbf16 = pufferl->weights_bf16;
 
         encoder.reg_params(wbf16.encoder, &bf16_params, psz);
@@ -782,7 +781,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         decoder.reg_train(wbf16.decoder, tb.decoder, &acts, &grads, B_TT);
         network.reg_train(wbf16.network, tb.network, &acts, &grads, B_TT);
 
-        pufferl->alloc_bf16.create();
+        allocset_create(&pufferl->alloc_bf16);
         pufferl->param_bf16_puf = {.bytes = (char*)bf16_params.mem, .shape = {bf16_params.total_elems}, .dtype_size = 2};
         pufferl->grad_bf16_puf = {.bytes = (char*)pufferl->alloc_bf16.grads.mem, .shape = {pufferl->alloc_bf16.grads.total_elems}, .dtype_size = 2};
 
@@ -804,8 +803,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         decoder.reg_train(wfp32.decoder, tb.decoder, &acts, &grads, B_TT);
         network.reg_train(wfp32.network, tb.network, &acts, &grads, B_TT);
 
-        pufferl->alloc_fp32.acts.create();
-        pufferl->alloc_fp32.grads.create();
+        alloc_create(&pufferl->alloc_fp32.acts);
+        alloc_create(&pufferl->alloc_fp32.grads);
         pufferl->grad_bf16_puf = {.bytes = (char*)grads.mem, .shape = {grads.total_elems}, .dtype_size = esz_fp32};
     }
 
@@ -839,15 +838,15 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->rng_offset_puf = {.shape = {num_buffers + 1}, .dtype_size = (int)sizeof(int64_t)};
     pufferl->act_sizes_puf = {.shape = {num_action_heads}, .dtype_size = (int)sizeof(int32_t)};
     pufferl->losses_puf = {.shape = {NUM_LOSSES}, .dtype_size = (int)sizeof(float)};
-    alloc.reg(&pufferl->rng_offset_puf);
-    alloc.reg(&pufferl->act_sizes_puf);
-    alloc.reg(&pufferl->losses_puf);
+    alloc_register(&alloc,&pufferl->rng_offset_puf);
+    alloc_register(&alloc,&pufferl->act_sizes_puf);
+    alloc_register(&alloc,&pufferl->losses_puf);
 
     // Per-buffer RNN states
     pufferl->buffer_states.resize(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_states[i] = {.shape = {num_layers, batch, hidden_size}, .dtype_size = p};
-        alloc.reg(&pufferl->buffer_states[i]);
+        alloc_register(&alloc,&pufferl->buffer_states[i]);
     }
 
     // Rollout buffers (horizon, total_agents, ...)
@@ -863,8 +862,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // Pre-allocated train temporaries
     pufferl->old_values_puf = {.shape = {total_agents, horizon}, .dtype_size = p};
     pufferl->advantages_puf = {.shape = {total_agents, horizon}, .dtype_size = (int)sizeof(float)};
-    alloc.reg(&pufferl->old_values_puf);
-    alloc.reg(&pufferl->advantages_puf);
+    alloc_register(&alloc,&pufferl->old_values_puf);
+    alloc_register(&alloc,&pufferl->advantages_puf);
 
     // PPO loss buffers
     register_ppo_buffers(pufferl->ppo_bufs_puf, alloc, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
@@ -880,7 +879,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     printf("DEBUG: Contiguous weight buffer: %ld elements\n", pufferl->muon->weights.numel());
 
     // Single allocation for all registered buffers
-    alloc.create();
+    alloc_create(&alloc);
 
     // Post-create initialization: copy data, set constants
     cudaMemset(pufferl->rng_offset_puf.bytes, 0, (num_buffers + 1) * sizeof(int64_t));
@@ -902,7 +901,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         encoder.reg_rollout(pufferl->weights_bf16.encoder, rbuf.encoder, &ralloc, inf_batch);
         decoder.reg_rollout(pufferl->weights_bf16.decoder, rbuf.decoder, &ralloc, inf_batch);
         network.reg_rollout(pufferl->weights_bf16.network, rbuf.network, &ralloc, inf_batch);
-        ralloc.create();
+        alloc_create(&ralloc);
     }
 
     if (hypers.cudagraphs >= 0) {
@@ -1002,33 +1001,27 @@ void close_impl(PuffeRL& pufferl) {
 
     delete pufferl.muon;
 
-    auto delete_weights = [&](PolicyWeights& w) {
-        if (pufferl.is_nmmo3) delete (NMMO3EncoderWeights*)w.encoder;
-        else delete (EncoderWeights*)w.encoder;
-        delete (DecoderWeights*)w.decoder;
-        delete (MinGRUWeights*)w.network;
-    };
     if (USE_BF16) {
-        delete_weights(pufferl.weights_bf16);
+        policy_weights_free(pufferl.policy, &pufferl.weights_bf16);
     }
     if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)pufferl.train_activations.encoder;
     else delete (EncoderActivations*)pufferl.train_activations.encoder;
     delete (DecoderActivations*)pufferl.train_activations.decoder;
     delete (MinGRUActivations*)pufferl.train_activations.network;
-    delete_weights(pufferl.weights_fp32);
+    policy_weights_free(pufferl.policy, &pufferl.weights_fp32);
     for (auto& rbuf : pufferl.buffer_activations) {
         if (pufferl.is_nmmo3) delete (NMMO3EncoderActivations*)rbuf.encoder;
         else delete (EncoderActivations*)rbuf.encoder;
         delete (DecoderActivations*)rbuf.decoder;
         delete (MinGRUActivations*)rbuf.network;
     }
-    delete pufferl.policy;
+    free(pufferl.policy);
 
-    pufferl.alloc_fp32.destroy();
-    pufferl.alloc_bf16.destroy();
-    pufferl.pufferl_alloc.destroy();
+    allocset_free(&pufferl.alloc_fp32);
+    allocset_free(&pufferl.alloc_bf16);
+    alloc_free(&pufferl.pufferl_alloc);
     for (auto& a : pufferl.buffer_allocs) {
-        a.destroy();
+        alloc_free(&a);
     }
 
     for (auto s : pufferl.streams) {
