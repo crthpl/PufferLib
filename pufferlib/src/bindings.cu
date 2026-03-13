@@ -26,7 +26,7 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     result["SPS"] = sps * gpus;
     result["agent_steps"] = global_step * gpus;
     result["uptime"] = now - pufferl.start_time;
-    result["epoch"] = epoch * gpus;
+    result["epoch"] = epoch;
 
     // Environment stats
     pybind11::dict env_dict;

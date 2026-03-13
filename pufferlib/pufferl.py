@@ -292,7 +292,7 @@ def train(env_name, args=None, gpus=None, **kwargs):
 
     subprocess = gpus is not None
     gpus = list(gpus or range(args['train']['gpus']))
-    args['vec']['num_threads'] //= len(gpus)
+    args['train']['total_timesteps'] //= len(gpus)
     args['world_size'] = len(gpus)
     args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
 
