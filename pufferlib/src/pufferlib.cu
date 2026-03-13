@@ -1,12 +1,3 @@
-/* Checklist for avoiding diabolical capture bugs:
- * 1. Don't start separate streams before tracing (i.e. env gpu buffers)
- * 2. Make sure input/output buffer pointers don't change
- * 3. Make sure to restore the original stream after tracing
- * 4. All custom kernels need to use the default torch stream
- * 5. Make sure you are using the torch stream fns, not the c10 ones.
- * 6. Scalars get captured by value. They cannot change between calls.
- */
-
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <nccl.h>
@@ -14,6 +5,7 @@
 #include <nvml.h>
 
 #include "models.cu"
+#include "muon.cu"
 #include "vecenv.h"
 
 
@@ -629,7 +621,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     int minibatch_segments = hypers.minibatch_size / hypers.horizon;
     int inf_batch = vec->total_agents / hypers.num_buffers;
-
+    int B_TT = minibatch_segments * hypers.horizon;
+    int psz = PRECISION_SIZE;
+    int horizon = hypers.horizon;
+    int total_agents = vec->total_agents;
+    int batch = total_agents / hypers.num_buffers;
+    int num_buffers = hypers.num_buffers;
 
     Encoder encoder = {
         .forward = encoder_forward,
@@ -672,13 +669,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .num_atns = act_n,
     };
 
-    int B_TT = minibatch_segments * hypers.horizon;
-    int psz = PRECISION_SIZE;
-    int horizon = hypers.horizon;
-    int total_agents = vec->total_agents;
-    int batch = total_agents / hypers.num_buffers;
-    int num_buffers = hypers.num_buffers;
-
     // Create and allocate params
     Allocator* params = &pufferl->params_alloc;
     Allocator* acts = &pufferl->activations_alloc;
@@ -689,11 +679,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->train_activations = policy_reg_train(&pufferl->policy, pufferl->weights, acts, grads, B_TT);
     pufferl->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
     pufferl->buffer_states = (PufTensor*)calloc(num_buffers, sizeof(PufTensor));
-    int p = PRECISION_SIZE;
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_activations[i] = policy_reg_rollout(
             &pufferl->policy, pufferl->weights, acts, inf_batch);
-        pufferl->buffer_states[i] = {.shape = {num_layers, batch, hidden_size}, .dtype_size = p};
+        pufferl->buffer_states[i] = {
+            .shape = {num_layers, batch, hidden_size},
+            .dtype_size = PRECISION_SIZE
+        };
         alloc_register(acts, &pufferl->buffer_states[i]);
     }
     register_rollout_buffers(pufferl->rollouts,
@@ -746,17 +738,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemset(pufferl->rng_offset_puf.bytes, 0, (num_buffers + 1) * sizeof(long));
     cudaMemcpy(pufferl->act_sizes_puf.bytes, raw_act_sizes, num_action_heads * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses_puf.bytes, 0, NUM_LOSSES * sizeof(float));
-
     float one = 1.0f;
     cudaMemcpy(&pufferl->ppo_bufs_puf.grad_loss.bytes, &one, sizeof(float), cudaMemcpyHostToDevice);
-
     muon_post_create(&pufferl->muon);
 
     if (hypers.cudagraphs >= 0) {
-        pufferl->train_warmup = 0;
-
-        // Fused rollout cudagraphs: [horizon][num_buffers]
         pufferl->fused_rollout_cudagraphs = (RawCudaGraph*)calloc(horizon*num_buffers, sizeof(RawCudaGraph));
+        pufferl->train_warmup = 0;
 
         // Snapshot weights + optimizer state before init-time capture
         long wb_bytes = pufferl->master_weights.numel() * sizeof(float);
@@ -767,8 +755,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaMalloc(&saved_momentum, wb_bytes);
         cudaMemcpy(saved_momentum, pufferl->muon.mb_puf.bytes, wb_bytes, cudaMemcpyDeviceToDevice);
 
-        // Run warmup + capture on a fresh stream.
-        // Swap default_stream (used by train_impl) and tl_stream (used by callback on main thread).
+        // Checklist for avoiding diabolical capture bugs:
+        // 1. Don't start separate streams before tracing (i.e. env gpu buffers)
+        // 2. Make sure input/output buffer pointers don't change
+        // 3. Make sure to restore the original stream after tracing
+        // 4. Scalars get captured by value. They cannot change between calls.
         cudaStream_t saved_default = pufferl->default_stream;
         cudaStream_t saved_tl = tl_stream;
         cudaStream_t warmup_stream;
