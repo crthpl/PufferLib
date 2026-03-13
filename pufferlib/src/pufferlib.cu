@@ -726,7 +726,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->param_puf = {.bytes = (char*)params->mem,
         .shape = {params->total_elems}, .dtype_size = psz};
 
-    policy_init_weights(&pufferl->policy, pufferl->weights, &seed, pufferl->default_stream);
+    ulong init_seed = hypers.seed;
+    policy_init_weights(&pufferl->policy, pufferl->weights, &init_seed, pufferl->default_stream);
     pufferl->master_weights = pufferl->param_puf;
     if (USE_BF16) {
         pufferl->master_weights = {.shape = {params->total_elems}, .dtype_size = 4};
