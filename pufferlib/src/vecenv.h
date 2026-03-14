@@ -259,6 +259,8 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 
+            memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
+            memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
             clock_gettime(CLOCK_MONOTONIC, &t0);
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
