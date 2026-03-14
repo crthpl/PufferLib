@@ -8,6 +8,82 @@
 #include "muon.cu"
 #include "vecenv.h"
 
+// Loss component indices
+enum LossIdx {
+    LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
+    LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
+    LOSS_N = 7, NUM_LOSSES = 8,
+};
+
+struct RolloutBuf {
+    PufTensor observations;  // (horizon, segments, input_size) PRECISION
+    PufTensor actions;       // (horizon, segments, num_atns) f64
+    PufTensor values;        // (horizon, segments) PRECISION
+    PufTensor logprobs;      // (horizon, segments) PRECISION
+    PufTensor rewards;       // (horizon, segments) PRECISION
+    PufTensor terminals;     // (horizon, segments) PRECISION
+    PufTensor ratio;         // (horizon, segments) PRECISION
+    PufTensor importance;    // (horizon, segments) PRECISION
+};
+
+struct TrainGraph {
+    PufTensor mb_obs;         // (S, H, input_size) PRECISION
+    PufTensor mb_state;       // (L, S, 1, hidden) PRECISION
+    PufTensor mb_actions;     // (S, H, num_atns) f64
+    PufTensor mb_logprobs;    // (S, H) PRECISION
+    PufTensor mb_advantages;  // (S, H) f32
+    PufTensor mb_prio;        // (S, 1) PRECISION
+    PufTensor mb_values;      // (S, H) PRECISION
+    PufTensor mb_returns;     // (S, H) PRECISION
+    PufTensor mb_ratio;       // (S, H) PRECISION
+    PufTensor mb_newvalue;    // (S, H, 1) PRECISION
+};
+
+// Fused PPO forward + backward kernel: computes loss partials AND gradients in one pass.
+// Avoids redundant recomputation of logits, logsumexp, ratio, advantage normalization.
+struct PPOGraphArgs {
+    precision_t* out_ratio;
+    precision_t* out_newvalue;
+    const double* actions;
+    const precision_t* old_logprobs;
+    const float* advantages;
+    const precision_t* prio;
+    const precision_t* values;
+    const precision_t* returns;
+};
+
+struct PPOKernelArgs {
+    // Gradient outputs
+    float* grad_logits;          // For continuous: grad_mean
+    float* grad_logstd;          // For continuous: grad_logstd (nullptr for discrete)
+    float* grad_values_pred;
+    // Inputs (from dec_out)
+    const precision_t* logits;
+    const precision_t* logstd;   // nullptr for discrete
+    const precision_t* values_pred;
+    const float* adv_mean;
+    const float* adv_var;
+    const int* act_sizes;
+    // Scalars
+    int num_atns;
+    float clip_coef, vf_clip_coef, vf_coef, ent_coef;
+    int T_seq, A_total, N;
+    int logits_stride_n, logits_stride_t, logits_stride_a;
+    int values_stride_n, values_stride_t;
+    bool is_continuous;
+};
+
+// Pre-allocated buffers for PPO loss
+struct PPOBuffersPuf {
+    PufTensor loss_output, saved_for_bwd, grad_loss;
+    PufTensor grad_logits, grad_values, grad_logstd, adv_scratch;
+};
+
+// Pre-allocated buffers for prio_replay
+struct PrioBuffers {
+    PufTensor prio_probs, cdf, idx, mb_prio;
+};
+
 
 void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minibatch_segments) {
     bufs = (PrioBuffers){

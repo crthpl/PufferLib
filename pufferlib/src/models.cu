@@ -142,6 +142,18 @@ __global__ void mingru_gate(
     out[idx] = from_float(proj_sigmoid * mingru_out + (1.0f - proj_sigmoid) * x);
 }
 
+// Prefix scan buffers
+struct PrefixScan {
+    void* combined_ptr = nullptr;
+    void* state_ptr = nullptr;
+    void* input_ptr = nullptr;      // (B, T, H) original input before projection (for highway gate)
+    int B = 0, T = 0, H = 0;
+    PufTensor a_star, s_vals, log_values_buf;
+    PufTensor out, next_state;
+    PufTensor grad_combined, grad_state;
+    PufTensor grad_input;           // (B, T, H) highway gate gradient w.r.t. input
+};
+
 // Optimized forward kernel with checkpointing
 // Writes checkpoints only every CHECKPOINT_INTERVAL timesteps (vs every time)
 // Uses fast math intrinsics for better performance
