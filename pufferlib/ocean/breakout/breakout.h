@@ -456,7 +456,7 @@ void step_frame(Breakout* env, float action) {
 
         env->ball_vy = cosf(direction) * env->ball_speed * TICK_RATE;
         env->ball_vx = sinf(direction) * env->ball_speed * TICK_RATE;
-        if (rand() % 2 == 0) {
+        if (rand_r(&env->rng) % 2 == 0) {
             env->ball_vx = -env->ball_vx;
         }
     }   

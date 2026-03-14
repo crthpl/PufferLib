@@ -1,27 +1,35 @@
-// models.cpp - MinGRU, LSTM, and related model classes for pufferlib
-// Included by pufferlib.cpp and profile_kernels.cu inside namespace pufferlib
+#ifndef PUFFERLIB_LEGACY_MODULES_H
+#define PUFFERLIB_LEGACY_MODULES_H
 
-using std::tuple;
-using std::vector;
+// Legacy torch-dependent code: reference implementations + PolicyLSTM
+// Kept for numerical tests and profiler torch benchmarks.
+
+#include "../models.cu"
+
+#ifdef PUFFERLIB_TORCH
+#include <torch/torch.h>
+
+namespace pufferlib {
+
 using std::shared_ptr;
+using std::vector;
+using std::tuple;
 namespace nn = torch::nn;
 typedef torch::Tensor Tensor;
 
-// Compile-time precision: default bf16, pass -DPRECISION_FLOAT for float32
+// Compile-time precision dtype for torch interop
 #ifdef PRECISION_FLOAT
-constexpr bool USE_BF16 = false;
 constexpr torch::ScalarType PRECISION_DTYPE = torch::kFloat32;
 #else
-constexpr bool USE_BF16 = true;
 constexpr torch::ScalarType PRECISION_DTYPE = torch::kBFloat16;
 #endif
 
 // Common tensor options
-auto cuda_f32 = torch::dtype(torch::kFloat32).device(torch::kCUDA);
-auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
-auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
-auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
-auto cuda_t = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
+inline auto cuda_f32 = torch::dtype(torch::kFloat32).device(torch::kCUDA);
+inline auto cuda_f64 = torch::dtype(torch::kFloat64).device(torch::kCUDA);
+inline auto cuda_i32 = torch::dtype(torch::kInt32).device(torch::kCUDA);
+inline auto cuda_i64 = torch::dtype(torch::kInt64).device(torch::kCUDA);
+inline auto cuda_t = torch::dtype(PRECISION_DTYPE).device(torch::kCUDA);
 
 // Raw struct bundling decoder outputs: mean (logits for discrete) + logstd
 struct Logits {
@@ -77,8 +85,6 @@ class DefaultDecoder : public Decoder {
 
     tuple<Logits, Tensor> forward(Tensor h) override {
         h = linear->forward(h);
-        // Logits and value are fused in contiguous memory
-        // This is mandatory in custom decoders for our loss kernel to work
         Logits logits = {.mean = h.narrow(-1, 0, output)};
         Tensor value = h.narrow(-1, output, 1).squeeze(-1);
         if (continuous) {
@@ -89,11 +95,7 @@ class DefaultDecoder : public Decoder {
 };
 
 // Reference implementation for mingru_gate (inference path)
-// Takes combined (B, 3*H) = [hidden, gate, proj] and state (B, H)
-// Returns {out, next_state} where:
-//   out (B, H) = sigmoid(proj) * mingru_out
-//   next_state (B, H) = mingru_out (for recurrence)
-vector<Tensor> mingru_gate_cpp(Tensor state, Tensor combined) {
+inline vector<Tensor> mingru_gate_cpp(Tensor state, Tensor combined) {
     auto chunks = combined.chunk(3, 1);
     auto hidden = chunks[0];
     auto gate = chunks[1];
@@ -107,20 +109,14 @@ vector<Tensor> mingru_gate_cpp(Tensor state, Tensor combined) {
 }
 
 // Reference implementation for fused_scan (training path)
-// Takes combined (B, T, 3*H) = [hidden, gate, proj] and state (B, 1, H)
-// Returns {out, next_state} where:
-//   out (B, T, H) = sigmoid(proj) * scan_result
-//   next_state (B, 1, H) = raw scan_result at T (for recurrence)
-vector<Tensor> fused_scan_cpp(Tensor combined, Tensor state) {
+inline vector<Tensor> fused_scan_cpp(Tensor combined, Tensor state) {
     auto seq_len = combined.size(1);
 
-    // Split combined into hidden, gate, proj
     auto chunks = combined.chunk(3, 2);
     auto hidden = chunks[0];
     auto gate = chunks[1];
     auto proj = chunks[2];
 
-    // Compute log_coeffs and log_values
     auto log_coeffs = -nn::functional::softplus(gate);
     auto log_z = -nn::functional::softplus(-gate);
     auto log_tilde_h = torch::where(hidden >= 0,
@@ -128,144 +124,21 @@ vector<Tensor> fused_scan_cpp(Tensor combined, Tensor state) {
         -nn::functional::softplus(-hidden));
     auto log_values = log_z + log_tilde_h;
 
-    // Cat state and pad for scan
     log_values = torch::cat({state.log(), log_values}, 1);
     log_coeffs = torch::pad(log_coeffs, {0, 0, 1, 0});
 
-    // Heinsen associative scan
     auto a_star = log_coeffs.cumsum(1);
     auto log_h0_plus_b_star = (log_values - a_star).logcumsumexp(1);
     auto log_h = a_star + log_h0_plus_b_star;
     auto scan_result = log_h.exp();
 
-    // Extract output and next_state
     scan_result = scan_result.narrow(1, scan_result.size(1) - seq_len, seq_len);
     auto next_state = scan_result.narrow(1, scan_result.size(1) - 1, 1);
 
-    // Apply sigmoid(proj) * scan_result for output
     auto out = torch::sigmoid(proj) * scan_result;
 
     return {out, next_state};
 }
-
-struct RNN : public nn::Module {
-    virtual tuple<Tensor, Tensor> forward(Tensor x, Tensor state) = 0;
-    virtual Tensor forward_train(Tensor x, Tensor state) = 0;
-    virtual Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) = 0;
-};
-
-struct MinGRU : public RNN {
-    int hidden, num_layers;
-    bool kernels;
-    vector<nn::Linear> layers;
-
-    MinGRU(int hidden, int num_layers = 1, bool kernels = true)
-            : hidden(hidden), num_layers(num_layers), kernels(kernels) {
-        for (int i = 0; i < num_layers; i++) {
-            nn::Linear layer = nn::Linear(nn::LinearOptions(hidden, 3*hidden).bias(false));
-            nn::init::orthogonal_(layer->weight);
-            layers.push_back(register_module("layer_" + std::to_string(i), layer));
-        }
-    }
-
-    Tensor initial_state(int batch_size, torch::Device device, torch::Dtype dtype) override {
-        return torch::zeros({num_layers, batch_size, hidden},
-            torch::dtype(dtype).device(device));
-    }
-
-    // Inference: x (B, H), state (num_layers, B, H) -> (h, state)
-    tuple<Tensor, Tensor> forward(Tensor x, Tensor state) override {
-        TORCH_CHECK(x.dim() == 2 && state.dim() == 3 && state.size(0) == num_layers
-            && x.size(0) == state.size(1) && x.size(1) == hidden && state.size(2) == hidden,
-            "Expected x={B, H=", hidden, "}, state={layers=", num_layers, ", B, H=", hidden, "}, ",
-            "Got x=", x.sizes(), ", state=", state.sizes());
-
-        for (int i = 0; i < num_layers; i++) {
-            Tensor state_i = state.select(0, i);
-            Tensor combined = layers[i]->forward(x);
-            auto result = kernels ? mingru_gate(state_i, combined.contiguous())
-                                  : mingru_gate_cpp(state_i, combined);
-            x = result[0];
-            state.select(0, i).copy_(result[1]);
-        }
-        return {x, state};
-    }
-
-    // Training: x (B, TT, H), state (num_layers, B, 1, H) -> h (B, TT, H)
-    Tensor forward_train(Tensor x, Tensor state) override {
-        TORCH_CHECK(x.dim() == 3 && x.size(2) == hidden
-            && state.dim() == 4 && state.size(0) == num_layers && x.size(0) == state.size(1)
-            && state.size(2) == 1 && state.size(3) == hidden,
-            "Expected x={B, TT, H=", hidden, "}, state={layers=", num_layers, ", B, 1, H=", hidden, "}, ",
-            "Got x=", x.sizes(), ", state=", state.sizes());
-
-        for (int i = 0; i < num_layers; i++) {
-            Tensor state_i = state.select(0, i);
-            Tensor combined = layers[i]->forward(x);
-            auto result = kernels ? PrefixScan::apply(combined, state_i)
-                                  : fused_scan_cpp(combined, state_i);
-            x = result[0];
-        }
-        return x;
-    }
-};
-
-struct Policy : public nn::Module {
-    int input, hidden, num_atns;
-    shared_ptr<Encoder> encoder{nullptr};
-    shared_ptr<Decoder> decoder{nullptr};
-    shared_ptr<RNN> rnn{nullptr};
-
-    Policy(shared_ptr<Encoder> enc, shared_ptr<Decoder> dec, shared_ptr<RNN> rnn_module,
-            int input, int num_atns, int hidden = 128)
-            : input(input), hidden(hidden), num_atns(num_atns) {
-        encoder = register_module("encoder", enc);
-        decoder = register_module("decoder", dec);
-        rnn = register_module("rnn", rnn_module);
-    }
-
-    Tensor initial_state(int batch_size, torch::Device device) {
-        auto dtype = parameters().empty() ? torch::kFloat32 : parameters()[0].scalar_type();
-        return rnn->initial_state(batch_size, device, dtype);
-    }
-
-    tuple<Logits, Tensor, Tensor> forward(Tensor observations, Tensor state) {
-        TORCH_CHECK(observations.dim() == 2 && observations.size(1) == input,
-            "Expected obs={B, ", input, "}, Got ", observations.sizes());
-
-        Tensor h = encoder->forward(observations);
-        auto [h_out, state_out] = rnn->forward(h, state);
-        auto [logits, values] = decoder->forward(h_out);
-        return {logits, values, state_out};
-    }
-
-    tuple<Logits, Tensor> forward_train(Tensor x, Tensor state) {
-        TORCH_CHECK(x.dim() == 3 && x.size(-1) == input,
-            "Expected obs={B, TT, ", input, "}, Got ", x.sizes());
-
-        int B = x.size(0);
-        int TT = x.size(1);
-
-        x = x.reshape({B*TT, input});
-        Tensor h = encoder->forward(x);
-        h = h.reshape({B, TT, hidden});
-
-        h = rnn->forward_train(h, state);
-        Tensor flat_h = h.reshape({-1, hidden});
-
-        auto [logits, values] = decoder->forward(flat_h);
-
-        logits.mean = logits.mean.reshape({B, TT, num_atns});
-        if (logits.logstd.defined()) {
-            logits.logstd = logits.logstd.reshape({B, TT, num_atns});
-        } else {
-            logits.logstd = torch::empty({0}, logits.mean.options());
-        }
-        values = values.reshape({B, TT, 1});
-
-        return {logits, values};
-    }
-};
 
 struct ShareableLSTMCell : public nn::LSTMCellImpl {
     ShareableLSTMCell(const nn::LSTMCellOptions& options) : nn::LSTMCellImpl(options) {}
@@ -276,7 +149,6 @@ struct ShareableLSTMCell : public nn::LSTMCellImpl {
         bias_ih = b_ih;
         bias_hh = b_hh;
 
-        // Remove the original (unused) tensors from the parameter dict to avoid waste
         parameters_.erase("weight_ih");
         parameters_.erase("weight_hh");
         parameters_.erase("bias_ih");
@@ -382,7 +254,6 @@ public:
                         "lstm_c must be [1, B, hidden]");
         }
 
-        // Flatten time steps if needed
         if (x.dim() == 3) {
             x = x.reshape({B * TT, input_});
         } else {
@@ -392,7 +263,7 @@ public:
         Tensor hidden = encoder->forward(x);
 
         hidden = hidden.reshape({B, TT, hidden_});
-        hidden = hidden.transpose(0, 1);  // [TT, B, hidden]
+        hidden = hidden.transpose(0, 1);
 
         tuple<Tensor, tuple<Tensor, Tensor>> lstm_out;
         if (lstm_h.defined() && lstm_h.numel() > 0) {
@@ -402,7 +273,7 @@ public:
         }
 
         hidden = std::get<0>(lstm_out);
-        hidden = hidden.transpose(0, 1);  // [B, TT, hidden]
+        hidden = hidden.transpose(0, 1);
 
         Tensor flat_hidden = hidden.reshape({-1, hidden_});
         Tensor logits = decoder->forward(flat_hidden);
@@ -415,8 +286,7 @@ public:
     }
 };
 
-
-void sync_fp16_fp32(PolicyLSTM* policy_16, PolicyLSTM* policy_32) {
+inline void sync_fp16_fp32(PolicyLSTM* policy_16, PolicyLSTM* policy_32) {
     auto params_32 = policy_32->parameters();
     auto params_16 = policy_16->parameters();
     for (size_t i = 0; i < params_32.size(); ++i) {
@@ -425,31 +295,22 @@ void sync_fp16_fp32(PolicyLSTM* policy_16, PolicyLSTM* policy_32) {
 }
 
 // Sync bf16 working weights from fp32 master weights (for mixed-precision training)
-void sync_policy_weights(Policy* policy_bf16, Policy* policy_fp32) {
-    auto params_fp32 = policy_fp32->parameters();
-    auto params_bf16 = policy_bf16->parameters();
-    for (size_t i = 0; i < params_fp32.size(); ++i) {
-        params_bf16[i].data().copy_(params_fp32[i].data().to(torch::kBFloat16));
-    }
-}
-
-// Copy gradients from bf16 policy to fp32 policy (for optimizer step)
-void copy_gradients_to_fp32(Policy* policy_bf16, Policy* policy_fp32) {
-    auto params_fp32 = policy_fp32->parameters();
-    auto params_bf16 = policy_bf16->parameters();
-    for (size_t i = 0; i < params_fp32.size(); ++i) {
-        if (params_bf16[i].grad().defined()) {
-            params_fp32[i].mutable_grad() = params_bf16[i].grad().to(torch::kFloat32);
-        }
+inline void sync_policy_weights(Tensor& dst_param_buffer, const Tensor& src_param_buffer) {
+    PufTensor dst = PufTensor::from_torch(dst_param_buffer);
+    PufTensor src = PufTensor::from_torch(src_param_buffer);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    if (dst.dtype_size == src.dtype_size) {
+        puf_copy(&dst, &src, stream);
+    } else {
+        puf_cast_f32_to_bf16(dst, src, stream);
     }
 }
 
 // =============================================================================
 // Reference/fallback implementations (pure PyTorch, no CUDA kernels)
-// Moved from modules.cu for cleaner separation of CUDA vs torch-native code
 // =============================================================================
 
-torch::autograd::tensor_list log_coeffs_and_values_cpp(Tensor gate, Tensor hidden) {
+inline torch::autograd::tensor_list log_coeffs_and_values_cpp(Tensor gate, Tensor hidden) {
     auto log_coeffs = -nn::functional::softplus(gate);
     auto log_z = -nn::functional::softplus(-gate);
     auto log_tilde_h = torch::where(hidden >= 0,
@@ -459,13 +320,12 @@ torch::autograd::tensor_list log_coeffs_and_values_cpp(Tensor gate, Tensor hidde
     return {log_coeffs, log_values};
 }
 
-Tensor logcumsumexp_cpp(Tensor x) {
+inline Tensor logcumsumexp_cpp(Tensor x) {
     return x.exp().cumsum(1).log();
 }
 
 // Sample from multi-head discrete distribution
-// Returns {actions (B, heads), total_logprob (B,)}
-vector<Tensor> sample_discrete_cpp(Tensor logits, Tensor act_sizes_cpu, int num_heads) {
+inline vector<Tensor> sample_discrete_cpp(Tensor logits, Tensor act_sizes_cpu, int num_heads) {
     logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
     auto split = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_heads), 1);
     vector<Tensor> actions_vec, logprobs_vec;
@@ -479,8 +339,7 @@ vector<Tensor> sample_discrete_cpp(Tensor logits, Tensor act_sizes_cpu, int num_
 }
 
 // Sample from continuous Normal distribution
-// Returns {actions (B, D), total_logprob (B,)}
-vector<Tensor> sample_continuous_cpp(Tensor mean, Tensor logstd) {
+inline vector<Tensor> sample_continuous_cpp(Tensor mean, Tensor logstd) {
     auto std = logstd.exp();
     auto actions = mean + std * torch::randn_like(mean);
     auto log_prob = -0.5 * ((actions - mean) / std).pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
@@ -488,8 +347,7 @@ vector<Tensor> sample_continuous_cpp(Tensor mean, Tensor logstd) {
 }
 
 // Compute logprob + entropy for multi-head discrete actions
-// Returns {logprob (batch,), entropy scalar}
-vector<Tensor> discrete_logprob_entropy_cpp(Tensor logits, Tensor actions, Tensor act_sizes_cpu, int num_heads) {
+inline vector<Tensor> discrete_logprob_entropy_cpp(Tensor logits, Tensor actions, Tensor act_sizes_cpu, int num_heads) {
     logits = torch::nan_to_num(logits, 1e-8, 1e-8, 1e-8);
     auto split = torch::split(logits, c10::IntArrayRef(act_sizes_cpu.data_ptr<int64_t>(), num_heads), 1);
     int batch = logits.size(0);
@@ -507,8 +365,7 @@ vector<Tensor> discrete_logprob_entropy_cpp(Tensor logits, Tensor actions, Tenso
 }
 
 // Compute logprob + entropy for continuous Normal actions
-// Returns {logprob (batch,), entropy scalar}
-vector<Tensor> continuous_logprob_entropy_cpp(Tensor mean, Tensor logstd, Tensor actions) {
+inline vector<Tensor> continuous_logprob_entropy_cpp(Tensor mean, Tensor logstd, Tensor actions) {
     auto std = logstd.exp();
     auto normalized = (actions.to(mean.dtype()) - mean) / std;
     auto log_prob = -0.5 * normalized.pow(2) - 0.5 * std::log(2 * M_PI) - logstd;
@@ -519,7 +376,7 @@ vector<Tensor> continuous_logprob_entropy_cpp(Tensor mean, Tensor logstd, Tensor
 }
 
 // PPO clipped loss with clipped value loss
-Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
+inline Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
         Tensor newvalue, Tensor values, Tensor returns, Tensor entropy,
         float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
         Tensor losses) {
@@ -535,7 +392,6 @@ Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
 
     auto total = pg_loss + vf_coef * v_loss - ent_coef * entropy;
 
-    // Accumulate loss components for logging (detached, no grad)
     losses.select(0, LOSS_PG).add_(pg_loss.detach());
     losses.select(0, LOSS_VF).add_(v_loss.detach());
     losses.select(0, LOSS_ENT).add_(entropy.detach());
@@ -548,36 +404,29 @@ Tensor ppo_loss_cpp(Tensor ratio, Tensor advantages, Tensor prio,
     return total;
 }
 
-// Dispatch: sample actions using kernel or cpp path, write to output buffers
-void sample_actions(Logits& logits, Tensor value,
+// CPU fallback: sample actions using torch ops (no custom kernel)
+inline void sample_actions_cpp(Logits& logits, Tensor value,
         Tensor actions_out, Tensor logprobs_out, Tensor values_out,
-        Tensor act_sizes, Tensor act_sizes_cpu,
-        bool is_continuous, bool kernels, uint64_t rng_seed, Tensor rng_offset) {
-    if (kernels) {
-        Tensor logstd = logits.logstd.defined() ? logits.logstd : Tensor();
-        sample_logits(logits.mean, logstd, value, actions_out, logprobs_out,
-            values_out, act_sizes, rng_seed, rng_offset);
+        Tensor act_sizes_cpu, bool is_continuous) {
+    vector<Tensor> result;
+    if (is_continuous) {
+        result = sample_continuous_cpp(logits.mean, logits.logstd);
     } else {
-        vector<Tensor> result;
-        if (is_continuous) {
-            result = sample_continuous_cpp(logits.mean, logits.logstd);
-        } else {
-            result = sample_discrete_cpp(logits.mean, act_sizes_cpu, actions_out.size(1));
-        }
-        actions_out.copy_(result[0].to(torch::kFloat64), false);
-        logprobs_out.copy_(result[1], false);
-        values_out.copy_(value.flatten(), false);
+        result = sample_discrete_cpp(logits.mean, act_sizes_cpu, actions_out.size(1));
     }
+    actions_out.copy_(result[0].to(torch::kFloat64), false);
+    logprobs_out.copy_(result[1], false);
+    values_out.copy_(value.flatten(), false);
 }
 
-void train_select_and_copy_cpp(
+inline void train_select_and_copy_cpp(
         Tensor observations, Tensor actions,
         Tensor logprobs, Tensor values, Tensor advantages,
         Tensor idx, Tensor mb_prio,
         Tensor dst_obs, Tensor dst_state,
         Tensor dst_actions, Tensor dst_logprobs,
         Tensor dst_advantages, Tensor dst_prio,
-        Tensor dst_values, Tensor dst_returns ){
+        Tensor dst_values, Tensor dst_returns) {
     Tensor mb_obs = observations.index_select(0, idx);
     Tensor mb_actions = actions.index_select(0, idx);
     Tensor mb_logprobs = logprobs.index_select(0, idx);
@@ -595,7 +444,7 @@ void train_select_and_copy_cpp(
     dst_returns.copy_(mb_returns, false);
 }
 
-std::tuple<Tensor, Tensor> prio_replay_cpp(
+inline std::tuple<Tensor, Tensor> prio_replay_cpp(
     Tensor advantages, float prio_alpha, int minibatch_segments,
     int total_agents, float anneal_beta
 ) {
@@ -607,8 +456,8 @@ std::tuple<Tensor, Tensor> prio_replay_cpp(
     return {idx, mb_prio};
 }
 
-// Fused PPO loss (PyTorch fallback path — matches PPOLoss::apply signature)
-torch::autograd::tensor_list fused_ppo_loss_cpp(
+// Fused PPO loss (PyTorch fallback path)
+inline torch::autograd::tensor_list fused_ppo_loss_cpp(
         Tensor logits, Tensor logstd, Tensor newvalue,
         Tensor actions, Tensor old_logprobs, Tensor advantages, Tensor prio,
         Tensor values, Tensor returns,
@@ -640,72 +489,27 @@ torch::autograd::tensor_list fused_ppo_loss_cpp(
         clip_coef, vf_clip_coef, vf_coef, ent_coef, losses)};
 }
 
-// Fast clip_grad_norm_ for contiguous weights
-// Cats all grads for one-shot norm computation, then scales each grad
-void clip_grad_norm_(
-    const vector<Tensor>& parameters,
-    double max_norm
-    ) {
-  // Collect flattened grads
-  vector<Tensor> flat_grads;
-  flat_grads.reserve(parameters.size());
-
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      flat_grads.push_back(grad.flatten());
-    }
-  }
-
-  if (flat_grads.empty()) {
-    return;
-  }
-
-  // Single cat + norm (avoids per-param norm calls)
-  Tensor all_grads = torch::cat(flat_grads);
-  Tensor total_norm = all_grads.to(torch::kFloat32).norm(2);
-
-  // Compute clip coefficient
-  Tensor clip_coef = torch::clamp_max(max_norm / (total_norm + 1e-6), 1.0);
-
-  // Scale each grad in-place
-  for (const auto& param : parameters) {
-    auto& grad = param.grad();
-    if (grad.defined()) {
-      grad.mul_(clip_coef);
-    }
-  }
-}
-
-float cosine_annealing(float lr_base, float lr_min, int t, int T) {
-    if (T == 0) return lr_base;  // avoid division by zero
-    float ratio = (float)t / (float)T;
-    ratio = std::max(0.0f, std::min(1.0f, ratio));  // clamp to [0, 1]
-    return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
-}
-
 // Reference implementation for testing
-Tensor fc_relu_fc_max_cpp(
+inline Tensor fc_relu_fc_max_cpp(
     Tensor x,      // (B, N, D_in)
     Tensor W1,     // (D_mid, D_in)
     Tensor b1,     // (D_mid)
     Tensor W2,     // (D_out, D_mid)
     Tensor b2      // (D_out)
 ) {
-    // FC1: x @ W1.T + b1 -> (B, N, D_mid)
     auto fc1 = torch::addmm(b1, x.flatten(0, 1), W1.t()).view({x.size(0), x.size(1), -1});
-    // ReLU
     auto relu_out = torch::relu(fc1);
-    // FC2: relu_out @ W2.T + b2 -> (B, N, D_out)
     auto fc2 = torch::addmm(b2, relu_out.flatten(0, 1), W2.t()).view({x.size(0), x.size(1), -1});
-    // Max over N dimension
     return std::get<0>(fc2.max(1));
 }
 
 // Reference implementation for testing
-Tensor fc_max_cpp(Tensor x, Tensor W, Tensor b) {
-    // FC: x @ W.T + b -> (B, N, D_out)
+inline Tensor fc_max_cpp(Tensor x, Tensor W, Tensor b) {
     auto fc = torch::addmm(b, x.flatten(0, 1), W.t()).view({x.size(0), x.size(1), -1});
-    // Max over N dimension
     return std::get<0>(fc.max(1));
 }
+
+#endif // PUFFERLIB_TORCH
+} // namespace pufferlib
+
+#endif // PUFFERLIB_LEGACY_MODULES_H

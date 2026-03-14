@@ -352,7 +352,7 @@ class DriveEncoder : public Encoder {
         Tensor partner_features;
         if (use_fused_kernel) {
             // Fused FC -> Max kernel
-            partner_features = FCMax::apply(partner_objects, partner_W, partner_b)[0];
+            partner_features = fc_max_cpp(partner_objects, partner_W, partner_b);
         } else {
             // Torch: Linear -> LayerNorm -> Linear -> Max
             auto h = partner_linear1->forward(partner_objects);  // (B, 63, 128)
@@ -371,7 +371,7 @@ class DriveEncoder : public Encoder {
         Tensor road_features;
         if (use_fused_kernel) {
             // Fused FC -> Max kernel
-            road_features = FCMax::apply(road_combined, road_W, road_b)[0];
+            road_features = fc_max_cpp(road_combined, road_W, road_b);
         } else {
             // Torch: Linear -> LayerNorm -> Linear -> Max
             auto h = road_linear1->forward(road_combined);  // (B, 200, 128)
@@ -436,28 +436,10 @@ class G2048Decoder : public Decoder {
     }
 };
 
-// Create policy with env-specific encoder/decoder
-Policy* create_policy(const std::string& env_name, int input_size, int hidden_size,
+// Create native policy (DefaultEncoder + MinGRU + DefaultDecoder)
+// TODO: Custom encoders/decoders (snake, nmmo3, drive) will use TorchPolicy
+Policy* create_policy(const std::string& env_name, Allocator& alloc,
+        int input_size, int hidden_size,
         int decoder_output_size, int num_layers, int act_n, bool is_continuous, bool kernels) {
-    shared_ptr<Encoder> enc;
-    shared_ptr<Decoder> dec;
-    if (env_name == "puffer_snake") {
-        enc = std::make_shared<SnakeEncoder>(input_size, hidden_size, 8);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-    } else if (env_name == "falsepuffer_g2048") {
-        //TODO: This encoder is worse (hence commented with falsepuffer)
-        enc = std::make_shared<SimpleG2048Encoder>(input_size, hidden_size);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-    } else if (env_name == "puffer_nmmo3") {
-        enc = std::make_shared<NMMO3Encoder>(input_size, hidden_size);
-        dec = std::make_shared<NMMO3Decoder>(hidden_size, decoder_output_size);
-    } else if (env_name == "puffer_drive") {
-        enc = std::make_shared<DriveEncoder>(input_size, hidden_size);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-    } else {
-        enc = std::make_shared<DefaultEncoder>(input_size, hidden_size);
-        dec = std::make_shared<DefaultDecoder>(hidden_size, decoder_output_size, is_continuous);
-    }
-    auto rnn = std::make_shared<MinGRU>(hidden_size, num_layers, kernels);
-    return new Policy(enc, dec, rnn, input_size, act_n, hidden_size);
+    return new Policy(alloc, input_size, hidden_size, decoder_output_size, num_layers, act_n, is_continuous);
 }

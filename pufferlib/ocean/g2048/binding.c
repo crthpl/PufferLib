@@ -6,7 +6,7 @@
 #define ACT_TYPE DOUBLE
 
 #define Env Game
-#include "env_binding.h"
+#include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;

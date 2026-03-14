@@ -49,16 +49,22 @@ void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
 }
 
 #define SETTINGS_HEIGHT 20
-#define TOGGLE_WIDTH 60
-#define DROPDOWN_WIDTH 136
+#define SEP 8
+#define SPACER 25
+#define TOGGLE_WIDTH 70
+#define DROPDOWN_WIDTH 125
+
+#define LINEAR 0
+#define LOG 1
+#define LOGIT 2
 
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 const Color CONSTELLATION = (Color){255, 255, 255, 128};
 
-#define MAX_PARTICLES 10000
-#define MAX_POINTS 10000
+#define MAX_PARTICLES 50000
+#define MAX_POINTS 50000
 
 typedef struct Glyph {
     float x;
@@ -124,6 +130,36 @@ Color rgb(float h) {
     return ColorFromHSV(120*(1.0 + h), 0.8f, 0.15f);
 }
 
+float safe_log10(float x) {
+    if (x <= 0) {
+        return x;
+    }
+    return log10(x);
+}
+
+float scale_val(int scale, float val) {
+    if (scale == LINEAR) {
+        return val;
+    } else if (scale == LOG) {
+        return safe_log10(val);
+    } else if (scale == LOGIT) {
+        return safe_log10(1 - val);
+    } else {
+        return val;
+    }
+}
+
+float unscale_val(int scale, float val) {
+    if (scale == LINEAR) {
+        return val;
+    } else if (scale == LOG) {
+        return powf(10, val);
+    } else if (scale == LOGIT) {
+        return 1 / (1 + powf(10, val));
+    }
+    return val;
+}
+
 typedef struct PlotArgs {
     float x_min;
     float x_max;
@@ -133,10 +169,10 @@ typedef struct PlotArgs {
     float z_max;
     float c_min;
     float c_max;
-    bool log_x;
-    bool log_y;
-    bool log_z;
-    bool log_c;
+    int x_scale;
+    int y_scale;
+    int z_scale;
+    int c_scale;
     int width;
     int height;
     int title_font_size;
@@ -189,26 +225,18 @@ PlotArgs DEFAULT_PLOT_ARGS = {
     .z_label = "Train/Learning Rate",
 };
 
-float safe_log10(float x) {
-    if (x <= 0) {
-        return x;
-    }
-    return log10(x);
-}
-
 const char* format_tick_label(double value) {
     static char buffer[32];
-    int precision = 2;
 
     if (fabs(value) < 1e-10) {
         strcpy(buffer, "0");
         return buffer;
     }
 
-    if (fabs(value) < 0.01 || fabs(value) > 10000) {
-        snprintf(buffer, sizeof(buffer), "%.2e\0", value);
+    if (fabs(value) < 0.001 || fabs(value) > 10000) {
+        snprintf(buffer, sizeof(buffer), "%.3e\0", value);
     } else {
-        snprintf(buffer, sizeof(buffer), "%.2f\0", value);
+        snprintf(buffer, sizeof(buffer), "%.3f\0", value);
         //char *end = buffer + strlen(buffer) - 1;
         //while (end > buffer && *end == '0') *end-- = '\0';
         //if (end > buffer && *end == '.') *end = '\0';
@@ -337,25 +365,21 @@ void draw_ticks(char x_ticks[][32], int x_n, char y_ticks[][32], int y_n, PlotAr
 void draw_all_ticks(PlotArgs args) {
     Vector2 tick_n = compute_ticks(args);
     char x_ticks[(int)tick_n.x][32];
-    float x_min = args.log_x ? safe_log10(args.x_min) : args.x_min;
-    float x_max = args.log_x ? safe_log10(args.x_max) : args.x_max;
+    float x_min = scale_val(args.x_scale, args.x_min);
+    float x_max = scale_val(args.x_scale, args.x_max);
     for (int i=0; i<tick_n.x; i++) {
         float val = x_min + i*(x_max - x_min)/(tick_n.x - 1.0f);
-        if (args.log_x) {
-            val = pow(10, val);
-        }
+        val = unscale_val(args.x_scale, val);
         char* label = format_tick_label(val);
         strcpy(x_ticks[i], label);
     }
 
     char y_ticks[(int)tick_n.y][32];
-    float y_min = args.log_y ? safe_log10(args.y_min) : args.y_min;
-    float y_max = args.log_y ? safe_log10(args.y_max) : args.y_max;
+    float y_min = scale_val(args.y_scale, args.y_min);
+    float y_max = scale_val(args.y_scale, args.y_max);
     for (int i=0; i<tick_n.y; i++) {
         float val = y_min + i*(y_max - y_min)/(tick_n.y - 1.0f);
-        if (args.log_y) {
-            val = pow(10, val);
-        }
+        val = unscale_val(args.y_scale, val);
         char* label = format_tick_label(val);
         strcpy(y_ticks[i], label);
     }
@@ -365,15 +389,18 @@ void draw_all_ticks(PlotArgs args) {
 
 void draw_box_ticks(char* hypers[], int hyper_count, PlotArgs args) {
     Vector2 tick_n = compute_ticks(args);
+    float x_min = scale_val(args.x_scale, args.x_min);
+    float x_max = scale_val(args.x_scale, args.x_max);
     char x_ticks[(int)tick_n.x][32];
     for (int i=0; i<tick_n.x; i++) {
-        float val = args.x_min + i*(args.x_max - args.x_min)/(tick_n.x - 1.0f);
+        float val = x_min + i*(x_max - x_min)/(tick_n.x - 1.0f);
+        val = unscale_val(args.x_scale, val);
         char* label = format_tick_label(val);
         strcpy(x_ticks[i], label);
     }
     char fixed_hypers[hyper_count][32];
     for (int i=0; i<hyper_count; i++) {
-        strncpy(fixed_hypers[i], hypers[i], 32);
+        strncpy(fixed_hypers[hyper_count - i - 1], hypers[i], 32);
     }
 
     draw_ticks(x_ticks, tick_n.x, fixed_hypers, hyper_count, args);
@@ -437,25 +464,16 @@ float hyper_max(Dataset *data, char* key, int start, int end) {
 }
 
 
-void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
+void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
     int width = args.width;
     int height = args.height;
-
-    float x_min = args.x_min;
-    float x_max = args.x_max;
 
     float plot_width = width - args.left_margin - args.right_margin;
     float plot_height = height - args.top_margin - args.bottom_margin;
 
-    if (log_x) {
-        x_min = x_min<=1e-8 ? -8 : log10(x_min);
-        x_max = x_max<=1e-8 ? -8 : log10(x_max);
-    }
-
-    float dx = x_max - x_min;
-    if (dx == 0) dx = 1.0f;
-    x_min -= 0.1f * dx; x_max += 0.1f * dx;
-    dx = x_max - x_min;
+    float x_min = scale_val(x_scale, args.x_min);
+    float x_max = scale_val(x_scale, args.x_max);
+ 
     float dy = plot_height/((float)hyper_count);
 
     Color faded = Fade(color, 0.15f);
@@ -471,17 +489,17 @@ void boxplot(Hyper* hyper, bool log_x, int i, int hyper_count, PlotArgs args, Co
         mmax = fmax(mmax, ary[j]);
     }
 
-    if (log_x) {
-        mmin = mmin <= 0 ? 0 : log10(mmin);
-        mmax = mmax <= 0 ? 0 : log10(mmax);
-    }
+    mmin = scale_val(x_scale, mmin);
+    mmax = scale_val(x_scale, mmax);
+    //printf("mmin %f mmax %f, x_scale %d, x_min %f, x_max %f\n", mmin, mmax, x_scale, x_min, x_max);
+    //printf("Hyper %s mmin %f mmax %f, xmin %f xmax %f, left_perc %f right_perc %f\n", hyper->key, mmin, mmax, x_min, x_max, (mmin-x_min)/(x_max - x_min), (mmax-x_min)/(x_max - x_min));
 
     float left = args.left_margin + (mmin - x_min)/(x_max - x_min)*plot_width;
     float right = args.left_margin + (mmax - x_min)/(x_max - x_min)*plot_width;
 
     // TODO - rough patch
-    left = fmax(left, args.left_margin);
-    right = fmin(right, width - args.right_margin);
+    left = fminf(fmax(left, args.left_margin), width - args.right_margin);
+    right = fmaxf(fmin(right, width - args.right_margin), 0);
     DrawRectangle(left, args.top_margin + i*dy, right - left, dy, faded);
 }
 
@@ -531,6 +549,28 @@ int cleanup(Hyper *map, int map_count, cJSON *root, char *json_str) {
     return 1;
 }
 
+typedef struct GuiAxisScale {
+    int x, y, axis_width, scale_width, height;
+    char* axis_options;
+    int axis_selection;
+    bool axis_active;
+    char* scale_options;
+    int scale_selection;
+    bool scale_active;
+    char* scale_text;
+} GuiAxisScale;
+
+void gui_axis_scale(GuiAxisScale *scale) {
+    Rectangle axis_rect = {scale->x, scale->y, scale->axis_width, scale->height};
+    if (GuiDropdownBox(axis_rect, scale->axis_options, &scale->axis_selection, scale->axis_active)) {
+        scale->axis_active = !scale->axis_active;
+    }
+    Rectangle scale_rect = {scale->x + axis_rect.width , scale->y, scale->scale_width, scale->height};
+    if (GuiDropdownBox(scale_rect, scale->scale_options, &scale->scale_selection, scale->scale_active)) {
+        scale->scale_active = !scale->scale_active;
+    }
+}
+
 void GuiDropdownCheckbox(int x, int y, char* options, int *selection, bool *active, char *text, bool *checked) {
     Rectangle rect = {x, y, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
     if (GuiDropdownBox(rect, options, selection, *active)) {
@@ -546,12 +586,12 @@ void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdo
     if (GuiDropdownBox(rect, options, selection, *dropdown_active)) {
         *dropdown_active = !*dropdown_active;
     }
-    Rectangle text1_rect = {x + rect.width, y, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+    Rectangle text1_rect = {x + DROPDOWN_WIDTH, y, TOGGLE_WIDTH, SETTINGS_HEIGHT};
     bool text1_active = CheckCollisionPointRec(focus, text1_rect);
     if (GuiTextBox(text1_rect, text1, 32, text1_active)) {
         *text1_val = atof(text1);
     }
-    Rectangle text2_rect = {x + 1.5*DROPDOWN_WIDTH, y, DROPDOWN_WIDTH/2, SETTINGS_HEIGHT};
+    Rectangle text2_rect = {x + DROPDOWN_WIDTH + TOGGLE_WIDTH, y, TOGGLE_WIDTH, SETTINGS_HEIGHT};
     bool text2_active = CheckCollisionPointRec(focus, text2_rect);
     if (GuiTextBox(text2_rect, text2, 32, text2_active)) {
         *text2_val = atof(text2);
@@ -619,14 +659,14 @@ void autoscale(Point* points, int size, PlotArgs *args) {
 }
 
 void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
-    float x_min = args.log_x ? safe_log10(args.x_min) : args.x_min;
-    float x_max = args.log_x ? safe_log10(args.x_max) : args.x_max;
-    float y_min = args.log_y ? safe_log10(args.y_min) : args.y_min;
-    float y_max = args.log_y ? safe_log10(args.y_max) : args.y_max;
-    float z_min = args.log_z ? safe_log10(args.z_min) : args.z_min;
-    float z_max = args.log_z ? safe_log10(args.z_max) : args.z_max;
-    float c_min = args.log_c ? safe_log10(args.c_min) : args.c_min;
-    float c_max = args.log_c ? safe_log10(args.c_max) : args.c_max;
+    float x_min = scale_val(args.x_scale, args.x_min);
+    float x_max = scale_val(args.x_scale, args.x_max);
+    float y_min = scale_val(args.y_scale, args.y_min);
+    float y_max = scale_val(args.y_scale, args.y_max);
+    float z_min = scale_val(args.z_scale, args.z_min);
+    float z_max = scale_val(args.z_scale, args.z_max);
+    float c_min = scale_val(args.c_scale, args.c_min);
+    float c_max = scale_val(args.c_scale, args.c_max);
 
     float dx = x_max - x_min;
     float dy = y_max - y_min;
@@ -634,9 +674,9 @@ void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
 
     for (int i = 0; i < size; i++) {
         Point p = points[i];
-        float xi = (args.log_x) ? safe_log10(p.x) : p.x;
-        float yi = (args.log_y) ? safe_log10(p.y) : p.y;
-        float zi = (args.log_z) ? safe_log10(p.z) : p.z;
+        float xi = scale_val(args.x_scale, p.x);
+        float yi = scale_val(args.y_scale, p.y);
+        float zi = scale_val(args.z_scale, p.z);
         float px, py;
 
         if (args.z_min != 0 || args.z_max != 0) {
@@ -656,9 +696,7 @@ void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
         }
 
         float cmap = points[i].c;
-        if (args.log_c) {
-            cmap = safe_log10(cmap);
-        }
+        cmap = scale_val(args.c_scale, cmap);
         if (c_min != c_max) {
             cmap = (cmap - c_min)/(c_max - c_min);
         }
@@ -696,14 +734,34 @@ void update_closest(Tooltip* tooltip, Vector2 *indices, Glyph* glyphs, int size,
 
 void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
     char* start = buffer;
+    char* prefix = NULL;
+    int prefix_len = 0;
     for (int hyper_idx = 0; hyper_idx < env->n; hyper_idx++) {
         Hyper *hyper = &env->hypers[hyper_idx];
         char *slash = strchr(hyper->key, '/');
         if (!slash) {
             continue;
         }
+
+        if (prefix == NULL || strncmp(prefix, hyper->key, prefix_len) != 0) {
+            if (prefix != NULL) {
+                buffer += sprintf(buffer, "\n");
+            }
+            prefix = hyper->key;
+            prefix_len = slash - prefix;
+            buffer += sprintf(buffer, "[");
+            snprintf(buffer, prefix_len+1, "%s", prefix);
+            buffer += prefix_len;
+            buffer += sprintf(buffer, "]\n");
+        }
+
         char* suffix = slash + 1;
-        buffer += sprintf(buffer, "%s = %f\n", suffix, hyper->ary[ary_idx]);
+        float val = hyper->ary[ary_idx];
+        if ((int)val == val) {
+            buffer += sprintf(buffer, "%s = %d\n", suffix, (int)val);
+        } else {
+            buffer += sprintf(buffer, "%s = %f\n", suffix, val);
+        }
     }
     buffer[0] = '\0';
     SetClipboardText(start);
@@ -713,7 +771,7 @@ void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
         float env_perf, float perf_threshold, Vector2 tsne, float tsne_thresh) {
     for (int i=0; i<data->n; i++) {
         Env* env = &data->envs[i];
-        Hyper* perf = get_hyper(data, env->key, "environment/perf");
+        Hyper* perf = get_hyper(data, env->key, "env/perf");
         Hyper* tsne1 = get_hyper(data, env->key, "tsne1");
         Hyper* tsne2 = get_hyper(data, env->key, "tsne2");
         for (int j=0; j<tsne1->n; j++) {
@@ -752,7 +810,7 @@ int main(void) {
     fclose(file);
     cJSON *root = cJSON_Parse(json_str);
     if (!root) {
-        printf("JSON parse error: %s\n", cJSON_GetErrorPtr());
+        printf("JSON parse error: %.100s\n", cJSON_GetErrorPtr());
         free(json_str);
         return 1;
     }
@@ -810,12 +868,12 @@ int main(void) {
         }
     }
 
-    int hyper_count = 24;
-    char *hyper_key[24] = {
+    int hyper_count = 23;
+    char *hyper_key[23] = {
         "agent_steps",
-        "cost",
-        "environment/perf",
-        "environment/score",
+        "uptime",
+        "env/perf",
+        "env/score",
         "train/learning_rate",
         "train/ent_coef",
         "train/gamma",
@@ -831,7 +889,7 @@ int main(void) {
         "train/eps",
         "train/prio_alpha",
         "train/prio_beta0",
-        "train/horizon",
+        //"train/horizon",
         "train/replay_ratio",
         "train/minibatch_size",
         "policy/hidden_size",
@@ -872,7 +930,7 @@ int main(void) {
         strcat(env_options, data.envs[i].key);
     }
 
-    char* clipboard = malloc(1024);
+    char* clipboard = malloc(8192);
 
     // Points
     Point* points = calloc(MAX_POINTS, sizeof(Point));
@@ -882,6 +940,7 @@ int main(void) {
     // Initialize Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(2*DEFAULT_PLOT_ARGS.width, 2*DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
+    Texture2D puffer = LoadTexture("resources/shared/puffers.png");
 
     DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
@@ -912,34 +971,65 @@ int main(void) {
     args1.camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     args1.camera.fovy = 45.0f;
     args1.camera.projection = CAMERA_PERSPECTIVE;
-    args1.log_x = true;
-    args1.log_z = true;
+    args1.x_scale = 1;
+    args1.z_scale = 1;
     RenderTexture2D fig1 = LoadRenderTexture(args1.width, args1.height);
     RenderTexture2D fig1_overlay = LoadRenderTexture(args1.width, args1.height);
-    int fig1_env_idx = 0;
-    bool fig1_env_active = false;
-    bool fig1_x_active = false;
-    int fig1_x_idx = 0;
-    bool fig1_y_active = false;
-    int fig1_y_idx = 2;
-    bool fig1_z_active = false;
-    int fig1_z_idx = 1;
-    int fig1_color_idx = 0;
-    bool fig1_color_active = false;
+    int fig_env_idx = 0;
+    bool fig_env_active = false;
+    bool fig_x_active = false;
+    int fig_x_idx = 0;
+    bool fig_xscale_active = false;
+    int fig_xscale_idx = 0;
+    bool fig_y_active = false;
+    int fig_y_idx = 2;
+    bool fig_yscale_active = false;
+    bool fig_z_active = false;
+    int fig_z_idx = 1;
+    bool fig_zscale_active = false;
+    int fig_zscale_idx = 0;
+    int fig_color_idx = 0;
+    bool fig_color_active = false;
+    int fig_colorscale_idx = 0;
+    bool fig_colorscale_active = false;
+    bool fig_range1_active = false;
+    int fig_range1_idx = 2;
+    char fig_range1_min[32];
+    char fig_range1_max[32];
+    float fig_range1_min_val = 0;
+    float fig_range1_max_val = 1;
+    bool fig_range2_active = false;
+    int fig_range2_idx = 1;
+    char fig_range2_min[32];
+    char fig_range2_max[32];
+    float fig_range2_min_val = 0;
+    float fig_range2_max_val = 10000;
+    int fig_box_idx = 2;
+    bool fig_box_active = false;
+
+    char* scale_options = "linear;log;logit";
+
+    /*
+    GuiAxisScale fig1x_opts = {
+        .x = DROPDOWN_WIDTH,
+        .y = 0,
+        .axis_width = DROPDOWN_WIDTH,
+        .scale_width = TOGGLE_WIDTH,
+        .height = SETTINGS_HEIGHT,
+        .axis_options = options,
+        .axis_selection = 0,
+        .axis_active = false,
+        .scale_options = "log;linear",
+        .scale_selection = 0,
+        .scale_active = false,
+    };
+    */
 
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
     //SetTextureFilter(fig2.texture, TEXTURE_FILTER_POINT);
     args2.right_margin = 50;
-    args2.log_x = true;
-    int fig2_env_idx = 1;
-    bool fig2_env_active = false;
-    bool fig2_x_active = false;
-    int fig2_x_idx = 1;
-    bool fig2_y_active = false;
-    int fig2_y_idx = 3;
-    int fig2_color_idx = 1;
-    bool fig2_color_active = false;
+    args2.x_scale = 1;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
@@ -950,18 +1040,6 @@ int main(void) {
     args3.bottom_margin = 10;
     args3.x_label = "tsne1";
     args3.y_label = "tsne2";
-    bool fig3_range1_active = false;
-    int fig3_range1_idx = 2;
-    char fig3_range1_min[32];
-    char fig3_range1_max[32];
-    float fig3_range1_min_val = 0;
-    float fig3_range1_max_val = 1;
-    bool fig3_range2_active = false;
-    int fig3_range2_idx = 1;
-    char fig3_range2_min[32];
-    char fig3_range2_max[32];
-    float fig3_range2_min_val = 0;
-    float fig3_range2_max_val = 10000;
 
     PlotArgs args4 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig4 = LoadRenderTexture(args4.width, args4.height);
@@ -971,21 +1049,6 @@ int main(void) {
     args4.right_margin = 50;
     args4.top_margin = 10;
     args4.bottom_margin = 50;
-    args4.x_min = 1e-8;
-    args4.x_max = 1e8;
-    bool fig4_x_log = true;
-    bool fig4_range1_active = false;
-    int fig4_range1_idx = 2;
-    char fig4_range1_min[32];
-    char fig4_range1_max[32];
-    float fig4_range1_min_val = 0;
-    float fig4_range1_max_val = 1;
-    bool fig4_range2_active = false;
-    int fig4_range2_idx = 1;
-    char fig4_range2_min[32];
-    char fig4_range2_max[32];
-    float fig4_range2_min_val = 0;
-    float fig4_range2_max_val = 10000;
 
     float perf_thresholds[4] = {0.5f, 0.75f, 0.9f, 0.95f};
     int best_srci[4];
@@ -1019,7 +1082,7 @@ int main(void) {
     memset(best_srci, 0, sizeof(int)*4);
     for (int env_i=0; env_i<data.n; env_i++) {
         Env* src = &data.envs[env_i];
-        Hyper* src_perf = get_hyper(&data, src->key, "environment/perf");
+        Hyper* src_perf = get_hyper(&data, src->key, "env/perf");
         Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
         Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
         for (int i=0; i<src_tsne1->n; i++) {
@@ -1077,17 +1140,17 @@ int main(void) {
         }
 
         // Figure 1
-        x_label = hyper_key[fig1_x_idx];
-        y_label = hyper_key[fig1_y_idx];
-        z_label = hyper_key[fig1_z_idx];
+        x_label = hyper_key[fig_x_idx];
+        y_label = hyper_key[fig_y_idx];
+        z_label = hyper_key[fig_z_idx];
         args1.x_label = x_label;
         args1.y_label = y_label;
         args1.z_label = z_label;
         int start = 0;
         int end = data.n;
-        if (fig1_env_idx != 0) {
-            start = fig1_env_idx - 1;
-            end = fig1_env_idx;
+        if (fig_env_idx != 0) {
+            start = fig_env_idx - 1;
+            end = fig_env_idx;
         }
         BeginTextureMode(fig1);
         ClearBackground(PUFF_BACKGROUND);
@@ -1095,18 +1158,29 @@ int main(void) {
         int size = 0;
         for (int i=start; i<end; i++) {
             char* env = data.envs[i].key;
-            x = get_hyper(&data, env, hyper_key[fig1_x_idx]);
-            y = get_hyper(&data, env, hyper_key[fig1_y_idx]);
-            z = get_hyper(&data, env, hyper_key[fig1_z_idx]);
-            if (fig1_color_idx != 0) {
-                c = get_hyper(&data, env, hyper_key[fig1_color_idx - 1]);
+            x = get_hyper(&data, env, hyper_key[fig_x_idx]);
+            y = get_hyper(&data, env, hyper_key[fig_y_idx]);
+            z = get_hyper(&data, env, hyper_key[fig_z_idx]);
+            if (fig_color_idx != 0) {
+                c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
             }
             for (int j=0; j<x->n; j++) {
+                filter[j] = true;
+            }
+            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
+            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
+            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+ 
+            for (int j=0; j<x->n; j++) {
+                if (!filter[j]) {
+                    continue;
+                }
                 points[size] = (Point){
                     x->ary[j],
                     y->ary[j],
                     z->ary[j],
-                    (fig1_color_idx == 0) ? i/(float)data.n : c->ary[j],
+                    (fig_color_idx == 0) ? i/(float)data.n : c->ary[j],
                 };
                 env_indices[size] = (Vector2){i, j};
                 size++;
@@ -1124,8 +1198,8 @@ int main(void) {
         EndTextureMode();
 
         // Figure 2
-        x_label = hyper_key[fig2_x_idx];
-        y_label = hyper_key[fig2_y_idx];
+        x_label = hyper_key[fig_x_idx];
+        y_label = hyper_key[fig_y_idx];
         args2.x_label = x_label;
         args2.y_label = y_label;
         args2.top_margin = 20;
@@ -1135,24 +1209,32 @@ int main(void) {
 
         start = 0;
         end = data.n;
-        if (fig2_env_idx != 0) {
-            start = fig2_env_idx - 1;
-            end = fig2_env_idx;
+        if (fig_env_idx != 0) {
+            start = fig_env_idx - 1;
+            end = fig_env_idx;
         }
         size = 0;
         for (int i=start; i<end; i++) {
             char* env = data.envs[i].key;
-            x = get_hyper(&data, env, hyper_key[fig2_x_idx]);
-            y = get_hyper(&data, env, hyper_key[fig2_y_idx]);
-            if (fig2_color_idx != 0) {
-                c = get_hyper(&data, env, hyper_key[fig2_color_idx - 1]);
+            x = get_hyper(&data, env, hyper_key[fig_x_idx]);
+            y = get_hyper(&data, env, hyper_key[fig_y_idx]);
+            if (fig_color_idx != 0) {
+                c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
             }
+            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
+            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
+            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+ 
             for (int j=0; j<x->n; j++) {
+                if (!filter[j]) {
+                    continue;
+                }
                 points[size] = (Point){
                     x->ary[j],
                     y->ary[j],
                     0.0f,
-                    (fig2_color_idx == 0) ? i/(float)data.n : c->ary[j],
+                    (fig_color_idx == 0) ? i/(float)data.n : c->ary[j],
                 };
                 env_indices[size] = (Vector2){i, j};
                 size++;
@@ -1178,10 +1260,10 @@ int main(void) {
             for (int j=0; j<x->n; j++) {
                 filter[j] = true;
             }
-            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig3_range1_idx]);
-            apply_filter(filter, filter_param_1, fig3_range1_min_val, fig3_range1_max_val);
-            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig3_range2_idx]);
-            apply_filter(filter, filter_param_2, fig3_range2_min_val, fig3_range2_max_val);
+            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
+            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
+            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
  
             for (int j=0; j<x->n; j++) {
                 if (!filter[j]) {
@@ -1206,22 +1288,33 @@ int main(void) {
         EndTextureMode();
 
         // Figure 4
+        args4.x_scale = fig_box_idx;
+        if (args4.x_scale == LINEAR) {
+            args4.x_min = 0.0f;
+            args4.x_max = 5.0f;
+        } else if (args4.x_scale == LOG) {
+            args4.x_min = 1.0e-5f;
+            args4.x_max = 1.0e5f;
+        } else if (args4.x_scale == LOGIT) {
+            args4.x_min = 0.5f;
+            args4.x_max = 0.999f;
+        }
         BeginTextureMode(fig4);
         ClearBackground(PUFF_BACKGROUND);
         rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         for (int i=0; i<data.n; i++) {
             Env* env = &data.envs[i];
-            Hyper* filter_param_1 = get_hyper(&data, env->key, hyper_key[fig4_range1_idx]);
-            Hyper* filter_param_2 = get_hyper(&data, env->key, hyper_key[fig4_range2_idx]);
+            Hyper* filter_param_1 = get_hyper(&data, env->key, hyper_key[fig_range1_idx]);
+            Hyper* filter_param_2 = get_hyper(&data, env->key, hyper_key[fig_range2_idx]);
             for (int j=0; j<hyper_count; j++) {
                 Hyper* hyper = get_hyper(&data, env->key, hyper_key[j]);
                 for (int k=0; k<hyper->n; k++) {
                     filter[k] = true;
                 }
-                apply_filter(filter, filter_param_1, fig4_range1_min_val, fig4_range1_max_val);
-                apply_filter(filter, filter_param_2, fig4_range2_min_val, fig4_range2_max_val);
-                boxplot(hyper, fig4_x_log, j, hyper_count, args4, PUFF_CYAN, filter);
+                //apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+                //apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+                boxplot(hyper, args4.x_scale, j, hyper_count, args4, PUFF_CYAN, filter);
             }
         }
         EndBlendMode();
@@ -1270,27 +1363,27 @@ int main(void) {
         );
 
         // Figure 1 Overlay
-        if (fig1_env_idx == 0) {
-            float x_min = (args1.log_x) ? safe_log10(args1.x_min) : args1.x_min;
-            float x_max = (args1.log_x) ? safe_log10(args1.x_max) : args1.x_max;
-            float y_min = (args1.log_y) ? safe_log10(args1.y_min) : args1.y_min;
-            float y_max = (args1.log_y) ? safe_log10(args1.y_max) : args1.y_max;
-            float z_min = (args1.log_z) ? safe_log10(args1.z_min) : args1.z_min;
-            float z_max = (args1.log_z) ? safe_log10(args1.z_max) : args1.z_max;
+        if (fig_env_idx == 0) {
+            float x_min = scale_val(args1.x_scale, args1.x_min);
+            float x_max = scale_val(args1.x_scale, args1.x_max);
+            float y_min = scale_val(args1.y_scale, args1.y_min);
+            float y_max = scale_val(args1.y_scale, args1.y_max);
+            float z_min = scale_val(args1.z_scale, args1.z_min);
+            float z_max = scale_val(args1.z_scale, args1.z_max);
             for (int k=0; k<4; k++) {
                 int bsi = best_srci[k];
                 char* src_env = data.envs[bsi].key;
                 int src_idx = best_idx[k][bsi];
-                x = get_hyper(&data, src_env, hyper_key[fig1_x_idx]);
-                y = get_hyper(&data, src_env, hyper_key[fig1_y_idx]);
-                z = get_hyper(&data, src_env, hyper_key[fig1_z_idx]);
+                x = get_hyper(&data, src_env, hyper_key[fig_x_idx]);
+                y = get_hyper(&data, src_env, hyper_key[fig_y_idx]);
+                z = get_hyper(&data, src_env, hyper_key[fig_z_idx]);
                 float xi = x->ary[src_idx];
                 float yi = y->ary[src_idx];
                 float zi = z->ary[src_idx];
 
-                xi = (args1.log_x) ? safe_log10(xi) : xi;
-                yi = (args1.log_y) ? safe_log10(yi) : yi;
-                zi = (args1.log_z) ? safe_log10(zi) : zi;
+                xi = scale_val(args1.x_scale, xi);
+                yi = scale_val(args1.y_scale, yi);
+                zi = scale_val(args1.z_scale, zi);
 
                 Vector3 src_point = (Vector3){
                     (xi - x_min)/(x_max - x_min),
@@ -1306,16 +1399,16 @@ int main(void) {
                         continue;
                     }
                     char* dst_env = data.envs[i].key;
-                    x = get_hyper(&data, dst_env, hyper_key[fig1_x_idx]);
-                    y = get_hyper(&data, dst_env, hyper_key[fig1_y_idx]);
-                    z = get_hyper(&data, dst_env, hyper_key[fig1_z_idx]);
+                    x = get_hyper(&data, dst_env, hyper_key[fig_x_idx]);
+                    y = get_hyper(&data, dst_env, hyper_key[fig_y_idx]);
+                    z = get_hyper(&data, dst_env, hyper_key[fig_z_idx]);
                     float xj = x->ary[bdi];
                     float yj = y->ary[bdi];
                     float zj = z->ary[bdi];
 
-                    xj = (args1.log_x) ? safe_log10(xj) : xj;
-                    yj = (args1.log_y) ? safe_log10(yj) : yj;
-                    zj = (args1.log_z) ? safe_log10(zj) : zj;
+                    xj = scale_val(args1.x_scale, xj);
+                    yj = scale_val(args1.y_scale, yj);
+                    zj = scale_val(args1.z_scale, zj);
 
                     Vector3 dst_point = (Vector3){
                         (xj - x_min)/(x_max - x_min),
@@ -1419,36 +1512,120 @@ int main(void) {
             //DrawCircleLines(xi, yi, tsne_thresh_px, CONSTELLATION);
         }
 
-        // Figure 3 UI
-        GuiDropdownFilter(0, SETTINGS_HEIGHT, options, &fig3_range1_idx, &fig3_range1_active, focus,
-            fig3_range1_min, &fig3_range1_min_val, fig3_range1_max, &fig3_range1_max_val);
-        GuiDropdownFilter(2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig3_range2_idx, &fig3_range2_active, focus,
-            fig3_range2_min, &fig3_range2_min_val, fig3_range2_max, &fig3_range2_max_val);
+        // UI
+        float y = SEP + SETTINGS_HEIGHT/2.0f - MeasureTextEx(args1.font_small, "Env", args1.axis_tick_font_size, 0).y/2.0f;
+        float x = SEP;
+        DrawTextEx(args1.font_small, "Env", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "Env", args1.axis_tick_font_size, 0).x + SEP;
 
-        // Figure 4 UI
-        GuiDropdownFilter(fig1.texture.width, SETTINGS_HEIGHT, options, &fig4_range1_idx, &fig4_range1_active, focus,
-            fig4_range1_min, &fig4_range1_min_val, fig4_range1_max, &fig4_range1_max_val);
-        GuiDropdownFilter(fig1.texture.width + 2*DROPDOWN_WIDTH, SETTINGS_HEIGHT, options, &fig4_range2_idx, &fig4_range2_active, focus,
-            fig4_range2_min, &fig4_range2_min_val, fig4_range2_max, &fig4_range2_max_val); 
-        
-        // Figure 1 UI
-        Rectangle fig1_env_rect = {0, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig1_env_rect, env_options, &fig1_env_idx, fig1_env_active)){
-            fig1_env_active = !fig1_env_active;
+        Rectangle fig_env_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH + SPACER;
+        if (GuiDropdownBox(fig_env_rect, env_options, &fig_env_idx, fig_env_active)){
+            fig_env_active = !fig_env_active;
         }
-        GuiDropdownCheckbox(DROPDOWN_WIDTH, 0, options, &fig1_x_idx, &fig1_x_active, "Log X", &args1.log_x);
-        GuiDropdownCheckbox(2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig1_y_idx, &fig1_y_active, "Log Y", &args1.log_y);
-        GuiDropdownCheckbox(3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, options, &fig1_z_idx, &fig1_z_active, "Log Z", &args1.log_z);
-        GuiDropdownCheckbox(4*DROPDOWN_WIDTH + 3*TOGGLE_WIDTH, 0, env_hyper_options, &fig1_color_idx, &fig1_color_active, "Log Color", &args1.log_c);
 
-        // Figure 2 UI
-        Rectangle fig2_env_rect = {fig1.texture.width, 0, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-        if (GuiDropdownBox(fig2_env_rect, env_options, &fig2_env_idx, fig2_env_active)){
-            fig2_env_active = !fig2_env_active;
+        // X axis
+        DrawTextEx(args1.font_small, "X", (Vector2){x, y}, args1.axis_tick_font_size, 0, RED);
+        x += MeasureTextEx(args1.font_small, "X", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_x_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
+        if (GuiDropdownBox(fig_x_rect, options, &fig_x_idx, fig_x_active)){
+            fig_x_active = !fig_x_active;
         }
-        GuiDropdownCheckbox(fig1.texture.width + DROPDOWN_WIDTH, 0, options, &fig2_x_idx, &fig2_x_active, "Log X", &args2.log_x);
-        GuiDropdownCheckbox(fig1.texture.width + 2*DROPDOWN_WIDTH + TOGGLE_WIDTH, 0, options, &fig2_y_idx, &fig2_y_active, "Log Y", &args2.log_y);
-        GuiDropdownCheckbox(fig1.texture.width + 3*DROPDOWN_WIDTH + 2*TOGGLE_WIDTH, 0, env_hyper_options, &fig2_color_idx, &fig2_color_active, "Log Color", &args2.log_c);
+        Rectangle fig_xscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
+        if (GuiDropdownBox(fig_xscale_rect, scale_options, &args1.x_scale, fig_xscale_active)){
+            fig_xscale_active = !fig_xscale_active;
+        }
+
+        // Y axis
+        DrawTextEx(args1.font_small, "Y", (Vector2){x, y}, args1.axis_tick_font_size, 0, GREEN);
+        x += MeasureTextEx(args1.font_small, "Y", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_y_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
+        if (GuiDropdownBox(fig_y_rect, options, &fig_y_idx, fig_y_active)){
+            fig_y_active = !fig_y_active;
+        }
+        Rectangle fig_yscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
+        if (GuiDropdownBox(fig_yscale_rect, scale_options, &args1.y_scale, fig_yscale_active)){
+            fig_yscale_active = !fig_yscale_active;
+        }
+
+        // Z axis
+        DrawTextEx(args1.font_small, "Z", (Vector2){x, y}, args1.axis_tick_font_size, 0, BLUE);
+        x += MeasureTextEx(args1.font_small, "Z", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_z_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
+        if (GuiDropdownBox(fig_z_rect, options, &fig_z_idx, fig_z_active)){
+            fig_z_active = !fig_z_active;
+        }
+        Rectangle fig_zscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
+        if (GuiDropdownBox(fig_zscale_rect, scale_options, &args1.z_scale, fig_zscale_active)){
+            fig_zscale_active = !fig_zscale_active;
+        }
+
+        // Color
+        DrawTextEx(args1.font_small, "C", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "C", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle fig_color_rect = {x, SEP, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
+        x += DROPDOWN_WIDTH;
+        if (GuiDropdownBox(fig_color_rect, env_hyper_options, &fig_color_idx, fig_color_active)){
+            fig_color_active = !fig_color_active;
+        }
+        Rectangle fig_colorscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        x += TOGGLE_WIDTH + SPACER;
+        if (GuiDropdownBox(fig_colorscale_rect, scale_options, &args1.c_scale, fig_colorscale_active)){
+            fig_colorscale_active = !fig_colorscale_active;
+        }
+
+        // Temp hack
+        args2.c_scale = args1.c_scale;
+        args3.c_scale = args1.c_scale;
+        args4.c_scale = args1.c_scale;
+
+        // Filters
+        DrawTextEx(args1.font_small, "F1", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "F1", args1.axis_tick_font_size, 0).x + SEP;
+
+        GuiDropdownFilter(x, SEP, options,
+                &fig_range1_idx, &fig_range1_active, focus, fig_range1_min,
+                &fig_range1_min_val, fig_range1_max, &fig_range1_max_val);
+        x += DROPDOWN_WIDTH + 2*TOGGLE_WIDTH + SPACER;
+
+        DrawTextEx(args1.font_small, "F2", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "F2", args1.axis_tick_font_size, 0).x + SEP;
+
+        GuiDropdownFilter(x, SEP, options,
+            &fig_range2_idx, &fig_range2_active, focus, fig_range2_min,
+            &fig_range2_min_val, fig_range2_max, &fig_range2_max_val);
+        x += DROPDOWN_WIDTH + 2*TOGGLE_WIDTH + SPACER;
+
+        // Box
+        DrawTextEx(args1.font_small, "Box", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
+        x += MeasureTextEx(args1.font_small, "Box", args1.axis_tick_font_size, 0).x + SEP;
+
+        Rectangle box_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
+        if (GuiDropdownBox(box_rect, scale_options, &fig_box_idx, fig_box_active)) {
+            fig_box_active = !fig_box_active;
+        }
+
+        // Puffer
+        float width = GetScreenWidth();
+        float height = GetScreenHeight();
+        DrawTexturePro(
+            puffer,
+            (Rectangle){0, 128, 128, 128},
+            (Rectangle){width - 48, -8, 48, 48},
+            (Vector2){0, 0},
+            0,
+            WHITE
+        );
 
         // Tooltip
         int env_idx = tooltip.env_idx;
@@ -1456,10 +1633,10 @@ int main(void) {
         Env* env = &data.envs[env_idx];
         char* env_key = env->key;
 
-        float cost = get_hyper(&data, env_key, "cost")->ary[ary_idx];
-        float score = get_hyper(&data, env_key, "environment/score")->ary[ary_idx];
+        float cost = get_hyper(&data, env_key, "uptime")->ary[ary_idx];
+        float score = get_hyper(&data, env_key, "env/score")->ary[ary_idx];
         float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
-        float perf = get_hyper(&data, env_key, "environment/perf")->ary[ary_idx];
+        float perf = get_hyper(&data, env_key, "env/perf")->ary[ary_idx];
         float tsne1 = get_hyper(&data, env_key, "tsne1")->ary[ary_idx];
         float tsne2 = get_hyper(&data, env_key, "tsne2")->ary[ary_idx];
         Vector2 tsne = (Vector2){tsne1, tsne2};
@@ -1477,9 +1654,17 @@ int main(void) {
 
             char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
-            DrawRectangle(tooltip.x, tooltip.y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
+            float x = tooltip.x;
+            float y = tooltip.y;
+            if (x + text_size.x + 4 > GetScreenWidth()) {
+                x = x - text_size.x - 4;
+            }
+            if (y + text_size.y + 4 > GetScreenHeight()) {
+                y = y - text_size.y - 4;
+            }
+            DrawRectangle(x, y, text_size.x + 4, text_size.y + 4, PUFF_BACKGROUND);
             DrawCircle(tooltip.x, tooltip.y, 2, PUFF_CYAN);
-            DrawTextEx(args1.font_small, text, (Vector2){tooltip.x + 2, tooltip.y + 2}, args1.axis_tick_font_size, 0, WHITE);
+            DrawTextEx(args1.font_small, text, (Vector2){x + 2, y + 2}, args1.axis_tick_font_size, 0, WHITE);
         }
         //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
