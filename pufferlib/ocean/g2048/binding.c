@@ -2,7 +2,7 @@
 #define OBS_SIZE 16
 #define NUM_ATNS 1
 #define ACT_SIZES {4}
-#define OBS_TYPE UNSIGNED_CHAR
+#define OBS_TENSOR_T ByteTensor
 #define ACT_TYPE DOUBLE
 
 #define Env Game

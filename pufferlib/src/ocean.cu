@@ -1,5 +1,5 @@
 // NMMO3 CUDA encoder: multihot, cuDNN conv, embedding, concat, projection
-// Included by models.cu — requires precision_t, PufTensor, Allocator, puf_mm, etc.
+// Included by models.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
 
 #include "cudnn_conv2d.cu"
 
@@ -144,14 +144,14 @@ __global__ void n3_concat_backward_conv_kernel(
 
 struct NMMO3EncoderWeights {
     ConvWeights conv1, conv2;
-    PufTensor embed_w, proj_w, proj_b;
+    PrecisionTensor embed_w, proj_w, proj_b;
     int obs_size, hidden;
 };
 
 struct NMMO3EncoderActivations {
     ConvActivations conv1, conv2;
-    PufTensor multihot, embed_out, concat, out, saved_obs;
-    PufTensor embed_wgrad, proj_wgrad, proj_bgrad;
+    PrecisionTensor multihot, embed_out, concat, out, saved_obs;
+    PrecisionTensor embed_wgrad, proj_wgrad, proj_bgrad;
 };
 
 static NMMO3EncoderWeights* nmmo3_encoder_create(int obs_size, int hidden) {
@@ -164,90 +164,84 @@ static NMMO3EncoderWeights* nmmo3_encoder_create(int obs_size, int hidden) {
 
 // ---- NMMO3 encoder interface ----
 
-static PufTensor nmmo3_encoder_forward(void* w, void* activations, PufTensor input, cudaStream_t stream) {
+static PrecisionTensor nmmo3_encoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
     int B = input.shape[0];
 
-    if (a->saved_obs.bytes) puf_copy(&a->saved_obs, &input, stream);
+    if (a->saved_obs.data) puf_copy(&a->saved_obs, &input, stream);
 
-    cudaMemsetAsync(a->multihot.bytes, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * PRECISION_SIZE, stream);
+    cudaMemsetAsync(a->multihot.data, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * sizeof(precision_t), stream);
     n3_multihot_kernel<<<grid_size(B * N3_MAP_H * N3_MAP_W), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->multihot.bytes, (precision_t*)input.bytes, B, ew->obs_size);
+        a->multihot.data, input.data, B, ew->obs_size);
 
-    conv_forward(&ew->conv1, &a->conv1, a->multihot.bytes, B, stream);
-    conv_forward(&ew->conv2, &a->conv2, a->conv1.out.bytes, B, stream);
+    conv_forward(&ew->conv1, &a->conv1, a->multihot.data, B, stream);
+    conv_forward(&ew->conv2, &a->conv2, a->conv1.out.data, B, stream);
 
     n3_embedding_kernel<<<grid_size(B * N3_PLAYER), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->embed_out.bytes, (precision_t*)input.bytes,
-        (precision_t*)ew->embed_w.bytes, B, ew->obs_size);
+        a->embed_out.data, input.data, ew->embed_w.data, B, ew->obs_size);
     n3_concat_kernel<<<grid_size(B * N3_CONCAT), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->concat.bytes, (precision_t*)a->conv2.out.bytes,
-        (precision_t*)a->embed_out.bytes, (precision_t*)input.bytes, B, ew->obs_size);
+        a->concat.data, a->conv2.out.data, a->embed_out.data, input.data, B, ew->obs_size);
 
     puf_mm(&a->concat, &ew->proj_w, &a->out, stream);
     n3_bias_relu_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->out.bytes, (precision_t*)ew->proj_b.bytes, B * ew->hidden, ew->hidden);
+        a->out.data, ew->proj_b.data, B * ew->hidden, ew->hidden);
     return a->out;
 }
 
-static void nmmo3_encoder_backward(void* w, void* activations, PufTensor grad, cudaStream_t stream) {
+static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor grad, cudaStream_t stream) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
-    int B = grad.shape[0], H = ew->hidden, p = PRECISION_SIZE;
+    int B = grad.shape[0], H = ew->hidden;
 
     n3_relu_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)grad.bytes, (precision_t*)a->out.bytes, B * H);
+        grad.data, a->out.data, B * H);
     n3_bias_grad_kernel<<<H, 256, 0, stream>>>(
-        (precision_t*)a->proj_bgrad.bytes, (precision_t*)grad.bytes, B, H);
+        a->proj_bgrad.data, grad.data, B, H);
     puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
 
-    PufTensor grad_concat = {.bytes = a->concat.bytes, .shape = {B, N3_CONCAT}, .dtype_size = p};
+    PrecisionTensor grad_concat = {.data = a->concat.data, .shape = {B, N3_CONCAT}};
     puf_mm_nn(&grad, &ew->proj_w, &grad_concat, stream);
 
     n3_concat_backward_conv_kernel<<<grid_size(B * N3_CONV_FLAT), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->conv2.grad.bytes, (precision_t*)grad_concat.bytes, B);
+        a->conv2.grad.data, grad_concat.data, B);
 
-    // Conv2 backward: relu mask + bias grad + cuDNN filter/data grad
-    // conv2 has no relu, so skip relu backward
     n3_conv_bias_grad_nchw<<<ew->conv2.OC, 256, 0, stream>>>(
-        (precision_t*)a->conv2.bgrad.bytes, (precision_t*)a->conv2.grad.bytes,
+        a->conv2.bgrad.data, a->conv2.grad.data,
         B, ew->conv2.OC, ew->conv2.OH * ew->conv2.OW);
-    conv_backward(&ew->conv2, &a->conv2, a->conv1.grad.bytes, stream);
+    conv_backward(&ew->conv2, &a->conv2, a->conv1.grad.data, stream);
 
-    // Conv1 backward: relu mask + bias grad + cuDNN filter grad (no data grad)
-    // Conv2's data grad lands in conv1.grad — that's conv1's upstream grad
     n3_relu_backward_kernel<<<grid_size(B * ew->conv1.OC * ew->conv1.OH * ew->conv1.OW), BLOCK_SIZE, 0, stream>>>(
-        (precision_t*)a->conv1.grad.bytes, (precision_t*)a->conv1.out.bytes,
+        a->conv1.grad.data, a->conv1.out.data,
         B * ew->conv1.OC * ew->conv1.OH * ew->conv1.OW);
     n3_conv_bias_grad_nchw<<<ew->conv1.OC, 256, 0, stream>>>(
-        (precision_t*)a->conv1.bgrad.bytes, (precision_t*)a->conv1.grad.bytes,
+        a->conv1.bgrad.data, a->conv1.grad.data,
         B, ew->conv1.OC, ew->conv1.OH * ew->conv1.OW);
     conv_backward(&ew->conv1, &a->conv1, NULL, stream);
 
-    cudaMemsetAsync(a->embed_wgrad.bytes, 0, a->embed_wgrad.numel() * p, stream);
+    cudaMemsetAsync(a->embed_wgrad.data, 0, numel(a->embed_wgrad.shape) * sizeof(precision_t), stream);
 }
 
 static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     conv_init_weights(&ew->conv1, seed, stream);
     conv_init_weights(&ew->conv2, seed, stream);
-    auto init2d = [&](PufTensor& t, int rows, int cols, float gain) {
-        PufTensor wt = {.bytes = t.bytes, .shape = {rows, cols}, .dtype_size = t.dtype_size};
+    auto init2d = [&](PrecisionTensor& t, int rows, int cols, float gain) {
+        PrecisionTensor wt = {.data = t.data, .shape = {rows, cols}};
         puf_kaiming_init(&wt, gain, (*seed)++, stream);
     };
     init2d(ew->embed_w, N3_EMBED_VOCAB, N3_EMBED_DIM, 1.0f);
     init2d(ew->proj_w, ew->hidden, N3_CONCAT, std::sqrt(2.0f));
-    cudaMemsetAsync(ew->proj_b.bytes, 0, ew->proj_b.numel() * ew->proj_b.dtype_size, stream);
+    cudaMemsetAsync(ew->proj_b.data, 0, numel(ew->proj_b.shape) * sizeof(precision_t), stream);
 }
 
-static void nmmo3_encoder_reg_params(void* w, Allocator* alloc, int esz) {
+static void nmmo3_encoder_reg_params(void* w, Allocator* alloc) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
-    conv_reg_params(&ew->conv1, alloc, esz);
-    conv_reg_params(&ew->conv2, alloc, esz);
-    ew->embed_w = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}, .dtype_size = esz};
-    ew->proj_w  = {.shape = {ew->hidden, N3_CONCAT}, .dtype_size = esz};
-    ew->proj_b  = {.shape = {ew->hidden}, .dtype_size = esz};
+    conv_reg_params(&ew->conv1, alloc);
+    conv_reg_params(&ew->conv2, alloc);
+    ew->embed_w = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+    ew->proj_w  = {.shape = {ew->hidden, N3_CONCAT}};
+    ew->proj_b  = {.shape = {ew->hidden}};
     alloc_register(alloc,&ew->embed_w);
     alloc_register(alloc,&ew->proj_w);  alloc_register(alloc,&ew->proj_b);
 }
@@ -255,21 +249,20 @@ static void nmmo3_encoder_reg_params(void* w, Allocator* alloc, int esz) {
 static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
-    int p = PRECISION_SIZE;
     *a = {};
-    a->multihot = {.shape = {B_TT, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}, .dtype_size = p};
+    a->multihot = {.shape = {B_TT, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}};
     alloc_register(acts,&a->multihot);
     conv_reg_train(&ew->conv1, &a->conv1, acts, grads, B_TT, n3_cudnn_dtype());
     conv_reg_train(&ew->conv2, &a->conv2, acts, grads, B_TT, n3_cudnn_dtype());
-    a->embed_out = {.shape = {B_TT, N3_PLAYER_EMBED}, .dtype_size = p};
-    a->concat    = {.shape = {B_TT, N3_CONCAT}, .dtype_size = p};
-    a->out       = {.shape = {B_TT, ew->hidden}, .dtype_size = p};
-    a->saved_obs = {.shape = {B_TT, ew->obs_size}, .dtype_size = p};
+    a->embed_out = {.shape = {B_TT, N3_PLAYER_EMBED}};
+    a->concat    = {.shape = {B_TT, N3_CONCAT}};
+    a->out       = {.shape = {B_TT, ew->hidden}};
+    a->saved_obs = {.shape = {B_TT, ew->obs_size}};
     alloc_register(acts,&a->embed_out); alloc_register(acts,&a->concat);
     alloc_register(acts,&a->out);       alloc_register(acts,&a->saved_obs);
-    a->embed_wgrad = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}, .dtype_size = p};
-    a->proj_wgrad  = {.shape = {ew->hidden, N3_CONCAT}, .dtype_size = p};
-    a->proj_bgrad  = {.shape = {ew->hidden}, .dtype_size = p};
+    a->embed_wgrad = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+    a->proj_wgrad  = {.shape = {ew->hidden, N3_CONCAT}};
+    a->proj_bgrad  = {.shape = {ew->hidden}};
     alloc_register(grads,&a->embed_wgrad);
     alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
 }
@@ -277,18 +270,17 @@ static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts,
 static void nmmo3_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
     NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
-    int p = PRECISION_SIZE;
-    a->multihot = {.shape = {B, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}, .dtype_size = p};
+    a->multihot = {.shape = {B, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}};
     alloc_register(alloc,&a->multihot);
     conv_reg_rollout(&ew->conv1, &a->conv1, alloc, B, n3_cudnn_dtype());
     conv_reg_rollout(&ew->conv2, &a->conv2, alloc, B, n3_cudnn_dtype());
-    a->embed_out = {.shape = {B, N3_PLAYER_EMBED}, .dtype_size = p};
-    a->concat    = {.shape = {B, N3_CONCAT}, .dtype_size = p};
-    a->out       = {.shape = {B, ew->hidden}, .dtype_size = p};
+    a->embed_out = {.shape = {B, N3_PLAYER_EMBED}};
+    a->concat    = {.shape = {B, N3_CONCAT}};
+    a->out       = {.shape = {B, ew->hidden}};
     alloc_register(alloc,&a->embed_out); alloc_register(alloc,&a->concat); alloc_register(alloc,&a->out);
 }
 
-static void* nmmo3_encoder_create_weights(void* self, int esz) {
+static void* nmmo3_encoder_create_weights(void* self) {
     Encoder* e = (Encoder*)self;
     return nmmo3_encoder_create(e->in_dim, e->out_dim);
 }

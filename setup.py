@@ -395,6 +395,15 @@ STATIC_ENVS = [
     and os.path.exists(f'pufferlib/ocean/{name}/binding.c')
 ]
 
+def _extract_obs_tensor_t(obj_path):
+    """Extract OBS_TENSOR_T from a compiled .o via the embedded dtype_symbol string."""
+    import subprocess
+    out = subprocess.check_output(['strings', obj_path], text=True)
+    for line in out.splitlines():
+        if line.endswith('Tensor'):
+            return line.strip()
+    raise RuntimeError(f'Could not find OBS_TENSOR_T in {obj_path}')
+
 def _build_static_lib(env_name, force=False):
     """Build a static .a library for a given env using clang."""
     import subprocess
@@ -405,7 +414,7 @@ def _build_static_lib(env_name, force=False):
     env_deps = [env_binding_src, 'pufferlib/src/vecenv.h']
     if not force and not _needs_rebuild(static_lib, env_deps):
         print(f'Static env up to date: {static_lib}')
-        return static_lib
+        return static_lib, _extract_obs_tensor_t(static_obj)
 
     clang_cmd = [
         'clang', '-c', '-O2', '-DNDEBUG',
@@ -422,7 +431,9 @@ def _build_static_lib(env_name, force=False):
     ar_cmd = ['ar', 'rcs', static_lib, static_obj]
     print(f'Creating static library: {" ".join(ar_cmd)}')
     subprocess.check_call(ar_cmd)
-    return static_lib
+    obs_tensor_t = _extract_obs_tensor_t(static_obj)
+    print(f'OBS_TENSOR_T={obs_tensor_t}')
+    return static_lib, obs_tensor_t
 
 def _needs_rebuild(output, sources):
     """Check if output needs rebuilding based on source mtimes."""
@@ -442,7 +453,7 @@ _BINDINGS_CU_DEPS = [
     'pufferlib/src/puffernet.h',
 ]
 
-def _build_notorch_C(static_lib=None, force=False, precision='bf16'):
+def _build_notorch_C(static_lib=None, obs_tensor_t=None, force=False, precision='bf16'):
     """Build _C.so via single nvcc compile (no torch dependency)."""
     import subprocess
     import sysconfig
@@ -483,6 +494,8 @@ def _build_notorch_C(static_lib=None, force=False, precision='bf16'):
     ]
     if precision_flag:
         nvcc_cmd.append(precision_flag)
+    if obs_tensor_t:
+        nvcc_cmd.append(f'-DOBS_TENSOR_T={obs_tensor_t}')
     if DEBUG:
         nvcc_cmd += ['-O0', '-g']
     else:
@@ -534,8 +547,8 @@ def create_static_env_build_class(env_name):
             super().finalize_options()
 
         def run(self):
-            static_lib = _build_static_lib(env_name, force=self.force)
-            _build_notorch_C(static_lib, force=self.force, precision=self.precision)
+            static_lib, obs_tensor_t = _build_static_lib(env_name, force=self.force)
+            _build_notorch_C(static_lib, obs_tensor_t, force=self.force, precision=self.precision)
     return StaticEnvBuildExt
 
 # Add build_<env> for static-linked envs (always available, torch optional)

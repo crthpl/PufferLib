@@ -39,7 +39,7 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     // Losses
     pybind11::dict losses_dict;
     float losses_host[NUM_LOSSES];
-    cudaMemcpy(losses_host, pufferl.losses_puf.bytes, sizeof(losses_host), cudaMemcpyDeviceToHost);
+    cudaMemcpy(losses_host, pufferl.losses_puf.data, sizeof(losses_host), cudaMemcpyDeviceToHost);
     float n = losses_host[LOSS_N];
     if (n > 0) {
         float inv_n = 1.0f / n;
@@ -51,7 +51,7 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
         losses_dict["kl"] = losses_host[LOSS_APPROX_KL] * inv_n;
         losses_dict["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
     }
-    cudaMemset(pufferl.losses_puf.bytes, 0, pufferl.losses_puf.numel() * pufferl.losses_puf.dtype_size);
+    cudaMemset(pufferl.losses_puf.data, 0, numel(pufferl.losses_puf.shape) * sizeof(float));
     result["loss"] = losses_dict;
 
     // Profile
@@ -168,9 +168,9 @@ void puf_close(pybind11::object pufferl_obj) {
 
 void save_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.master_weights.numel() * sizeof(float);
+    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
     std::vector<char> buf(nbytes);
-    cudaMemcpy(buf.data(), pufferl.master_weights.bytes, nbytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(buf.data(), pufferl.master_weights.data, nbytes, cudaMemcpyDeviceToHost);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
     fwrite(buf.data(), 1, nbytes, f);
@@ -179,7 +179,7 @@ void save_weights(pybind11::object pufferl_obj, const std::string& path) {
 
 void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = pufferl.master_weights.numel() * sizeof(float);
+    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
     // Verify file size matches
@@ -198,11 +198,11 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         throw std::runtime_error("Failed to read weight file");
     }
     fclose(f);
-    cudaMemcpy(pufferl.master_weights.bytes, buf.data(), nbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(pufferl.master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
-        int n = pufferl.param_puf.numel();
+        int n = numel(pufferl.param_puf.shape);
         cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
-            (precision_t*)pufferl.param_puf.bytes, (const float*)pufferl.master_weights.bytes, n);
+            pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
 }
 
@@ -356,11 +356,18 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("gpu_id", &HypersT::gpu_id)
         .def_readwrite("nccl_id", &HypersT::nccl_id);
 
-    py::class_<PufTensor>(m, "PufTensor")
-        .def("__repr__", &PufTensor::repr)
-        .def("ndim", &PufTensor::ndim)
-        .def("numel", &PufTensor::numel)
-        .def_readonly("dtype_size", &PufTensor::dtype_size);
+    py::class_<PrecisionTensor>(m, "PrecisionTensor")
+        .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })
+        .def("ndim", [](const PrecisionTensor& t) { return ndim(t.shape); })
+        .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); });
+    py::class_<DoubleTensor>(m, "DoubleTensor")
+        .def("__repr__", [](const DoubleTensor& t) { return std::string(puf_repr(&t)); })
+        .def("ndim", [](const DoubleTensor& t) { return ndim(t.shape); })
+        .def("numel", [](const DoubleTensor& t) { return numel(t.shape); });
+    py::class_<FloatTensor>(m, "FloatTensor")
+        .def("__repr__", [](const FloatTensor& t) { return std::string(puf_repr(&t)); })
+        .def("ndim", [](const FloatTensor& t) { return ndim(t.shape); })
+        .def("numel", [](const FloatTensor& t) { return numel(t.shape); });
 
     py::class_<RolloutBuf>(m, "RolloutBuf")
         .def_readwrite("observations", &RolloutBuf::observations)
@@ -388,6 +395,6 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("global_step", &PuffeRL::global_step)
         .def_readonly("last_log_time", &PuffeRL::last_log_time)
         .def("num_params", [](PuffeRL& self) -> int64_t {
-            return self.master_weights.numel();
+            return numel(self.master_weights.shape);
         });
 }

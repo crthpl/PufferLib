@@ -28,7 +28,7 @@ static cudnnHandle_t get_cudnn_handle() {
 // ---- ConvWeights: params + cuDNN descriptors ----
 
 struct ConvWeights {
-    PufTensor w, b;  // w: (OC, IC*K*K), b: (OC)
+    PrecisionTensor w, b;  // w: (OC, IC*K*K), b: (OC)
     int IC, OC, K, S, IH, IW, OH, OW;
     bool relu;
     // cuDNN state
@@ -46,8 +46,8 @@ struct ConvWeights {
 };
 
 struct ConvActivations {
-    PufTensor out, grad, saved_input;
-    PufTensor wgrad, bgrad;
+    PrecisionTensor out, grad, saved_input;
+    PrecisionTensor wgrad, bgrad;
 };
 
 static void conv_init(ConvWeights* cw, int IC, int OC, int K, int S, int IH, int IW, bool relu) {
@@ -108,35 +108,33 @@ static void conv_setup(ConvWeights* cw, int B, cudnnDataType_t dt) {
     cw->cudnn_ready = true;
 }
 
-static void conv_reg_params(ConvWeights* cw, Allocator* alloc, int esz) {
-    cw->w = {.shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = esz};
-    cw->b = {.shape = {cw->OC}, .dtype_size = esz};
+static void conv_reg_params(ConvWeights* cw, Allocator* alloc) {
+    cw->w = {.shape = {cw->OC, cw->IC * cw->K * cw->K}};
+    cw->b = {.shape = {cw->OC}};
     alloc_register(alloc,&cw->w); alloc_register(alloc,&cw->b);
 }
 
 static void conv_reg_train(ConvWeights* cw, ConvActivations* ca, Allocator* acts, Allocator* grads, int B, cudnnDataType_t dt) {
-    int p = cw->w.dtype_size ? cw->w.dtype_size : (dt == CUDNN_DATA_BFLOAT16 ? 2 : 4);
-    ca->out         = {.shape = {B * cw->OC * cw->OH * cw->OW}, .dtype_size = p};
-    ca->grad        = {.shape = {B * cw->OC * cw->OH * cw->OW}, .dtype_size = p};
-    ca->saved_input = {.shape = {B * cw->IC * cw->IH * cw->IW}, .dtype_size = p};
-    ca->wgrad       = {.shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = p};
-    ca->bgrad       = {.shape = {cw->OC}, .dtype_size = p};
+    ca->out         = {.shape = {B * cw->OC * cw->OH * cw->OW}};
+    ca->grad        = {.shape = {B * cw->OC * cw->OH * cw->OW}};
+    ca->saved_input = {.shape = {B * cw->IC * cw->IH * cw->IW}};
+    ca->wgrad       = {.shape = {cw->OC, cw->IC * cw->K * cw->K}};
+    ca->bgrad       = {.shape = {cw->OC}};
     alloc_register(acts,&ca->out); alloc_register(acts,&ca->grad); alloc_register(acts,&ca->saved_input);
     alloc_register(grads,&ca->wgrad); alloc_register(grads,&ca->bgrad);
     conv_setup(cw, B, dt);
 }
 
 static void conv_reg_rollout(ConvWeights* cw, ConvActivations* ca, Allocator* alloc, int B, cudnnDataType_t dt) {
-    int p = cw->w.dtype_size ? cw->w.dtype_size : (dt == CUDNN_DATA_BFLOAT16 ? 2 : 4);
-    ca->out = {.shape = {B * cw->OC * cw->OH * cw->OW}, .dtype_size = p};
+    ca->out = {.shape = {B * cw->OC * cw->OH * cw->OW}};
     alloc_register(alloc,&ca->out);
     conv_setup(cw, B, dt);
 }
 
 static void conv_init_weights(ConvWeights* cw, uint64_t* seed, cudaStream_t stream) {
-    PufTensor wt = {.bytes = cw->w.bytes, .shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = cw->w.dtype_size};
+    PrecisionTensor wt = {.data = cw->w.data, .shape = {cw->OC, cw->IC * cw->K * cw->K}};
     puf_kaiming_init(&wt, cw->relu ? std::sqrt(2.0f) : 1.0f, (*seed)++, stream);
-    cudaMemsetAsync(cw->b.bytes, 0, cw->b.numel() * cw->b.dtype_size, stream);
+    cudaMemsetAsync(cw->b.data, 0, numel(cw->b.shape) * sizeof(precision_t), stream);
 }
 
 // ---- Forward / Backward ----
@@ -146,16 +144,15 @@ static void conv_forward(ConvWeights* cw, ConvActivations* ca, void* input, int 
     cudnnHandle_t h = get_cudnn_handle();
     CHECK_CUDNN(cudnnSetStream(h, stream));
     float alpha = 1.0f, beta = 0.0f;
-    int elem_size = (cw->dtype == CUDNN_DATA_BFLOAT16) ? 2 : 4;
-    if (ca->saved_input.bytes) {
-        cudaMemcpyAsync(ca->saved_input.bytes, input,
-            (int64_t)B * cw->IC * cw->IH * cw->IW * elem_size, cudaMemcpyDeviceToDevice, stream);
+    if (ca->saved_input.data) {
+        cudaMemcpyAsync(ca->saved_input.data, input,
+            (int64_t)B * cw->IC * cw->IH * cw->IW * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
     }
     CHECK_CUDNN(cudnnConvolutionBiasActivationForward(h,
-        &alpha, cw->cudnn_in, input, cw->cudnn_filt, cw->w.bytes,
+        &alpha, cw->cudnn_in, input, cw->cudnn_filt, cw->w.data,
         cw->cudnn_conv, cw->fwd_algo, cw->fwd_ws, cw->fwd_ws_bytes,
-        &beta, cw->cudnn_out, ca->out.bytes, cw->cudnn_bias, cw->b.bytes,
-        cw->cudnn_act, cw->cudnn_out, ca->out.bytes));
+        &beta, cw->cudnn_out, ca->out.data, cw->cudnn_bias, cw->b.data,
+        cw->cudnn_act, cw->cudnn_out, ca->out.data));
 }
 
 // Backward: upstream grad in ca->grad, relu mask in ca->out.
@@ -167,13 +164,13 @@ static void conv_backward(ConvWeights* cw, ConvActivations* ca, void* input_grad
     float alpha = 1.0f, beta = 0.0f;
 
     CHECK_CUDNN(cudnnConvolutionBackwardFilter(h,
-        &alpha, cw->cudnn_in, ca->saved_input.bytes, cw->cudnn_out, ca->grad.bytes,
+        &alpha, cw->cudnn_in, ca->saved_input.data, cw->cudnn_out, ca->grad.data,
         cw->cudnn_conv, cw->bwd_filt_algo, cw->bwd_filt_ws, cw->bwd_filt_ws_bytes,
-        &beta, cw->cudnn_filt, ca->wgrad.bytes));
+        &beta, cw->cudnn_filt, ca->wgrad.data));
 
     if (input_grad) {
         CHECK_CUDNN(cudnnConvolutionBackwardData(h,
-            &alpha, cw->cudnn_filt, cw->w.bytes, cw->cudnn_out, ca->grad.bytes,
+            &alpha, cw->cudnn_filt, cw->w.data, cw->cudnn_out, ca->grad.data,
             cw->cudnn_conv, cw->bwd_data_algo, cw->bwd_data_ws, cw->bwd_data_ws_bytes,
             &beta, cw->cudnn_in, input_grad));
     }

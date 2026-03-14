@@ -179,85 +179,80 @@ __global__ void add_kernel(precision_t* __restrict__ dst, const precision_t* __r
     }
 }
 
-// Minimal tensor: raw pointer + shape, no torch dependency in the struct itself.
-// Memory is owned by an Allocator buffer — PufTensor is just a view.
-#define PUF_MAX_DIMS 8
-struct PufTensor {
-    char* bytes = nullptr;
-    int64_t shape[PUF_MAX_DIMS] = {};
-    int dtype_size = 0;      // bytes per element (2 for bf16/f16, 4 for f32, 8 for f64)
+#include "tensor.h"
 
-    __host__ __device__ int ndim() const {
-        int n = 0;
-        while (n < PUF_MAX_DIMS && shape[n] != 0) {
-            n++;
-        }
-        return n;
-    }
+// PrecisionTensor depends on precision_t (CUDA bf16/f32) so lives here, not in tensor.h
+typedef struct {
+    precision_t* data;
+    int64_t shape[PUF_MAX_DIMS];
+} PrecisionTensor;
 
-    __host__ __device__ int64_t numel() const {
-        int64_t n = 1;
-        for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) {
-            n *= shape[i];
-        }
-        return n;
-    }
 
-    // Merge shape[dim] into shape[dim+1]: {B, TT, H} -> {B*TT, H}
-    PufTensor squeeze(int dim) {
-        int n = ndim();
-        shape[dim + 1] *= shape[dim];
-        for (int i = dim; i < n - 1; i++) shape[i] = shape[i + 1];
-        shape[n - 1] = 0;
-        return *this;
-    }
+// Core shape helpers on raw int64_t* — everything else inlines through these
+__host__ __device__ inline int ndim(const int64_t* shape) {
+    int n = 0; while (n < PUF_MAX_DIMS && shape[n] != 0) n++; return n;
+}
+__host__ __device__ inline int64_t numel(const int64_t* shape) {
+    int64_t n = 1; for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) n *= shape[i]; return n;
+}
 
-    // Split shape[dim] into two: {B*TT, H} with unsqueeze(0, B, TT) -> {B, TT, H}
-    PufTensor unsqueeze(int dim, int64_t d0, int64_t d1) {
-        assert(d0 * d1 == shape[dim] && "unsqueeze: d0 * d1 must equal shape[dim]");
-        int n = ndim();
-        for (int i = n; i > dim; i--) {
-            shape[i] = shape[i - 1];
-        }
-        shape[dim] = d0;
-        shape[dim + 1] = d1;
-        return *this;
-    }
+// --- puf_squeeze: merge shape[dim] into shape[dim+1] ---
+inline PrecisionTensor* puf_squeeze(PrecisionTensor* t, int dim) {
+    int n = ndim(t->shape);
+    t->shape[dim + 1] *= t->shape[dim];
+    for (int i = dim; i < n - 1; i++) t->shape[i] = t->shape[i + 1];
+    t->shape[n - 1] = 0;
+    return t;
+}
+inline FloatTensor* puf_squeeze(FloatTensor* t, int dim) {
+    int n = ndim(t->shape);
+    t->shape[dim + 1] *= t->shape[dim];
+    for (int i = dim; i < n - 1; i++) t->shape[i] = t->shape[i + 1];
+    t->shape[n - 1] = 0;
+    return t;
+}
 
-    // Product of all dims except the last two (1 if ndim <= 2)
-    int64_t batch_size() const {
-        int n = ndim();
-        int64_t b = 1;
-        for (int i = 0; i < n - 2; i++) {
-            b *= shape[i];
-        }
-        return b;
-    }
+// --- puf_unsqueeze: split shape[dim] into {d0, d1} ---
+inline PrecisionTensor* puf_unsqueeze(PrecisionTensor* t, int dim, int64_t d0, int64_t d1) {
+    assert(d0 * d1 == t->shape[dim] && "puf_unsqueeze: d0 * d1 must equal shape[dim]");
+    int n = ndim(t->shape);
+    for (int i = n; i > dim; i--) t->shape[i] = t->shape[i - 1];
+    t->shape[dim] = d0;
+    t->shape[dim + 1] = d1;
+    return t;
+}
 
-    const char* dtype_name() const {
-        switch (dtype_size) {
-            case 1: return "i8";
-            case 2: return "bf16";
-            case 4: return "f32";
-            case 8: return "f64";
-            default: return "?";
-        }
-    }
+// Product of all dims except the last two (1 if ndim <= 2)
+inline int64_t batch_size(const int64_t* shape) {
+    int n = ndim(shape);
+    int64_t b = 1;
+    for (int i = 0; i < n - 2; i++) b *= shape[i];
+    return b;
+}
 
-    const char* repr() const {
-        static char buf[256];
-        if (!bytes) {
-            snprintf(buf, sizeof(buf), "PufTensor(empty)");
-            return buf;
-        }
-        int pos = snprintf(buf, sizeof(buf), "PufTensor(%s, [", dtype_name());
-        for (int i = 0; i < ndim() && pos < (int)sizeof(buf) - 32; i++) {
-            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
-        }
-        snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)numel());
-        return buf;
-    }
-};
+// --- puf_repr (Python bindings only need these three) ---
+static inline const char* _puf_repr_impl(const char* name, const char* dtype,
+        const int64_t* shape, int nd, int64_t ne, bool empty) {
+    static thread_local char buf[256];
+    if (empty) { snprintf(buf, sizeof(buf), "%s(empty)", name); return buf; }
+    int pos = snprintf(buf, sizeof(buf), "%s(%s, [", name, dtype);
+    for (int i = 0; i < nd && pos < (int)sizeof(buf) - 32; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)ne);
+    return buf;
+}
+inline const char* puf_repr(const PrecisionTensor* t) {
+    return _puf_repr_impl("PrecisionTensor", USE_BF16 ? "bf16" : "f32",
+        t->shape, ndim(t->shape), numel(t->shape), !t->data);
+}
+inline const char* puf_repr(const DoubleTensor* t) {
+    return _puf_repr_impl("DoubleTensor", "f64",
+        t->shape, ndim(t->shape), numel(t->shape), !t->data);
+}
+inline const char* puf_repr(const FloatTensor* t) {
+    return _puf_repr_impl("FloatTensor", "f32",
+        t->shape, ndim(t->shape), numel(t->shape), !t->data);
+}
 
 
 // Dense row-major GEMM: C(M,N) = alpha * op_a(A) @ op_b(B) + beta * C
@@ -284,39 +279,39 @@ static inline void cublasGemmExDense(
 }
 
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
-void puf_mm(PufTensor* a, PufTensor* b, PufTensor* out, cudaStream_t stream) {
-    int M = a->batch_size() * a->shape[a->ndim()-2];
-    int K = a->shape[a->ndim()-1];
-    int N = b->shape[b->ndim()-2];
+void puf_mm(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int N = b->shape[ndim(b->shape)-2];
     cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_T, M, N, K,
-        a->bytes, b->bytes, out->bytes, stream);
+        a->data, b->data, out->data, stream);
 }
 
 // out(M,N) = a(...,M)^T @ b(...,N)  — leading dims folded into K
-void puf_mm_tn(PufTensor* a, PufTensor* b, PufTensor* out, cudaStream_t stream) {
-    int M = a->shape[a->ndim()-1];
-    int K = a->batch_size() * a->shape[a->ndim()-2];
-    int N = b->shape[b->ndim()-1];
+void puf_mm_tn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
+    int M = a->shape[ndim(a->shape)-1];
+    int K = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int N = b->shape[ndim(b->shape)-1];
     cublasGemmExDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
-        a->bytes, b->bytes, out->bytes, stream);
+        a->data, b->data, out->data, stream);
 }
 
 // out(...,N) = a(...,K) @ b(K,N)  — leading dims folded into M
-void puf_mm_nn(PufTensor* a, PufTensor* b, PufTensor* out, cudaStream_t stream) {
-    int M = a->batch_size() * a->shape[a->ndim()-2];
-    int K = a->shape[a->ndim()-1];
-    int N = b->shape[b->ndim()-1];
+void puf_mm_nn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int N = b->shape[ndim(b->shape)-1];
     cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
-        a->bytes, b->bytes, out->bytes, stream);
+        a->data, b->data, out->data, stream);
 }
 
-static void puf_addmm_nn(PufTensor* a, PufTensor* b, PufTensor* out,
+static void puf_addmm_nn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out,
         float alpha, float beta, cudaStream_t stream) {
-    int M = a->batch_size() * a->shape[a->ndim()-2];
-    int K = a->shape[a->ndim()-1];
-    int N = b->shape[b->ndim()-1];
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int N = b->shape[ndim(b->shape)-1];
     cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
-        a->bytes, b->bytes, out->bytes, stream, alpha, beta);
+        a->data, b->data, out->data, stream, alpha, beta);
 }
 
 __global__ void cast_kernel(precision_t* __restrict__ dst,
@@ -351,77 +346,84 @@ __global__ void cast_kernel(unsigned char* __restrict__ dst,
     }
 }
 
-void puf_copy(PufTensor* dst, const PufTensor* src, cudaStream_t stream) {
-    assert(dst->numel() == src->numel() && "puf_copy: size mismatch");
-    assert(dst->dtype_size == src->dtype_size && "puf_copy: dtype mismatch");
-    cudaMemcpyAsync(dst->bytes, src->bytes, dst->numel() * dst->dtype_size, cudaMemcpyDeviceToDevice, stream);
+void puf_copy(PrecisionTensor* dst, const PrecisionTensor* src, cudaStream_t stream) {
+    assert(numel(dst->shape) == numel(src->shape) && "puf_copy: size mismatch");
+    cudaMemcpyAsync(dst->data, src->data, numel(dst->shape) * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
 }
 
-void puf_zero(PufTensor* dst, cudaStream_t stream) {
-    cudaMemsetAsync(dst->bytes, 0, dst->numel() * dst->dtype_size, stream);
+void puf_zero(PrecisionTensor* dst, cudaStream_t stream) {
+    cudaMemsetAsync(dst->data, 0, numel(dst->shape) * sizeof(precision_t), stream);
 }
 
-void puf_add(PufTensor* dst, const PufTensor* src, cudaStream_t stream) {
-    assert(dst->numel() == src->numel() && "puf_add: size mismatch");
-    assert(dst->dtype_size == 4 && "puf_add: dst must be f32");
-    add_kernel<<<grid_size(dst->numel()), BLOCK_SIZE, 0, stream>>>(
-        (float*)dst->bytes, (const precision_t*)src->bytes, dst->numel());
+void puf_zero(FloatTensor* dst, cudaStream_t stream) {
+    cudaMemsetAsync(dst->data, 0, numel(dst->shape) * sizeof(float), stream);
 }
 
-void puf_kaiming_init(PufTensor* dst, float gain, ulong seed, cudaStream_t stream) {
-    assert(dst->ndim() == 2);
+void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t stream) {
+    assert(ndim(dst->shape) == 2);
     long rows = dst->shape[0], cols = dst->shape[1];
     assert(rows > 0 && cols > 0);
     long n = rows * cols;
-
-    float std = gain / std::sqrt((float)cols);  // fan_in = cols for (out, in) layout
-
+    float std = gain / std::sqrt((float)cols);
     long rand_count = (n % 2 == 0) ? n : n + 1;
     float* buf;
     cudaMalloc(&buf, rand_count * sizeof(float));
-
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
     curandDestroyGenerator(gen);
-
-    if (dst->dtype_size == 4) {
-        cudaMemcpyAsync(dst->bytes, buf, n * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-    } else {
-        cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>((precision_t*)dst->bytes, buf, n);
-    }
-
+    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
     cudaFree(buf);
 }
 
+struct AllocEntry {
+    void** data_ptr;    // address of the tensor's data field
+    int64_t* shape;     // pointer to the tensor's shape array
+    int elem_size;      // sizeof element type
+};
+
 struct Allocator {
-    PufTensor** regs = nullptr;
+    AllocEntry* regs = nullptr;
     int num_regs = 0;
     void* mem = nullptr;
     long total_elems = 0;
     long total_bytes = 0;
 };
-void alloc_register(Allocator* alloc, PufTensor* ptr) {
-    alloc->regs = (PufTensor**)realloc(alloc->regs, (alloc->num_regs + 1) * sizeof(PufTensor*));
-    alloc->regs[alloc->num_regs++] = ptr;
-    alloc->total_elems += ptr->numel();
+
+static void alloc_register_impl(Allocator* alloc, void** data_ptr, int64_t* shape, int elem_size) {
+    alloc->regs = (AllocEntry*)realloc(alloc->regs, (alloc->num_regs + 1) * sizeof(AllocEntry));
+    alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
+    int64_t n = numel(shape);
+    alloc->total_elems += n;
     alloc->total_bytes = (alloc->total_bytes + 15) & ~15;
-    alloc->total_bytes += ptr->numel() * ptr->dtype_size;
+    alloc->total_bytes += n * elem_size;
+}
+void alloc_register(Allocator* a, PrecisionTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(precision_t));
+}
+void alloc_register(Allocator* a, FloatTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(float));
+}
+void alloc_register(Allocator* a, DoubleTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(double));
+}
+void alloc_register(Allocator* a, LongTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(long));
+}
+void alloc_register(Allocator* a, IntTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(int));
 }
 
 void alloc_create(Allocator* alloc) {
-    if (alloc->total_bytes == 0) {
-        return;
-    }
+    if (alloc->total_bytes == 0) return;
     cudaMalloc(&alloc->mem, alloc->total_bytes);
     cudaMemset(alloc->mem, 0, alloc->total_bytes);
     long offset = 0;
     for (int i = 0; i < alloc->num_regs; i++) {
-        PufTensor* t = alloc->regs[i];
         offset = (offset + 15) & ~15;
-        t->bytes = (char*)alloc->mem + offset;
-        offset += t->numel() * t->dtype_size;
+        *alloc->regs[i].data_ptr = (char*)alloc->mem + offset;
+        offset += numel(alloc->regs[i].shape) * alloc->regs[i].elem_size;
     }
 }
 
@@ -430,6 +432,7 @@ void alloc_free(Allocator* alloc) {
     if (alloc->regs) { free(alloc->regs); alloc->regs = nullptr; }
     alloc->num_regs = 0;
     alloc->total_elems = 0;
+    alloc->total_bytes = 0;
 }
 
 #endif // PUFFERLIB_KERNELS_CU

@@ -13,12 +13,7 @@
 extern "C" {
 #endif
 
-// Type constants
-#define FLOAT 1
-#define INT 2
-#define UNSIGNED_CHAR 3
-#define DOUBLE 4
-#define CHAR 5
+#include "tensor.h"
 
 // Dict types
 typedef struct {
@@ -123,7 +118,6 @@ void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]);
 
 // Env info
 int get_obs_size(void);
-int get_obs_type(void);
 int get_num_atns(void);
 int* get_act_sizes(void);
 
@@ -142,6 +136,16 @@ int my_put(void* env, Dict* kwargs);
 // ============================================================================
 
 #ifdef OBS_SIZE
+
+static inline size_t obs_element_size(void) {
+    OBS_TENSOR_T t;
+    return sizeof(*t.data);
+}
+
+// Usually near the top, after any #includes
+#define _STRINGIFY(x)   #x
+#define  STRINGIFY(x)  _STRINGIFY(x)
+const char dtype_symbol[] = STRINGIFY(OBS_TENSOR_T);
 
 #include <omp.h>
 #include <stdatomic.h>
@@ -179,17 +183,6 @@ extern const char* cudaGetErrorString(cudaError_t);
 void my_init(Env* env, Dict* kwargs);
 void my_log(Log* log, Dict* out);
 
-// Helper to get observation element size based on OBS_TYPE
-static inline size_t obs_element_size(void) {
-    switch (OBS_TYPE) {
-        case FLOAT: return sizeof(float);
-        case INT: return sizeof(int);
-        case UNSIGNED_CHAR: return sizeof(unsigned char);
-        case DOUBLE: return sizeof(double);
-        case CHAR: return sizeof(char);
-        default: return sizeof(float);
-    }
-}
 
 struct StaticThreading {
     atomic_int* buffer_states;
@@ -573,7 +566,6 @@ void static_vec_render(StaticVec* vec, int env_id) {
 }
 
 int get_obs_size(void) { return OBS_SIZE; }
-int get_obs_type(void) { return OBS_TYPE; }
 int get_num_atns(void) { return NUM_ATNS; }
 static int _act_sizes[] = ACT_SIZES;
 int* get_act_sizes(void) { return _act_sizes; }
