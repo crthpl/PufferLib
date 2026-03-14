@@ -300,7 +300,7 @@ inline void sync_policy_weights(Tensor& dst_param_buffer, const Tensor& src_para
     PufTensor src = PufTensor::from_torch(src_param_buffer);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     if (dst.dtype_size == src.dtype_size) {
-        puf_copy(dst, src, stream);
+        puf_copy(&dst, &src, stream);
     } else {
         puf_cast_f32_to_bf16(dst, src, stream);
     }

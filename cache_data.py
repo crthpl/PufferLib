@@ -14,10 +14,10 @@ env_names = sorted([
     #'tetris',
     'g2048',
     #'moba',
-    #'pong',
+    'pong',
     #'tower_climb',
     'grid',
-    #'nmmo3',
+    'nmmo3',
     #'snake',
     #'tripletriad'
 ])
@@ -142,10 +142,10 @@ def load_sweep_data(path):
 
 def cached_sweep_load(path, env_name):
     cache_file = os.path.join(path, 'c_cache.json')
-    #if not os.path.exists(cache_file):
-    data = load_sweep_data(os.path.join(path, '*.json'))
-    with open(cache_file, 'w') as f:
-        json.dump(data, f)
+    if not os.path.exists(cache_file):
+        data = load_sweep_data(os.path.join(path, '*.json'))
+        with open(cache_file, 'w') as f:
+            json.dump(data, f)
 
     with open(cache_file, 'r') as f:
         data = json.load(f)
