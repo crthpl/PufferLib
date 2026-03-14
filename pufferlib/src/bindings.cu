@@ -136,7 +136,7 @@ void rollouts(pybind11::object pufferl_obj) {
 
     // Zero state buffers
     for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-        puf_zero(pufferl.buffer_states[i], pufferl.default_stream);
+        puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
     }
 
     static_vec_omp_step(pufferl.vec);
@@ -200,7 +200,9 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     fclose(f);
     cudaMemcpy(pufferl.master_weights.bytes, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
-        puf_cast_f32_to_bf16(pufferl.param_puf, pufferl.master_weights, pufferl.default_stream);
+        int n = pufferl.param_puf.numel();
+        cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
+            (precision_t*)pufferl.param_puf.bytes, (const float*)pufferl.master_weights.bytes, n);
     }
 }
 

@@ -1,6 +1,3 @@
-#ifndef PUFFERLIB_MUON_CU
-#define PUFFERLIB_MUON_CU
-
 #include <nccl.h>
 
 __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
@@ -214,9 +211,9 @@ void muon_step(Muon* m, PufTensor weights, PufTensor grads, float max_grad_norm,
                 PufTensor& dst = (i % 2 == 0) ? x_buf : x;
                 cublasGemmExDense(gram_op_a, gram_op_b, (int)M, (int)M, (int)N,
                     src.bytes, src.bytes, gram.bytes, stream);
-                puf_copy(gram_buf, gram, stream);
-                puf_addmm_nn(gram, gram, gram_buf, ns_coeffs[i][2], ns_coeffs[i][1], stream);
-                puf_copy(dst, src, stream);
+                puf_copy(&gram_buf, &gram, stream);
+                puf_addmm_nn(&gram, &gram, &gram_buf, ns_coeffs[i][2], ns_coeffs[i][1], stream);
+                puf_copy(&dst, &src, stream);
                 cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
                     tall ? src.bytes : gram_buf.bytes, tall ? gram_buf.bytes : src.bytes, dst.bytes,
                     stream, 1.0f, ns_coeffs[i][0]);
@@ -233,5 +230,3 @@ void muon_step(Muon* m, PufTensor weights, PufTensor grads, float max_grad_norm,
         offset += numel;
     }
 }
-
-#endif // PUFFERLIB_MUON_CU

@@ -169,7 +169,7 @@ static PufTensor nmmo3_encoder_forward(void* w, void* activations, PufTensor inp
     NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
     int B = input.shape[0];
 
-    if (a->saved_obs.bytes) puf_copy(a->saved_obs, input, stream);
+    if (a->saved_obs.bytes) puf_copy(&a->saved_obs, &input, stream);
 
     cudaMemsetAsync(a->multihot.bytes, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * PRECISION_SIZE, stream);
     n3_multihot_kernel<<<grid_size(B * N3_MAP_H * N3_MAP_W), BLOCK_SIZE, 0, stream>>>(
@@ -185,7 +185,7 @@ static PufTensor nmmo3_encoder_forward(void* w, void* activations, PufTensor inp
         (precision_t*)a->concat.bytes, (precision_t*)a->conv2.out.bytes,
         (precision_t*)a->embed_out.bytes, (precision_t*)input.bytes, B, ew->obs_size);
 
-    puf_mm(a->concat, ew->proj_w, a->out, stream);
+    puf_mm(&a->concat, &ew->proj_w, &a->out, stream);
     n3_bias_relu_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)a->out.bytes, (precision_t*)ew->proj_b.bytes, B * ew->hidden, ew->hidden);
     return a->out;
@@ -200,10 +200,10 @@ static void nmmo3_encoder_backward(void* w, void* activations, PufTensor grad, c
         (precision_t*)grad.bytes, (precision_t*)a->out.bytes, B * H);
     n3_bias_grad_kernel<<<H, 256, 0, stream>>>(
         (precision_t*)a->proj_bgrad.bytes, (precision_t*)grad.bytes, B, H);
-    puf_mm_tn(grad, a->concat, a->proj_wgrad, stream);
+    puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
 
     PufTensor grad_concat = {.bytes = a->concat.bytes, .shape = {B, N3_CONCAT}, .dtype_size = p};
-    puf_mm_nn(grad, ew->proj_w, grad_concat, stream);
+    puf_mm_nn(&grad, &ew->proj_w, &grad_concat, stream);
 
     n3_concat_backward_conv_kernel<<<grid_size(B * N3_CONV_FLAT), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)a->conv2.grad.bytes, (precision_t*)grad_concat.bytes, B);
@@ -234,7 +234,7 @@ static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t str
     conv_init_weights(&ew->conv2, seed, stream);
     auto init2d = [&](PufTensor& t, int rows, int cols, float gain) {
         PufTensor wt = {.bytes = t.bytes, .shape = {rows, cols}, .dtype_size = t.dtype_size};
-        puf_kaiming_init(wt, gain, (*seed)++, stream);
+        puf_kaiming_init(&wt, gain, (*seed)++, stream);
     };
     init2d(ew->embed_w, N3_EMBED_VOCAB, N3_EMBED_DIM, 1.0f);
     init2d(ew->proj_w, ew->hidden, N3_CONCAT, std::sqrt(2.0f));

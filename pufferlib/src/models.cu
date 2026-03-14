@@ -72,21 +72,354 @@ struct Network {
     int hidden, num_layers, horizon;
 };
 
+struct EncoderWeights {
+    PufTensor weight;
+    int in_dim, out_dim;
+};
 
-struct EncoderWeights { PufTensor weight; int in_dim, out_dim; };
-struct EncoderActivations { PufTensor out, saved_input, wgrad_scratch; };
+struct EncoderActivations {
+    PufTensor out, saved_input, wgrad_scratch;
+};
+
+__device__ __forceinline__ void log_coeffs_and_values_fwd(float gate, float hidden, float* log_coeff_out, float* log_value_out) {
+    float abs_gate = fabsf(gate);
+    float sp_neg = log1pf(expf(-abs_gate));
+    float softplus_gate = (gate >= 0.0f) ? gate + sp_neg : sp_neg;
+    float softplus_neg_gate = (gate >= 0.0f) ? sp_neg : -gate + sp_neg;
+    *log_coeff_out = -softplus_gate;
+    float log_tilde_h = (hidden >= 0.0f) ? logf(hidden + 0.5f) : -softplus_fwd(-hidden);
+    *log_value_out = -softplus_neg_gate + log_tilde_h;
+}
+
+__device__ __forceinline__ void log_coeffs_and_values_bwd(float grad_log_coeffs, float grad_log_values, float gate, float hidden, float* grad_gate_out, float* grad_hidden_out) {
+    float sig_gate = sigmoid(gate);
+    *grad_gate_out = -grad_log_coeffs * sig_gate + grad_log_values * (1.0f - sig_gate);
+    *grad_hidden_out = (hidden >= 0.0f) ? grad_log_values / (hidden + 0.5f) : grad_log_values * sigmoid(-hidden);
+}
+
+// Fused kernel: chunk + mingru_gate + highway gate output
+// combined is (B, 1, 3*H) containing [hidden, gate, proj] concatenated on last dim
+// state is (B, 1, H)
+// x_in is (B, H) = original input before the h->3h projection
+// out is (B, H) = sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x_in (highway gate)
+// next_state is (B, H) = mingru_out (recurrent state, without proj)
+__global__ void mingru_gate(
+    precision_t* out,
+    precision_t* next_state,
+    const precision_t* combined,    // (B, 3*H) = [hidden, gate, proj]
+    const precision_t* state_in,    // (B, H)
+    const precision_t* x_in,       // (B, H) = input before projection
+    int H,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * H;
+    if (idx >= N) {
+        return;
+    }
+
+    int b = idx / H;
+    int h = idx % H;
+
+    // Read from combined: layout is [hidden(H), gate(H), proj(H)] for each batch
+    int combined_base = b * 3 * H;
+    float hidden = to_float(combined[combined_base + h]);
+    float gate = to_float(combined[combined_base + H + h]);
+    float proj = to_float(combined[combined_base + 2*H + h]);
+    float state = to_float(state_in[idx]);
+    float x = to_float(x_in[idx]);
+
+    // mingru_gate computation
+    float gate_sigmoid = sigmoid(gate);
+    float hidden_tilde = (hidden >= 0.0f) ? hidden + 0.5f : fast_sigmoid(hidden);
+    float mingru_out = lerp(state, hidden_tilde, gate_sigmoid);
+
+    // next_state is mingru_out (for recurrence)
+    next_state[idx] = from_float(mingru_out);
+
+    // Highway connection: sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x (highway gate)
+    float proj_sigmoid = sigmoid(proj);
+    out[idx] = from_float(proj_sigmoid * mingru_out + (1.0f - proj_sigmoid) * x);
+}
+
+// Optimized forward kernel with checkpointing
+// Writes checkpoints only every CHECKPOINT_INTERVAL timesteps (vs every time)
+// Uses fast math intrinsics for better performance
+#define CHECKPOINT_INTERVAL 4
+__global__ void fused_scan_forward(PrefixScan scan) {
+    int T_seq = scan.T, H = scan.H, B = scan.B;
+    precision_t* __restrict__ out = (precision_t*)scan.out.bytes;
+    precision_t* __restrict__ next_state = (precision_t*)scan.next_state.bytes;
+    float* __restrict__ a_star_buf = (float*)scan.a_star.bytes;
+    float* __restrict__ s_buf = (float*)scan.s_vals.bytes;
+    float* __restrict__ log_values_buf = (float*)scan.log_values_buf.bytes;
+    const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
+    const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+    const precision_t* __restrict__ input = (const precision_t*)scan.input_ptr;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) {
+        return;
+    }
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int bH = b * H;
+    int H3 = 3 * H;
+    int H2 = 2 * H;
+    int bHT = bH * T_seq;
+    int out_base = bHT + h;
+    int cbase = 3 * bHT;
+
+    float a_star = 0.0f;
+    float log_value = 0.0f;
+
+    // Handle t=0 outside the loop: use log(state), coeff = 0
+    float s = __logf(to_float(state[bH + h]));
+    log_value = s;
+
+    int T_out = T_seq + 1;
+    int buf_base = b * T_out * H + h;
+    int buf_curr = buf_base;
+    a_star_buf[buf_curr] = a_star;
+    s_buf[buf_curr] = s;
+    log_values_buf[buf_curr] = log_value;
+
+    const precision_t* combined_h_base = &combined[cbase + h];
+    const precision_t* combined_g_base = &combined[cbase + H + h];
+    const precision_t* combined_p_base = &combined[cbase + H2 + h];
+
+    // Loop t=1..T_seq with sparse checkpointing
+    float scan_result = 0.0f;
+    int out_curr = out_base;
+    int t_offset = 0;
+
+    for (int t = 1; t < T_seq + 1; t++) {
+        float hidden_val = to_float(combined_h_base[t_offset]);
+        float gate_val = to_float(combined_g_base[t_offset]);
+        float proj_val = to_float(combined_p_base[t_offset]);
+        float x_val = to_float(input[out_base + (t - 1) * H]);
+
+        float log_coeff_val;
+        log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value);
+
+        // a_star[t] = sum_{i=0}^t log_coeffs[i]
+        a_star += log_coeff_val;
+
+        float z = log_value - a_star;
+        s = logaddexp(s, z);
+
+        scan_result = __expf(a_star + s);
+        float proj_sigmoid = sigmoid(proj_val);
+
+        // out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x (highway gate)
+        out[out_curr] = from_float(proj_sigmoid * scan_result + (1.0f - proj_sigmoid) * x_val);
+
+        buf_curr += H;
+        out_curr += H;
+        t_offset += H3;
+
+        if (t % CHECKPOINT_INTERVAL == 0) {
+            a_star_buf[buf_curr] = a_star;
+            s_buf[buf_curr] = s;
+            log_values_buf[buf_curr] = log_value;
+        }
+    }
+
+    // Write timestep T to next_state (raw scan_result, no proj, for recurrence)
+    next_state[bH + h] = from_float(scan_result);
+}
+
+// Optimized backward kernel with sparse checkpoint loading
+// Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
+// Uses fast math intrinsics for better performance
+__global__ void fused_scan_backward(
+    PrefixScan scan,
+    const precision_t* __restrict__ grad_out,        // (B, T, H)
+    const precision_t* __restrict__ grad_next_state  // (B, 1, H)
+) {
+    int T_seq = scan.T, H = scan.H, B = scan.B;
+    precision_t* __restrict__ grad_combined = (precision_t*)scan.grad_combined.bytes;
+    precision_t* __restrict__ grad_state = (precision_t*)scan.grad_state.bytes;
+    precision_t* __restrict__ grad_input = (precision_t*)scan.grad_input.bytes;
+    const precision_t* __restrict__ combined = (const precision_t*)scan.combined_ptr;
+    const precision_t* __restrict__ state = (const precision_t*)scan.state_ptr;
+    const precision_t* __restrict__ input = (const precision_t*)scan.input_ptr;
+    const float* __restrict__ a_star_buf = (const float*)scan.a_star.bytes;
+    const float* __restrict__ s_buf = (const float*)scan.s_vals.bytes;
+    const float* __restrict__ log_values_buf = (const float*)scan.log_values_buf.bytes;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) {
+        return;
+    }
+
+    int b = idx / H;
+    int h = idx % H;
+
+    int bHT = b * H * T_seq;
+    int cbase = 3 * bHT;
+    int H3 = 3 * H;
+    int H2 = 2 * H;
+    const int state_idx = b * H + h;
+    const int out_base = bHT + h;
+
+    const precision_t* combined_h_base = &combined[cbase + h];
+    const precision_t* combined_g_base = &combined[cbase + H + h];
+    const precision_t* combined_p_base = &combined[cbase + H2 + h];
+
+    precision_t* grad_combined_h_base = &grad_combined[cbase + h];
+    precision_t* grad_combined_g_base = &grad_combined[cbase + H + h];
+    precision_t* grad_combined_p_base = &grad_combined[cbase + H2 + h];
+
+    int T_out = T_seq + 1;
+    int buf_base = b * T_out * H + h;
+
+    float acc = 0.0;
+    float s_val_next = 0.0;
+    float carry_grad_a = 0.0;
+
+    for (int chunk_end = T_seq; chunk_end > 0; chunk_end -= CHECKPOINT_INTERVAL) {
+        int chunk_start = (chunk_end > CHECKPOINT_INTERVAL) ? (chunk_end - CHECKPOINT_INTERVAL) : 0;
+        int chunk_len = chunk_end - chunk_start;
+
+        // Chunk storage in registers
+        float chunk_a_star[CHECKPOINT_INTERVAL];
+        float chunk_s[CHECKPOINT_INTERVAL];
+        float chunk_log_values[CHECKPOINT_INTERVAL];
+        float chunk_hidden[CHECKPOINT_INTERVAL];
+        float chunk_gate[CHECKPOINT_INTERVAL];
+
+        // Load checkpoint from global memory
+        int ckpt_buf_idx = buf_base + chunk_start * H;
+        float recomp_a_star = a_star_buf[ckpt_buf_idx];
+        float recomp_s = s_buf[ckpt_buf_idx];
+        float recomp_log_value = log_values_buf[ckpt_buf_idx];
+
+        // Recompute and store from chunk_start to chunk_end
+        for (int i = 0; i < chunk_len; ++i) {
+            int t = chunk_start + 1 + i;
+            int t_offset = (t - 1) * H3;
+            float hv = to_float(combined_h_base[t_offset]);
+            float gv = to_float(combined_g_base[t_offset]);
+
+            float lc;
+            log_coeffs_and_values_fwd(gv, hv, &lc, &recomp_log_value);
+            recomp_a_star += lc;
+
+            float z = recomp_log_value - recomp_a_star;
+            recomp_s = logaddexp(recomp_s, z);
+
+            chunk_a_star[i] = recomp_a_star;
+            chunk_s[i] = recomp_s;
+            chunk_log_values[i] = recomp_log_value;
+            chunk_hidden[i] = hv;
+            chunk_gate[i] = gv;
+        }
+
+        for (int i = chunk_len - 1; i >= 0; --i) {
+            int t = chunk_start + 1 + i;
+            int t_offset = (t - 1) * H3;
+
+            float a_star_t = chunk_a_star[i];
+            float s_t = chunk_s[i];
+            float log_value_t = chunk_log_values[i];
+            float hidden_val = chunk_hidden[i];
+            float gate_val = chunk_gate[i];
+
+            float proj_val = to_float(combined_p_base[t_offset]);
+            int input_idx = out_base + (t - 1) * H;
+            float x_val = to_float(input[input_idx]);
+
+            float scan_result = __expf(a_star_t + s_t);
+            float z = log_value_t - a_star_t;
+
+            float grad_out_val = to_float(grad_out[input_idx]);
+            float grad_scan_from_next = (t == T_seq) ? to_float(grad_next_state[state_idx]) : 0.0f;
+            float proj_sigmoid = sigmoid(proj_val);
+
+            // Highway gate gradients: out = sigmoid(proj) * scan_result + (1 - sigmoid(proj)) * x
+            float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
+            float grad_proj = grad_out_val * (scan_result - x_val) * proj_sigmoid * (1.0f - proj_sigmoid);
+            grad_input[input_idx] = from_float(grad_out_val * (1.0f - proj_sigmoid));
+
+            float grad_log_h = grad_scan_result * scan_result;
+            float grad_s = grad_log_h;
+
+            if (t == T_seq) {
+                acc = grad_s;
+            } else {
+                acc = grad_s + acc * __expf(s_t - s_val_next);
+            }
+            float grad_z = acc * __expf(z - s_t);
+            s_val_next = s_t;
+
+            float grad_a = grad_log_h + carry_grad_a - grad_z;
+            carry_grad_a = grad_a;
+
+            float grad_g, grad_h;
+            log_coeffs_and_values_bwd(grad_a, grad_z, gate_val, hidden_val, &grad_g, &grad_h);
+
+            grad_combined_h_base[t_offset] = from_float(grad_h);
+            grad_combined_g_base[t_offset] = from_float(grad_g);
+            grad_combined_p_base[t_offset] = from_float(grad_proj);
+        }
+    }
+
+    int ckpt_0_idx = buf_base;
+    float a_star_0 = a_star_buf[ckpt_0_idx];
+    float s_0 = s_buf[ckpt_0_idx];
+    float log_value_0 = log_values_buf[ckpt_0_idx];
+
+    float scan_result_0 = __expf(a_star_0 + s_0);
+    float z_0 = log_value_0 - a_star_0;
+
+    float grad_scan_result_0 = 0.0f;
+    float grad_log_h_0 = grad_scan_result_0 * scan_result_0;
+    float grad_s_0 = grad_log_h_0;
+
+    acc = grad_s_0 + acc * __expf(s_0 - s_val_next);
+    float grad_z_0 = acc * __expf(z_0 - s_0);
+
+    grad_state[state_idx] = from_float(grad_z_0 / to_float(state[state_idx]));
+}
+
+// Sum f32 rows → bf16 output (set, not accumulate)
+__global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst, const float* __restrict__ src, int R, int C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= C) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int r = 0; r < R; r++) {
+        sum += src[r * C + col];
+    }
+    dst[col] = from_float(sum);
+}
+
+__global__ void assemble_decoder_grad_kernel(
+    precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
+    const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B_TT * od_plus_1) {
+        return;
+    }
+    int row = idx / od_plus_1, col = idx % od_plus_1;
+    dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
+}
 
 static PufTensor encoder_forward(void* w, void* activations, PufTensor input, cudaStream_t stream) {
     EncoderWeights* ew = (EncoderWeights*)w;
     EncoderActivations* a = (EncoderActivations*)activations;
-    if (a->saved_input.bytes) puf_copy(a->saved_input, input, stream);
-    puf_mm(input, ew->weight, a->out, stream);
+    if (a->saved_input.bytes) puf_copy(&a->saved_input, &input, stream);
+    puf_mm(&input, &ew->weight, &a->out, stream);
     return a->out;
 }
 
 static void encoder_backward(void* w, void* activations, PufTensor grad, cudaStream_t stream) {
     EncoderActivations* a = (EncoderActivations*)activations;
-    puf_mm_tn(grad, a->saved_input, a->wgrad_scratch, stream);
+    puf_mm_tn(&grad, &a->saved_input, &a->wgrad_scratch, stream);
 }
 
 static void encoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
@@ -96,7 +429,7 @@ static void encoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         .shape = {ew->out_dim, ew->in_dim},
         .dtype_size = ew->weight.dtype_size
     };
-    puf_kaiming_init(wt, std::sqrt(2.0f), (*seed)++, stream);
+    puf_kaiming_init(&wt, std::sqrt(2.0f), (*seed)++, stream);
 }
 
 static void encoder_reg_params(void* w, Allocator* alloc, int esz) {
@@ -132,18 +465,30 @@ static void* encoder_create_weights(void* self, int esz) {
     ew->in_dim = e->in_dim; ew->out_dim = e->out_dim;
     return ew;
 }
-static void encoder_free_weights(void* weights) { free(weights); }
+
+static void encoder_free_weights(void* weights) {
+    free(weights);
+}
 
 #include "ocean.cu"
 
-struct DecoderWeights { PufTensor weight, logstd; int hidden_dim, output_dim; bool continuous; };
-struct DecoderActivations { PufTensor out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch; };
+struct DecoderWeights {
+    PufTensor weight, logstd;
+    int hidden_dim, output_dim;
+    bool continuous;
+};
+
+struct DecoderActivations {
+    PufTensor out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch;
+};
 
 static PufTensor decoder_forward(void* w, void* activations, PufTensor input, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
-    if (a->saved_input.bytes) puf_copy(a->saved_input, input, stream);
-    puf_mm(input, dw->weight, a->out, stream);
+    if (a->saved_input.bytes) {
+        puf_copy(&a->saved_input, &input, stream);
+    }
+    puf_mm(&input, &dw->weight, &a->out, stream);
     return a->out;
 }
 
@@ -154,7 +499,7 @@ static void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         .shape = {dw->output_dim + 1, dw->hidden_dim},
         .dtype_size = dw->weight.dtype_size
     };
-    puf_kaiming_init(wt, 0.01f, (*seed)++, stream);
+    puf_kaiming_init(&wt, 0.01f, (*seed)++, stream);
 }
 
 static void decoder_reg_params(void* w, Allocator* alloc, int esz) {
@@ -201,7 +546,10 @@ static void* decoder_create_weights(void* self, int esz) {
     dw->hidden_dim = d->hidden_dim; dw->output_dim = d->output_dim; dw->continuous = d->continuous;
     return dw;
 }
-static void decoder_free_weights(void* weights) { free(weights); }
+
+static void decoder_free_weights(void* weights) {
+    free(weights);
+}
 
 static PufTensor decoder_backward(void* w, void* activations,
     PufTensor grad_logits, PufTensor grad_logstd, PufTensor grad_value, cudaStream_t stream) {
@@ -212,13 +560,13 @@ static PufTensor decoder_backward(void* w, void* activations,
     assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
         (precision_t*)a->grad_out.bytes, (const float*)grad_logits.bytes,
         (const float*)grad_value.bytes, B_TT, od, od1);
-    puf_mm_tn(a->grad_out, a->saved_input, a->wgrad_scratch, stream);
+    puf_mm_tn(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.bytes != nullptr) {
         sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)a->logstd_scratch.bytes, (const float*)grad_logstd.bytes,
             B_TT, dw->output_dim);
     }
-    puf_mm_nn(a->grad_out, dw->weight, a->grad_input, stream);
+    puf_mm_nn(&a->grad_out, &dw->weight, &a->grad_input, stream);
     return a->grad_input;
 }
 
@@ -259,7 +607,7 @@ static void mingru_init_weights(void* w, ulong* seed, cudaStream_t stream) {
             .shape = {3 * m->hidden, m->hidden},
             .dtype_size = m->weights[i].dtype_size
         };
-        puf_kaiming_init(w2d, 1.0f, (*seed)++, stream);
+        puf_kaiming_init(&w2d, 1.0f, (*seed)++, stream);
     }
 }
 
@@ -342,33 +690,35 @@ static void mingru_free_weights(void* weights) {
     free(mw);
 }
 
-static PufTensor mingru_forward(void* w, PufTensor x, PufTensor state, void* activations, cudaStream_t stream) {
+static PufTensor mingru_forward(void* w, PufTensor x, PufTensor state,
+        void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = state.shape[1];
     int H = state.shape[2];
     for (int i = 0; i < m->num_layers; i++) {
         PufTensor state_i = mingru_state_layer(m, state, i);
-        puf_mm(x, m->weights[i], a->combined[i], stream);
+        puf_mm(&x, &m->weights[i], &a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)a->out.bytes, (precision_t*)a->next_state.bytes,
             (const precision_t*)a->combined[i].bytes, (const precision_t*)state_i.bytes,
             (const precision_t*)x.bytes, H, B);
-        puf_copy(state_i, a->next_state, stream);
+        puf_copy(&state_i, &a->next_state, stream);
         x = a->out;
     }
     return x;
 }
 
-static PufTensor mingru_forward_train(void* w, PufTensor x, PufTensor state, void* activations, cudaStream_t stream) {
+static PufTensor mingru_forward_train(void* w, PufTensor x, PufTensor state,
+        void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = x.shape[0];
     int TT = x.shape[1];
     for (int i = 0; i < m->num_layers; i++) {
-        puf_copy(a->saved_inputs[i], x, stream);
+        puf_copy(&a->saved_inputs[i], &x, stream);
         PufTensor state_i = mingru_state_layer(m, state, i);
-        puf_mm(x, m->weights[i], a->combined_bufs[i], stream);
+        puf_mm(&x, &m->weights[i], &a->combined_bufs[i], stream);
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].bytes;
         a->scan_bufs[i].state_ptr = state_i.bytes;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].bytes;
@@ -385,11 +735,11 @@ static PufTensor mingru_backward(void* w, PufTensor grad, void* activations, cud
         PrefixScan& scan = a->scan_bufs[i];
         fused_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
             scan, (const precision_t*)grad.bytes, (const precision_t*)a->grad_next_state.bytes);
-        puf_mm_tn(scan.grad_combined, a->saved_inputs[i], a->wgrad_scratch[i], stream);
-        puf_mm_nn(scan.grad_combined, m->weights[i], a->grad_input_buf, stream);
+        puf_mm_tn(&scan.grad_combined, &a->saved_inputs[i], &a->wgrad_scratch[i], stream);
+        puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         // Add highway gate gradient: grad_input += grad_out * (1 - sigmoid(proj))
         int n = scan.grad_input.numel();
-        add_precision_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        add_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             (precision_t*)a->grad_input_buf.bytes, (const precision_t*)scan.grad_input.bytes, n);
         grad = a->grad_input_buf;
     }
@@ -404,8 +754,17 @@ struct Policy {
     int num_atns;
 };
 
-struct PolicyActivations { void* encoder; void* decoder; void* network; };
-struct PolicyWeights { void* encoder; void* decoder; void* network; };
+struct PolicyActivations {
+    void* encoder;
+    void* decoder;
+    void* network;
+};
+
+struct PolicyWeights {
+    void* encoder;
+    void* decoder;
+    void* network;
+};
 
 static void policy_activations_free(PolicyActivations& a) {
     free(a.encoder);
@@ -439,7 +798,8 @@ void policy_backward(Policy* p, PolicyWeights& w, PolicyActivations& activations
     p->encoder.backward(w.encoder, activations.encoder, grad_h, stream);
 }
 
-PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w, Allocator* acts, Allocator* grads, int B_TT) {
+PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
+        Allocator* acts, Allocator* grads, int B_TT) {
     PolicyActivations a;
     a.encoder = alloc_encoder_activations(p->encoder);
     a.decoder = calloc(1, sizeof(DecoderActivations));
@@ -483,7 +843,5 @@ void policy_weights_free(Policy* p, PolicyWeights* w) {
     p->decoder.free_weights(w->decoder);
     p->network.free_weights(w->network);
 }
-
-#include "muon.cu"
 
 #endif // PUFFERLIB_MODELS_CU

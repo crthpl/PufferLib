@@ -135,7 +135,7 @@ static void conv_reg_rollout(ConvWeights* cw, ConvActivations* ca, Allocator* al
 
 static void conv_init_weights(ConvWeights* cw, uint64_t* seed, cudaStream_t stream) {
     PufTensor wt = {.bytes = cw->w.bytes, .shape = {cw->OC, cw->IC * cw->K * cw->K}, .dtype_size = cw->w.dtype_size};
-    puf_kaiming_init(wt, cw->relu ? std::sqrt(2.0f) : 1.0f, (*seed)++, stream);
+    puf_kaiming_init(&wt, cw->relu ? std::sqrt(2.0f) : 1.0f, (*seed)++, stream);
     cudaMemsetAsync(cw->b.bytes, 0, cw->b.numel() * cw->b.dtype_size, stream);
 }
 
