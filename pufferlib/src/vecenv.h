@@ -495,9 +495,9 @@ void static_vec_close(StaticVec* vec) {
     free(vec);
 }
 
-void static_vec_log(StaticVec* vec, Dict* out) {
+static inline float static_vec_aggregate_logs(StaticVec* vec, Log* out) {
     Env* envs = (Env*)vec->envs;
-    Log aggregate = {0};
+    memset(out, 0, sizeof(Log));
     int num_keys = sizeof(Log) / sizeof(float);
     for (int i = 0; i < vec->size; i++) {
         Env* env = &envs[i];
@@ -505,40 +505,38 @@ void static_vec_log(StaticVec* vec, Dict* out) {
             continue;
         }
         for (int j = 0; j < num_keys; j++) {
-            ((float*)&aggregate)[j] += ((float*)&env->log)[j];
+            ((float*)out)[j] += ((float*)&env->log)[j];
         }
-        memset(&env->log, 0, sizeof(Log));
     }
-    float n = aggregate.n;
+    float n = out->n;
     if (n == 0.0f) {
-        return;
+        return 0;
     }
     for (int i = 0; i < num_keys; i++) {
-        ((float*)&aggregate)[i] /= n;
+        ((float*)out)[i] /= n;
+    }
+    return n;
+}
+
+void static_vec_log(StaticVec* vec, Dict* out) {
+    Env* envs = (Env*)vec->envs;
+    Log aggregate;
+    float n = static_vec_aggregate_logs(vec, &aggregate);
+    if (n == 0) {
+        return;
+    }
+    for (int i = 0; i < vec->size; i++) {
+        memset(&envs[i].log, 0, sizeof(Log));
     }
     my_log(&aggregate, out);
     dict_set(out, "n", n);
 }
 
 void static_vec_eval_log(StaticVec* vec, Dict* out) {
-    Env* envs = (Env*)vec->envs;
-    Log aggregate = {0};
-    int num_keys = sizeof(Log) / sizeof(float);
-    for (int i = 0; i < vec->size; i++) {
-        Env* env = &envs[i];
-        if (env->log.n == 0) {
-            continue;
-        }
-        for (int j = 0; j < num_keys; j++) {
-            ((float*)&aggregate)[j] += ((float*)&env->log)[j];
-        }
-    }
-    float n = aggregate.n;
-    if (n == 0.0f) {
+    Log aggregate;
+    float n = static_vec_aggregate_logs(vec, &aggregate);
+    if (n == 0) {
         return;
-    }
-    for (int i = 0; i < num_keys; i++) {
-        ((float*)&aggregate)[i] /= n;
     }
     my_log(&aggregate, out);
     dict_set(out, "n", n);

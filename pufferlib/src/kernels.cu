@@ -172,12 +172,14 @@ __global__ void add_kernel(float* __restrict__ dst, const precision_t* __restric
     }
 }
 
+#ifndef PRECISION_FLOAT
 __global__ void add_kernel(precision_t* __restrict__ dst, const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] = from_float(to_float(dst[idx]) + to_float(src[idx]));
     }
 }
+#endif
 
 #include "tensor.h"
 
@@ -322,6 +324,7 @@ __global__ void cast_kernel(precision_t* __restrict__ dst,
     }
 }
 
+#ifndef PRECISION_FLOAT
 __global__ void cast_kernel(float* __restrict__ dst,
         const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -329,6 +332,7 @@ __global__ void cast_kernel(float* __restrict__ dst,
         dst[idx] = to_float(src[idx]);
     }
 }
+#endif
 
 __global__ void cast_kernel(precision_t* __restrict__ dst,
         const unsigned char* __restrict__ src, int n) {

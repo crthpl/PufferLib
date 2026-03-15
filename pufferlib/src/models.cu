@@ -1,17 +1,14 @@
-// Uses vector for MinGRU activations
+// Removed vector dependency for MinGRU activations - now uses raw pointers
 
 #ifndef PUFFERLIB_MODELS_CU
 #define PUFFERLIB_MODELS_CU
 
 #include <cuda_runtime.h>
-#include <vector>
 #include <string>
 #include <cstdint>
 
 #include <stdio.h>
 #include <stdlib.h>
-
-using std::vector;
 
 #include "kernels.cu"
 
@@ -22,6 +19,7 @@ typedef void (*reg_train_fn)(void* weights, void* buf, Allocator* acts, Allocato
 typedef void (*reg_rollout_fn)(void* weights, void* buf, Allocator* alloc, int B);
 typedef void* (*create_weights_fn)(void* self);
 typedef void  (*free_weights_fn)(void* weights);
+typedef void  (*free_activations_fn)(void* activations);
 typedef PrecisionTensor (*forward_fn)(void* weights, void* activations, PrecisionTensor input, cudaStream_t stream);
 typedef void (*encoder_backward_fn)(void* weights, void* activations,
     PrecisionTensor grad, cudaStream_t stream);
@@ -43,6 +41,7 @@ struct Encoder {
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
     free_weights_fn free_weights;
+    free_activations_fn free_activations;
     int in_dim, out_dim;
 };
 
@@ -55,6 +54,7 @@ struct Decoder {
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
     free_weights_fn free_weights;
+    free_activations_fn free_activations;
     int hidden_dim, output_dim;
     bool continuous;
 };
@@ -69,6 +69,7 @@ struct Network {
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
     free_weights_fn free_weights;
+    free_activations_fn free_activations;
     int hidden, num_layers, horizon;
 };
 
@@ -480,6 +481,10 @@ static void encoder_free_weights(void* weights) {
     free(weights);
 }
 
+static void encoder_free_activations(void* activations) {
+    free(activations);
+}
+
 #include "ocean.cu"
 
 struct DecoderWeights {
@@ -559,6 +564,10 @@ static void decoder_free_weights(void* weights) {
     free(weights);
 }
 
+static void decoder_free_activations(void* activations) {
+    free(activations);
+}
+
 static PrecisionTensor decoder_backward(void* w, void* activations,
     FloatTensor grad_logits, FloatTensor grad_logstd, FloatTensor grad_value, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
@@ -579,17 +588,25 @@ static PrecisionTensor decoder_backward(void* w, void* activations,
 struct MinGRUActivations {
     int num_layers;
     // Rollout
-    vector<PrecisionTensor> combined;     // per-layer (B_inf, 3*H)
+    PrecisionTensor* combined;            // per-layer (B_inf, 3*H) - malloc'd
     PrecisionTensor out;                  // (B_inf, H)
     PrecisionTensor next_state;           // (B_inf, H)
     // Training
-    vector<PrecisionTensor> saved_inputs; // per-layer (B, TT, H)
-    vector<PrefixScan> scan_bufs;         // per-layer scan state
-    vector<PrecisionTensor> combined_bufs;// per-layer (B_TT, 3*H)
-    vector<PrecisionTensor> wgrad_scratch;// per-layer (3*H, H) weight grad output
+    PrecisionTensor* saved_inputs;       // per-layer (B, TT, H) - malloc'd
+    PrefixScan* scan_bufs;               // per-layer scan state - malloc'd
+    PrecisionTensor* combined_bufs;      // per-layer (B_TT, 3*H) - malloc'd
+    PrecisionTensor* wgrad_scratch;      // per-layer (3*H, H) weight grad output - malloc'd
     PrecisionTensor grad_input_buf;       // (B_TT, H)
     PrecisionTensor grad_next_state;      // (B, 1, H)
 };
+
+void mingru_activations_free(MinGRUActivations* a) {
+    free(a->combined);
+    free(a->saved_inputs);
+    free(a->scan_bufs);
+    free(a->combined_bufs);
+    free(a->wgrad_scratch);
+}
 
 struct MinGRUWeights {
     int hidden, num_layers, horizon;
@@ -625,10 +642,10 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int H = m->hidden, TT = m->horizon, B = B_TT / TT;
     a->num_layers = m->num_layers;
-    a->saved_inputs.resize(m->num_layers);
-    a->scan_bufs.resize(m->num_layers);
-    a->combined_bufs.resize(m->num_layers);
-    a->wgrad_scratch.resize(m->num_layers);
+    a->saved_inputs = (PrecisionTensor*)calloc(m->num_layers, sizeof(PrecisionTensor));
+    a->scan_bufs = (PrefixScan*)calloc(m->num_layers, sizeof(PrefixScan));
+    a->combined_bufs = (PrecisionTensor*)calloc(m->num_layers, sizeof(PrecisionTensor));
+    a->wgrad_scratch = (PrecisionTensor*)calloc(m->num_layers, sizeof(PrecisionTensor));
     a->grad_input_buf = {.shape = {B_TT, H}};
     a->grad_next_state = {.shape = {B, 1, H}};
     alloc_register(acts,&a->grad_input_buf);
@@ -666,7 +683,7 @@ static void mingru_reg_rollout(void* weights, void* activations, Allocator* allo
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int H = w->hidden;
     a->num_layers = w->num_layers;
-    a->combined.resize(w->num_layers);
+    a->combined = (PrecisionTensor*)calloc(w->num_layers, sizeof(PrecisionTensor));
     for (int i = 0; i < w->num_layers; i++) {
         a->combined[i] = {.shape = {B_inf, 3 * H}};
         alloc_register(alloc,&a->combined[i]);
@@ -684,10 +701,17 @@ static void* mingru_create_weights(void* self) {
     mw->weights = (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
     return mw;
 }
+
 static void mingru_free_weights(void* weights) {
     MinGRUWeights* mw = (MinGRUWeights*)weights;
     free(mw->weights);
     free(mw);
+}
+
+static void mingru_free_activations(void* activations) {
+    MinGRUActivations* a = (MinGRUActivations*)activations;
+    mingru_activations_free(a);
+    free(a);
 }
 
 static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTensor state,
@@ -764,11 +788,10 @@ struct PolicyWeights {
     void* network;
 };
 
-static void policy_activations_free(PolicyActivations& a) {
-    free(a.encoder);
-    free(a.decoder);
-    ((MinGRUActivations*)a.network)->~MinGRUActivations();
-    free(a.network);
+static void policy_activations_free(Policy* p, PolicyActivations& a) {
+    p->encoder.free_activations(a.encoder);
+    p->decoder.free_activations(a.decoder);
+    p->network.free_activations(a.network);
 }
 
 PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& activations,

@@ -8,6 +8,8 @@
 #include <cudnn.h>
 #include <cstdio>
 
+#include "kernels.cu"
+
 #ifndef CHECK_CUDNN
 #define CHECK_CUDNN(call) do { \
     cudnnStatus_t e = call; \

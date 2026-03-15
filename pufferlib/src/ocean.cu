@@ -285,6 +285,7 @@ static void* nmmo3_encoder_create_weights(void* self) {
     return nmmo3_encoder_create(e->in_dim, e->out_dim);
 }
 static void nmmo3_encoder_free_weights(void* weights) { free(weights); }
+static void nmmo3_encoder_free_activations(void* activations) { free(activations); }
 
 // Override encoder vtable for known ocean environments. No-op for unknown envs.
 static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
@@ -298,6 +299,7 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .reg_rollout = nmmo3_encoder_reg_rollout,
             .create_weights = nmmo3_encoder_create_weights,
             .free_weights = nmmo3_encoder_free_weights,
+            .free_activations = nmmo3_encoder_free_activations,
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
         };
     }

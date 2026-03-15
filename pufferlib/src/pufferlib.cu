@@ -1,8 +1,8 @@
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
-#include <nccl.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvml.h>
+#include <nccl.h>
 
 #include "models.cu"
 #include "muon.cu"
@@ -166,32 +166,13 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int S, int H, in
     alloc_register(alloc, &bufs.mb_newvalue);
 }
 
-// Minimal CUDA graph wrapper using raw APIs (no torch dependency)
-struct RawCudaGraph {
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t exec = nullptr;
-
-    void capture_begin(cudaStream_t stream) {
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    }
-    void capture_end(cudaStream_t stream) {
-        cudaStreamEndCapture(stream, &graph);
-        cudaGraphInstantiate(&exec, graph, 0);
-    }
-    void replay(cudaStream_t stream) {
-        cudaGraphLaunch(exec, stream);
-    }
-    void reset() {
-        if (exec) {
-            cudaGraphExecDestroy(exec);
-            exec = nullptr;
-        }
-        if (graph) {
-            cudaGraphDestroy(graph);
-            graph = nullptr;
-        }
-    }
-};
+// CUDA graph helpers
+inline void cudagraph_capture_end(cudaGraphExec_t* exec, cudaStream_t stream) {
+    cudaGraph_t graph;
+    cudaStreamEndCapture(stream, &graph);
+    cudaGraphInstantiate(exec, graph, 0);
+    cudaGraphDestroy(graph);
+}
 
 // Slice: select dim0 index t, then narrow dim0 from start for count.
 // 3D (H, S, F) -> (count, F); 2D (H, S) -> (count,)
@@ -335,8 +316,8 @@ typedef struct {
     EnvBuf env;
     TrainGraph train_buf;
     FloatTensor advantages_puf;  // Pre-allocated for train_impl (S, H) f32
-    RawCudaGraph* fused_rollout_cudagraphs;  // [horizon][num_buffers]
-    RawCudaGraph train_cudagraph;
+    cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon][num_buffers]
+    cudaGraphExec_t train_cudagraph;
     cudaStream_t* streams;  // per-buffer raw CUDA streams
     cudaStream_t default_stream;  // main-thread stream (captured once at init)
     IntTensor act_sizes_puf;    // CUDA int32 tensor of action head sizes
@@ -562,7 +543,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     cudaStream_t current_stream = tl_stream;
     if (pufferl->rollout_captured) {
-        pufferl->fused_rollout_cudagraphs[graph].replay(current_stream);
+        cudaGraphLaunch(pufferl->fused_rollout_cudagraphs[graph], current_stream);
         profile_end(hypers.profile);
         return;
     }
@@ -572,7 +553,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     if (capturing) {
         cudaStreamCreate(&cap_stream_raw);
         current_stream = cap_stream_raw;
-        pufferl->fused_rollout_cudagraphs[graph].capture_begin(cap_stream_raw);
+        cudaStreamBeginCapture(cap_stream_raw, cudaStreamCaptureModeGlobal);
     }
 
     RolloutBuf& rollouts = pufferl->rollouts;
@@ -628,7 +609,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         act_slice.data, numel(act_slice.shape) * sizeof(double), cudaMemcpyDeviceToDevice, stream);
 
     if (capturing) {
-        pufferl->fused_rollout_cudagraphs[graph].capture_end(cap_stream_raw);
+        cudagraph_capture_end(&pufferl->fused_rollout_cudagraphs[graph], cap_stream_raw);
         cudaStreamSynchronize(cap_stream_raw);
         cudaDeviceSynchronize();
         cudaStreamDestroy(cap_stream_raw);
@@ -1460,13 +1441,13 @@ void train_impl(PuffeRL& pufferl) {
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
         if (pufferl.train_captured) {
-            pufferl.train_cudagraph.replay(train_stream);
+            cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
         } else {
             bool capturing = pufferl.train_warmup == hypers.cudagraphs;
             cudaStream_t cap_stream_raw = train_stream;
             if (capturing) {
                 cudaStreamCreate(&cap_stream_raw);
-                pufferl.train_cudagraph.capture_begin(cap_stream_raw);
+                cudaStreamBeginCapture(cap_stream_raw, cudaStreamCaptureModeGlobal);
             }
 
             cudaStream_t stream = cap_stream_raw;
@@ -1499,9 +1480,8 @@ void train_impl(PuffeRL& pufferl) {
                 cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
                     pufferl.param_puf.data, pufferl.master_weights.data, n);
             }
-
             if (capturing) {
-                pufferl.train_cudagraph.capture_end(cap_stream_raw);
+                cudagraph_capture_end(&pufferl.train_cudagraph, cap_stream_raw);
                 cudaStreamSynchronize(cap_stream_raw);
                 cudaDeviceSynchronize();
                 cudaStreamDestroy(cap_stream_raw);
@@ -1636,6 +1616,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_rollout = encoder_reg_rollout,
         .create_weights = encoder_create_weights,
         .free_weights = encoder_free_weights,
+        .free_activations = encoder_free_activations,
         .in_dim = input_size, .out_dim = hidden_size,
     };
     create_custom_encoder(env_name, &encoder);
@@ -1648,6 +1629,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_rollout = decoder_reg_rollout,
         .create_weights = decoder_create_weights,
         .free_weights = decoder_free_weights,
+        .free_activations = decoder_free_activations,
         .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
     };
     Network network = {
@@ -1660,6 +1642,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .reg_rollout = mingru_reg_rollout,
         .create_weights = mingru_create_weights,
         .free_weights = mingru_free_weights,
+        .free_activations = mingru_free_activations,
         .hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon,
     };
     pufferl->policy = Policy{
@@ -1744,7 +1727,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     muon_post_create(&pufferl->muon);
 
     if (hypers.cudagraphs >= 0) {
-        pufferl->fused_rollout_cudagraphs = (RawCudaGraph*)calloc(horizon*num_buffers, sizeof(RawCudaGraph));
+        pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(horizon*num_buffers, sizeof(cudaGraphExec_t));
         pufferl->train_warmup = 0;
 
         // Snapshot weights + optimizer state before init-time capture
@@ -1831,15 +1814,15 @@ void close_impl(PuffeRL& pufferl) {
         cudaProfilerStop();
     }
 
-    pufferl.train_cudagraph.reset();
+    cudaGraphExecDestroy(pufferl.train_cudagraph);
     for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        pufferl.fused_rollout_cudagraphs[i].reset();
+        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);
-    policy_activations_free(pufferl.train_activations);
+    policy_activations_free(&pufferl.policy, pufferl.train_activations);
     for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
-        policy_activations_free(pufferl.buffer_activations[buf]);
+        policy_activations_free(&pufferl.policy, pufferl.buffer_activations[buf]);
     }
 
     if (USE_BF16) {
