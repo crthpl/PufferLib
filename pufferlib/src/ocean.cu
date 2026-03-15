@@ -140,6 +140,32 @@ __global__ void n3_concat_backward_conv_kernel(
     conv_grad[b * N3_CONV_FLAT + c] = concat_grad[b * N3_CONCAT + c];
 }
 
+// Embedding backward: scatter-add grad from concat_grad's player_embed region
+// into embed_wgrad (float accumulation buffer).
+// Each (b, f) looked up row obs[b, MAP_SIZE+f] from the table.
+__global__ void n3_embedding_backward_kernel(
+    float* __restrict__ embed_wgrad_f,
+    const precision_t* __restrict__ concat_grad,
+    const precision_t* __restrict__ obs,
+    int B, int obs_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * N3_PLAYER * N3_EMBED_DIM) return;
+    int b = idx / (N3_PLAYER * N3_EMBED_DIM);
+    int rem = idx % (N3_PLAYER * N3_EMBED_DIM);
+    int f = rem / N3_EMBED_DIM;
+    int d = rem % N3_EMBED_DIM;
+    int val = (int)to_float(obs[b * obs_size + N3_MAP_SIZE + f]);
+    float g = to_float(concat_grad[b * N3_CONCAT + N3_CONV_FLAT + f * N3_EMBED_DIM + d]);
+    atomicAdd(&embed_wgrad_f[val * N3_EMBED_DIM + d], g);
+}
+
+// Cast float buffer to precision_t
+__global__ void n3_float_to_precision_kernel(
+    precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float(src[idx]);
+}
+
 // ---- NMMO3 encoder structs ----
 
 struct NMMO3EncoderWeights {
@@ -152,6 +178,7 @@ struct NMMO3EncoderActivations {
     ConvActivations conv1, conv2;
     PrecisionTensor multihot, embed_out, concat, out, saved_obs;
     PrecisionTensor embed_wgrad, proj_wgrad, proj_bgrad;
+    FloatTensor embed_wgrad_f;  // float accumulation buffer for scatter-add
 };
 
 static NMMO3EncoderWeights* nmmo3_encoder_create(int obs_size, int hidden) {
@@ -219,7 +246,13 @@ static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor g
         B, ew->conv1.OC, ew->conv1.OH * ew->conv1.OW);
     conv_backward(&ew->conv1, &a->conv1, NULL, stream);
 
-    cudaMemsetAsync(a->embed_wgrad.data, 0, numel(a->embed_wgrad.shape) * sizeof(precision_t), stream);
+    // Embedding backward: scatter-add from concat gradient into float buffer, then cast
+    int embed_n = N3_EMBED_VOCAB * N3_EMBED_DIM;
+    cudaMemsetAsync(a->embed_wgrad_f.data, 0, embed_n * sizeof(float), stream);
+    n3_embedding_backward_kernel<<<grid_size(B * N3_PLAYER * N3_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
+        a->embed_wgrad_f.data, grad_concat.data, a->saved_obs.data, B, ew->obs_size);
+    n3_float_to_precision_kernel<<<grid_size(embed_n), BLOCK_SIZE, 0, stream>>>(
+        a->embed_wgrad.data, a->embed_wgrad_f.data, embed_n);
 }
 
 static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
@@ -261,9 +294,11 @@ static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts,
     alloc_register(acts,&a->embed_out); alloc_register(acts,&a->concat);
     alloc_register(acts,&a->out);       alloc_register(acts,&a->saved_obs);
     a->embed_wgrad = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+    a->embed_wgrad_f = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
     a->proj_wgrad  = {.shape = {ew->hidden, N3_CONCAT}};
     a->proj_bgrad  = {.shape = {ew->hidden}};
     alloc_register(grads,&a->embed_wgrad);
+    alloc_register(acts,&a->embed_wgrad_f);
     alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
 }
 

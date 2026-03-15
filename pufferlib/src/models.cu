@@ -488,14 +488,21 @@ static void encoder_free_activations(void* activations) {
 #include "ocean.cu"
 
 struct DecoderWeights {
-    PrecisionTensor weight, logstd;
+    PrecisionTensor weight, bias, logstd;
     int hidden_dim, output_dim;
     bool continuous;
 };
 
 struct DecoderActivations {
-    PrecisionTensor out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch;
+    PrecisionTensor out, grad_out, saved_input, grad_input, wgrad_scratch, bgrad_scratch, logstd_scratch;
 };
+
+__global__ void bias_add_kernel(precision_t* __restrict__ data,
+        const precision_t* __restrict__ bias, int total, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    data[idx] = from_float(to_float(data[idx]) + to_float(bias[idx % dim]));
+}
 
 static PrecisionTensor decoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
@@ -504,6 +511,9 @@ static PrecisionTensor decoder_forward(void* w, void* activations, PrecisionTens
         puf_copy(&a->saved_input, &input, stream);
     }
     puf_mm(&input, &dw->weight, &a->out, stream);
+    int B = input.shape[0], od1 = dw->output_dim + 1;
+    bias_add_kernel<<<grid_size(B * od1), BLOCK_SIZE, 0, stream>>>(
+        a->out.data, dw->bias.data, B * od1, od1);
     return a->out;
 }
 
@@ -514,12 +524,15 @@ static void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         .shape = {dw->output_dim + 1, dw->hidden_dim},
     };
     puf_kaiming_init(&wt, 0.01f, (*seed)++, stream);
+    cudaMemsetAsync(dw->bias.data, 0, numel(dw->bias.shape) * sizeof(precision_t), stream);
 }
 
 static void decoder_reg_params(void* w, Allocator* alloc) {
     DecoderWeights* dw = (DecoderWeights*)w;
     dw->weight = {.shape = {dw->output_dim + 1, dw->hidden_dim}};
+    dw->bias = {.shape = {dw->output_dim + 1}};
     alloc_register(alloc,&dw->weight);
+    alloc_register(alloc,&dw->bias);
     if (dw->continuous) {
         dw->logstd = {.shape = {1, dw->output_dim}};
         alloc_register(alloc,&dw->logstd);
@@ -536,6 +549,7 @@ static void decoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
         .saved_input = {.shape = {B_TT, dw->hidden_dim}},
         .grad_input = {.shape = {B_TT, dw->hidden_dim}},
         .wgrad_scratch = {.shape = {od1, dw->hidden_dim}},
+        .bgrad_scratch = {.shape = {od1}},
         .logstd_scratch = {.shape = {1, dw->output_dim}},
     };
     alloc_register(acts,&a->out);
@@ -543,6 +557,7 @@ static void decoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
     alloc_register(acts,&a->grad_out);
     alloc_register(acts,&a->grad_input);
     alloc_register(grads,&a->wgrad_scratch);
+    alloc_register(grads,&a->bgrad_scratch);
     if (dw->continuous) alloc_register(grads,&a->logstd_scratch);
 }
 
@@ -577,6 +592,8 @@ static PrecisionTensor decoder_backward(void* w, void* activations,
     assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
         a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, od1);
     puf_mm_tn(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
+    n3_bias_grad_kernel<<<od1, 256, 0, stream>>>(
+        a->bgrad_scratch.data, a->grad_out.data, B_TT, od1);
     if (dw->continuous && grad_logstd.data != nullptr) {
         sum_rows_to_precision_kernel<<<grid_size(dw->output_dim), BLOCK_SIZE, 0, stream>>>(
             a->logstd_scratch.data, grad_logstd.data, B_TT, dw->output_dim);
