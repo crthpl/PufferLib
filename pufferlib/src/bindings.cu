@@ -206,6 +206,22 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     }
 }
 
+void py_puff_advantage(
+        long long values_ptr, long long rewards_ptr,
+        long long dones_ptr,  long long importance_ptr,
+        long long advantages_ptr,
+        int num_steps, int horizon,
+        float gamma, float lambda, float rho_clip, float c_clip) {
+    constexpr int N = 16 / sizeof(precision_t);
+    int blocks = grid_size(num_steps);
+    auto kernel = (horizon % N == 0) ? puff_advantage_kernel : puff_advantage_kernel_scalar;
+    kernel<<<blocks, 256>>>(
+        (const precision_t*)values_ptr, (const precision_t*)rewards_ptr,
+        (const precision_t*)dones_ptr,  (const precision_t*)importance_ptr,
+        (float*)advantages_ptr,
+        gamma, lambda, rho_clip, c_clip, num_steps, horizon);
+}
+
 double get_config(py::dict& kwargs, const char* key) {
     if (!kwargs.contains(key)) {
         throw std::runtime_error(std::string("Missing config key: ") + key);
@@ -228,6 +244,83 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
         }
     }
     return c_dict;
+}
+
+// ============================================================================
+// Python-facing VecEnv: wraps StaticVec for use from python_pufferl.py.
+// After vec_step(), GPU buffers are current — Python wraps them zero-copy
+// with torch.from_blob(ptr, shape, dtype, device='cuda').
+// ============================================================================
+
+struct VecEnv {
+    StaticVec* vec;
+    int total_agents;
+    int obs_size;
+    int num_atns;
+    std::vector<int> act_sizes;
+    std::string obs_dtype;
+    size_t obs_elem_size;
+};
+
+std::unique_ptr<VecEnv> create_vec(py::dict args) {
+    py::dict vec_kwargs = args["vec"].cast<py::dict>();
+    py::dict env_kwargs = args["env"].cast<py::dict>();
+
+    int total_agents = (int)get_config(vec_kwargs, "total_agents");
+    int num_buffers  = (int)get_config(vec_kwargs, "num_buffers");
+
+    Dict* vec_dict = py_dict_to_c_dict(vec_kwargs);
+    Dict* env_dict = py_dict_to_c_dict(env_kwargs);
+
+    auto ve = std::make_unique<VecEnv>();
+    {
+        py::gil_scoped_release no_gil;
+        ve->vec = create_static_vec(total_agents, num_buffers, vec_dict, env_dict);
+    }
+    ve->total_agents  = total_agents;
+    ve->obs_size      = get_obs_size();
+    ve->num_atns      = get_num_atns();
+    {
+        int* raw = get_act_sizes();
+        int  n   = get_num_act_sizes();
+        ve->act_sizes = std::vector<int>(raw, raw + n);
+    }
+    ve->obs_dtype     = std::string(get_obs_dtype());
+    ve->obs_elem_size = get_obs_elem_size();
+    return ve;
+}
+
+void vec_reset(VecEnv& ve) {
+    py::gil_scoped_release no_gil;
+    static_vec_reset(ve.vec);
+}
+
+// actions_ptr: data_ptr() of a (total_agents, num_atns) float64 CUDA tensor
+void vec_step(VecEnv& ve, long long actions_ptr) {
+    cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(double),
+        cudaMemcpyDeviceToDevice);
+    {
+        py::gil_scoped_release no_gil;
+        static_vec_step(ve.vec);
+    }
+}
+
+py::dict vec_log(VecEnv& ve) {
+    Dict* out = create_dict(32);
+    static_vec_log(ve.vec, out);
+    py::dict result;
+    for (int i = 0; i < out->size; i++) {
+        result[out->items[i].key] = out->items[i].value;
+    }
+    free(out->items);
+    free(out);
+    return result;
+}
+
+void vec_close(VecEnv& ve) {
+    static_vec_close(ve.vec);
+    ve.vec = nullptr;
 }
 
 std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
@@ -385,6 +478,24 @@ PYBIND11_MODULE(_C, m) {
             std::chrono::system_clock::now().time_since_epoch()).count();
         return now - pufferl.start_time;
     });
+    m.def("puff_advantage", &py_puff_advantage);
+    m.def("create_vec", &create_vec);
+    py::class_<VecEnv, std::unique_ptr<VecEnv>>(m, "VecEnv")
+        .def_readonly("total_agents",  &VecEnv::total_agents)
+        .def_readonly("obs_size",      &VecEnv::obs_size)
+        .def_readonly("num_atns",      &VecEnv::num_atns)
+        .def_readonly("act_sizes",     &VecEnv::act_sizes)
+        .def_readonly("obs_dtype",     &VecEnv::obs_dtype)
+        .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
+        // GPU buffer pointers — wrap with torch.from_blob(..., device='cuda')
+        .def_property_readonly("gpu_obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->gpu_observations; })
+        .def_property_readonly("gpu_rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->gpu_rewards; })
+        .def_property_readonly("gpu_terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->gpu_terminals; })
+        .def("reset", &vec_reset)
+        .def("step",  &vec_step)
+        .def("log",   &vec_log)
+        .def("close", &vec_close);
+
     m.def("create_pufferl", &create_pufferl);
     py::class_<PuffeRL, std::unique_ptr<PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &PuffeRL::policy)
