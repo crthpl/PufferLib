@@ -263,8 +263,8 @@ static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t str
         PrecisionTensor wt = {.data = t.data, .shape = {rows, cols}};
         puf_kaiming_init(&wt, gain, (*seed)++, stream);
     };
-    init2d(ew->embed_w, N3_EMBED_VOCAB, N3_EMBED_DIM, 1.0f);
-    init2d(ew->proj_w, ew->hidden, N3_CONCAT, std::sqrt(2.0f));
+    puf_normal_init(&ew->embed_w, 1.0f, (*seed)++, stream);
+    init2d(ew->proj_w, ew->hidden, N3_CONCAT, 1.0f);
     cudaMemsetAsync(ew->proj_b.data, 0, numel(ew->proj_b.shape) * sizeof(precision_t), stream);
 }
 

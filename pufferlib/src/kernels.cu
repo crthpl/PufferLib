@@ -363,12 +363,34 @@ void puf_zero(FloatTensor* dst, cudaStream_t stream) {
     cudaMemsetAsync(dst->data, 0, numel(dst->shape) * sizeof(float), stream);
 }
 
+__global__ void uniform_scale_kernel(float* data, float bound, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] = data[idx] * 2.0f * bound - bound;
+}
+
+// Kaiming uniform: U(-1/sqrt(fan_in), 1/sqrt(fan_in)) — matches PyTorch nn.Linear / nn.Conv2d defaults
 void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t stream) {
     assert(ndim(dst->shape) == 2);
     long rows = dst->shape[0], cols = dst->shape[1];
     assert(rows > 0 && cols > 0);
     long n = rows * cols;
-    float std = gain / std::sqrt((float)cols);
+    float bound = gain / std::sqrt((float)cols);
+    float* buf;
+    cudaMalloc(&buf, n * sizeof(float));
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, seed);
+    curandGenerateUniform(gen, buf, n);
+    curandDestroyGenerator(gen);
+    uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
+    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cudaFree(buf);
+}
+
+// Normal init: N(0, std) — matches PyTorch nn.Embedding default with std=1.0
+void puf_normal_init(PrecisionTensor* dst, float std, ulong seed, cudaStream_t stream) {
+    long n = numel(dst->shape);
+    assert(n > 0);
     long rand_count = (n % 2 == 0) ? n : n + 1;
     float* buf;
     cudaMalloc(&buf, rand_count * sizeof(float));
