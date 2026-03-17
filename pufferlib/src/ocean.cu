@@ -236,7 +236,7 @@ static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor g
     n3_conv_bias_grad_nchw<<<ew->conv2.OC, 256, 0, stream>>>(
         a->conv2.bgrad.data, a->conv2.grad.data,
         B, ew->conv2.OC, ew->conv2.OH * ew->conv2.OW);
-    conv_backward(&ew->conv2, &a->conv2, a->conv1.grad.data, stream);
+    conv_backward(&ew->conv2, &a->conv2, a->conv1.grad.data, B, stream);
 
     n3_relu_backward_kernel<<<grid_size(B * ew->conv1.OC * ew->conv1.OH * ew->conv1.OW), BLOCK_SIZE, 0, stream>>>(
         a->conv1.grad.data, a->conv1.out.data,
@@ -244,7 +244,7 @@ static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor g
     n3_conv_bias_grad_nchw<<<ew->conv1.OC, 256, 0, stream>>>(
         a->conv1.bgrad.data, a->conv1.grad.data,
         B, ew->conv1.OC, ew->conv1.OH * ew->conv1.OW);
-    conv_backward(&ew->conv1, &a->conv1, NULL, stream);
+    conv_backward(&ew->conv1, &a->conv1, NULL, B, stream);
 
     // Embedding backward: scatter-add from concat gradient into float buffer, then cast
     int embed_n = N3_EMBED_VOCAB * N3_EMBED_DIM;

@@ -34,6 +34,7 @@ struct ConvWeights {
     int IC, OC, K, S, IH, IW, OH, OW;
     bool relu;
     // cuDNN state
+    int last_B;  // batch size cuDNN was configured for
     cudnnDataType_t dtype;
     cudnnTensorDescriptor_t cudnn_in, cudnn_out, cudnn_bias;
     cudnnFilterDescriptor_t cudnn_filt;
@@ -55,7 +56,7 @@ struct ConvActivations {
 static void conv_init(ConvWeights* cw, int IC, int OC, int K, int S, int IH, int IW, bool relu) {
     cw->IC = IC; cw->OC = OC; cw->K = K; cw->S = S; cw->IH = IH; cw->IW = IW;
     cw->OH = (IH - K) / S + 1; cw->OW = (IW - K) / S + 1;
-    cw->relu = relu; cw->cudnn_ready = false;
+    cw->relu = relu; cw->cudnn_ready = false; cw->last_B = 0;
     cw->fwd_ws = nullptr; cw->bwd_data_ws = nullptr; cw->bwd_filt_ws = nullptr;
 }
 
@@ -108,6 +109,7 @@ static void conv_setup(ConvWeights* cw, int B, cudnnDataType_t dt) {
     cw->bwd_filt_ws = NULL; if (cw->bwd_filt_ws_bytes > 0) cudaMalloc(&cw->bwd_filt_ws, cw->bwd_filt_ws_bytes);
 
     cw->cudnn_ready = true;
+    cw->last_B = B;
 }
 
 static void conv_reg_params(ConvWeights* cw, Allocator* alloc) {
@@ -143,6 +145,7 @@ static void conv_init_weights(ConvWeights* cw, uint64_t* seed, cudaStream_t stre
 
 // Fused conv + bias + activation. All NCHW. Saves input for backward.
 static void conv_forward(ConvWeights* cw, ConvActivations* ca, void* input, int B, cudaStream_t stream) {
+    if (cw->last_B != B) conv_setup(cw, B, cw->dtype);
     cudnnHandle_t h = get_cudnn_handle();
     CHECK_CUDNN(cudnnSetStream(h, stream));
     float alpha = 1.0f, beta = 0.0f;
@@ -160,7 +163,8 @@ static void conv_forward(ConvWeights* cw, ConvActivations* ca, void* input, int 
 // Backward: upstream grad in ca->grad, relu mask in ca->out.
 // Caller must apply relu backward and bias grad (dtype-specific kernels).
 // This does cuDNN filter grad + optional data grad.
-static void conv_backward(ConvWeights* cw, ConvActivations* ca, void* input_grad, cudaStream_t stream) {
+static void conv_backward(ConvWeights* cw, ConvActivations* ca, void* input_grad, int B, cudaStream_t stream) {
+    if (cw->last_B != B) conv_setup(cw, B, cw->dtype);
     cudnnHandle_t h = get_cudnn_handle();
     CHECK_CUDNN(cudnnSetStream(h, stream));
     float alpha = 1.0f, beta = 0.0f;
