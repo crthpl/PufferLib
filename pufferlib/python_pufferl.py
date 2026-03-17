@@ -32,6 +32,90 @@ import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
 from pufferlib.muon import Muon
+
+_OBS_DTYPE_MAP = {
+    'ByteTensor':   torch.uint8,
+    'FloatTensor':  torch.float32,
+    'DoubleTensor': torch.float64,
+}
+
+_TORCH_TO_TYPESTR = {
+    torch.uint8:   '|u1',
+    torch.float32: '<f4',
+    torch.float64: '<f8',
+}
+
+class _CudaPtr:
+    '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
+    __cuda_array_interface__ without any copy or C++ torch dependency.'''
+    def __init__(self, ptr, shape, dtype):
+        self.__cuda_array_interface__ = {
+            'data':    (ptr, False),
+            'shape':   shape,
+            'typestr': _TORCH_TO_TYPESTR[dtype],
+            'version': 2,
+        }
+
+class _Space:
+    def __init__(self, shape, dtype, nvec=None):
+        self.shape = shape
+        self.dtype = np.dtype(dtype)
+        if nvec is not None:
+            self.nvec = np.array(nvec, dtype=np.int64)
+            self.n = int(self.nvec.sum())
+        else:
+            self.n = shape[0] if shape else 0
+            self.nvec = np.array([self.n], dtype=np.int64)
+
+class StaticVecEnv:
+    '''Wraps _C.VecEnv for use with PuffeRL. All total_agents step in sync.
+    recv() returns tensors pointing directly at the GPU buffers (zero-copy).
+    send(actions) writes actions to the GPU and advances the env one step.'''
+
+    def __init__(self, vec):
+        self._vec = vec
+        self.num_agents = vec.total_agents
+        self.agents_per_batch = vec.total_agents
+
+        obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
+        np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32,
+                        torch.float64: np.float64}[obs_dtype]
+        self._obs_dtype = obs_dtype
+        self.single_observation_space = _Space((vec.obs_size,), np_obs_dtype)
+        self.single_action_space = _Space((vec.num_atns,), np.float64, nvec=vec.act_sizes)
+        self.driver_env = self  # shim for load_policy
+
+    def async_reset(self, seed=0):
+        self._vec.reset()
+
+    def recv(self):
+        v = self._vec
+        obs = torch.as_tensor(_CudaPtr(v.gpu_obs_ptr,
+            (v.total_agents, v.obs_size), self._obs_dtype))
+        rewards = torch.as_tensor(_CudaPtr(v.gpu_rewards_ptr,
+            (v.total_agents,), torch.float32))
+        terminals = torch.as_tensor(_CudaPtr(v.gpu_terminals_ptr,
+            (v.total_agents,), torch.float32))
+        truncations = torch.zeros(v.total_agents, device='cuda')
+        mask = torch.ones(v.total_agents, device='cuda')
+        env_id = [0, v.total_agents - 1]
+        return obs, rewards, terminals, truncations, [], env_id, mask
+
+    def send(self, actions):
+        v = self._vec
+        # actions: [num_atns, total_agents] or [total_agents] → [total_agents, num_atns]
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(-1)
+        else:
+            actions = actions.T
+        actions_gpu = actions.to(dtype=torch.float64, device='cuda').contiguous()
+        v.step(actions_gpu.data_ptr())
+
+    def log(self):
+        return self._vec.log()
+
+    def close(self):
+        self._vec.close()
 try:
     from pufferlib import _C
 except ImportError:
@@ -47,22 +131,20 @@ rich.traceback.install(show_locals=False)
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
-# Assume advantage kernel has been built if CUDA compiler is available
-ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None, verbose=True):
+    def __init__(self, args, vecenv, policy, logger=None, verbose=True):
+        config = args['train']
         # Backend perf optimization
-        torch.set_float32_matmul_precision('high') # Old
+        torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.conv.fp32_precision = 'tf32'
-        torch.backends.cudnn.deterministic = config['torch_deterministic']
+        torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = True
+
+        device = config['device']
 
         # Reproducibility
         seed = config['seed']
-        #random.seed(seed)
-        #np.random.seed(seed)
-        #torch.manual_seed(seed)
 
         # Vecenv info
         vecenv.async_reset(seed)
@@ -72,36 +154,23 @@ class PuffeRL:
         self.total_agents = total_agents
 
         # Experience
-        if config['batch_size'] == 'auto' and config['bptt_horizon'] == 'auto':
-            raise pufferlib.APIUsageError('Must specify batch_size or bptt_horizon')
-        elif config['batch_size'] == 'auto':
-            config['batch_size'] = total_agents * config['bptt_horizon']
-        elif config['bptt_horizon'] == 'auto':
-            config['bptt_horizon'] = config['batch_size'] // total_agents
+        horizon = config['horizon']
+        batch_size = total_agents * horizon
+        config['batch_size'] = batch_size
+        self.segments = total_agents
 
-        batch_size = config['batch_size']
-        horizon = config['bptt_horizon']
-        segments = batch_size // horizon
-        self.segments = segments
-        if total_agents > segments:
-            raise pufferlib.APIUsageError(
-                f'Total agents {total_agents} <= segments {segments}'
-            )
-
-        device = config['device']
-        self.observations = torch.zeros(segments, horizon, *obs_space.shape,
+        self.observations = torch.zeros(total_agents, horizon, *obs_space.shape,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
-            pin_memory=device == 'cuda' and config['cpu_offload'],
-            device='cpu' if config['cpu_offload'] else device)
-        self.actions = torch.zeros(segments, horizon, *atn_space.shape, device=device,
+            device=device)
+        self.actions = torch.zeros(total_agents, horizon, *atn_space.shape, device=device,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
-        self.values = torch.zeros(segments, horizon, device=device)
-        self.logprobs = torch.zeros(segments, horizon, device=device)
-        self.rewards = torch.zeros(segments, horizon, device=device)
-        self.terminals = torch.zeros(segments, horizon, device=device)
-        self.truncations = torch.zeros(segments, horizon, device=device)
-        self.ratio = torch.ones(segments, horizon, device=device)
-        self.importance = torch.ones(segments, horizon, device=device)
+        self.values = torch.zeros(total_agents, horizon, device=device)
+        self.logprobs = torch.zeros(total_agents, horizon, device=device)
+        self.rewards = torch.zeros(total_agents, horizon, device=device)
+        self.terminals = torch.zeros(total_agents, horizon, device=device)
+        self.truncations = torch.zeros(total_agents, horizon, device=device)
+        self.ratio = torch.ones(total_agents, horizon, device=device)
+        self.importance = torch.ones(total_agents, horizon, device=device)
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
@@ -111,50 +180,40 @@ class PuffeRL:
             n = vecenv.agents_per_batch
             self.state = {i*n: policy.initial_state(n, device=device) for i in range(total_agents//n)}
 
-        # Minibatching & gradient accumulation
-        minibatch_size = config['minibatch_size']
-        max_minibatch_size = config['max_minibatch_size']
-        self.minibatch_size = min(minibatch_size, max_minibatch_size)
-        self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
-        self.minibatch_segments = self.minibatch_size // horizon 
+        # Minibatching
+        self.minibatch_size = config['minibatch_size']
+        self.minibatch_segments = self.minibatch_size // horizon
         if self.minibatch_segments * horizon != self.minibatch_size:
             raise pufferlib.APIUsageError(
-                f'minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {horizon}'
+                f'minibatch_size {self.minibatch_size} must be divisible by horizon {horizon}'
             )
 
-        # Torch compile
         self.uncompiled_policy = policy
         self.policy = policy
-        if config['compile']:
-            self.policy = torch.compile(policy, mode=config['compile_mode'])
-            self.policy.forward_eval = torch.compile(policy.forward_eval, mode=config['compile_mode'])
-            pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
         self.optimizer = Muon(
             self.policy.parameters(),
             lr=config['learning_rate'],
-            momentum=config['adam_beta1'],
-            eps=config['adam_eps'],
+            momentum=config['beta1'],
+            eps=config['eps'],
         )
 
         # Logging
         self.logger = logger
         if logger is None:
-            self.logger = Logger(config, policy.__class__.__name__)
+            self.logger = Logger(args, policy.__class__.__name__)
 
         # Learning rate scheduler
         epochs = max(1, config['total_timesteps'] // config['batch_size'])
         self.total_epochs = epochs
 
         # Automatic mixed precision
-        precision = config['precision']
         self.amp_context = contextlib.nullcontext()
-        if config.get('amp', True) and config['device'] == 'cuda':
-            self.amp_context = torch.amp.autocast(device_type='cuda', dtype=getattr(torch, precision))
-        if precision not in ('float32', 'bfloat16'):
-            raise pufferlib.APIUsageError(f'Invalid precision: {precision}: use float32 or bfloat16')
+        if device == 'cuda' and config.get('use_amp', False):
+            self.amp_context = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
         # Initializations
+        self.args = args
         self.config = config
         self.vecenv = vecenv
         self.epoch = 0
@@ -171,33 +230,7 @@ class PuffeRL:
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        def count_parameters(model):
-            return sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
-
-
-        '''
-        self.num_layers = 4
-        config['input_size'] = 118
-        config['num_atns'] = 3
-        config['hidden_size'] = 128
-        config['num_layers'] = self.num_layers
-        config['minibatch_segments'] = self.minibatch_segments
-        config['segments'] = segments
-        config['horizon'] = horizon
-        config['lr'] = config['learning_rate']
-        config['beta1'] = config['adam_beta1']
-        config['beta2'] = config['adam_beta2']
-        config['eps'] = config['adam_eps']
-        config['max_epochs'] = epochs
-        config['total_minibatches'] = config['num_minibatches']
-        config['accumulate_minibatches'] = self.accumulate_minibatches
-        config['num_envs'] = 8192
-        config['cudagraphs'] = False
-        config['kernels'] = False
-        config['num_buffers'] = 1
-        self.pufferl_cpp = _C.create_pufferl(config)
-        '''
 
 
     @property
@@ -225,18 +258,17 @@ class PuffeRL:
                 self.state[k] = [torch.zeros_like(e) for e in tensors]
 
         self.full_rows = 0
+        _debug_printed = False
         while self.full_rows < self.segments:
             profile('env', epoch)
 
-            '''
-            _C.python_vec_recv(self.pufferl_cpp, 0)
-            o, a, r, d = _C.env_buffers(self.pufferl_cpp)
-            t = torch.zeros(8192, device=device)
-            info = {}
-            mask = torch.ones(8192, device=device)
-            env_id = [0, 8191]
-            '''
             o, r, d, t, info, env_id, mask = self.vecenv.recv()
+            '''
+            if not _debug_printed:
+                print(f'[DBG] obs   shape={o.shape} dtype={o.dtype} min={o.float().min():.3f} max={o.float().max():.3f} mean={o.float().mean():.3f}')
+                print(f'[DBG] reward shape={r.shape} min={r.float().min():.3f} max={r.float().max():.3f}')
+                print(f'[DBG] done  shape={d.shape} sum={d.float().sum():.0f}')
+            '''
 
             profile('eval_misc', epoch)
             env_id = slice(env_id[0], env_id[-1] + 1)
@@ -269,12 +301,10 @@ class PuffeRL:
                 l = self.ep_lengths[env_id.start].item()
                 batch_rows = slice(self.ep_indices[env_id.start].item(), 1+self.ep_indices[env_id.stop - 1].item())
 
-                if config['cpu_offload']:
-                    self.observations[batch_rows, l] = o
-                else:
-                    self.observations[batch_rows, l] = o_device
+                self.observations[batch_rows, l] = o_device
 
-                self.actions[batch_rows, l] = action
+                a = action.unsqueeze(-1) if action.dim() == 1 else action.T
+                self.actions[batch_rows, l] = a
                 self.logprobs[batch_rows, l] = logprob
                 self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = d.float()
@@ -282,43 +312,28 @@ class PuffeRL:
 
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
-                if l+1 >= config['bptt_horizon']:
+                if l+1 >= config['horizon']:
                     num_full = env_id.stop - env_id.start
                     self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config['device']).int()
                     self.ep_lengths[env_id] = 0
                     self.free_idx += num_full
                     self.full_rows += num_full
 
-                #a[:] = action
-                action = action.cpu().numpy()
-                if isinstance(logits, torch.distributions.Normal):
-                    action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
 
-            profile('eval_misc', epoch)
-            for i in info:
-                for k, v in pufferlib.unroll_nested_dict(i):
-                    if isinstance(v, np.ndarray):
-                        v = v.tolist()
-                    elif isinstance(v, (list, tuple)):
-                        self.stats[k].extend(v)
-                    else:
-                        self.stats[k].append(v)
+            '''
+            if not _debug_printed:
+                print(f'[DBG] action shape={action.shape} dtype={action.dtype} min={action.float().min():.3f} max={action.float().max():.3f}')
+                print(f'[DBG] logprob shape={logprob.shape} min={logprob.min():.3f} max={logprob.max():.3f}')
+                print(f'[DBG] value  shape={value.shape} min={value.min():.3f} max={value.max():.3f}')
+                _debug_printed = True
+            '''
 
             profile('env', epoch)
-
-
-            #_C.python_vec_send(self.pufferl_cpp, 0)
             self.vecenv.send(action)
 
-        #logs = _C.log_environments(self.pufferl_cpp)
-        '''
-        if logs:
-            self.stats['perf'] = [logs['perf']]
-            self.stats['score'] = [logs['score']]
-            self.stats['episode_return'] = [logs['episode_return']]
-            self.stats['episode_length'] = [logs['episode_length']]
-            self.stats['n'] = [logs['n']]
-        '''
+        env_logs = self.vecenv.log()
+        for k, v in env_logs.items():
+            self.stats[k].append(v)
 
 
         profile('eval_misc', epoch)
@@ -351,10 +366,9 @@ class PuffeRL:
             learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
             self.optimizer.param_groups[0]['lr'] = learning_rate
 
-        num_minibatches = config['num_minibatches']
+        num_minibatches = int(config['replay_ratio'] * config['batch_size'] / config['minibatch_size'])
         for mb in range(num_minibatches):
             profile('train_misc', epoch, nest=True)
-            self.amp_context.__enter__()
 
             shape = self.values.shape
             advantages = torch.zeros(shape, device=device)
@@ -416,9 +430,7 @@ class PuffeRL:
             entropy_loss = entropy.mean()
 
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            self.amp_context.__enter__() # TODO: AMP needs some debugging
 
-            # This breaks vloss clipping?
             self.values[idx] = newvalue.detach().float()
 
             # Logging
@@ -431,13 +443,11 @@ class PuffeRL:
             losses['clipfrac'] += clipfrac.item() / num_minibatches
             losses['importance'] += ratio.mean().item() / num_minibatches
 
-            # Learn on accumulated minibatches
             profile('learn', epoch)
             loss.backward()
-            if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
         # Reprioritize experience
         profile('train_misc', epoch)
@@ -460,7 +470,7 @@ class PuffeRL:
             self.last_log_step = self.global_step
             profile.clear()
 
-        if self.epoch % config['checkpoint_interval'] == 0 or done_training:
+        if self.epoch % self.args['checkpoint_interval'] == 0 or done_training:
             self.save_checkpoint()
             self.msg = f'Checkpoint saved at update {self.epoch}'
 
@@ -508,8 +518,8 @@ class PuffeRL:
         self.utilization.stop()
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'],
-            self.config["env"], f'{run_id}.pt')
+        checkpoint_dir = self.args.get('data_dir', self.args.get('checkpoint_dir', 'checkpoints'))
+        path = os.path.join(checkpoint_dir, self.args['env_name'], f'{run_id}.pt')
         shutil.copy(model_path, path)
         return path
 
@@ -517,14 +527,14 @@ class PuffeRL:
         if torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
                return
- 
+
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'],
-            self.config["env"], run_id)
+        checkpoint_dir = self.args.get('data_dir', self.args.get('checkpoint_dir', 'checkpoints'))
+        path = os.path.join(checkpoint_dir, self.args['env_name'], run_id)
         if not os.path.exists(path):
             os.makedirs(path)
 
-        model_name = f'model_{self.config["env"]}_{self.epoch:06d}.pt'
+        model_name = f'model_{self.args["env_name"]}_{self.epoch:06d}.pt'
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path
@@ -586,7 +596,7 @@ class PuffeRL:
 
         s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
         s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
-        s.add_row(f'{c2}Env', f'{b2}{config["env"]}')
+        s.add_row(f'{c2}Env', f'{b2}{self.args["env_name"]}')
         s.add_row(f'{c2}Params', abbreviate(self.model_size, b2, c2))
         s.add_row(f'{c2}Steps', abbreviate(agent_steps, b2, c2))
         s.add_row(f'{c2}SPS', abbreviate(sps, b2, c2))
@@ -656,24 +666,12 @@ class PuffeRL:
 
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
-    '''CUDA kernel for puffer advantage with automatic CPU fallback. You need
-    nvcc (in cuda-dev-tools or in a cuda-dev docker base) for PufferLib to
-    compile the fast version.'''
-
-    device = values.device
-    if not ADVANTAGE_CUDA:
-        values = values.cpu()
-        rewards = rewards.cpu()
-        terminals = terminals.cpu()
-        ratio = ratio.cpu()
-        advantages = advantages.cpu()
-
-    torch.ops.pufferlib.compute_puff_advantage(values, rewards, terminals,
-        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
-
-    if not ADVANTAGE_CUDA:
-        return advantages.to(device)
-
+    num_steps, horizon = values.shape
+    _C.puff_advantage(
+        values.data_ptr(), rewards.data_ptr(), terminals.data_ptr(),
+        ratio.data_ptr(), advantages.data_ptr(),
+        num_steps, horizon,
+        gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
     return advantages
 
 
@@ -816,14 +814,16 @@ def downsample(arr, m):
 class Logger:
     def __init__(self, args, policy_name):
         self.run_id = str(int(1000*time.time()))
-        root = os.path.join(args['data_dir'], 'logs', policy_name, args['env'])
+        log_dir = args.get('data_dir', args.get('log_dir', 'logs'))
+        root = os.path.join(log_dir, policy_name, args['env_name'])
         if not os.path.exists(root):
             os.makedirs(root)
 
         self.path = os.path.join(root, self.run_id + '.json')
-        self.logs = {'data': []}
+        self.logs = {}
         for k, v in pufferlib.unroll_nested_dict(args):
             self.logs[k] = v
+        self.logs['data'] = []
 
     # Temp hack to log full config
     def init(self, args):
@@ -913,6 +913,15 @@ class WandbLogger:
 def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=True):
     args = args or load_config(env_name)
 
+    # Device: cuda -> mps -> cpu
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+    args['train']['device'] = device
+
     # Assume TorchRun DDP is used if LOCAL_RANK is set
     if 'LOCAL_RANK' in os.environ:
         world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -928,7 +937,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     policy = policy or load_policy(args, vecenv, env_name)
 
     if 'LOCAL_RANK' in os.environ:
-        args['train']['device'] = torch.cuda.current_device()
         torch.distributed.init_process_group(backend='nccl', world_size=world_size)
         policy = policy.to(local_rank)
         model = torch.nn.parallel.DistributedDataParallel(
@@ -947,25 +955,20 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, verbose=Tr
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = dict(**args['train'], env=env_name)
-    pufferl = PuffeRL(train_config, vecenv, policy, logger, verbose)
+    pufferl = PuffeRL(args, vecenv, policy, logger, verbose)
     pufferl.logger.init(args)
 
     all_logs = []
     max_cost = args['train'].get('max_cost', -1)
-    while pufferl.global_step < train_config['total_timesteps']:
+    while pufferl.global_step < args['train']['total_timesteps']:
         if pufferl.uptime > max_cost and max_cost > 0:
             break
 
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
         logs = pufferl.train()
 
         if logs is not None:
-            if pufferl.global_step > 0.20*train_config['total_timesteps']:
+            if pufferl.global_step > 0.20*args['train']['total_timesteps']:
                 all_logs.append(logs)
 
     # Final eval. You can reset the env here, but depending on
@@ -1004,7 +1007,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     policy = policy or load_policy(args, vecenv, env_name)
     ob, info = vecenv.reset()
     driver = vecenv.driver_env
-    num_agents = vecenv.observation_space.shape[0]
+    num_agents = vecenv.num_agents if isinstance(vecenv, StaticVecEnv) else vecenv.observation_space.shape[0]
     device = args['train']['device']
 
     state = {}
@@ -1258,8 +1261,7 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv)
 
-    train_config = dict(**args['train'], env=args['env_name'], tag=args['tag'])
-    pufferl = PuffeRL(train_config, vecenv, policy, neptune=args['neptune'], wandb=args['wandb'])
+    pufferl = PuffeRL(args, vecenv, policy)
 
     import torchvision.models as models
     from torch.profiler import profile, record_function, ProfilerActivity
@@ -1296,8 +1298,9 @@ def autotune(args=None, env_name=None, vecenv=None, policy=None):
     pufferlib.vector.autotune(make_env, batch_size=args['train']['env_batch_size'])
  
 def load_env(env_name, args):
-    package = args['package']
-    module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
+    if args['package'] == 'ocean':
+        return StaticVecEnv(_C.create_vec(args))
+    module_name = f'pufferlib.environments.{args["package"]}'
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
     return pufferlib.vector.make(make_env, env_kwargs=args['env'], **args['vec'])

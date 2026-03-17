@@ -160,7 +160,6 @@ void forward(MMONet* net, unsigned char* observations, int* actions) {
 }
 
 void demo(int num_players) {
-    srand(time(NULL));
     Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 3387547);
     MMONet* net = init_mmonet(weights, num_players);
 
@@ -323,15 +322,16 @@ void test_perlin_noise(int width, int height,
 }
 
 void test_flood_fill(int width, int height, int colors) {
+    unsigned int rng = 42;
     unsigned char unfilled[width][height];
     memset(unfilled, 0, width*height);
 
     // Draw some squares
     for (int i = 0; i < 32; i++) {
-        int w = rand() % width/4;
-        int h = rand() % height/4;
-        int start_r = rand() % (3*height/4);
-        int start_c = rand() % (3*width/4);
+        int w = rand_r(&rng) % width/4;
+        int h = rand_r(&rng) % height/4;
+        int start_r = rand_r(&rng) % (3*height/4);
+        int start_c = rand_r(&rng) % (3*width/4);
         int end_r = start_r + h;
         int end_c = start_c + w;
         for (int r = start_r; r < end_r; r++) {
@@ -346,7 +346,7 @@ void test_flood_fill(int width, int height, int colors) {
 
     char filled[width*height];
     flood_fill((unsigned char*)unfilled, (char*)filled,
-        width, height, colors, width*height);
+        width, height, colors, width*height, &rng);
 
     // Cast and colorize
     unsigned char output[width*height];
@@ -365,6 +365,7 @@ void test_flood_fill(int width, int height, int colors) {
 }
 
 void test_cellular_automata(int width, int height, int colors, int max_fill) {
+    unsigned int rng = 42;
     char grid[width][height];
     for (int r = 0; r < height; r++) {
         for (int c = 0; c < width; c++) {
@@ -374,13 +375,13 @@ void test_cellular_automata(int width, int height, int colors, int max_fill) {
 
     // Fill some squares
     for (int i = 0; i < 32; i++) {
-        int w = rand() % width/4;
-        int h = rand() % height/4;
-        int start_r = rand() % (3*height/4);
-        int start_c = rand() % (3*width/4);
+        int w = rand_r(&rng) % width/4;
+        int h = rand_r(&rng) % height/4;
+        int start_r = rand_r(&rng) % (3*height/4);
+        int start_c = rand_r(&rng) % (3*width/4);
         int end_r = start_r + h;
         int end_c = start_c + w;
-        int color = rand() % colors;
+        int color = rand_r(&rng) % colors;
         for (int r = start_r; r < end_r; r++) {
             for (int c = start_c; c < end_c; c++) {
                 grid[r][c] = color;
@@ -388,7 +389,7 @@ void test_cellular_automata(int width, int height, int colors, int max_fill) {
         }
     }
 
-    cellular_automata((char*)grid, width, height, colors, max_fill);
+    cellular_automata((char*)grid, width, height, colors, max_fill, &rng);
 
     // Colorize
     unsigned char output[width*height];
@@ -454,7 +455,7 @@ void test_performance(int num_players, int timeout) {
     int num_steps = 0;
     while (time(NULL) - start < timeout) {
         for (int i = 0; i < num_players; i++) {
-            env.actions[i] = rand() % 23;
+            env.actions[i] = rand_r(&env.rng) % 23;
         }
         c_step(&env);
         num_steps++;

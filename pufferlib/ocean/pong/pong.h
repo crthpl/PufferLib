@@ -50,6 +50,7 @@ struct Pong {
     int win;
     int frameskip;
     int continuous;
+    unsigned int rng;
 };
 
 void init(Pong* env) {
@@ -109,7 +110,7 @@ void reset_round(Pong* env) {
     env->ball_x = env->width / 5;
     env->ball_y = env->height / 2 - env->ball_height / 2;
     env->ball_vx = env->ball_initial_speed_x;
-    env->ball_vy = (rand() % 2 - 1) * env->ball_initial_speed_y;
+    env->ball_vy = (rand_r(&env->rng) % 2 - 1) * env->ball_initial_speed_y;
     env->tick = 0;
     env->n_bounces = 0;
 }

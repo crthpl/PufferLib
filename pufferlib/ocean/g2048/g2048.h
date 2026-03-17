@@ -43,6 +43,7 @@ typedef struct Log {
     float episode_return;
     float episode_length;
     float lifetime_max_tile;
+    float reached_16384;
     float reached_32768;
     float reached_65536;
     float reached_131072;
@@ -73,6 +74,7 @@ typedef struct Game {
     int empty_count;
     bool game_over_cached;
     bool grid_changed;
+    unsigned int rng;
 } Game;
 
 // Precomputed color table for rendering optimization
@@ -134,21 +136,22 @@ void add_log(Game* game) {
     game->log.episode_length += game->tick;
     game->log.episode_return += game->episode_reward;
     game->log.lifetime_max_tile += (float)(1 << game->lifetime_max_tile);
+    game->log.reached_16384 += (game->max_tile >= 14);
     game->log.reached_32768 += (game->max_tile >= 15);
     game->log.reached_65536 += (game->max_tile >= 16);
     game->log.reached_131072 += (game->max_tile >= 17);
     game->log.n += 1;
 }
 
-static inline unsigned char get_new_tile(void) {
+static inline unsigned char get_new_tile(Game* game) {
     // 10% chance of 2, 90% chance of 1
-    return (rand() % 10 == 0) ? 2 : 1;
+    return (rand_r(&game->rng) % 10 == 0) ? 2 : 1;
 }
 
 static inline void place_tile_at_random_cell(Game* game, unsigned char tile) {
     if (game->empty_count == 0) return;
 
-    int target = rand() % game->empty_count;
+    int target = rand_r(&game->rng) % game->empty_count;
     int pos = 0;
     for (int i = 0; i < SIZE; i++) {
         for (int j = 0; j < SIZE; j++) {
@@ -167,7 +170,7 @@ static inline void place_tile_at_random_cell(Game* game, unsigned char tile) {
 void set_scaffolding_curriculum(Game* game) {
     if (game->lifetime_max_tile < 14) {
         // Spawn one high tile from 8192 to 65536
-        int curriculum = rand() % 5;
+        int curriculum = rand_r(&game->rng) % 5;
         unsigned char high_tile = max(12 + curriculum, game->lifetime_max_tile);
         place_tile_at_random_cell(game, high_tile);
 
@@ -175,7 +178,7 @@ void set_scaffolding_curriculum(Game* game) {
         // base=14 until 65536 reached, then base=15 for 131072 practice
         // All random placement, 1-2 tiles max
         unsigned char base = (game->lifetime_max_tile >= 16) ? 15 : 14;
-        int curriculum = rand() % 4;
+        int curriculum = rand_r(&game->rng) % 4;
 
         if (curriculum == 0) {
             place_tile_at_random_cell(game, base);
@@ -205,14 +208,14 @@ void c_reset(Game* game) {
 
     // Higher tiles are spawned in scaffolding episodes
     // Having high tiles saves moves to get there, allowing agents to experience it faster
-    game->is_scaffolding_episode = (rand() / (float)RAND_MAX) < game->scaffolding_ratio;
+    game->is_scaffolding_episode = (rand_r(&game->rng) / (float)RAND_MAX) < game->scaffolding_ratio;
     if (game->is_scaffolding_episode) {
         set_scaffolding_curriculum(game);
 
     } else {
         // Add two random tiles at the start
         for (int i = 0; i < 2; i++) {
-            place_tile_at_random_cell(game, get_new_tile());
+            place_tile_at_random_cell(game, get_new_tile(game));
         }
     }
 
@@ -370,10 +373,10 @@ void c_step(Game* game) {
 
     if (did_move) {
         game->moves_made++;
-        place_tile_at_random_cell(game, get_new_tile());
-        game->score += score_add;
-
+        // Refresh empty_count after merges so spawning uses the correct count.
         update_stats(game);
+        place_tile_at_random_cell(game, get_new_tile(game));
+        game->score += score_add;
 
         // Observations only change if the grid changes
         update_observations(game);
@@ -415,9 +418,12 @@ void step_without_reset(Game* game) {
 
     if (did_move) {
         game->moves_made++;
-        place_tile_at_random_cell(game, get_new_tile());
-        game->score += score_add;
+
+        // Refresh empty_count after merges so spawning uses the correct count.
         update_stats(game);
+        place_tile_at_random_cell(game, get_new_tile(game));
+        game->score += score_add;
+
         // Observations only change if the grid changes
         update_observations(game);
     }

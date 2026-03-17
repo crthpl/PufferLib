@@ -25,7 +25,7 @@ typedef struct {
     float episode_return; // Recommended metric: sum of agent rewards over episode
     float episode_length; // Recommended metric: number of steps of agent episode
     // Any extra fields you add here may be exported to Python in binding.c
-    float n; // Required as the last field 
+    float n; // Required as the last field
 } Log;
 
 // Required that you have some struct for your env
@@ -86,7 +86,7 @@ void c_step(Squared* env) {
         env->c -= 1;
     }
 
-    if (env->tick > 3*env->size 
+    if (env->tick > 3*env->size
             || env->r < 0
             || env->c < 0
             || env->r >= env->size

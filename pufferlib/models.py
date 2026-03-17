@@ -45,19 +45,19 @@ class MinGRULayer(Module):
         super().__init__()
 
         dim_inner = int(dim * expansion_factor)
-        self.proj_out = default(proj_out, expansion_factor != 1.)
+        #self.proj_out = default(proj_out, expansion_factor != 1.)
 
-        self.to_hidden_and_gate = Linear(dim, dim_inner * 2, bias = False)
-        nn.init.orthogonal_(self.to_hidden_and_gate.weight)
+        self.to_hidden_and_gate = Linear(dim, dim_inner * 3, bias = False)
+        #nn.init.orthogonal_(self.to_hidden_and_gate.weight)
 
-        self.to_out = Linear(dim_inner, dim, bias = False)
-        nn.init.orthogonal_(self.to_out.weight)
+        #self.to_out = Linear(dim_inner, dim, bias = False)
+        #nn.init.orthogonal_(self.to_out.weight)
 
-        self.norm = torch.nn.RMSNorm(dim)
+        #self.norm = torch.nn.RMSNorm(dim)
 
     def forward(self, x, prev_hidden = None):
         seq_len = x.shape[1]
-        hidden, gate = self.to_hidden_and_gate(x).chunk(2, dim = -1)
+        hidden, gate, proj = self.to_hidden_and_gate(x).chunk(3, dim = -1)
 
         if seq_len == 1:
             # handle sequential
@@ -82,11 +82,15 @@ class MinGRULayer(Module):
 
         next_prev_hidden = out[:, -1:]
 
-        if self.proj_out:
-            out = self.to_out(out)
+        #if self.proj_out:
+        #    out = self.to_out(out)
 
-        out = out + x
-        out = self.norm(out)
+        # Highway connection
+        proj_sigmoid = F.sigmoid(proj);
+        out = proj_sigmoid*out + (1.0 - proj_sigmoid)*x;
+
+        #out = out + x
+        #out = self.norm(out)
 
         return out, next_prev_hidden
 
@@ -94,9 +98,9 @@ class DefaultEncoder(nn.Module):
     def __init__(self, env, hidden_size=128):
         super().__init__()
         try:
-            self.is_dict_obs = isinstance(env.env.observation_space, pufferlib.spaces.Dict) 
+            self.is_dict_obs = isinstance(env.env.observation_space, pufferlib.spaces.Dict)
         except:
-            self.is_dict_obs = isinstance(env.observation_space, pufferlib.spaces.Dict) 
+            self.is_dict_obs = False
 
         if self.is_dict_obs:
             dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
@@ -106,7 +110,8 @@ class DefaultEncoder(nn.Module):
             dtype = env.single_observation_space.dtype
 
         self.dtype = dtype
-        self.encoder = pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size))
+        #self.encoder = pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size))
+        self.encoder = nn.Linear(num_obs, hidden_size)
 
     def forward(self, observations):
         batch_size = observations.shape[0]
@@ -117,7 +122,8 @@ class DefaultEncoder(nn.Module):
             observations = observations.view(batch_size, -1)
 
         hidden = self.encoder(observations.float())
-        return F.gelu(hidden)
+        return hidden
+        #return F.gelu(hidden)
 
 class DefaultDecoder(nn.Module):
     def __init__(self, env, hidden_size=128):
@@ -134,16 +140,20 @@ class DefaultDecoder(nn.Module):
                     nn.Linear(hidden_size, num_atns), std=0.01)
         elif not self.is_continuous:
             num_atns = env.single_action_space.n
-            self.decoder = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, num_atns), std=0.01)
+            #self.decoder = pufferlib.pytorch.layer_init(
+            #    nn.Linear(hidden_size, num_atns), std=0.01)
+            self.decoder = nn.Linear(hidden_size, num_atns)
+ 
         else:
             self.decoder_mean = pufferlib.pytorch.layer_init(
                 nn.Linear(hidden_size, env.single_action_space.shape[0]), std=0.01)
             self.decoder_logstd = nn.Parameter(torch.zeros(
                 1, env.single_action_space.shape[0]))
 
-        self.value_function = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 1), std=1)
+        #self.value_function = pufferlib.pytorch.layer_init(
+        #    nn.Linear(hidden_size, 1), std=1)
+
+        self.value_function = nn.Linear(hidden_size, 1)
 
 
     def forward(self, hidden):

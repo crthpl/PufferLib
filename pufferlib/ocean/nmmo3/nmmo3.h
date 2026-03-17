@@ -174,17 +174,17 @@ void range(int* array, int n) {
     }
 }
 
-void shuffle(int* array, int n) {
+void shuffle(int* array, int n, unsigned int* rng) {
     for (int i = 0; i < n; i++) {
-        int j = rand() % n;
+        int j = rand_r(rng) % n;
         int temp = array[i];
         array[i] = array[j];
         array[j] = temp;
     }
 }
 
-double sample_exponential(double halving_rate) {
-    double u = (double)rand() / RAND_MAX; // Random number u in [0, 1)
+double sample_exponential(double halving_rate, unsigned int* rng) {
+    double u = (double)rand_r(rng) / RAND_MAX; // Random number u in [0, 1)
     return 1 + halving_rate*(-log(1 - u) / log(2));
 }
 
@@ -275,7 +275,7 @@ void perlin_noise(float* map, int width, int height,
 }
 
 void flood_fill(unsigned char* input, char* output,
-        int width, int height, int n, int max_fill) {
+        int width, int height, int n, int max_fill, unsigned int* rng) {
 
     for (int r = 0; r < height; r++) {
         for (int c = 0; c < width; c++) {
@@ -285,7 +285,7 @@ void flood_fill(unsigned char* input, char* output,
 
     int* pos = calloc(width*height, sizeof(int));
     range((int*)pos, width*height);
-    shuffle((int*)pos, width*height);
+    shuffle((int*)pos, width*height, rng);
 
     short queue[2*max_fill];
     for (int i = 0; i < 2*max_fill; i++) {
@@ -301,7 +301,7 @@ void flood_fill(unsigned char* input, char* output,
             continue;
         }
 
-        int color = rand() % n;
+        int color = rand_r(rng) % n;
         output[adr] = color;
         queue[0] = r;
         queue[1] = c;
@@ -366,7 +366,7 @@ void flood_fill(unsigned char* input, char* output,
 }
 
 void cellular_automata(char* grid,
-        int width, int height, int colors, int max_fill) {
+        int width, int height, int colors, int max_fill, unsigned int* rng) {
 
     int* pos = calloc(2*width*height, sizeof(int));
     int pos_sz = 0;
@@ -389,7 +389,7 @@ void cellular_automata(char* grid,
         for (int i = 0; i < pos_sz; i+=2) {
             int r = pos[i];
             int c = pos[i + 1];
-            int adr = rand() % pos_sz;
+            int adr = rand_r(rng) % pos_sz;
             if (adr % 2 == 1) {
                 adr--;
             }
@@ -450,7 +450,7 @@ void cellular_automata(char* grid,
             }
 
             int idx = 0;
-            int winner = rand() % num_ties;
+            int winner = rand_r(rng) % num_ties;
             for (int j = 0; j < colors; j++) {
                 if (counts[j] == max_count) {
                     if (idx == winner) {
@@ -469,12 +469,12 @@ void cellular_automata(char* grid,
 }
 
 void generate_terrain(char* terrain, unsigned char* rendered,
-        int R, int C, int x_border, int y_border) {
+        int R, int C, int x_border, int y_border, unsigned int* rng) {
     // Perlin noise for the base terrain
     // TODO: Not handling octaves correctly
     float* perlin_map = calloc(R*C, sizeof(float));
-    int offset_x = rand() % 100000;
-    int offset_y = rand() % 100000;
+    int offset_x = rand_r(rng) % 100000;
+    int offset_y = rand_r(rng) % 100000;
     perlin_noise(perlin_map, C, R, 1.0/64.0, 2, offset_x, offset_y);
  
     // Flood fill connected components to determine biomes
@@ -486,10 +486,10 @@ void generate_terrain(char* terrain, unsigned char* rendered,
         }
     }
     char *biomes = calloc(R*C, sizeof(char));
-    flood_fill(ridges, biomes, R, C, 4, 4000);
+    flood_fill(ridges, biomes, R, C, 4, 4000, rng);
 
     // Cellular automata to cover unfilled ridges
-    cellular_automata(biomes, R, C, 4, 4000);
+    cellular_automata(biomes, R, C, 4, 4000, rng);
 
     unsigned char (*rendered_ary)[C][3] = (unsigned char(*)[C][3])rendered;
 
@@ -714,6 +714,7 @@ struct MMO {
     RespawnBuffer* enemy_respawn_buffer;
     RespawnBuffer* drop_respawn_buffer;
     Log log;
+    unsigned int rng;
     float reward_combat_level;
     float reward_prof_level;
     float reward_item_level;
@@ -1020,7 +1021,7 @@ int safe_tile(MMO* env, int delta) {
     int idx;
     while (!valid) {
         valid = true;
-        idx = rand() % (env->width * env->height);
+        idx = rand_r(&env->rng) % (env->width * env->height);
         char tile = env->terrain[idx];
         if (!is_grass(tile)) {
             valid = false;
@@ -1089,7 +1090,7 @@ void spawn(MMO* env, Entity* entity) {
         entity->is_equipped[idx] = 0;
     }
 
-    entity->goal = (rand() % 2) == 0;
+    entity->goal = (rand_r(&env->rng) % 2) == 0;
     memset(entity->min_comb_prof, 0, sizeof(entity->min_comb_prof));
     entity->min_comb_prof_idx = 0;
 }
@@ -1099,8 +1100,8 @@ void give_starter_gear(MMO* env, int pid, int tier) {
     assert(tier <= env->tiers);
 
     Entity* player = &env->players[pid];
-    int idx = (rand() % 6) + 1;
-    tier = (rand() % tier) + 1;
+    int idx = (rand_r(&env->rng) % 6) + 1;
+    tier = (rand_r(&env->rng) % tier) + 1;
     player->inventory[0] = item_index(idx, tier);
     player->gold += 50;
 }
@@ -1174,7 +1175,7 @@ void pickup_item(MMO* env, int pid) {
 
     // Some items are different on the ground and in inventory
     if (ground_type == I_ORE) {
-        int armor_id = I_HELM + rand() % 3;
+        int armor_id = I_HELM + rand_r(&env->rng) % 3;
         ground_id = item_index(armor_id, ground_tier);
     } else if (ground_type == I_HILT) {
         ground_id = item_index(I_SWORD, ground_tier);
@@ -1264,7 +1265,7 @@ void wander(MMO* env, int pid) {
     }
 
     // Move randomly
-    int direction = rand() % 4;
+    int direction = rand_r(&env->rng) % 4;
     if (direction == ATN_UP) {
         end_r -= 1;
     } else if (direction == ATN_DOWN) {
@@ -1643,7 +1644,7 @@ void c_reset(MMO* env) {
 
     // TODO: Check width/height args!
     generate_terrain(env->terrain, env->rendered, env->width, env->height,
-        env->x_window, env->y_window);
+        env->x_window, env->y_window, &env->rng);
 
     for (int i = 0; i < env->width*env->height; i++) {
         env->pids[i] = -1;
@@ -1666,7 +1667,7 @@ void c_reset(MMO* env) {
     // Randomly generate spawn candidates
     int *spawn_cands = calloc(env->width*env->height, sizeof(int));
     range((int*)spawn_cands, env->width*env->height);
-    shuffle((int*)spawn_cands, env->width*env->height);
+    shuffle((int*)spawn_cands, env->width*env->height, &env->rng);
 
     for (int cand_idx = 0; cand_idx < env->width*env->height; cand_idx++) {
         int cand = spawn_cands[cand_idx];
@@ -1721,7 +1722,7 @@ void c_reset(MMO* env) {
         //int tier = 1 + env->tiers*level/env->levels;
         int tier = 0;
         while (tier < 1 || tier > env->tiers) {
-            tier = sample_exponential(1);
+            tier = sample_exponential(1, &env->rng);
         }
 
         if (spawned) {
@@ -1797,9 +1798,9 @@ void c_reset(MMO* env) {
     for (int enemy_count = 0; enemy_count < env->num_enemies; enemy_count++) {
         int level = 0;
         while (level < 1 || level > env->levels) {
-            level = sample_exponential(8);
+            level = sample_exponential(8, &env->rng);
         }
-        if (rand() % 8 == 0) {
+        if (rand_r(&env->rng) % 8 == 0) {
             level = 1;
         }
         //if (distance > 8 && r < env->height/2 && enemy_count < env->num_enemies) {
@@ -1901,7 +1902,7 @@ void c_step(MMO* env) {
         // Teleportitis: Randomly teleport players and enemies
         // to a safe tile. This prevents players from clumping
         // and messing up training dynamics
-        double prob = (double)rand() / RAND_MAX;
+        double prob = (double)rand_r(&env->rng) / RAND_MAX;
         if (prob < env->teleportitis_prob) {
             r = entity->r;
             c = entity->c;
@@ -2330,7 +2331,7 @@ Animation ANIMATIONS[7] = {
 #define STONE_OFFSET OFF * 1
 #define DIRT_OFFSET  0
 
-void render_conversion(char* flat_tiles, int* flat_converted, int R, int C) {
+void render_conversion(char* flat_tiles, int* flat_converted, int R, int C, unsigned int* rng) {
     char* tex_codes = tile_atlas;
     char (*tiles)[C] = (char(*)[C])flat_tiles;
     int (*converted)[C] = (int(*)[C])flat_converted;
@@ -2374,11 +2375,11 @@ void render_conversion(char* flat_tiles, int* flat_converted, int R, int C) {
             int idx = code;
             if (code == TEX_FULL) {
                 if (is_dirt(tile)) {
-                    idx = DIRT_OFFSET + rand() % 5;
+                    idx = DIRT_OFFSET + rand_r(rng) % 5;
                 } else if (is_stone(tile)) {
-                    idx = STONE_OFFSET + rand() % 5;
+                    idx = STONE_OFFSET + rand_r(rng) % 5;
                 } else if (is_water(tile)) {
-                    idx = WATER_OFFSET + rand() % 5;
+                    idx = WATER_OFFSET + rand_r(rng) % 5;
                 }
             } else if (is_dirt(tile)) {
                 idx += DIRT_OFFSET + 5;
@@ -2426,13 +2427,13 @@ void render_conversion(char* flat_tiles, int* flat_converted, int R, int C) {
                 } else {
                     int lookup = (1000*num_spring + 100*num_summer
                         + 10*num_autumn + num_winter);
-                    int offset = (rand() % 4) * 714; // num_lerps;
+                    int offset = (rand_r(rng) % 4) * 714; // num_lerps;
                     idx = lerps[lookup] + offset + 240 + 5*4*3*4;
                 }
             }
             if (code == TEX_FULL && is_water(tile)) {
-                int variant = (rand() % 5);
-                int anim = rand() % 3;
+                int variant = (rand_r(rng) % 5);
+                int anim = rand_r(rng) % 3;
                 idx = 240 + 3*4*4*variant + 4*4*anim;
                 if (tile == TILE_SPRING_WATER) {
                     idx += 0;
@@ -2459,7 +2460,7 @@ Client* make_client(MMO* env) {
     client->command_len = 0;
 
     client->terrain = calloc(env->height*env->width, sizeof(int));
-    render_conversion(env->terrain, client->terrain, env->height, env->width);
+    render_conversion(env->terrain, client->terrain, env->height, env->width, &env->rng);
 
     client->shader = LoadShader("", TextFormat("resources/nmmo3/map_shader_%i.fs", GLSL_VERSION));
 
