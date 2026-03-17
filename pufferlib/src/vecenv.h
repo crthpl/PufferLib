@@ -120,6 +120,12 @@ void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]);
 int get_obs_size(void);
 int get_num_atns(void);
 int* get_act_sizes(void);
+int get_num_act_sizes(void);
+const char* get_obs_dtype(void);
+size_t get_obs_elem_size(void);
+
+// Synchronous single-step (no threads/callback): D2H actions, OMP env step, H2D obs/rewards/terminals
+void static_vec_step(StaticVec* vec);
 
 // Optional shared state functions
 void* my_shared(void* env, Dict* kwargs);
@@ -424,10 +430,8 @@ void static_vec_reset(StaticVec* vec) {
     }
     cudaMemcpy(vec->gpu_observations, vec->observations,
         vec->total_agents * OBS_SIZE * obs_element_size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(vec->gpu_rewards, vec->rewards,
-        vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(vec->gpu_terminals, vec->terminals,
-        vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
+    cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
     cudaDeviceSynchronize();
 }
 
@@ -567,6 +571,35 @@ int get_obs_size(void) { return OBS_SIZE; }
 int get_num_atns(void) { return NUM_ATNS; }
 static int _act_sizes[] = ACT_SIZES;
 int* get_act_sizes(void) { return _act_sizes; }
+int get_num_act_sizes(void) { return (int)(sizeof(_act_sizes) / sizeof(_act_sizes[0])); }
+const char* get_obs_dtype(void) { return dtype_symbol; }
+size_t get_obs_elem_size(void) { return obs_element_size(); }
+
+void static_vec_step(StaticVec* vec) {
+    // D2H: copy GPU actions to CPU pinned memory so envs can read them
+    cudaMemcpy(vec->actions, vec->gpu_actions,
+        (size_t)vec->total_agents * NUM_ATNS * sizeof(double),
+        cudaMemcpyDeviceToHost);
+
+    memset(vec->rewards, 0, vec->total_agents * sizeof(float));
+    memset(vec->terminals, 0, vec->total_agents * sizeof(float));
+
+    // OMP-parallel env step across all envs
+    Env* envs = (Env*)vec->envs;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < vec->size; i++) {
+        c_step(&envs[i]);
+    }
+
+    // H2D: copy obs/rewards/terminals back to GPU
+    cudaMemcpy(vec->gpu_observations, vec->observations,
+        (size_t)vec->total_agents * OBS_SIZE * obs_element_size(),
+        cudaMemcpyHostToDevice);
+    cudaMemcpy(vec->gpu_rewards, vec->rewards,
+        vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(vec->gpu_terminals, vec->terminals,
+        vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+}
 
 // Optional shared state functions - default implementations
 #ifndef MY_SHARED
