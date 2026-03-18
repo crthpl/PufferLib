@@ -217,7 +217,7 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
             }
 
             update_ptr = x_buf.data;
-            scale = sqrtf(fmaxf(1.0f, (float)M / (float)N));
+            scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
         }
 
         muon_weight_update_kernel<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(

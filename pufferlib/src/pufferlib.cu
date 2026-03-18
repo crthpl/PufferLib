@@ -1334,9 +1334,9 @@ __global__ void select_copy_kernel(
     }
 }
 
-inline float cosine_annealing(float lr_base, float lr_min, int t, int T) {
+inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
     if (T == 0) return lr_base;
-    float ratio = (float)t / (float)T;
+    float ratio = (double )t / (double) T;
     ratio = std::max(0.0f, std::min(1.0f, ratio));
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
