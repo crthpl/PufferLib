@@ -889,7 +889,7 @@ int main(void) {
         "train/eps",
         "train/prio_alpha",
         "train/prio_beta0",
-        //"train/horizon",
+        "train/horizon",
         "train/replay_ratio",
         "train/minibatch_size",
         "policy/hidden_size",
@@ -978,14 +978,14 @@ int main(void) {
     int fig_env_idx = 0;
     bool fig_env_active = false;
     bool fig_x_active = false;
-    int fig_x_idx = 0;
+    int fig_x_idx = 1;
     bool fig_xscale_active = false;
     int fig_xscale_idx = 0;
     bool fig_y_active = false;
     int fig_y_idx = 2;
     bool fig_yscale_active = false;
     bool fig_z_active = false;
-    int fig_z_idx = 1;
+    int fig_z_idx = 0;
     bool fig_zscale_active = false;
     int fig_zscale_idx = 0;
     int fig_color_idx = 0;
