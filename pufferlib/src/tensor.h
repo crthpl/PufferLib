@@ -11,11 +11,6 @@ typedef struct {
 } FloatTensor;
 
 typedef struct {
-    double* data;
-    int64_t shape[PUF_MAX_DIMS];
-} DoubleTensor;
-
-typedef struct {
     unsigned char* data;
     int64_t shape[PUF_MAX_DIMS];
 } ByteTensor;
