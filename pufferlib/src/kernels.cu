@@ -26,7 +26,7 @@ typedef __nv_bfloat16 precision_t;
 constexpr bool USE_BF16 = true;
 constexpr int PRECISION_SIZE = 2;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
-static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F_FAST_16BF;
+static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F; // Note: fast bf16 is not deterministic
 #define NCCL_PRECISION ncclBfloat16
 #define to_float(x) __bfloat162float(x)
 #define from_float(x) __float2bfloat16(x)
