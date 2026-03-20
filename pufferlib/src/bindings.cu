@@ -2,7 +2,6 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <chrono>
 #include "pufferlib.cu"
 
 namespace py = pybind11;
@@ -16,8 +15,7 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     int gpus = pufferl.hypers.world_size;
     long global_step = pufferl.global_step;
     long epoch = pufferl.epoch;
-    double now = std::chrono::duration<double>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    double now = wall_clock();
     double dt = now - pufferl.last_log_time;
     long sps = dt > 0 ? (long)((global_step - pufferl.last_log_step) / dt) : 0;
     pufferl.last_log_time = now;
@@ -100,8 +98,7 @@ pybind11::dict puf_eval_log(pybind11::object pufferl_obj) {
     auto& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::dict result;
 
-    double now = std::chrono::duration<double>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    double now = wall_clock();
     pufferl.last_log_time = now;
     pufferl.last_log_step = pufferl.global_step;
  
@@ -132,7 +129,7 @@ void render(pybind11::object pufferl_obj, int env_id) {
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
-    auto t0 = std::chrono::high_resolution_clock::now();
+    double t0 = wall_clock();
 
     // Zero state buffers
     for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
@@ -140,8 +137,7 @@ void rollouts(pybind11::object pufferl_obj) {
     }
 
     static_vec_omp_step(pufferl.vec);
-    float sec = std::chrono::duration<float>(
-        std::chrono::high_resolution_clock::now() - t0).count();
+    float sec = (float)(wall_clock() - t0);
     pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms
 
     float eval_prof[NUM_EVAL_PROF];
@@ -388,6 +384,10 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
         pufferl = create_pufferl_impl(hypers, env_name, vec_dict, env_dict);
     }
 
+    if (!pufferl) {
+        throw std::runtime_error("CUDA OOM: failed to allocate training buffers");
+    }
+
     return pufferl;
 }
 
@@ -470,8 +470,7 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("uptime", [](py::object pufferl_obj) -> double {
         PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-        double now = std::chrono::duration<double>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        double now = wall_clock();
         return now - pufferl.start_time;
     });
     m.def("puff_advantage", &py_puff_advantage);

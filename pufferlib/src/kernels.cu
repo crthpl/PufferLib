@@ -422,9 +422,10 @@ void alloc_register(Allocator* a, IntTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(int));
 }
 
-void alloc_create(Allocator* alloc) {
-    if (alloc->total_bytes == 0) return;
-    cudaMalloc(&alloc->mem, alloc->total_bytes);
+cudaError_t alloc_create(Allocator* alloc) {
+    if (alloc->total_bytes == 0) return cudaSuccess;
+    cudaError_t err = cudaMalloc(&alloc->mem, alloc->total_bytes);
+    if (err != cudaSuccess) return err;
     cudaMemset(alloc->mem, 0, alloc->total_bytes);
     long offset = 0;
     for (int i = 0; i < alloc->num_regs; i++) {
@@ -432,6 +433,7 @@ void alloc_create(Allocator* alloc) {
         *alloc->regs[i].data_ptr = (char*)alloc->mem + offset;
         offset += numel(alloc->regs[i].shape) * alloc->regs[i].elem_size;
     }
+    return cudaSuccess;
 }
 
 void alloc_free(Allocator* alloc) {
