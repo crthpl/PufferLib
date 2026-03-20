@@ -6,6 +6,7 @@
 
 #include <time.h>
 #include "models.cu"
+#include "ocean.cu"
 #include "muon.cu"
 #include "vecenv.h"
 
@@ -325,6 +326,9 @@ typedef struct {
     bool rollout_captured;
     bool train_captured;
     ulong seed;
+    cublasHandle_t* cublas_buf_handles;  // per-buffer cuBLAS handles baked into rollout cudagraphs
+    int num_cublas_buf_handles;
+    curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -356,6 +360,13 @@ extern "C" void thread_init_wrapper(void* ctx, int buf) {
     tl_stream = pufferl->streams[buf];
 }
 
+__global__ void rng_init_kernel(curandStatePhilox4_32_10_t* states, uint64_t seed, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        curand_init(seed, idx, 0, &states[idx]);
+    }
+}
+
 // Expects action logits and values to be in the same contiguous buffer. See default decoder
 __global__ void sample_logits_kernel(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
@@ -364,8 +375,7 @@ __global__ void sample_logits_kernel(
         precision_t* __restrict__ actions,    // (B, num_atns)
         precision_t* __restrict__ logprobs,   // (B,)
         precision_t* __restrict__ value_out,  // (B,)
-        uint64_t seed,
-        const int64_t* __restrict__ offset_ptr) {
+        curandStatePhilox4_32_10_t* __restrict__ rng_states) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = numel(act_sizes_puf.shape);
@@ -383,12 +393,8 @@ __global__ void sample_logits_kernel(
         return;
     }
 
-    // Read offset at execution time (important for CUDA graph replay)
-    uint64_t offset = static_cast<uint64_t>(*offset_ptr);
-
-    // Initialize RNG state once per thread
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, idx, offset, &state);
+    // Load persistent RNG state (advanced in-place each call)
+    curandStatePhilox4_32_10_t state = rng_states[idx];
 
     int logits_base = idx * logits_stride;
     float total_log_prob = 0.0f;
@@ -496,10 +502,8 @@ __global__ void sample_logits_kernel(
     // Copy value (fused to avoid separate elementwise kernel for strided->contiguous copy)
     value_out[idx] = value[idx * value_stride];
 
-    // Increment RNG offset for next call (thread 0 only, fused to avoid separate kernel)
-    if (idx == 0) {
-        atomicAdd((unsigned long long*)offset_ptr, 1ULL);
-    }
+    // Save RNG state back for next call
+    rng_states[idx] = state;
 }
 
 // Single step rollout forward pass. Called by each environment worker in their
@@ -518,11 +522,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     }
 
     bool capturing = pufferl->epoch == hypers.cudagraphs;
-    cudaStream_t cap_stream_raw = 0;
     if (capturing) {
-        cudaStreamCreate(&cap_stream_raw);
-        current_stream = cap_stream_raw;
-        cudaStreamBeginCapture(cap_stream_raw, cudaStreamCaptureModeGlobal);
+        cudaStreamBeginCapture(current_stream, cudaStreamCaptureModeGlobal);
     }
 
     RolloutBuf& rollouts = pufferl->rollouts;
@@ -561,13 +562,10 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         p_logstd = dw->logstd;
     }
 
-    // Each buffer uses its own RNG seed and offset slot for deterministic parallel rollouts
-    long* buf_rng_offset = pufferl->rng_offset_puf.data + buf;
-    ulong buf_rng_seed = pufferl->seed + buf;
     sample_logits_kernel<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
         dec_puf, p_logstd, pufferl->act_sizes_puf,
         act_slice.data, lp_slice.data, val_slice.data,
-        buf_rng_seed, buf_rng_offset);
+        pufferl->rng_states[buf]);
 
     // Copy actions to env
     long act_cols = env.actions.shape[1];
@@ -576,12 +574,10 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     if (capturing) {
         cudaGraph_t _graph;
-        cudaStreamEndCapture(cap_stream_raw, &_graph);
+        cudaStreamEndCapture(current_stream, &_graph);
         cudaGraphInstantiate(&pufferl->fused_rollout_cudagraphs[graph], _graph, 0);
         cudaGraphDestroy(_graph);
-        cudaStreamSynchronize(cap_stream_raw);
         cudaDeviceSynchronize();
-        cudaStreamDestroy(cap_stream_raw);
     }
     profile_end(hypers.profile);
 }
@@ -1392,13 +1388,11 @@ void train_impl(PuffeRL& pufferl) {
             cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
         } else {
             bool capturing = pufferl.train_warmup == hypers.cudagraphs;
-            cudaStream_t cap_stream_raw = train_stream;
             if (capturing) {
-                cudaStreamCreate(&cap_stream_raw);
-                cudaStreamBeginCapture(cap_stream_raw, cudaStreamCaptureModeGlobal);
+                cudaStreamBeginCapture(train_stream, cudaStreamCaptureModeGlobal);
             }
 
-            cudaStream_t stream = cap_stream_raw;
+            cudaStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
             PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
@@ -1430,12 +1424,10 @@ void train_impl(PuffeRL& pufferl) {
             }
             if (capturing) {
                 cudaGraph_t _graph;
-                cudaStreamEndCapture(cap_stream_raw, &_graph);
+                cudaStreamEndCapture(train_stream, &_graph);
                 cudaGraphInstantiate(&pufferl.train_cudagraph, _graph, 0);
                 cudaGraphDestroy(_graph);
-                cudaStreamSynchronize(cap_stream_raw);
                 cudaDeviceSynchronize();
-                cudaStreamDestroy(cap_stream_raw);
                 pufferl.train_captured = true;
             }
             pufferl.train_warmup++;
@@ -1669,8 +1661,16 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
             pufferl->master_weights.data, pufferl->param_puf.data, n);
     }
 
+    // Per-buffer persistent RNG states
+    int agents_per_buf = total_agents / num_buffers;
+    pufferl->rng_states = (curandStatePhilox4_32_10_t**)calloc(num_buffers, sizeof(curandStatePhilox4_32_10_t*));
+    for (int i = 0; i < num_buffers; i++) {
+        cudaMalloc(&pufferl->rng_states[i], agents_per_buf * sizeof(curandStatePhilox4_32_10_t));
+        rng_init_kernel<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
+            pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
+    }
+
     // Post-create initialization
-    cudaMemset(pufferl->rng_offset_puf.data, 0, (num_buffers + 1) * sizeof(long));
     cudaMemcpy(pufferl->act_sizes_puf.data, raw_act_sizes, num_action_heads * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
     float one = 1.0f;
@@ -1691,26 +1691,40 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaMalloc(&saved_momentum, wb_bytes);
         cudaMemcpy(saved_momentum, pufferl->muon.mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
 
-        // Checklist for avoiding diabolical capture bugs:
-        // 1. Don't start separate streams before tracing (i.e. env gpu buffers)
-        // 2. Make sure input/output buffer pointers don't change
-        // 3. Make sure to restore the original stream after tracing
-        // 4. Scalars get captured by value. They cannot change between calls.
+        // Create per-buffer streams before capture so graphs are
+        // captured and replayed on the same streams.
+        pufferl->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
+        for (int i = 0; i < num_buffers; i++) {
+            cudaStreamCreate(&pufferl->streams[i]);
+            vec->streams[i] = pufferl->streams[i];
+        }
+
         cudaStream_t saved_default = pufferl->default_stream;
         cudaStream_t saved_tl = tl_stream;
         cudaStream_t warmup_stream;
         cudaStreamCreate(&warmup_stream);
         pufferl->default_stream = warmup_stream;
-        tl_stream = warmup_stream;
+
+        // Create per-buffer cuBLAS handles for deterministic parallel graph replay.
+        pufferl->cublas_buf_handles = (cublasHandle_t*)calloc(num_buffers, sizeof(cublasHandle_t));
+        pufferl->num_cublas_buf_handles = num_buffers;
+        for (int i = 0; i < num_buffers; i++) {
+            pufferl->cublas_buf_handles[i] = cublas_create_handle();
+        }
 
         for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
             for (int i = 0; i < num_buffers * horizon; ++i) {
-                net_callback_wrapper(pufferl.get(), i % num_buffers, i / num_buffers);
+                int buf = i % num_buffers;
+                tl_stream = pufferl->streams[buf];
+                cublas_set_override(pufferl->cublas_buf_handles[buf]);
+                net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
                 cudaDeviceSynchronize();
             }
         }
+        cublas_set_override(nullptr);
         pufferl->rollout_captured = true;
 
+        tl_stream = warmup_stream;
         for (int i = 0; i <= hypers.cudagraphs; i++) {
             train_impl(*pufferl);
         }
@@ -1732,17 +1746,24 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
                 pufferl->param_puf.data, pufferl->master_weights.data, n);
         }
 
+        // Re-init RNG states corrupted by warmup
+        for (int i = 0; i < num_buffers; i++) {
+            rng_init_kernel<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
+                pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
+        }
+        cudaDeviceSynchronize();
+
         pufferl->epoch = 0;
         pufferl->global_step = 0;
     }
 
-    // Create per-buffer streams
-    pufferl->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
-    for (int i = 0; i < num_buffers; i++) {
-        cudaStream_t s;
-        cudaStreamCreate(&s);
-        pufferl->streams[i] = s;
-        vec->streams[i] = s;
+    // Create per-buffer streams if not already created by cudagraph path
+    if (!pufferl->streams) {
+        pufferl->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
+        for (int i = 0; i < num_buffers; i++) {
+            cudaStreamCreate(&pufferl->streams[i]);
+            vec->streams[i] = pufferl->streams[i];
+        }
     }
 
     create_static_threads(vec, hypers.num_threads, horizon, pufferl.get(),
@@ -1779,9 +1800,19 @@ void close_impl(PuffeRL& pufferl) {
         policy_activations_free(&pufferl.policy, pufferl.buffer_activations[buf]);
     }
 
+    for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+        cudaFree(pufferl.rng_states[i]);
+    }
+    free(pufferl.rng_states);
+
     if (USE_BF16) {
         cudaFree(pufferl.master_weights.data);
     }
+
+    for (int i = 0; i < pufferl.num_cublas_buf_handles; i++) {
+        cublasDestroy(pufferl.cublas_buf_handles[i]);
+    }
+    free(pufferl.cublas_buf_handles);
 
     alloc_free(&pufferl.params_alloc);
     alloc_free(&pufferl.grads_alloc);

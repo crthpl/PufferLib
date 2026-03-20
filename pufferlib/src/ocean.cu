@@ -1,5 +1,5 @@
 // NMMO3 CUDA encoder: multihot, cuDNN conv, embedding, concat, projection
-// Included by models.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
+// Included by pufferlib.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
 
 #include "cudnn_conv2d.cu"
 
@@ -85,26 +85,6 @@ __global__ void n3_relu_backward_kernel(
     if (to_float(out[idx]) <= 0.0f) grad[idx] = from_float(0.0f);
 }
 
-__global__ void n3_bias_grad_kernel(
-    precision_t* __restrict__ bgrad, const precision_t* __restrict__ grad, int N, int dim) {
-    int d = blockIdx.x;
-    if (d >= dim) return;
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < N; i += blockDim.x)
-        sum += to_float(grad[i * dim + d]);
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    __shared__ float sdata[32];
-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    if (lane == 0) sdata[warp] = sum;
-    __syncthreads();
-    if (warp == 0) {
-        sum = (lane < (blockDim.x + 31) / 32) ? sdata[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_down_sync(0xffffffff, sum, offset);
-        if (lane == 0) bgrad[d] = from_float(sum);
-    }
-}
 
 // NCHW bias grad: sum over (B, OH, OW) for each OC channel
 __global__ void n3_conv_bias_grad_nchw(
@@ -425,7 +405,7 @@ static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor g
 
     n3_relu_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
         grad.data, a->out.data, B * H);
-    n3_bias_grad_kernel<<<H, 256, 0, stream>>>(
+    bias_grad_kernel<<<H, 256, 0, stream>>>(
         a->proj_bgrad.data, grad.data, B, H);
     puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
 

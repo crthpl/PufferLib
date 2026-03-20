@@ -189,7 +189,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     log_dir = os.path.join(args['log_dir'], args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
 
-    pufferl = _C.create_pufferl(args)
+    try:
+        pufferl = _C.create_pufferl(args)
+    except RuntimeError as e:
+        print(f'WARNING: {e}, skipping')
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], None, None, None))
+        return
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:

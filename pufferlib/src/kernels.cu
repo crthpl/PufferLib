@@ -2,7 +2,6 @@
 #define PUFFERLIB_KERNELS_CU
 
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <curand_kernel.h>
 #include <cstdio>
 #include <cstdint>
@@ -11,25 +10,17 @@
 #include <cassert>
 #include <stdlib.h>
 
-// PufferLib defaults to bf16, but float32 is supported with the --precision compile-time flag
+#include "tensor.h"
+
+// cublas precision constants (depend on precision_t from tensor.h)
 #ifdef PRECISION_FLOAT
-typedef float precision_t;
-constexpr bool USE_BF16 = false;
-constexpr int PRECISION_SIZE = 4;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
 static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F;
 #define NCCL_PRECISION ncclFloat
-#define to_float(x) (x)
-#define from_float(x) (x)
 #else
-typedef __nv_bfloat16 precision_t;
-constexpr bool USE_BF16 = true;
-constexpr int PRECISION_SIZE = 2;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
-static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F; // Note: fast bf16 is not deterministic
+static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F;
 #define NCCL_PRECISION ncclBfloat16
-#define to_float(x) __bfloat162float(x)
-#define from_float(x) __float2bfloat16(x)
 #endif
 
 #ifndef CUDART_INF_F
@@ -115,10 +106,8 @@ __device__ __forceinline__ float logaddexp(float a, float b) {
     return (diff < -88.0f) ? m : m + log1pf(__expf(diff));
 }
 
-__device__ __forceinline__ void copy_bytes(
-    const char* __restrict__ src, char* __restrict__ dst,
-    int src_row, int dst_row, int row_bytes
-) {
+__device__ __forceinline__ void copy_bytes(const char* __restrict__ src,
+        char* __restrict__ dst, int src_row, int dst_row, int row_bytes) {
     const int* soffset = (const int*)(src + (int64_t)src_row * row_bytes);
     int* doffset = (int*)(dst + (int64_t)dst_row * row_bytes);
     for (int i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
@@ -169,24 +158,7 @@ __global__ void add_kernel(precision_t* __restrict__ dst, const precision_t* __r
 }
 #endif
 
-#include "tensor.h"
-
-// PrecisionTensor depends on precision_t (CUDA bf16/f32) so lives here, not in tensor.h
-typedef struct {
-    precision_t* data;
-    int64_t shape[PUF_MAX_DIMS];
-} PrecisionTensor;
-
-
-// Core shape helpers on raw int64_t* — everything else inlines through these
-__host__ __device__ inline int ndim(const int64_t* shape) {
-    int n = 0; while (n < PUF_MAX_DIMS && shape[n] != 0) n++; return n;
-}
-__host__ __device__ inline int64_t numel(const int64_t* shape) {
-    int64_t n = 1; for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) n *= shape[i]; return n;
-}
-
-// --- puf_squeeze: merge shape[dim] into shape[dim+1] ---
+// merge shape[dim] into shape[dim+1] ---
 inline PrecisionTensor* puf_squeeze(PrecisionTensor* t, int dim) {
     int n = ndim(t->shape);
     t->shape[dim + 1] *= t->shape[dim];
@@ -202,7 +174,7 @@ inline FloatTensor* puf_squeeze(FloatTensor* t, int dim) {
     return t;
 }
 
-// --- puf_unsqueeze: split shape[dim] into {d0, d1} ---
+// split shape[dim] into {d0, d1} ---
 inline PrecisionTensor* puf_unsqueeze(PrecisionTensor* t, int dim, int64_t d0, int64_t d1) {
     assert(d0 * d1 == t->shape[dim] && "puf_unsqueeze: d0 * d1 must equal shape[dim]");
     int n = ndim(t->shape);
@@ -212,37 +184,40 @@ inline PrecisionTensor* puf_unsqueeze(PrecisionTensor* t, int dim, int64_t d0, i
     return t;
 }
 
-// Product of all dims except the last two (1 if ndim <= 2)
-inline int64_t batch_size(const int64_t* shape) {
-    int n = ndim(shape);
-    int64_t b = 1;
-    for (int i = 0; i < n - 2; i++) b *= shape[i];
-    return b;
-}
-
-// --- puf_repr (Python bindings only need these three) ---
-static inline const char* _puf_repr_impl(const char* name, const char* dtype,
-        const int64_t* shape, int nd, int64_t ne, bool empty) {
-    static thread_local char buf[256];
-    if (empty) { snprintf(buf, sizeof(buf), "%s(empty)", name); return buf; }
-    int pos = snprintf(buf, sizeof(buf), "%s(%s, [", name, dtype);
-    for (int i = 0; i < nd && pos < (int)sizeof(buf) - 32; i++)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
-    snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)ne);
-    return buf;
-}
-inline const char* puf_repr(const PrecisionTensor* t) {
-    return _puf_repr_impl("PrecisionTensor", USE_BF16 ? "bf16" : "f32",
-        t->shape, ndim(t->shape), numel(t->shape), !t->data);
-}
-inline const char* puf_repr(const FloatTensor* t) {
-    return _puf_repr_impl("FloatTensor", "f32",
-        t->shape, ndim(t->shape), numel(t->shape), !t->data);
-}
-
-
 // Dense row-major GEMM: C(M,N) = alpha * op_a(A) @ op_b(B) + beta * C
 // Strides derived from M, N, K assuming tightly packed row-major storage.
+static const size_t CUBLAS_WS_BYTES = 32 * 1024 * 1024;
+
+// Override handle for cudagraph capture (nullptr = use thread-local default)
+static thread_local cublasHandle_t cublas_override_handle = nullptr;
+
+static cublasHandle_t cublas_get_handle() {
+    if (cublas_override_handle) {
+        return cublas_override_handle;
+    }
+    static thread_local cublasHandle_t handle = nullptr;
+    if (!handle) {
+        cublasCreate(&handle);
+        void* ws = nullptr;
+        cudaMalloc(&ws, CUBLAS_WS_BYTES);
+        cublasSetWorkspace(handle, ws, CUBLAS_WS_BYTES);
+    }
+    return handle;
+}
+
+cublasHandle_t cublas_create_handle() {
+    cublasHandle_t h;
+    cublasCreate(&h);
+    void* ws = nullptr;
+    cudaMalloc(&ws, CUBLAS_WS_BYTES);
+    cublasSetWorkspace(h, ws, CUBLAS_WS_BYTES);
+    return h;
+}
+
+void cublas_set_override(cublasHandle_t h) {
+    cublas_override_handle = h;
+}
+
 static inline void cublasGemmExDense(
         cublasOperation_t op_a, cublasOperation_t op_b,
         int M, int N, int K, void* A, void* B, void* C,
@@ -250,14 +225,7 @@ static inline void cublasGemmExDense(
     int lda = (op_a == CUBLAS_OP_N) ? K : M;
     int ldb = (op_b == CUBLAS_OP_N) ? N : K;
 
-    static thread_local cublasHandle_t handle = nullptr;
-    if (!handle) {
-        cublasCreate(&handle);
-        void* workspace = nullptr;
-        cudaMalloc(&workspace, 32 * 1024 * 1024);
-        cublasSetWorkspace(handle, workspace, 32 * 1024 * 1024);
-    }
-
+    cublasHandle_t handle = cublas_get_handle();
     cublasSetStream(handle, stream);
     cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
         B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
@@ -352,7 +320,7 @@ __global__ void uniform_scale_kernel(float* data, float bound, int n) {
     if (idx < n) data[idx] = data[idx] * 2.0f * bound - bound;
 }
 
-// Kaiming uniform: U(-1/sqrt(fan_in), 1/sqrt(fan_in)) — matches PyTorch nn.Linear / nn.Conv2d defaults
+// Uniform(-1/sqrt(fan_in), 1/sqrt(fan_in))
 void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t stream) {
     assert(ndim(dst->shape) == 2);
     long rows = dst->shape[0], cols = dst->shape[1];
@@ -371,7 +339,7 @@ void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t
     cudaFree(buf);
 }
 
-// Normal init: N(0, std) — matches PyTorch nn.Embedding default with std=1.0
+// Normal(0, std). Used for embeddings
 void puf_normal_init(PrecisionTensor* dst, float std, ulong seed, cudaStream_t stream) {
     long n = numel(dst->shape);
     assert(n > 0);

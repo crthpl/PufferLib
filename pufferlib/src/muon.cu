@@ -57,7 +57,7 @@ __global__ void nesterov_momentum_kernel(float* __restrict__ mb, precision_t* __
 
 // Fused weight update: wb = wb * (1 - lr*wd) - lr * scale * update
 __global__ void muon_weight_update_kernel(float* __restrict__ wb, const precision_t* __restrict__ update,
-                                           const float* __restrict__ lr_ptr, float wd, float scale, int n) {
+        const float* __restrict__ lr_ptr, float wd, float scale, int n) {
     float lr = *lr_ptr;
     float wd_scale = 1.0f - lr * wd;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -66,8 +66,8 @@ __global__ void muon_weight_update_kernel(float* __restrict__ wb, const precisio
     }
 }
 
-__global__ void clip_by_norm_partials_kernel(precision_t* __restrict__ dst, const float* __restrict__ sum_sq_ptr,
-                                               float max_norm, float eps, int n) {
+__global__ void clip_by_norm_partials_kernel(precision_t* __restrict__ dst,
+        const float* __restrict__ sum_sq_ptr, float max_norm, float eps, int n) {
     float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -100,9 +100,9 @@ struct Muon {
     int world_size;
 };
 
-void muon_init(Muon* m, Allocator* param_alloc,
-               double lr_val, double momentum, double eps, double weight_decay,
-               Allocator* alloc) {
+void muon_init(Muon* m, Allocator* param_alloc, double lr_val,
+        double momentum, double eps, double weight_decay,
+        Allocator* alloc) {
     m->momentum = momentum;
     m->weight_decay = weight_decay;
     m->eps = eps;
@@ -114,11 +114,11 @@ void muon_init(Muon* m, Allocator* param_alloc,
     m->world_size = 1;
     m->max_M = 0; m->max_N = 0;
     long n = param_alloc->total_elems;
-    m->lr_puf = {.shape = {1}};
+    m->lr_puf =         {.shape = {1}};
     m->lr_derived_puf = {.shape = {2}};
-    m->mb_puf = {.shape = {n}};
-    m->norm_partials = {.shape = {256}};
-    m->grad_norm_puf = {.shape = {1}};
+    m->mb_puf =         {.shape = {n}};
+    m->norm_partials =  {.shape = {256}};
+    m->grad_norm_puf =  {.shape = {1}};
     alloc_register(alloc, &m->lr_puf);
     alloc_register(alloc, &m->lr_derived_puf);
     alloc_register(alloc, &m->mb_puf);
@@ -135,9 +135,9 @@ void muon_init(Muon* m, Allocator* param_alloc,
     }
     if (max_M > 0) {
         m->max_M = max_M; m->max_N = max_N;
-        m->gram = {.shape = {max_M, max_M}};
-        m->gram_buf = {.shape = {max_M, max_M}};
-        m->x_buf = {.shape = {max_M, max_N}};
+        m->gram =        {.shape = {max_M, max_M}};
+        m->gram_buf =    {.shape = {max_M, max_M}};
+        m->x_buf =       {.shape = {max_M, max_N}};
         m->ns_norm_puf = {.shape = {1}};
         alloc_register(alloc, &m->gram);
         alloc_register(alloc, &m->gram_buf);
