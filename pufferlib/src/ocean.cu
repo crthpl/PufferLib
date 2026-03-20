@@ -86,6 +86,27 @@ __global__ void n3_relu_backward_kernel(
 }
 
 
+__global__ void bias_grad_kernel(
+    precision_t* __restrict__ bgrad, const precision_t* __restrict__ grad, int N, int dim) {
+    int d = blockIdx.x;
+    if (d >= dim) return;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < N; i += blockDim.x)
+        sum += to_float(grad[i * dim + d]);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    __shared__ float sdata[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) sdata[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = (lane < (blockDim.x + 31) / 32) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) bgrad[d] = from_float(sum);
+    }
+}
+
 // NCHW bias grad: sum over (B, OH, OW) for each OC channel
 __global__ void n3_conv_bias_grad_nchw(
     precision_t* __restrict__ bgrad, const precision_t* __restrict__ grad,
@@ -556,8 +577,13 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
     }
 }
 
-static void* alloc_encoder_activations(const Encoder& enc) {
-    return (enc.forward == nmmo3_encoder_forward)
-        ? calloc(1, sizeof(NMMO3EncoderActivations))
-        : calloc(1, sizeof(EncoderActivations));
+// Override default EncoderActivations for known ocean environments. No-op for unknown envs.
+static void alloc_custom_encoder_activations(const std::string& env_name,
+        PolicyActivations* activations, int count) {
+    if (env_name == "puffer_nmmo3") {
+        for (int i = 0; i < count; i++) {
+            free(activations[i].encoder);
+            activations[i].encoder = calloc(1, sizeof(NMMO3EncoderActivations));
+        }
+    }
 }
