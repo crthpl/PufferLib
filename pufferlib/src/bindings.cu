@@ -453,10 +453,6 @@ PYBIND11_MODULE(_C, m) {
         .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const PrecisionTensor& t) { return ndim(t.shape); })
         .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); });
-    py::class_<DoubleTensor>(m, "DoubleTensor")
-        .def("__repr__", [](const DoubleTensor& t) { return std::string(puf_repr(&t)); })
-        .def("ndim", [](const DoubleTensor& t) { return ndim(t.shape); })
-        .def("numel", [](const DoubleTensor& t) { return numel(t.shape); });
     py::class_<FloatTensor>(m, "FloatTensor")
         .def("__repr__", [](const FloatTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const FloatTensor& t) { return ndim(t.shape); })

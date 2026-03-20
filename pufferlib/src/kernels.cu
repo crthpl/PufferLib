@@ -138,18 +138,6 @@ __global__ void transpose_102(precision_t* __restrict__ dst,
     dst[b * A * C + a * C + c] = src[idx];
 }
 
-// This exists for actions (currently fp64)
-__global__ void transpose_102(double* __restrict__ dst,
-        const double* __restrict__ src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
-    }
-    int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
-}
-
 __global__ void fill_precision_kernel(precision_t* __restrict__ dst, precision_t val, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -245,10 +233,6 @@ static inline const char* _puf_repr_impl(const char* name, const char* dtype,
 }
 inline const char* puf_repr(const PrecisionTensor* t) {
     return _puf_repr_impl("PrecisionTensor", USE_BF16 ? "bf16" : "f32",
-        t->shape, ndim(t->shape), numel(t->shape), !t->data);
-}
-inline const char* puf_repr(const DoubleTensor* t) {
-    return _puf_repr_impl("DoubleTensor", "f64",
         t->shape, ndim(t->shape), numel(t->shape), !t->data);
 }
 inline const char* puf_repr(const FloatTensor* t) {
@@ -430,9 +414,6 @@ void alloc_register(Allocator* a, PrecisionTensor* t) {
 }
 void alloc_register(Allocator* a, FloatTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(float));
-}
-void alloc_register(Allocator* a, DoubleTensor* t) {
-    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(double));
 }
 void alloc_register(Allocator* a, LongTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(long));

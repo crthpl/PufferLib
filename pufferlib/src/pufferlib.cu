@@ -16,7 +16,7 @@ enum LossIdx {
 
 struct RolloutBuf {
     PrecisionTensor observations;  // (horizon, segments, input_size)
-    DoubleTensor actions;          // (horizon, segments, num_atns)
+    PrecisionTensor actions;       // (horizon, segments, num_atns)
     PrecisionTensor values;        // (horizon, segments)
     PrecisionTensor logprobs;      // (horizon, segments)
     PrecisionTensor rewards;       // (horizon, segments)
@@ -49,7 +49,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, 
 struct TrainGraph {
     PrecisionTensor mb_obs;         // (S, H, input_size)
     PrecisionTensor mb_state;       // (L, S, 1, hidden)
-    DoubleTensor mb_actions;        // (S, H, num_atns)
+    PrecisionTensor mb_actions;     // (S, H, num_atns)
     PrecisionTensor mb_logprobs;    // (S, H)
     FloatTensor mb_advantages;      // (S, H) f32
     PrecisionTensor mb_prio;        // (S, 1)
@@ -62,7 +62,7 @@ struct TrainGraph {
 struct PPOGraphArgs {
     precision_t* out_ratio;
     precision_t* out_newvalue;
-    const double* actions;
+    const precision_t* actions;
     const precision_t* old_logprobs;
     const float* advantages;
     const precision_t* prio;
@@ -90,7 +90,7 @@ struct PPOKernelArgs {
 
 struct PPOBuffersPuf {
     FloatTensor loss_output, grad_loss;
-    DoubleTensor saved_for_bwd;
+    FloatTensor saved_for_bwd;
     FloatTensor grad_logits, grad_values, grad_logstd, adv_scratch;
 };
 
@@ -179,19 +179,10 @@ inline PrecisionTensor puf_slice(PrecisionTensor& p, int t, int start, int count
         return {.data = p.data + (t*S + start), .shape = {count}};
     }
 }
-inline DoubleTensor puf_slice(DoubleTensor& p, int t, int start, int count) {
-    if (ndim(p.shape) == 3) {
-        long S = p.shape[1], F = p.shape[2];
-        return {.data = p.data + (t*S + start)*F, .shape = {count, F}};
-    } else {
-        long S = p.shape[1];
-        return {.data = p.data + (t*S + start), .shape = {count}};
-    }
-}
 
 struct EnvBuf {
     OBS_TENSOR_T obs;     // (total_agents, obs_size) — type defined per-env in binding.c
-    DoubleTensor actions; // (total_agents, num_atns) f64
+    FloatTensor actions; // (total_agents, num_atns) f64
     FloatTensor rewards;  // (total_agents,) f32
     FloatTensor terminals;// (total_agents,) f32
 };
@@ -204,7 +195,7 @@ StaticVec* create_environments(int num_buffers, int total_agents,
         .shape = {total_agents, get_obs_size()},
     };
     env.actions = {
-        .data = (double*)vec->gpu_actions,
+        .data = (float*)vec->gpu_actions,
         .shape = {total_agents, get_num_atns()},
     };
     env.rewards = {
@@ -386,7 +377,7 @@ __global__ void sample_logits_kernel(
     PrecisionTensor dec_out,              // (B, fused_cols) fused logits+value from decoder
     PrecisionTensor logstd_puf,           // (1, od) log std for continuous, or empty
     IntTensor act_sizes_puf,              // (num_atns,) action head sizes
-    double* __restrict__ actions,         // (B, num_atns) output
+    precision_t* __restrict__ actions,    // (B, num_atns) output
     precision_t* __restrict__ logprobs,   // (B,) output
     precision_t* __restrict__ value_out,  // (B,) output
     uint64_t seed,
@@ -437,7 +428,7 @@ __global__ void sample_logits_kernel(
             float normalized = (action - mean) / std;
             float log_prob = -0.5f * normalized * normalized - 0.5f * LOG_2PI - log_std;
 
-            actions[idx * num_atns + h] = double(action);
+            actions[idx * num_atns + h] = from_float(action);
             total_log_prob += log_prob;
         }
     } else {
@@ -508,7 +499,7 @@ __global__ void sample_logits_kernel(
             float log_prob = sampled_logit - logsumexp;
 
             // Write action for this head
-            actions[idx * num_atns + h] = double(sampled_action);
+            actions[idx * num_atns + h] = from_float(sampled_action);
             total_log_prob += log_prob;
 
             // Advance to next action head
@@ -578,7 +569,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PrecisionTensor dec_puf = policy_forward(&pufferl->policy, pufferl->weights, pufferl->buffer_activations[buf], obs_dst, state_puf, stream);
 
     // Sample actions, logprobs, values into rollout buffer
-    DoubleTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
+    PrecisionTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
     PrecisionTensor lp_slice = puf_slice(rollouts.logprobs, t, start, block_size);
     PrecisionTensor val_slice = puf_slice(rollouts.values, t, start, block_size);
 
@@ -598,9 +589,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
 
     // Copy actions to env
     long act_cols = env.actions.shape[1];
-    cudaMemcpyAsync(
-        env.actions.data + start * act_cols,
-        act_slice.data, numel(act_slice.shape) * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+    cast_kernel<<<grid_size(numel(act_slice.shape)), BLOCK_SIZE, 0, stream>>>(
+            env.actions.data + start * act_cols, act_slice.data, numel(act_slice.shape));
 
     if (capturing) {
         cudagraph_capture_end(&pufferl->fused_rollout_cudagraphs[graph], cap_stream_raw);
@@ -1301,7 +1291,7 @@ __global__ void select_copy_kernel(
 
     // Compute row byte counts from tensor shapes
     int obs_row_bytes = (numel(rollouts.observations.shape) / rollouts.observations.shape[0]) * sizeof(precision_t);
-    int act_row_bytes = (numel(rollouts.actions.shape) / rollouts.actions.shape[0]) * sizeof(double);
+    int act_row_bytes = (numel(rollouts.actions.shape) / rollouts.actions.shape[0]) * sizeof(precision_t);
     int lp_row_bytes = (numel(rollouts.logprobs.shape) / rollouts.logprobs.shape[0]) * sizeof(precision_t);
     int horizon = rollouts.values.shape[1];
 
