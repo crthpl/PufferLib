@@ -14,27 +14,31 @@ enum LossIdx {
     LOSS_N = 7, NUM_LOSSES = 8,
 };
 
+// Data collected by parallel environment workers. Each worker handles
+// a constant subset of agents 
 struct RolloutBuf {
-    PrecisionTensor observations;  // (horizon, segments, input_size)
-    PrecisionTensor actions;       // (horizon, segments, num_atns)
-    PrecisionTensor values;        // (horizon, segments)
-    PrecisionTensor logprobs;      // (horizon, segments)
-    PrecisionTensor rewards;       // (horizon, segments)
-    PrecisionTensor terminals;     // (horizon, segments)
-    PrecisionTensor ratio;         // (horizon, segments)
-    PrecisionTensor importance;    // (horizon, segments)
+    PrecisionTensor observations;  // (horizon, agents, input_size)
+    PrecisionTensor actions;       // (horizon, agents, num_atns)
+    PrecisionTensor values;        // (horizon, agents) - all other tensors
+    PrecisionTensor logprobs;
+    PrecisionTensor rewards;
+    PrecisionTensor terminals;
+    PrecisionTensor ratio;
+    PrecisionTensor importance;
 };
 
-void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, int input_size, int num_atns) {
+// Buffers are initialized as raw structs with only shape information. alloc_register
+// stores the shape and data pointer. Memory is only allocated after all buffers are registered.
+void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc,int T, int B, int input_size, int num_atns) {
     bufs = (RolloutBuf){
-        .observations = {.shape = {H, S, input_size}},
-        .actions = {.shape = {H, S, num_atns}},
-        .values = {.shape = {H, S}},
-        .logprobs = {.shape = {H, S}},
-        .rewards = {.shape = {H, S}},
-        .terminals = {.shape = {H, S}},
-        .ratio = {.shape = {H, S}},
-        .importance = {.shape = {H, S}},
+        .observations = {.shape = {T, B, input_size}},
+        .actions      = {.shape = {T, B, num_atns}},
+        .values       = {.shape = {T, B}},
+        .logprobs     = {.shape = {T, B}},
+        .rewards      = {.shape = {T, B}},
+        .terminals    = {.shape = {T, B}},
+        .ratio        = {.shape = {T, B}},
+        .importance   = {.shape = {T, B}},
     };
     alloc_register(alloc, &bufs.observations);
     alloc_register(alloc, &bufs.actions);
@@ -46,17 +50,20 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, 
     alloc_register(alloc, &bufs.importance);
 }
 
+// Train data layout is transposed to (B, T) from rollouts layout (T, B)
+// This allows env workers to collect data with contiguous writes and
+// training to perform several (though not all) ops in contiguous memory
 struct TrainGraph {
-    PrecisionTensor mb_obs;         // (S, H, input_size)
-    PrecisionTensor mb_state;       // (L, S, 1, hidden)
-    PrecisionTensor mb_actions;     // (S, H, num_atns)
-    PrecisionTensor mb_logprobs;    // (S, H)
-    FloatTensor mb_advantages;      // (S, H) f32
-    PrecisionTensor mb_prio;        // (S, 1)
-    PrecisionTensor mb_values;      // (S, H)
-    PrecisionTensor mb_returns;     // (S, H)
-    PrecisionTensor mb_ratio;       // (S, H)
-    PrecisionTensor mb_newvalue;    // (S, H, 1)
+    PrecisionTensor mb_obs;         // (B, T, input_size)
+    PrecisionTensor mb_state;       // (layers, B, 1, hidden)
+    PrecisionTensor mb_actions;     // (B, T, num_atns)
+    PrecisionTensor mb_logprobs;    // (B, T)
+    PrecisionTensor mb_advantages;  // (B, T)
+    PrecisionTensor mb_prio;        // (B, T)
+    PrecisionTensor mb_values;      // (B, T)
+    PrecisionTensor mb_returns;     // (B, T)
+    PrecisionTensor mb_ratio;       // (B, T)
+    PrecisionTensor mb_newvalue;    // (B, T, 1)
 };
 
 struct PPOGraphArgs {
@@ -64,7 +71,7 @@ struct PPOGraphArgs {
     precision_t* out_newvalue;
     const precision_t* actions;
     const precision_t* old_logprobs;
-    const float* advantages;
+    const precision_t* advantages;
     const precision_t* prio;
     const precision_t* values;
     const precision_t* returns;
@@ -300,7 +307,7 @@ typedef struct {
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
     TrainGraph train_buf;
-    FloatTensor advantages_puf;  // Pre-allocated for train_impl (S, H) f32
+    PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (S, H)
     cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon][num_buffers]
     cudaGraphExec_t train_cudagraph;
     cudaStream_t* streams;  // per-buffer raw CUDA streams
@@ -696,7 +703,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     // --- Shared computation (used by both forward and backward) ---
 
     float old_logp = to_float(g.old_logprobs[nt]);
-    float adv = float(g.advantages[nt]);
+    float adv = to_float(g.advantages[nt]);
     float w = to_float(g.prio[n]);
     float val = to_float(g.values[nt]);
     float ret = to_float(g.returns[nt]);
@@ -880,13 +887,13 @@ __global__ void ppo_loss_reduce_kernel(
     }
 }
 
-__global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict__ var_out,
+__global__ void var_mean_kernel(const precision_t* __restrict__ src, float* __restrict__ var_out,
         float* __restrict__ mean_out, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
-        sum += src[i];
+        sum += to_float(src[i]);
     }
     sdata[tid] = sum;
     __syncthreads();
@@ -903,7 +910,7 @@ __global__ void var_mean_kernel(const float* __restrict__ src, float* __restrict
     __syncthreads();
     float ss = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
-        float d = src[i] - mean;
+        float d = to_float(src[i]) - mean;
         ss += d * d;
     }
     sdata[tid] = ss;
@@ -994,7 +1001,7 @@ void ppo_loss_fwd_bwd(
 #define PRIO_BLOCK_SIZE 256
 #define PRIO_NUM_WARPS (PRIO_BLOCK_SIZE / PRIO_WARP_SIZE)
 __global__ void compute_prio_adv_reduction(
-    const float* __restrict__ advantages,
+    const precision_t* __restrict__ advantages,
     float* prio_weights,
     float prio_alpha,
     int stride
@@ -1005,7 +1012,7 @@ __global__ void compute_prio_adv_reduction(
 
     float local_sum = 0.0f;
     for (int t = tx; t < stride; t += blockDim.x) {
-        local_sum += fabsf(advantages[offset + t]);
+        local_sum += fabsf(to_float(advantages[offset + t]));
     }
 
     for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
@@ -1112,7 +1119,7 @@ __global__ void multinomial_with_replacement_kernel(
     }
 }
 
-void prio_replay_cuda(FloatTensor& advantages, float prio_alpha,
+void prio_replay_cuda(PrecisionTensor& advantages, float prio_alpha,
         int minibatch_segments, int total_agents, float anneal_beta,
         PrioBuffers& bufs, ulong seed, long* offset_ptr, cudaStream_t stream) {
     int S = advantages.shape[0], T = advantages.shape[1];
@@ -1132,7 +1139,7 @@ void prio_replay_cuda(FloatTensor& advantages, float prio_alpha,
 
 __device__ void puff_advantage_row_scalar(
     const precision_t* values, const precision_t* rewards, const precision_t* dones,
-    const precision_t* importance, float* advantages, float gamma, float lambda,
+    const precision_t* importance, precision_t* advantages, float gamma, float lambda,
     float rho_clip, float c_clip, int horizon
 ) {
     float lastpufferlam = 0;
@@ -1147,7 +1154,7 @@ __device__ void puff_advantage_row_scalar(
         float v_nxt = to_float(values[t_next]);
         float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
-        advantages[t] = lastpufferlam;
+        advantages[t] = from_float(lastpufferlam);
     }
 }
 
@@ -1165,9 +1172,22 @@ __device__ __forceinline__ void adv_vec_load(const __nv_bfloat16* ptr, float* ou
     }
 }
 
+// Store N floats as precision_t via 128-bit writes (float4 for f32, uint4 for bf16)
+__device__ __forceinline__ void adv_vec_store(float* ptr, const float* vals) {
+    *reinterpret_cast<float4*>(ptr) = make_float4(vals[0], vals[1], vals[2], vals[3]);
+}
+
+__device__ __forceinline__ void adv_vec_store(__nv_bfloat16* ptr, const float* vals) {
+    // N=8 for bf16: all 8 elements fit in one uint4 (128 bits)
+    __nv_bfloat16 tmp[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) tmp[i] = __float2bfloat16(vals[i]);
+    *reinterpret_cast<uint4*>(ptr) = *reinterpret_cast<const uint4*>(tmp);
+}
+
 __device__ __forceinline__ void puff_advantage_row_vec(
     const precision_t* values, const precision_t* rewards, const precision_t* dones,
-    const precision_t* importance, float* advantages, float gamma, float lambda,
+    const precision_t* importance, precision_t* advantages, float gamma, float lambda,
     float rho_clip, float c_clip, int horizon
 ) {
     constexpr int N = 16 / sizeof(precision_t);
@@ -1204,17 +1224,12 @@ __device__ __forceinline__ void puff_advantage_row_vec(
             next_reward = r[i];
         }
 
-        *reinterpret_cast<float4*>(advantages + base) =
-            make_float4(adv[0], adv[1], adv[2], adv[3]);
-        if (N > 4) {
-            *reinterpret_cast<float4*>(advantages + base + 4) =
-                make_float4(adv[4], adv[5], adv[6], adv[7]);
-        }
+        adv_vec_store(advantages + base, adv);
     }
 }
 
 __global__ void puff_advantage_kernel(const precision_t* values, const precision_t* rewards,
-        const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
+        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
     if (row >= num_steps) {
@@ -1226,7 +1241,7 @@ __global__ void puff_advantage_kernel(const precision_t* values, const precision
 }
 
 __global__ void puff_advantage_kernel_scalar(const precision_t* values, const precision_t* rewards,
-        const precision_t* dones, const precision_t* importance, float* advantages, float gamma,
+        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
     if (row >= num_steps) {
@@ -1238,7 +1253,7 @@ __global__ void puff_advantage_kernel_scalar(const precision_t* values, const pr
 }
 
 void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
-        PrecisionTensor& dones, PrecisionTensor& importance, FloatTensor& advantages,
+        PrecisionTensor& dones, PrecisionTensor& importance, PrecisionTensor& advantages,
         float gamma, float lambda, float rho_clip, float c_clip, cudaStream_t stream) {
     int num_steps = values.shape[0], horizon = values.shape[1];
     int blocks = grid_size(num_steps);
@@ -1260,30 +1275,30 @@ __global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restr
 
 __device__ __forceinline__ void copy_values_adv_returns(
     const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
-    const float* __restrict__ src_advantages, float* __restrict__ dst_advantages,
+    const precision_t* __restrict__ src_advantages, precision_t* __restrict__ dst_advantages,
     precision_t* __restrict__ dst_returns,
     int src_row, int dst_row, int horizon
 ) {
     int srh = (int64_t)src_row * horizon;
     int drh = (int64_t)dst_row * horizon;
     const precision_t* s_values = src_values + srh;
-    const float* s_adv = src_advantages + srh;
+    const precision_t* s_adv = src_advantages + srh;
     precision_t* d_values = dst_values + drh;
-    float* d_adv = dst_advantages + drh;
+    precision_t* d_adv = dst_advantages + drh;
     precision_t* d_returns = dst_returns + drh;
     for (int i = threadIdx.x; i < horizon; i += blockDim.x) {
         precision_t val = s_values[i];
-        float adv = s_adv[i];
+        precision_t adv = s_adv[i];
         d_values[i] = val;
         d_adv[i] = adv;
-        d_returns[i] = from_float(to_float(val) + adv);
+        d_returns[i] = from_float(to_float(val) + to_float(adv));
     }
 }
 
 __global__ void select_copy_kernel(
     RolloutBuf rollouts, TrainGraph graph,
     const int64_t* __restrict__ idx,
-    const float* __restrict__ advantages, const float* __restrict__ mb_prio
+    const precision_t* __restrict__ advantages, const float* __restrict__ mb_prio
 ) {
     int mb = blockIdx.x;
     int ch = blockIdx.y;
@@ -1364,7 +1379,7 @@ void train_impl(PuffeRL& pufferl) {
         rollouts.ratio.data, from_float(1.0f), numel(rollouts.ratio.shape));
 
     // Zero pre-allocated advantages buffer
-    FloatTensor& advantages_puf = pufferl.advantages_puf;
+    PrecisionTensor& advantages_puf = pufferl.advantages_puf;
 
     // Inline any of these only used once
     int minibatch_size = hypers.minibatch_size;

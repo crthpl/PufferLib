@@ -218,7 +218,7 @@ void py_puff_advantage(
     kernel<<<blocks, 256>>>(
         (const precision_t*)values_ptr, (const precision_t*)rewards_ptr,
         (const precision_t*)dones_ptr,  (const precision_t*)importance_ptr,
-        (float*)advantages_ptr,
+        (precision_t*)advantages_ptr,
         gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
