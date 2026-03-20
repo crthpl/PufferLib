@@ -8,7 +8,6 @@
 #include "muon.cu"
 #include "vecenv.h"
 
-// Loss component indices
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
@@ -26,6 +25,27 @@ struct RolloutBuf {
     PrecisionTensor importance;    // (horizon, segments)
 };
 
+void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, int input_size, int num_atns) {
+    bufs = (RolloutBuf){
+        .observations = {.shape = {H, S, input_size}},
+        .actions = {.shape = {H, S, num_atns}},
+        .values = {.shape = {H, S}},
+        .logprobs = {.shape = {H, S}},
+        .rewards = {.shape = {H, S}},
+        .terminals = {.shape = {H, S}},
+        .ratio = {.shape = {H, S}},
+        .importance = {.shape = {H, S}},
+    };
+    alloc_register(alloc, &bufs.observations);
+    alloc_register(alloc, &bufs.actions);
+    alloc_register(alloc, &bufs.values);
+    alloc_register(alloc, &bufs.logprobs);
+    alloc_register(alloc, &bufs.rewards);
+    alloc_register(alloc, &bufs.terminals);
+    alloc_register(alloc, &bufs.ratio);
+    alloc_register(alloc, &bufs.importance);
+}
+
 struct TrainGraph {
     PrecisionTensor mb_obs;         // (S, H, input_size)
     PrecisionTensor mb_state;       // (L, S, 1, hidden)
@@ -39,8 +59,6 @@ struct TrainGraph {
     PrecisionTensor mb_newvalue;    // (S, H, 1)
 };
 
-// Fused PPO forward + backward kernel: computes loss partials AND gradients in one pass.
-// Avoids redundant recomputation of logits, logsumexp, ratio, advantage normalization.
 struct PPOGraphArgs {
     precision_t* out_ratio;
     precision_t* out_newvalue;
@@ -53,18 +71,15 @@ struct PPOGraphArgs {
 };
 
 struct PPOKernelArgs {
-    // Gradient outputs
-    float* grad_logits;          // For continuous: grad_mean
-    float* grad_logstd;          // For continuous: grad_logstd (nullptr for discrete)
+    float* grad_logits;
+    float* grad_logstd; // For continuous actions
     float* grad_values_pred;
-    // Inputs (from dec_out)
     const precision_t* logits;
-    const precision_t* logstd;   // nullptr for discrete
+    const precision_t* logstd; // Continuous only
     const precision_t* values_pred;
     const float* adv_mean;
     const float* adv_var;
     const int* act_sizes;
-    // Scalars
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef, ent_coef;
     int T_seq, A_total, N;
@@ -73,31 +88,11 @@ struct PPOKernelArgs {
     bool is_continuous;
 };
 
-// Pre-allocated buffers for PPO loss
 struct PPOBuffersPuf {
     FloatTensor loss_output, grad_loss;
     DoubleTensor saved_for_bwd;
     FloatTensor grad_logits, grad_values, grad_logstd, adv_scratch;
 };
-
-// Pre-allocated buffers for prio_replay
-struct PrioBuffers {
-    FloatTensor prio_probs, cdf, mb_prio;
-    LongTensor idx;
-};
-
-void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minibatch_segments) {
-    bufs = (PrioBuffers){
-        .prio_probs = {.shape = {S}},
-        .cdf = {.shape = {S}},
-        .mb_prio = {.shape = {minibatch_segments, 1}},
-        .idx = {.shape = {minibatch_segments}},
-    };
-    alloc_register(alloc, &bufs.prio_probs);
-    alloc_register(alloc, &bufs.cdf);
-    alloc_register(alloc, &bufs.idx);
-    alloc_register(alloc, &bufs.mb_prio);
-}
 
 void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
     long total = (long)N * T;
@@ -119,25 +114,24 @@ void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, i
     alloc_register(alloc, &bufs.adv_scratch);
 }
 
-void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int H, int S, int input_size, int num_atns) {
-    bufs = (RolloutBuf){
-        .observations = {.shape = {H, S, input_size}},
-        .actions = {.shape = {H, S, num_atns}},
-        .values = {.shape = {H, S}},
-        .logprobs = {.shape = {H, S}},
-        .rewards = {.shape = {H, S}},
-        .terminals = {.shape = {H, S}},
-        .ratio = {.shape = {H, S}},
-        .importance = {.shape = {H, S}},
+// Prioritized replay over single-epoch data. These kernels are
+// the least cleaned because we will likely have a better method in 5.0
+struct PrioBuffers {
+    FloatTensor prio_probs, cdf, mb_prio;
+    LongTensor idx;
+};
+
+void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minibatch_segments) {
+    bufs = (PrioBuffers){
+        .prio_probs = {.shape = {S}},
+        .cdf = {.shape = {S}},
+        .mb_prio = {.shape = {minibatch_segments, 1}},
+        .idx = {.shape = {minibatch_segments}},
     };
-    alloc_register(alloc, &bufs.observations);
-    alloc_register(alloc, &bufs.actions);
-    alloc_register(alloc, &bufs.values);
-    alloc_register(alloc, &bufs.logprobs);
-    alloc_register(alloc, &bufs.rewards);
-    alloc_register(alloc, &bufs.terminals);
-    alloc_register(alloc, &bufs.ratio);
-    alloc_register(alloc, &bufs.importance);
+    alloc_register(alloc, &bufs.prio_probs);
+    alloc_register(alloc, &bufs.cdf);
+    alloc_register(alloc, &bufs.idx);
+    alloc_register(alloc, &bufs.mb_prio);
 }
 
 void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int S, int H, int input_size,
