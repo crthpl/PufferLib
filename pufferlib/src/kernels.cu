@@ -188,13 +188,7 @@ inline PrecisionTensor* puf_unsqueeze(PrecisionTensor* t, int dim, int64_t d0, i
 // Strides derived from M, N, K assuming tightly packed row-major storage.
 static const size_t CUBLAS_WS_BYTES = 32 * 1024 * 1024;
 
-// Override handle for cudagraph capture (nullptr = use thread-local default)
-static thread_local cublasHandle_t cublas_override_handle = nullptr;
-
 static cublasHandle_t cublas_get_handle() {
-    if (cublas_override_handle) {
-        return cublas_override_handle;
-    }
     static thread_local cublasHandle_t handle = nullptr;
     if (!handle) {
         cublasCreate(&handle);
@@ -203,19 +197,6 @@ static cublasHandle_t cublas_get_handle() {
         cublasSetWorkspace(handle, ws, CUBLAS_WS_BYTES);
     }
     return handle;
-}
-
-cublasHandle_t cublas_create_handle() {
-    cublasHandle_t h;
-    cublasCreate(&h);
-    void* ws = nullptr;
-    cudaMalloc(&ws, CUBLAS_WS_BYTES);
-    cublasSetWorkspace(h, ws, CUBLAS_WS_BYTES);
-    return h;
-}
-
-void cublas_set_override(cublasHandle_t h) {
-    cublas_override_handle = h;
 }
 
 static inline void cublasGemmExDense(

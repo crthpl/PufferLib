@@ -326,8 +326,6 @@ typedef struct {
     bool rollout_captured;
     bool train_captured;
     ulong seed;
-    cublasHandle_t* cublas_buf_handles;  // per-buffer cuBLAS handles baked into rollout cudagraphs
-    int num_cublas_buf_handles;
     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
 } PuffeRL;
 
@@ -1705,23 +1703,14 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaStreamCreate(&warmup_stream);
         pufferl->default_stream = warmup_stream;
 
-        // Create per-buffer cuBLAS handles for deterministic parallel graph replay.
-        pufferl->cublas_buf_handles = (cublasHandle_t*)calloc(num_buffers, sizeof(cublasHandle_t));
-        pufferl->num_cublas_buf_handles = num_buffers;
-        for (int i = 0; i < num_buffers; i++) {
-            pufferl->cublas_buf_handles[i] = cublas_create_handle();
-        }
-
         for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
             for (int i = 0; i < num_buffers * horizon; ++i) {
                 int buf = i % num_buffers;
                 tl_stream = pufferl->streams[buf];
-                cublas_set_override(pufferl->cublas_buf_handles[buf]);
                 net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
                 cudaDeviceSynchronize();
             }
         }
-        cublas_set_override(nullptr);
         pufferl->rollout_captured = true;
 
         tl_stream = warmup_stream;
@@ -1808,11 +1797,6 @@ void close_impl(PuffeRL& pufferl) {
     if (USE_BF16) {
         cudaFree(pufferl.master_weights.data);
     }
-
-    for (int i = 0; i < pufferl.num_cublas_buf_handles; i++) {
-        cublasDestroy(pufferl.cublas_buf_handles[i]);
-    }
-    free(pufferl.cublas_buf_handles);
 
     alloc_free(&pufferl.params_alloc);
     alloc_free(&pufferl.grads_alloc);
