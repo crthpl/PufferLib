@@ -218,7 +218,7 @@ void py_puff_advantage(
     kernel<<<blocks, 256>>>(
         (const precision_t*)values_ptr, (const precision_t*)rewards_ptr,
         (const precision_t*)dones_ptr,  (const precision_t*)importance_ptr,
-        (float*)advantages_ptr,
+        (precision_t*)advantages_ptr,
         gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
@@ -453,10 +453,6 @@ PYBIND11_MODULE(_C, m) {
         .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const PrecisionTensor& t) { return ndim(t.shape); })
         .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); });
-    py::class_<DoubleTensor>(m, "DoubleTensor")
-        .def("__repr__", [](const DoubleTensor& t) { return std::string(puf_repr(&t)); })
-        .def("ndim", [](const DoubleTensor& t) { return ndim(t.shape); })
-        .def("numel", [](const DoubleTensor& t) { return numel(t.shape); });
     py::class_<FloatTensor>(m, "FloatTensor")
         .def("__repr__", [](const FloatTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const FloatTensor& t) { return ndim(t.shape); })

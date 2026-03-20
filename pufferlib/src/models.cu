@@ -523,7 +523,7 @@ static void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         .data = dw->weight.data,
         .shape = {dw->output_dim + 1, dw->hidden_dim},
     };
-    puf_kaiming_init(&wt, 0.01f, (*seed)++, stream);
+    puf_kaiming_init(&wt, 1.0f, (*seed)++, stream);
     cudaMemsetAsync(dw->bias.data, 0, numel(dw->bias.shape) * sizeof(precision_t), stream);
 }
 

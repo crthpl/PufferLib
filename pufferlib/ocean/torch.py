@@ -72,26 +72,43 @@ class NMMO3(nn.Module):
         self.multihot_dim = self.factors.sum()
         self.is_continuous = False
 
+        #self.map_2d = nn.Sequential(
+        #    pufferlib.pytorch.layer_init(nn.Conv2d(self.multihot_dim, 128, 5, stride=3)),
+        #    nn.ReLU(),
+        #    pufferlib.pytorch.layer_init(nn.Conv2d(128, 128, 3, stride=1)),
+        #    nn.Flatten(),
+        #)
+
         self.map_2d = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Conv2d(self.multihot_dim, 128, 5, stride=3)),
+            nn.Conv2d(self.multihot_dim, 128, 5, stride=3),
             nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(128, 128, 3, stride=1)),
+            nn.Conv2d(128, 128, 3, stride=1),
             nn.Flatten(),
         )
+
 
         self.player_discrete_encoder = nn.Sequential(
             nn.Embedding(128, 32),
             nn.Flatten(),
         )
+
+        #self.proj = nn.Sequential(
+        #    pufferlib.pytorch.layer_init(nn.Linear(1817, hidden_size)),
+        #    nn.ReLU(),
+        #)
+
         self.proj = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(1817, hidden_size)),
+            nn.Linear(1817, hidden_size),
             nn.ReLU(),
         )
 
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        self.actor = pufferlib.pytorch.layer_init(
-            nn.Linear(output_size, self.num_actions), std=0.01)
-        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(output_size, 1), std=1)
+        #self.layer_norm = nn.LayerNorm(hidden_size)
+        #self.actor = pufferlib.pytorch.layer_init(
+        #    nn.Linear(output_size, self.num_actions), std=0.01)
+        #self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(output_size, 1), std=0.01)
+
+        self.actor = nn.Linear(output_size, self.num_actions)
+        self.value_fn = nn.Linear(output_size, 1)
 
     def forward(self, x, state=None):
         hidden = self.encode_observations(x)
@@ -120,7 +137,7 @@ class NMMO3(nn.Module):
         return obs
 
     def decode_actions(self, flat_hidden):
-        flat_hidden = self.layer_norm(flat_hidden)
+        #flat_hidden = self.layer_norm(flat_hidden)
         action = self.actor(flat_hidden)
         value = self.value_fn(flat_hidden)
         return action, value

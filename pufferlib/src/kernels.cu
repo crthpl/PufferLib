@@ -26,7 +26,7 @@ typedef __nv_bfloat16 precision_t;
 constexpr bool USE_BF16 = true;
 constexpr int PRECISION_SIZE = 2;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
-static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F_FAST_16BF;
+static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F; // Note: fast bf16 is not deterministic
 #define NCCL_PRECISION ncclBfloat16
 #define to_float(x) __bfloat162float(x)
 #define from_float(x) __float2bfloat16(x)
@@ -138,18 +138,6 @@ __global__ void transpose_102(precision_t* __restrict__ dst,
     dst[b * A * C + a * C + c] = src[idx];
 }
 
-// This exists for actions (currently fp64)
-__global__ void transpose_102(double* __restrict__ dst,
-        const double* __restrict__ src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
-    }
-    int a = idx / (B * C), rem = idx % (B * C), b = rem / C, c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
-}
-
 __global__ void fill_precision_kernel(precision_t* __restrict__ dst, precision_t val, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -245,10 +233,6 @@ static inline const char* _puf_repr_impl(const char* name, const char* dtype,
 }
 inline const char* puf_repr(const PrecisionTensor* t) {
     return _puf_repr_impl("PrecisionTensor", USE_BF16 ? "bf16" : "f32",
-        t->shape, ndim(t->shape), numel(t->shape), !t->data);
-}
-inline const char* puf_repr(const DoubleTensor* t) {
-    return _puf_repr_impl("DoubleTensor", "f64",
         t->shape, ndim(t->shape), numel(t->shape), !t->data);
 }
 inline const char* puf_repr(const FloatTensor* t) {
@@ -363,12 +347,34 @@ void puf_zero(FloatTensor* dst, cudaStream_t stream) {
     cudaMemsetAsync(dst->data, 0, numel(dst->shape) * sizeof(float), stream);
 }
 
+__global__ void uniform_scale_kernel(float* data, float bound, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] = data[idx] * 2.0f * bound - bound;
+}
+
+// Kaiming uniform: U(-1/sqrt(fan_in), 1/sqrt(fan_in)) — matches PyTorch nn.Linear / nn.Conv2d defaults
 void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t stream) {
     assert(ndim(dst->shape) == 2);
     long rows = dst->shape[0], cols = dst->shape[1];
     assert(rows > 0 && cols > 0);
     long n = rows * cols;
-    float std = gain / std::sqrt((float)cols);
+    float bound = gain / std::sqrt((float)cols);
+    float* buf;
+    cudaMalloc(&buf, n * sizeof(float));
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, seed);
+    curandGenerateUniform(gen, buf, n);
+    curandDestroyGenerator(gen);
+    uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
+    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cudaFree(buf);
+}
+
+// Normal init: N(0, std) — matches PyTorch nn.Embedding default with std=1.0
+void puf_normal_init(PrecisionTensor* dst, float std, ulong seed, cudaStream_t stream) {
+    long n = numel(dst->shape);
+    assert(n > 0);
     long rand_count = (n % 2 == 0) ? n : n + 1;
     float* buf;
     cudaMalloc(&buf, rand_count * sizeof(float));
@@ -408,9 +414,6 @@ void alloc_register(Allocator* a, PrecisionTensor* t) {
 }
 void alloc_register(Allocator* a, FloatTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(float));
-}
-void alloc_register(Allocator* a, DoubleTensor* t) {
-    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(double));
 }
 void alloc_register(Allocator* a, LongTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(long));
