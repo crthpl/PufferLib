@@ -4,9 +4,16 @@
 #include <nvml.h>
 #include <nccl.h>
 
+#include <time.h>
 #include "models.cu"
 #include "muon.cu"
 #include "vecenv.h"
+
+static double wall_clock() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
@@ -14,13 +21,36 @@ enum LossIdx {
     LOSS_N = 7, NUM_LOSSES = 8,
 };
 
+enum ProfileIdx {
+    PROF_ROLLOUT = 0,
+    PROF_EVAL_GPU,
+    PROF_EVAL_ENV,
+    PROF_TRAIN_MISC,
+    PROF_TRAIN_FORWARD,
+    NUM_PROF,
+};
+
+static const char* PROF_NAMES[NUM_PROF] = {
+    "rollout",
+    "eval_gpu",
+    "eval_env",
+    "train_misc",
+    "train_forward",
+};
+
+#define NUM_TRAIN_EVENTS 5
+typedef struct {
+    cudaEvent_t events[NUM_TRAIN_EVENTS];
+    float accum[NUM_PROF];
+} ProfileT;
+
 // Data collected by parallel environment workers. Each worker handles
 // a constant subset of agents 
 struct RolloutBuf {
     PrecisionTensor observations;  // (horizon, agents, input_size)
     PrecisionTensor actions;       // (horizon, agents, num_atns)
-    PrecisionTensor values;        // (horizon, agents) - all other tensors
-    PrecisionTensor logprobs;
+    PrecisionTensor values;        // (horizon, agents)
+    PrecisionTensor logprobs;      // ...
     PrecisionTensor rewards;
     PrecisionTensor terminals;
     PrecisionTensor ratio;
@@ -29,7 +59,7 @@ struct RolloutBuf {
 
 // Buffers are initialized as raw structs with only shape information. alloc_register
 // stores the shape and data pointer. Memory is only allocated after all buffers are registered.
-void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc,int T, int B, int input_size, int num_atns) {
+void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, int input_size, int num_atns) {
     bufs = (RolloutBuf){
         .observations = {.shape = {T, B, input_size}},
         .actions      = {.shape = {T, B, num_atns}},
@@ -54,18 +84,46 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc,int T, int B, i
 // This allows env workers to collect data with contiguous writes and
 // training to perform several (though not all) ops in contiguous memory
 struct TrainGraph {
+    PrecisionTensor mb_state;       // (layers, B, hidden)
     PrecisionTensor mb_obs;         // (B, T, input_size)
-    PrecisionTensor mb_state;       // (layers, B, 1, hidden)
     PrecisionTensor mb_actions;     // (B, T, num_atns)
     PrecisionTensor mb_logprobs;    // (B, T)
-    PrecisionTensor mb_advantages;  // (B, T)
-    PrecisionTensor mb_prio;        // (B, T)
-    PrecisionTensor mb_values;      // (B, T)
-    PrecisionTensor mb_returns;     // (B, T)
-    PrecisionTensor mb_ratio;       // (B, T)
-    PrecisionTensor mb_newvalue;    // (B, T, 1)
+    PrecisionTensor mb_advantages;  // ...
+    PrecisionTensor mb_values;
+    PrecisionTensor mb_returns;
+    PrecisionTensor mb_ratio;
+    PrecisionTensor mb_newvalue;
+    PrecisionTensor mb_prio;        // (B,)
 };
 
+void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, int input_size,
+        int hidden_size, int num_atns, int num_layers) {
+    bufs = (TrainGraph){
+        .mb_state =         {.shape = {num_layers, B, hidden_size}},
+        .mb_obs =           {.shape = {B, T, input_size}},
+        .mb_actions =       {.shape = {B, T, num_atns}},
+        .mb_logprobs =      {.shape = {B, T}},
+        .mb_advantages =    {.shape = {B, T}},
+        .mb_values =        {.shape = {B, T}},
+        .mb_returns =       {.shape = {B, T}},
+        .mb_ratio =         {.shape = {B, T}},
+        .mb_newvalue =      {.shape = {B, T}},
+        .mb_prio =          {.shape = {B}},
+    };
+    alloc_register(alloc, &bufs.mb_obs);
+    alloc_register(alloc, &bufs.mb_state);
+    alloc_register(alloc, &bufs.mb_actions);
+    alloc_register(alloc, &bufs.mb_logprobs);
+    alloc_register(alloc, &bufs.mb_advantages);
+    alloc_register(alloc, &bufs.mb_prio);
+    alloc_register(alloc, &bufs.mb_values);
+    alloc_register(alloc, &bufs.mb_returns);
+    alloc_register(alloc, &bufs.mb_ratio);
+    alloc_register(alloc, &bufs.mb_newvalue);
+}
+
+// PPO buffers + args are quite complex. We do the entire
+// forward + backwards pass for the full loss function in one kernel
 struct PPOGraphArgs {
     precision_t* out_ratio;
     precision_t* out_newvalue;
@@ -117,7 +175,9 @@ void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, i
     alloc_register(alloc, &bufs.grad_loss);
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
-    if (is_continuous) alloc_register(alloc, &bufs.grad_logstd);
+    if (is_continuous) {
+        alloc_register(alloc, &bufs.grad_logstd);
+    }
     alloc_register(alloc, &bufs.adv_scratch);
 }
 
@@ -125,14 +185,14 @@ void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, i
 // the least cleaned because we will likely have a better method in 5.0
 struct PrioBuffers {
     FloatTensor prio_probs, cdf, mb_prio;
-    LongTensor idx;
+    IntTensor idx;
 };
 
-void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minibatch_segments) {
+void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int B, int minibatch_segments) {
     bufs = (PrioBuffers){
-        .prio_probs = {.shape = {S}},
-        .cdf = {.shape = {S}},
-        .mb_prio = {.shape = {minibatch_segments, 1}},
+        .prio_probs = {.shape = {B}},
+        .cdf = {.shape = {B}},
+        .mb_prio = {.shape = {minibatch_segments}},
         .idx = {.shape = {minibatch_segments}},
     };
     alloc_register(alloc, &bufs.prio_probs);
@@ -141,57 +201,23 @@ void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc, int S, int minib
     alloc_register(alloc, &bufs.mb_prio);
 }
 
-void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int S, int H, int input_size,
-        int hidden_size, int num_atns, int num_layers) {
-    bufs = (TrainGraph){
-        .mb_obs = {.shape = {S, H, input_size}},
-        .mb_state = {.shape = {num_layers, S, 1, hidden_size}},
-        .mb_actions = {.shape = {S, H, num_atns}},
-        .mb_logprobs = {.shape = {S, H}},
-        .mb_advantages = {.shape = {S, H}},
-        .mb_prio = {.shape = {S, 1}},
-        .mb_values = {.shape = {S, H}},
-        .mb_returns = {.shape = {S, H}},
-        .mb_ratio = {.shape = {S, H}},
-        .mb_newvalue = {.shape = {S, H, 1}},
-    };
-    alloc_register(alloc, &bufs.mb_obs);
-    alloc_register(alloc, &bufs.mb_state);
-    alloc_register(alloc, &bufs.mb_actions);
-    alloc_register(alloc, &bufs.mb_logprobs);
-    alloc_register(alloc, &bufs.mb_advantages);
-    alloc_register(alloc, &bufs.mb_prio);
-    alloc_register(alloc, &bufs.mb_values);
-    alloc_register(alloc, &bufs.mb_returns);
-    alloc_register(alloc, &bufs.mb_ratio);
-    alloc_register(alloc, &bufs.mb_newvalue);
-}
-
-// CUDA graph helpers
-inline void cudagraph_capture_end(cudaGraphExec_t* exec, cudaStream_t stream) {
-    cudaGraph_t graph;
-    cudaStreamEndCapture(stream, &graph);
-    cudaGraphInstantiate(exec, graph, 0);
-    cudaGraphDestroy(graph);
-}
-
 // Slice: select dim0 index t, then narrow dim0 from start for count.
-// 3D (H, S, F) -> (count, F); 2D (H, S) -> (count,)
+// 3D (T, B, F) -> (count, F); 2D (T, B) -> (count,)
 inline PrecisionTensor puf_slice(PrecisionTensor& p, int t, int start, int count) {
     if (ndim(p.shape) == 3) {
-        long S = p.shape[1], F = p.shape[2];
-        return {.data = p.data + (t*S + start)*F, .shape = {count, F}};
+        long B = p.shape[1], F = p.shape[2];
+        return {.data = p.data + (t*B + start)*F, .shape = {count, F}};
     } else {
-        long S = p.shape[1];
-        return {.data = p.data + (t*S + start), .shape = {count}};
+        long B = p.shape[1];
+        return {.data = p.data + (t*B + start), .shape = {count}};
     }
 }
 
 struct EnvBuf {
-    OBS_TENSOR_T obs;     // (total_agents, obs_size) — type defined per-env in binding.c
-    FloatTensor actions; // (total_agents, num_atns) f64
-    FloatTensor rewards;  // (total_agents,) f32
-    FloatTensor terminals;// (total_agents,) f32
+    OBS_TENSOR_T obs;      // (total_agents, obs_size) - type defined per-env in binding.c
+    FloatTensor actions;   // (total_agents, num_atns)
+    FloatTensor rewards;   // (total_agents,)
+    FloatTensor terminals; // (total_agents,)
 };
 
 StaticVec* create_environments(int num_buffers, int total_agents,
@@ -201,18 +227,9 @@ StaticVec* create_environments(int num_buffers, int total_agents,
         .data = (decltype(env.obs.data))vec->gpu_observations,
         .shape = {total_agents, get_obs_size()},
     };
-    env.actions = {
-        .data = (float*)vec->gpu_actions,
-        .shape = {total_agents, get_num_atns()},
-    };
-    env.rewards = {
-        .data = (float*)vec->gpu_rewards,
-        .shape = {total_agents},
-    };
-    env.terminals = {
-        .data = (float*)vec->gpu_terminals,
-        .shape = {total_agents},
-    };
+    env.actions = { .data = (float*)vec->gpu_actions, .shape = {total_agents, get_num_atns()} };
+    env.rewards = { .data = (float*)vec->gpu_rewards, .shape = {total_agents} };
+    env.terminals = { .data = (float*)vec->gpu_terminals, .shape = {total_agents} };
     return vec;
 }
 
@@ -266,29 +283,6 @@ typedef struct {
     int seed;
 } HypersT;
 
-enum ProfileIdx {
-    PROF_ROLLOUT = 0,
-    PROF_EVAL_GPU,
-    PROF_EVAL_ENV,
-    PROF_TRAIN_MISC,
-    PROF_TRAIN_FORWARD,
-    NUM_PROF,
-};
-
-static const char* PROF_NAMES[NUM_PROF] = {
-    "rollout",
-    "eval_gpu",
-    "eval_env",
-    "train_misc",
-    "train_forward",
-};
-
-#define NUM_TRAIN_EVENTS 5  // preloop start/end, loop misc start, forward start/end
-typedef struct {
-    cudaEvent_t events[NUM_TRAIN_EVENTS];
-    float accum[NUM_PROF];
-} ProfileT;
-
 typedef struct {
     Policy policy;
     PolicyWeights weights;       // current precision_t weights (structured)
@@ -307,7 +301,7 @@ typedef struct {
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
     TrainGraph train_buf;
-    PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (S, H)
+    PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (B, T)
     cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon][num_buffers]
     cudaGraphExec_t train_cudagraph;
     cudaStream_t* streams;  // per-buffer raw CUDA streams
@@ -362,34 +356,16 @@ extern "C" void thread_init_wrapper(void* ctx, int buf) {
     tl_stream = pufferl->streams[buf];
 }
 
-// ============================================================================
-// Fused sample_logits kernel: nan_to_num + log_softmax + multinomial + gather + value copy
-// Inference-only (no gradients needed)
-// Uses inline cuRAND to avoid separate torch::rand() kernel launch
-//
-// NOTE: This kernel supports strided (non-contiguous) logits/value input.
-// This is needed for fused logit+value decoder output where logits is a view
-// of a larger (B, V+A) tensor. The stride parameters handle this case
-// to avoid .contiguous() kernel launches.
-// ============================================================================
-
-// Single kernel that handles both discrete and continuous action sampling
-// Discrete: nan_to_num, log_softmax, multinomial sampling, logprob gather, value copy
-// Continuous: sample from Normal(mean, exp(logstd)), compute log_prob, value copy
-// Input: logits (B, num_atns) for continuous or (B, sum(act_sizes)) for discrete
-//        logstd (B, num_atns) for continuous, nullptr for discrete
-// Output: actions (B, num_atns) as float64, logprobs (B,), value_out (B,)
-// NOTE: offset is read from a pointer (not passed by value) so it works correctly with CUDA graphs.
+// Expects action logits and values to be in the same contiguous buffer. See default decoder
 __global__ void sample_logits_kernel(
-    PrecisionTensor dec_out,              // (B, fused_cols) fused logits+value from decoder
-    PrecisionTensor logstd_puf,           // (1, od) log std for continuous, or empty
-    IntTensor act_sizes_puf,              // (num_atns,) action head sizes
-    precision_t* __restrict__ actions,    // (B, num_atns) output
-    precision_t* __restrict__ logprobs,   // (B,) output
-    precision_t* __restrict__ value_out,  // (B,) output
-    uint64_t seed,
-    const int64_t* __restrict__ offset_ptr
-) {
+        PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
+        PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
+        IntTensor act_sizes_puf,              // (num_atns,) action head sizes
+        precision_t* __restrict__ actions,    // (B, num_atns)
+        precision_t* __restrict__ logprobs,   // (B,)
+        precision_t* __restrict__ value_out,  // (B,)
+        uint64_t seed,
+        const int64_t* __restrict__ offset_ptr) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = numel(act_sizes_puf.shape);
@@ -526,7 +502,8 @@ __global__ void sample_logits_kernel(
     }
 }
 
-// Called by vecenv per buffer thread
+// Single step rollout forward pass. Called by each environment worker in their
+// own buffer thread. This operation is cudagraphed.
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
@@ -554,14 +531,13 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     int start = buf * block_size;
     cudaStream_t stream = current_stream;
 
-    // Copy env data to rollout buffer — cast_kernel overload resolved at compile time from OBS_TENSOR_T
+    // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
     OBS_TENSOR_T& obs_env = env.obs;
-    PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     int n = block_size * obs_env.shape[1];
+    PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n);
 
-    // Rewards/terminals: env is f32, rollout is precision_t
     PrecisionTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     n = block_size;
     cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -571,7 +547,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         term_dst.data, env.terminals.data + start, n);
 
-    // Forward pass — obs_dst already contains the cast obs in precision_t
+    // Policy forward pass for rollouts
     PrecisionTensor state_puf = pufferl->buffer_states[buf];
     PrecisionTensor dec_puf = policy_forward(&pufferl->policy, pufferl->weights, pufferl->buffer_activations[buf], obs_dst, state_puf, stream);
 
@@ -579,7 +555,6 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PrecisionTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
     PrecisionTensor lp_slice = puf_slice(rollouts.logprobs, t, start, block_size);
     PrecisionTensor val_slice = puf_slice(rollouts.values, t, start, block_size);
-
     PrecisionTensor p_logstd = {};
     DecoderWeights* dw = (DecoderWeights*)pufferl->weights.decoder;
     if (dw->continuous) {
@@ -600,7 +575,10 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             env.actions.data + start * act_cols, act_slice.data, numel(act_slice.shape));
 
     if (capturing) {
-        cudagraph_capture_end(&pufferl->fused_rollout_cudagraphs[graph], cap_stream_raw);
+        cudaGraph_t _graph;
+        cudaStreamEndCapture(cap_stream_raw, &_graph);
+        cudaGraphInstantiate(&pufferl->fused_rollout_cudagraphs[graph], _graph, 0);
+        cudaGraphDestroy(_graph);
         cudaStreamSynchronize(cap_stream_raw);
         cudaDeviceSynchronize();
         cudaStreamDestroy(cap_stream_raw);
@@ -608,28 +586,11 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     profile_end(hypers.profile);
 }
 
-void rollouts_impl(PuffeRL& pufferl) {
-    HypersT& hypers = pufferl.hypers;
-
-    int horizon = hypers.horizon;
-    int num_buffers = hypers.num_buffers;
-    // TODO: You removed state zeros and reward clamping
-
-    for (int i = 0; i < num_buffers*horizon; ++i) {
-        int buf = i % num_buffers;
-        int h = i / num_buffers;
-
-        net_callback_wrapper(&pufferl, buf, h);
-        cudaDeviceSynchronize();
-    }
-}
 
 __device__ __forceinline__ void ppo_discrete_head(
-    const precision_t* __restrict__ logits,
-    int logits_base, int logits_stride_a, int logits_offset,
-    int A, int act,
-    float* out_logsumexp, float* out_entropy, float* out_logp
-) {
+        const precision_t* __restrict__ logits, int logits_base,
+        int logits_stride_a, int logits_offset, int A, int act,
+        float* out_logsumexp, float* out_entropy, float* out_logp) {
     float max_logit = -INFINITY;
     float sum = 0.0f;
     float act_logit = 0.0f;
@@ -660,11 +621,9 @@ __device__ __forceinline__ void ppo_discrete_head(
     *out_logp = act_logit - logsumexp;
 }
 
-// Compute log-probability and entropy for a single continuous action dimension.
 __device__ __forceinline__ void ppo_continuous_head(
-    float mean, float log_std, float action,
-    float* out_logp, float* out_entropy
-) {
+        float mean, float log_std, float action,
+        float* out_logp, float* out_entropy) {
     constexpr float HALF_LOG_2PI = 0.9189385332046727f;
     constexpr float HALF_1_PLUS_LOG_2PI = 1.4189385332046727f;
     float std = __expf(log_std);
@@ -674,9 +633,8 @@ __device__ __forceinline__ void ppo_continuous_head(
 }
 
 __global__ void ppo_loss_fwd_bwd_kernel(
-    float* __restrict__ ppo_partials,
-    PPOKernelArgs a, PPOGraphArgs g
-) {
+        float* __restrict__ ppo_partials,
+        PPOKernelArgs a, PPOGraphArgs g) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
     int total_elements = a.N * a.T_seq;
@@ -700,7 +658,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     int values_idx = n * a.values_stride_n + t * a.values_stride_t;
     int grad_logits_base = nt * a.A_total;
 
-    // --- Shared computation (used by both forward and backward) ---
+    // Shared computation (used by both forward and backward)
 
     float old_logp = to_float(g.old_logprobs[nt]);
     float adv = to_float(g.advantages[nt]);
@@ -718,7 +676,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     float d_pg_loss = dL;
     float d_entropy_term = dL * (-a.ent_coef);
 
-    // --- Value loss (forward) + value gradient (backward) ---
+    // Value loss (forward) + value gradient (backward)
 
     float v_error = val_pred - val;
     float v_clipped = val + fmaxf(-a.vf_clip_coef, fminf(a.vf_clip_coef, v_error));
@@ -738,7 +696,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     }
     a.grad_values_pred[nt] = dL * a.vf_coef * d_val_pred;
 
-    // --- Policy loss + gradients ---
+    // Policy loss + gradients
 
     float pg_loss, total_entropy, logratio, ratio;
     float total_log_prob = 0.0f;
@@ -837,6 +795,7 @@ __global__ void ppo_loss_fwd_bwd_kernel(
     block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
     } // end if (idx < total_elements)
 
+// Deterministic aggregation
 reduce:
     __syncthreads();
 
@@ -860,11 +819,10 @@ reduce:
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce_kernel(
-    float* __restrict__ loss,
-    float* __restrict__ losses_acc,
-    const float* __restrict__ partials,
-    int num_blocks
-) {
+        float* __restrict__ loss,
+        float* __restrict__ losses_acc,
+        const float* __restrict__ partials,
+        int num_blocks) {
     int tid = threadIdx.x;
     if (tid > LOSS_N) {
         return;
@@ -887,8 +845,8 @@ __global__ void ppo_loss_reduce_kernel(
     }
 }
 
-__global__ void var_mean_kernel(const precision_t* __restrict__ src, float* __restrict__ var_out,
-        float* __restrict__ mean_out, int n) {
+__global__ void var_mean_kernel(const precision_t* __restrict__ src,
+        float* __restrict__ var_out, float* __restrict__ mean_out, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -926,15 +884,17 @@ __global__ void var_mean_kernel(const precision_t* __restrict__ src, float* __re
     }
 }
 
+// This is a huge kernel for a relatively cheap operation. But without this,
+// it's death by a thousand cuts with repeated kernel launches. Even graphed, you
+// blow up the memory bandwidth.
 void ppo_loss_fwd_bwd(
-    PrecisionTensor& dec_out,    // (N, T, fused_cols) — fused logits+value from decoder
-    PrecisionTensor& logstd,     // continuous logstd or empty
-    TrainGraph& graph,
-    IntTensor& act_sizes, FloatTensor& losses_acc,
-    float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
-    PPOBuffersPuf& bufs, bool is_continuous,
-    cudaStream_t stream
-) {
+        PrecisionTensor& dec_out,    // (N, T, fused_cols) — fused logits+value from decoder
+        PrecisionTensor& logstd,     // continuous logstd or empty
+        TrainGraph& graph,
+        IntTensor& act_sizes, FloatTensor& losses_acc,
+        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        PPOBuffersPuf& bufs, bool is_continuous,
+        cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
@@ -1001,11 +961,8 @@ void ppo_loss_fwd_bwd(
 #define PRIO_BLOCK_SIZE 256
 #define PRIO_NUM_WARPS (PRIO_BLOCK_SIZE / PRIO_WARP_SIZE)
 __global__ void compute_prio_adv_reduction(
-    const precision_t* __restrict__ advantages,
-    float* prio_weights,
-    float prio_alpha,
-    int stride
-) {
+        const precision_t* __restrict__ advantages,
+        float* prio_weights, float prio_alpha, int stride) {
     int row = blockIdx.x;
     int tx = threadIdx.x;
     int offset = row * stride;
@@ -1027,10 +984,7 @@ __global__ void compute_prio_adv_reduction(
     }
 }
 
-__global__ void compute_prio_normalize(
-    float* prio_weights,
-    int length
-) {
+__global__ void compute_prio_normalize(float* prio_weights, int length) {
     __shared__ float shmem[PRIO_NUM_WARPS];
     __shared__ float block_sum;
 
@@ -1067,16 +1021,12 @@ __global__ void compute_prio_normalize(
     }
 }
 
-// Part 3: compute importance weights for sampled indices
 // mb_prio[i] = pow(total_agents * prio_probs[idx[i]], -anneal_beta)
 __global__ void compute_prio_imp_weights(
-    const int64_t* __restrict__ indices,
-    const float* __restrict__ prio_probs,
-    float* mb_prio,
-    int total_agents,
-    float anneal_beta,
-    int minibatch_segments
-) {
+        const int* __restrict__ indices,
+        const float* __restrict__ prio_probs,
+        float* mb_prio, int total_agents,
+        float anneal_beta, int minibatch_segments) {
     int tx = threadIdx.x + blockIdx.x * blockDim.x;
     if (tx < minibatch_segments) {
         float value = prio_probs[indices[tx]] * (float)total_agents;
@@ -1086,13 +1036,13 @@ __global__ void compute_prio_imp_weights(
 
 // Multinomial with replacement (uses cuRAND)
 __global__ void multinomial_with_replacement_kernel(
-        int64_t* __restrict__ out_idx, const float* __restrict__ probs,
-        float* __restrict__ cdf, int S, int num_samples,
+        int* __restrict__ out_idx, const float* __restrict__ probs,
+        float* __restrict__ cdf, int B, int num_samples,
         uint64_t seed, int64_t* __restrict__ offset_ptr) {
     int tid = threadIdx.x;
     if (tid == 0) {
         float cum = 0.0f;
-        for (int i = 0; i < S; i++) {
+        for (int i = 0; i < B; i++) {
             cum += probs[i];
             cdf[i] = cum;
         }
@@ -1103,7 +1053,7 @@ __global__ void multinomial_with_replacement_kernel(
         curandStatePhilox4_32_10_t rng_state;
         curand_init(seed, base_off + tid, 0, &rng_state);
         float u = curand_uniform(&rng_state);
-        int lo = 0, hi = S - 1;
+        int lo = 0, hi = B - 1;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
             if (cdf[mid] < u) {
@@ -1119,29 +1069,35 @@ __global__ void multinomial_with_replacement_kernel(
     }
 }
 
+// Prioritize high absolute advantage trajectories
+// This is a form of implicit curriculum learning
+// It is a major improvement in some complex environments
+// The values of alpha and beta found by sweeps will tell you
+// whether it is important for your task
 void prio_replay_cuda(PrecisionTensor& advantages, float prio_alpha,
         int minibatch_segments, int total_agents, float anneal_beta,
         PrioBuffers& bufs, ulong seed, long* offset_ptr, cudaStream_t stream) {
-    int S = advantages.shape[0], T = advantages.shape[1];
-    compute_prio_adv_reduction<<<S, PRIO_WARP_SIZE, 0, stream>>>(
+    int B = advantages.shape[0], T = advantages.shape[1];
+    compute_prio_adv_reduction<<<B, PRIO_WARP_SIZE, 0, stream>>>(
         advantages.data, bufs.prio_probs.data, prio_alpha, T);
     compute_prio_normalize<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
-        bufs.prio_probs.data, S);
+        bufs.prio_probs.data, B);
     int block = fmaxf(((minibatch_segments + 31) / 32) * 32, 32);
     multinomial_with_replacement_kernel<<<1, block, 0, stream>>>(
         bufs.idx.data, bufs.prio_probs.data,
-        bufs.cdf.data, S, minibatch_segments, seed, offset_ptr);
+        bufs.cdf.data, B, minibatch_segments, seed, offset_ptr);
     int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
     compute_prio_imp_weights<<<p3_blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
         bufs.idx.data, bufs.prio_probs.data,
         bufs.mb_prio.data, total_agents, anneal_beta, minibatch_segments);
 }
 
+// Experience the puffer advantage! Generalized advantage estimation + V-Trace
+// importance sampling correction in a single streamlined operation
 __device__ void puff_advantage_row_scalar(
-    const precision_t* values, const precision_t* rewards, const precision_t* dones,
-    const precision_t* importance, precision_t* advantages, float gamma, float lambda,
-    float rho_clip, float c_clip, int horizon
-) {
+        const precision_t* values, const precision_t* rewards, const precision_t* dones,
+        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
+        float rho_clip, float c_clip, int horizon) {
     float lastpufferlam = 0;
     for (int t = horizon-2; t >= 0; t--) {
         int t_next = t + 1;
@@ -1158,6 +1114,8 @@ __device__ void puff_advantage_row_scalar(
     }
 }
 
+// These loading fns just optimize bandwidth for advantage since we call it on all
+// the data every minibatch. This should change in 5.0
 __device__ __forceinline__ void adv_vec_load(const float* ptr, float* out) {
     float4 v = *reinterpret_cast<const float4*>(ptr);
     out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
@@ -1186,10 +1144,9 @@ __device__ __forceinline__ void adv_vec_store(__nv_bfloat16* ptr, const float* v
 }
 
 __device__ __forceinline__ void puff_advantage_row_vec(
-    const precision_t* values, const precision_t* rewards, const precision_t* dones,
-    const precision_t* importance, precision_t* advantages, float gamma, float lambda,
-    float rho_clip, float c_clip, int horizon
-) {
+        const precision_t* values, const precision_t* rewards, const precision_t* dones,
+        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
+        float rho_clip, float c_clip, int horizon) {
     constexpr int N = 16 / sizeof(precision_t);
 
     float lastpufferlam = 0.0f;
@@ -1264,21 +1221,21 @@ void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
         advantages.data, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
-__global__ void index_copy_kernel(char* __restrict__ dst, const int64_t* __restrict__ idx,
+// Minor copy bandwidth optimizations
+__global__ void index_copy_kernel(char* __restrict__ dst, const int* __restrict__ idx,
         const char* __restrict__ src, int num_idx, int row_bytes) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < num_idx) {
-        int64_t dst_row = idx[i];
-        memcpy(dst + dst_row * row_bytes, src + (int64_t)i * row_bytes, row_bytes);
+        int dst_row = idx[i];
+        memcpy(dst + (int64_t)dst_row * row_bytes, src + (int64_t)i * row_bytes, row_bytes);
     }
 }
 
 __device__ __forceinline__ void copy_values_adv_returns(
-    const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
-    const precision_t* __restrict__ src_advantages, precision_t* __restrict__ dst_advantages,
-    precision_t* __restrict__ dst_returns,
-    int src_row, int dst_row, int horizon
-) {
+        const precision_t* __restrict__ src_values, precision_t* __restrict__ dst_values,
+        const precision_t* __restrict__ src_advantages, precision_t* __restrict__ dst_advantages,
+        precision_t* __restrict__ dst_returns,
+        int src_row, int dst_row, int horizon) {
     int srh = (int64_t)src_row * horizon;
     int drh = (int64_t)dst_row * horizon;
     const precision_t* s_values = src_values + srh;
@@ -1295,14 +1252,12 @@ __device__ __forceinline__ void copy_values_adv_returns(
     }
 }
 
-__global__ void select_copy_kernel(
-    RolloutBuf rollouts, TrainGraph graph,
-    const int64_t* __restrict__ idx,
-    const precision_t* __restrict__ advantages, const float* __restrict__ mb_prio
-) {
+__global__ void select_copy_kernel(RolloutBuf rollouts, TrainGraph graph,
+        const int* __restrict__ idx, const precision_t* __restrict__ advantages,
+        const float* __restrict__ mb_prio) {
     int mb = blockIdx.x;
     int ch = blockIdx.y;
-    int src_row = (int)idx[mb];
+    int src_row = idx[mb];
 
     // Compute row byte counts from tensor shapes
     int obs_row_bytes = (numel(rollouts.observations.shape) / rollouts.observations.shape[0]) * sizeof(precision_t);
@@ -1344,42 +1299,40 @@ void train_impl(PuffeRL& pufferl) {
     // Update to HypersT& p
     HypersT& hypers = pufferl.hypers;
 
-    // Buffers are stored as {horizon, segments, ...} for contiguous rollout writes
-    // Transpose to {segments, horizon, ...} for train logic
     cudaEventRecord(pufferl.profile.events[0]);  // pre-loop start
     cudaStream_t train_stream = pufferl.default_stream;
 
-    // Use pre-allocated transposed buffers (segments, horizon, ...)
+    // Transpose from rollout layout (T, B, ...) to train layout (B, T, ...)
     RolloutBuf& src = pufferl.rollouts;
     RolloutBuf& rollouts = pufferl.train_rollouts;
+    PrecisionTensor& advantages_puf = pufferl.advantages_puf;
 
-    int H = src.observations.shape[0], S = src.observations.shape[1];
+    int T = src.observations.shape[0], B = src.observations.shape[1];
     int obs_size = (ndim(src.observations.shape) >= 3) ? src.observations.shape[2] : 1;
     int num_atns = (ndim(src.actions.shape) >= 3) ? src.actions.shape[2] : 1;
 
-    transpose_102<<<grid_size(H*S*obs_size), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.observations.data, src.observations.data, H, S, obs_size);
-    transpose_102<<<grid_size(H*S*num_atns), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.actions.data, src.actions.data, H, S, num_atns);
-    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.logprobs.data, src.logprobs.data, H, S, 1);
-    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.rewards.data, src.rewards.data, H, S, 1);
-    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.terminals.data, src.terminals.data, H, S, 1);
-    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.ratio.data, src.ratio.data, H, S, 1);
-    transpose_102<<<grid_size(H*S), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.values.data, src.values.data, H, S, 1);
+    transpose_102<<<grid_size(T*B*obs_size), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.observations.data, src.observations.data, T, B, obs_size);
+    transpose_102<<<grid_size(T*B*num_atns), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.actions.data, src.actions.data, T, B, num_atns);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.logprobs.data, src.logprobs.data, T, B, 1);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.rewards.data, src.rewards.data, T, B, 1);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.terminals.data, src.terminals.data, T, B, 1);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.ratio.data, src.ratio.data, T, B, 1);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.values.data, src.values.data, T, B, 1);
 
-    // Clamp rewards and fill ratio
+    // We hard-clamp rewards to -1, 1. Our envs are mostly designed to respect this range
     clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.rewards.data, -1.0f, 1.0f, numel(rollouts.rewards.shape));
+
+    // Set importance weights to 1.0
     fill_precision_kernel<<<grid_size(numel(rollouts.ratio.shape)), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.ratio.data, from_float(1.0f), numel(rollouts.ratio.shape));
-
-    // Zero pre-allocated advantages buffer
-    PrecisionTensor& advantages_puf = pufferl.advantages_puf;
 
     // Inline any of these only used once
     int minibatch_size = hypers.minibatch_size;
@@ -1391,9 +1344,7 @@ void train_impl(PuffeRL& pufferl) {
     int current_epoch = pufferl.epoch;
 
     Muon* muon = &pufferl.muon;
-
     int total_epochs = hypers.total_timesteps / batch_size;
-
     if (anneal_lr) {
         float lr_min = hypers.min_lr_ratio * hypers.lr;
         float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);
@@ -1402,12 +1353,10 @@ void train_impl(PuffeRL& pufferl) {
 
     // Annealed priority exponent
     float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
-
-    int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
-
     TrainGraph& graph = pufferl.train_buf;
     cudaEventRecord(pufferl.profile.events[1]);  // pre-loop end
 
+    int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
     for (int mb = 0; mb < total_minibatches; ++mb) {
         cudaEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
         puf_zero(&advantages_puf, train_stream);
@@ -1480,7 +1429,10 @@ void train_impl(PuffeRL& pufferl) {
                     pufferl.param_puf.data, pufferl.master_weights.data, n);
             }
             if (capturing) {
-                cudagraph_capture_end(&pufferl.train_cudagraph, cap_stream_raw);
+                cudaGraph_t _graph;
+                cudaStreamEndCapture(cap_stream_raw, &_graph);
+                cudaGraphInstantiate(&pufferl.train_cudagraph, _graph, 0);
+                cudaGraphDestroy(_graph);
                 cudaStreamSynchronize(cap_stream_raw);
                 cudaDeviceSynchronize();
                 cudaStreamDestroy(cap_stream_raw);
@@ -1489,9 +1441,8 @@ void train_impl(PuffeRL& pufferl) {
             pufferl.train_warmup++;
         }
 
-        // Bugged version did not have the below updates correct but worked better.
-        // Keeping this version until we can resweep hypers etc
-        // mb_ratio is (S, H) precision — scatter into rollouts.ratio (S_total, H)
+        // This version is consistent with PufferLib 3.0. One of the major algorithmic
+        // questions remaining is how and when to update value and advantage estimates.
         {
             int num_idx = numel(pufferl.prio_bufs.idx.shape);
             int row_bytes = (numel(graph.mb_ratio.shape) / graph.mb_ratio.shape[0]) * sizeof(precision_t);
@@ -1499,11 +1450,10 @@ void train_impl(PuffeRL& pufferl) {
                 (char*)rollouts.ratio.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_ratio.data, num_idx, row_bytes);
         }
-        // mb_newvalue is (S, H, 1) — treat as (S, H) for scatter into rollouts.values
         {
             int num_idx = numel(pufferl.prio_bufs.idx.shape);
-            int S = graph.mb_newvalue.shape[0], H = graph.mb_newvalue.shape[1];
-            int row_bytes = H * sizeof(precision_t);
+            int B = graph.mb_newvalue.shape[0], T = graph.mb_newvalue.shape[1];
+            int row_bytes = T * sizeof(precision_t);
             index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
                 (char*)rollouts.values.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_newvalue.data, num_idx, row_bytes);
@@ -1534,6 +1484,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     auto pufferl = std::make_unique<PuffeRL>();
     pufferl->hypers = hypers;
     pufferl->nccl_comm = nullptr;
+    pufferl->default_stream = 0;
 
     cudaSetDevice(hypers.gpu_id);
 
@@ -1547,9 +1498,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         printf("Rank %d/%d: NCCL initialized\n", hypers.rank, hypers.world_size);
     }
 
-    // Use CUDA default stream (stream 0) for main-thread work
-    pufferl->default_stream = 0;
-
     ulong seed = hypers.seed + hypers.rank;
     pufferl->seed = seed;
 
@@ -1559,6 +1507,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         env_name, vec_kwargs, env_kwargs, pufferl->env);
     pufferl->vec = vec;
 
+    // Sanity check action space
     int num_action_heads = pufferl->env.actions.shape[1];
     int* raw_act_sizes = get_act_sizes();  // CPU int32 pointer from env
     int act_n = 0;
@@ -1582,22 +1531,20 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         printf("Detected discrete action space with %d heads\n", num_action_heads);
     }
 
+    // Create profiling events
     for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
         cudaEventCreate(&pufferl->profile.events[i]);
     }
     memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
-
     nvmlInit();
     nvmlDeviceGetHandleByIndex(hypers.gpu_id, &pufferl->nvml_device);
 
+    // Create policy
     int input_size = pufferl->env.obs.shape[1];
     int hidden_size = hypers.hidden_size;
     int num_layers = hypers.num_layers;
-
-    // Decoder output size: discrete = act_n (sum of action sizes), continuous = num_action_heads
     bool is_continuous = pufferl->is_continuous;
     int decoder_output_size = is_continuous ? num_action_heads : act_n;
-
     int minibatch_segments = hypers.minibatch_size / hypers.horizon;
     int inf_batch = vec->total_agents / hypers.num_buffers;
     int B_TT = minibatch_segments * hypers.horizon;
@@ -1697,14 +1644,19 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->muon.nccl_comm = pufferl->nccl_comm;
     pufferl->muon.world_size = hypers.world_size;
 
-    alloc_create(params);
-    alloc_create(grads);
-    alloc_create(acts);
+    // All buffers allocated here
+    if (alloc_create(params) != cudaSuccess) {
+        return nullptr;
+    }
+    if (alloc_create(grads) != cudaSuccess) {
+        return nullptr;
+    }
+    if (alloc_create(acts) != cudaSuccess) {
+        return nullptr;
+    }
 
-    pufferl->grad_puf = {.data = (precision_t*)grads->mem,
-        .shape = {grads->total_elems}};
-    pufferl->param_puf = {.data = (precision_t*)params->mem,
-        .shape = {params->total_elems}};
+    pufferl->grad_puf = {.data = (precision_t*)grads->mem, .shape = {grads->total_elems}};
+    pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
 
     ulong init_seed = hypers.seed;
     policy_init_weights(&pufferl->policy, pufferl->weights, &init_seed, pufferl->default_stream);
@@ -1725,6 +1677,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
     muon_post_create(&pufferl->muon);
 
+    // Cudagraph rolluts and entire training step
     if (hypers.cudagraphs >= 0) {
         pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(horizon*num_buffers, sizeof(cudaGraphExec_t));
         pufferl->train_warmup = 0;
@@ -1751,7 +1704,10 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         tl_stream = warmup_stream;
 
         for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
-            rollouts_impl(*pufferl);
+            for (int i = 0; i < num_buffers * horizon; ++i) {
+                net_callback_wrapper(pufferl.get(), i % num_buffers, i / num_buffers);
+                cudaDeviceSynchronize();
+            }
         }
         pufferl->rollout_captured = true;
 
@@ -1798,8 +1754,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaProfilerStart();
     }
 
-    double now = std::chrono::duration<double>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    double now = wall_clock();
     pufferl->start_time = now;
     pufferl->last_log_time = now;
     pufferl->last_log_step = 0;
