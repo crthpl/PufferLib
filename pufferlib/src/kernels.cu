@@ -10,18 +10,65 @@
 #include <cassert>
 #include <stdlib.h>
 
-#include "tensor.h"
+#include <cuda_bf16.h>
 
-// cublas precision constants (depend on precision_t from tensor.h)
 #ifdef PRECISION_FLOAT
+typedef float precision_t;
+constexpr bool USE_BF16 = false;
+constexpr int PRECISION_SIZE = 4;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_32F;
 static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F;
 #define NCCL_PRECISION ncclFloat
+#define to_float(x) (x)
+#define from_float(x) (x)
 #else
+typedef __nv_bfloat16 precision_t;
+constexpr bool USE_BF16 = true;
+constexpr int PRECISION_SIZE = 2;
 static constexpr cudaDataType_t CUBLAS_PRECISION = CUDA_R_16BF;
 static constexpr cublasComputeType_t CUBLAS_COMPUTE_PRECISION = CUBLAS_COMPUTE_32F;
 #define NCCL_PRECISION ncclBfloat16
+#define to_float(x) __bfloat162float(x)
+#define from_float(x) __float2bfloat16(x)
 #endif
+
+#include "tensor.h"
+
+__host__ __device__ inline int ndim(const int64_t* shape) {
+    int n = 0; while (n < PUF_MAX_DIMS && shape[n] != 0) n++; return n;
+}
+
+__host__ __device__ inline int64_t numel(const int64_t* shape) {
+    int64_t n = 1; for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) n *= shape[i]; return n;
+}
+
+inline int64_t batch_size(const int64_t* shape) {
+    int n = ndim(shape);
+    int64_t b = 1;
+    for (int i = 0; i < n - 2; i++) b *= shape[i];
+    return b;
+}
+
+inline const char* _puf_repr_impl(const char* name, const char* dtype,
+        const int64_t* shape, int nd, int64_t ne, bool empty) {
+    static thread_local char buf[256];
+    if (empty) { snprintf(buf, sizeof(buf), "%s(empty)", name); return buf; }
+    int pos = snprintf(buf, sizeof(buf), "%s(%s, [", name, dtype);
+    for (int i = 0; i < nd && pos < (int)sizeof(buf) - 32; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%lld", i ? ", " : "", (long long)shape[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "], %lld elems)", (long long)ne);
+    return buf;
+}
+
+inline const char* puf_repr(const PrecisionTensor* t) {
+    return _puf_repr_impl("PrecisionTensor", USE_BF16 ? "bf16" : "f32",
+        t->shape, ndim(t->shape), numel(t->shape), !t->data);
+}
+
+inline const char* puf_repr(const FloatTensor* t) {
+    return _puf_repr_impl("FloatTensor", "f32",
+        t->shape, ndim(t->shape), numel(t->shape), !t->data);
+}
 
 #ifndef CUDART_INF_F
 #define CUDART_INF_F __int_as_float(0x7f800000)
