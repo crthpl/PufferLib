@@ -697,7 +697,7 @@ struct MMO {
     float* terminals;
     Reward* reward_struct;
     Reward* returns;
-    double* actions;
+    float* actions;
     int tick;
     int tiers;
     int levels;
@@ -794,7 +794,7 @@ void allocate_mmo(MMO* env) {
     env->observations = calloc(env->num_agents*(11*15*10+47+10), sizeof(unsigned char));
     env->rewards = calloc(env->num_agents, sizeof(float));
     env->terminals = calloc(env->num_agents, sizeof(float));
-    env->actions = calloc(env->num_agents, sizeof(double));
+    env->actions = calloc(env->num_agents, sizeof(float));
     init(env);
 }
 
