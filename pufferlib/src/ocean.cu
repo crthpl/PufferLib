@@ -573,17 +573,7 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .free_weights = nmmo3_encoder_free_weights,
             .free_activations = nmmo3_encoder_free_activations,
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+            .activation_size = sizeof(NMMO3EncoderActivations),
         };
-    }
-}
-
-// Override default EncoderActivations for known ocean environments. No-op for unknown envs.
-static void alloc_custom_encoder_activations(const std::string& env_name,
-        PolicyActivations* activations, int count) {
-    if (env_name == "puffer_nmmo3") {
-        for (int i = 0; i < count; i++) {
-            free(activations[i].encoder);
-            activations[i].encoder = calloc(1, sizeof(NMMO3EncoderActivations));
-        }
     }
 }

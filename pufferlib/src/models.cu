@@ -43,6 +43,7 @@ struct Encoder {
     free_weights_fn free_weights;
     free_activations_fn free_activations;
     int in_dim, out_dim;
+    size_t activation_size;  // sizeof(EncoderActivations) or custom override
 };
 
 struct Decoder {
@@ -806,7 +807,7 @@ void policy_backward(Policy* p, PolicyWeights& w, PolicyActivations& activations
 PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
         Allocator* acts, Allocator* grads, int B_TT) {
     PolicyActivations a;
-    a.encoder = calloc(1, sizeof(EncoderActivations));
+    a.encoder = calloc(1, p->encoder.activation_size);
     a.decoder = calloc(1, sizeof(DecoderActivations));
     a.network = calloc(1, sizeof(MinGRUActivations));
     p->encoder.reg_train(w.encoder, a.encoder, acts, grads, B_TT);
@@ -817,7 +818,7 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
 
 PolicyActivations policy_reg_rollout(Policy* p, PolicyWeights& w, Allocator* acts, int B_inf) {
     PolicyActivations a;
-    a.encoder = calloc(1, sizeof(EncoderActivations));
+    a.encoder = calloc(1, p->encoder.activation_size);
     a.decoder = calloc(1, sizeof(DecoderActivations));
     a.network = calloc(1, sizeof(MinGRUActivations));
     p->encoder.reg_rollout(w.encoder, a.encoder, acts, B_inf);

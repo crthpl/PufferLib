@@ -1550,6 +1550,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .free_weights = encoder_free_weights,
         .free_activations = encoder_free_activations,
         .in_dim = input_size, .out_dim = hidden_size,
+        .activation_size = sizeof(EncoderActivations),
     };
     create_custom_encoder(env_name, &encoder);
     Decoder decoder = {
@@ -1601,9 +1602,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         };
         alloc_register(acts, &pufferl->buffer_states[i]);
     }
-    alloc_custom_encoder_activations(env_name, &pufferl->train_activations, 1);
-    alloc_custom_encoder_activations(env_name, pufferl->buffer_activations, num_buffers);
-
     register_rollout_buffers(pufferl->rollouts,
         acts, horizon, total_agents, input_size, num_action_heads);
     register_train_buffers(pufferl->train_buf,
