@@ -842,6 +842,9 @@ int main(void) {
             if (hyper_points == 0) {
                 hyper_points = nxt_hyper_points;
             } else {
+                if (hyper_points != nxt_hyper_points) {
+                    printf("Error: hyper_points %d != nxt_hyper_points %d\n", hyper_points, nxt_hyper_points);
+                }
                 assert(hyper_points == nxt_hyper_points);
             }
             if (hyper_points > max_data_points) {
@@ -868,8 +871,8 @@ int main(void) {
         }
     }
 
-    int hyper_count = 23;
-    char *hyper_key[23] = {
+    int hyper_count = 22;
+    char *hyper_key[22] = {
         "agent_steps",
         "uptime",
         "env/perf",
@@ -889,7 +892,7 @@ int main(void) {
         "train/eps",
         "train/prio_alpha",
         "train/prio_beta0",
-        "train/horizon",
+        //"train/horizon",
         "train/replay_ratio",
         "train/minibatch_size",
         "policy/hidden_size",
@@ -1002,8 +1005,8 @@ int main(void) {
     int fig_range2_idx = 1;
     char fig_range2_min[32];
     char fig_range2_max[32];
-    float fig_range2_min_val = 0;
-    float fig_range2_max_val = 10000;
+    float fig_range2_min_val = FLT_MIN;
+    float fig_range2_max_val = FLT_MAX;
     int fig_box_idx = 2;
     bool fig_box_active = false;
 
