@@ -17,6 +17,11 @@ import pufferlib
 import pufferlib.pufferl
 from pufferlib.muon import Muon
 from pufferlib import _C
+if _C.precision_bytes != 4:
+    raise RuntimeError(
+        f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
+        'The PyTorch backend requires float32. Rebuild with: pip install -e . --no-build-isolation --config-settings="--build-option=--precision=float"'
+    )
 
 _NP_TO_TORCH_DTYPE = {
     np.dtype("float64"): torch.float64,

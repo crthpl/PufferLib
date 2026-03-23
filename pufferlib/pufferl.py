@@ -429,7 +429,7 @@ def load_config(env_name):
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    parser.add_argument('--torch', action='store_true', help='Use PyTorch training backend')
+    parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
     parser.add_argument('--save-frames', type=int, default=0)
     parser.add_argument('--gif-path', type=str, default='eval.gif')
     parser.add_argument('--fps', type=float, default=15)
@@ -494,7 +494,7 @@ def main():
     args = load_config(env_name)
 
     backend = _C
-    if args.get('torch'):
+    if args.get('slowly'):
         from pufferlib.python_pufferl import PuffeRL
         backend = PuffeRL
 
