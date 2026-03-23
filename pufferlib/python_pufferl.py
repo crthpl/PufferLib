@@ -5,22 +5,39 @@
 import os
 import glob
 import time
-import importlib
 from collections import defaultdict
 
 import numpy as np
 
 import torch
 import torch.distributed
+from torch.distributions.utils import logits_to_probs
 
 import pufferlib
-import pufferlib.pytorch
 import pufferlib.pufferl
 from pufferlib.muon import Muon
-
 from pufferlib import _C
 
-from torch.distributions.utils import logits_to_probs
+_NP_TO_TORCH_DTYPE = {
+    np.dtype("float64"): torch.float64,
+    np.dtype("float32"): torch.float32,
+    np.dtype("float16"): torch.float16,
+    np.dtype("uint8"): torch.uint8,
+    np.dtype("int64"): torch.int64,
+    np.dtype("int32"): torch.int32,
+    np.dtype("int16"): torch.int16,
+    np.dtype("int8"): torch.int8,
+}
+
+_OBS_DTYPE_MAP = {
+    'ByteTensor':   torch.uint8,
+    'FloatTensor':  torch.float32,
+}
+
+_TORCH_TO_TYPESTR = {
+    torch.uint8:   '|u1',
+    torch.float32: '<f4',
+}
 
 def _log_prob(logits, value):
     value = value.long().unsqueeze(-1)
@@ -70,16 +87,6 @@ def sample_logits(logits, action=None):
         return action.T, logprob.squeeze(0), logits_entropy.squeeze(0)
 
     return action.T, logprob.sum(0), logits_entropy
-
-_OBS_DTYPE_MAP = {
-    'ByteTensor':   torch.uint8,
-    'FloatTensor':  torch.float32,
-}
-
-_TORCH_TO_TYPESTR = {
-    torch.uint8:   '|u1',
-    torch.float32: '<f4',
-}
 
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
@@ -156,9 +163,9 @@ class PuffeRL:
         horizon = config['horizon']
 
         self.observations = torch.zeros(horizon, total_agents, *obs_space.shape,
-            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype], device=device)
+            dtype=_NP_TO_TORCH_DTYPE[obs_space.dtype], device=device)
         self.actions = torch.zeros(horizon, total_agents, *atn_space.shape, device=device,
-            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
+            dtype=_NP_TO_TORCH_DTYPE[atn_space.dtype])
         self.values = torch.zeros(horizon, total_agents, device=device)
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
         self.rewards = torch.zeros(horizon, total_agents, device=device)
@@ -465,14 +472,10 @@ def load_env(env_name, args):
 
 def load_policy(args, vecenv, env_name=''):
     import pufferlib.models
-    package = args['package']
-    module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
-    env_module = importlib.import_module(module_name)
-
     policy_kwargs = args['policy']
     network_cls = getattr(pufferlib.models, policy_kwargs['network'])
-    encoder_cls = getattr(env_module.torch, 'Encoder', pufferlib.models.DefaultEncoder)
-    decoder_cls = getattr(env_module.torch, 'Decoder', pufferlib.models.DefaultDecoder)
+    encoder_cls = pufferlib.models.DefaultEncoder
+    decoder_cls = pufferlib.models.DefaultDecoder
     network = network_cls(**policy_kwargs)
     encoder = encoder_cls(vecenv.driver_env, policy_kwargs['hidden_size'])
     decoder = decoder_cls(vecenv.driver_env, policy_kwargs['hidden_size'])
