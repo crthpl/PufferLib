@@ -436,9 +436,9 @@ def load_config(env_name):
     parser.description = f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]' \
         ' demo options. Shows valid args for your env and policy'
 
-    puffer_dir = os.path.dirname(os.path.realpath(__file__))
-    puffer_config_dir = os.path.join(puffer_dir, 'config/**/*.ini')
-    puffer_default_config = os.path.join(puffer_dir, 'config/default.ini')
+    repo_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    puffer_config_dir = os.path.join(repo_dir, 'config/**/*.ini')
+    puffer_default_config = os.path.join(repo_dir, 'config/default.ini')
     #CC: Remove the default. Just raise an error on "puffer train" etc with no env (think we already do)
     if env_name == 'default':
         p = configparser.ConfigParser()

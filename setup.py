@@ -611,7 +611,7 @@ if not NO_TRAIN:
 
 setup(
     version="3.0.0",
-    packages=find_namespace_packages() + find_packages() + c_extension_paths + ['src'],
+    packages=find_namespace_packages() + find_packages() + c_extension_paths,
     package_data={
         "pufferlib": [RAYLIB_NAME + '/lib/libraylib.a']
     },
