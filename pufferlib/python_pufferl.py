@@ -23,17 +23,6 @@ if _C.precision_bytes != 4:
         'The PyTorch backend requires float32. Rebuild with: pip install -e . --no-build-isolation --config-settings="--build-option=--precision=float"'
     )
 
-_NP_TO_TORCH_DTYPE = {
-    np.dtype("float64"): torch.float64,
-    np.dtype("float32"): torch.float32,
-    np.dtype("float16"): torch.float16,
-    np.dtype("uint8"): torch.uint8,
-    np.dtype("int64"): torch.int64,
-    np.dtype("int32"): torch.int32,
-    np.dtype("int16"): torch.int16,
-    np.dtype("int8"): torch.int8,
-}
-
 _OBS_DTYPE_MAP = {
     'ByteTensor':   torch.uint8,
     'FloatTensor':  torch.float32,
@@ -104,55 +93,8 @@ class _CudaPtr:
             'version': 2,
         }
 
-class _Space:
-    def __init__(self, shape, dtype, nvec=None):
-        self.shape = shape
-        self.dtype = np.dtype(dtype)
-        if nvec is not None:
-            self.nvec = np.array(nvec, dtype=np.int64)
-            self.n = int(self.nvec.sum())
-        else:
-            self.n = shape[0] if shape else 0
-            self.nvec = np.array([self.n], dtype=np.int64)
-
-class VecEnv:
-    '''Wraps _C.VecEnv. GPU buffer tensors created once at init (zero-copy).
-    step(actions) advances the env; obs/rewards/terminals update in-place.'''
-
-    def __init__(self, vec):
-        self._vec = vec
-        self.num_agents = vec.total_agents
-        obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
-        np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32}[obs_dtype]
-        self.single_observation_space = _Space((vec.obs_size,), np_obs_dtype)
-        self.single_action_space = _Space((vec.num_atns,), np.float64, nvec=vec.act_sizes)
-        self.driver_env = self
-
-        self.observations = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
-            (vec.total_agents, vec.obs_size), obs_dtype))
-        self.rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
-            (vec.total_agents,), torch.float32))
-        self.terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
-            (vec.total_agents,), torch.float32))
-
-    def reset(self, seed=0):
-        self._vec.reset()
-
-    def step(self, actions):
-        actions = actions.T if actions.dim() > 1 else actions.unsqueeze(-1)
-        actions_gpu = actions.to(dtype=torch.float32, device='cuda').contiguous()
-        self._vec.step(actions_gpu.data_ptr())
-        torch.cuda.synchronize()
-        return self.observations, self.rewards, self.terminals
-
-    def log(self):
-        return self._vec.log()
-
-    def close(self):
-        self._vec.close()
-
 class PuffeRL:
-    def __init__(self, args, vecenv, policy, verbose=True):
+    def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
         device = config['device']
 
@@ -160,17 +102,25 @@ class PuffeRL:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = True
 
-        vecenv.reset(config['seed'])
-        obs_space = vecenv.single_observation_space
-        atn_space = vecenv.single_action_space
-        total_agents = vecenv.num_agents
+        self._vec = vec
+        total_agents = vec.total_agents
         self.total_agents = total_agents
-        horizon = config['horizon']
+        obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
 
-        self.observations = torch.zeros(horizon, total_agents, *obs_space.shape,
-            dtype=_NP_TO_TORCH_DTYPE[obs_space.dtype], device=device)
-        self.actions = torch.zeros(horizon, total_agents, *atn_space.shape, device=device,
-            dtype=_NP_TO_TORCH_DTYPE[atn_space.dtype])
+        self.vec_obs = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
+            (total_agents, vec.obs_size), obs_dtype))
+        self.vec_rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
+            (total_agents,), torch.float32))
+        self.vec_terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
+            (total_agents,), torch.float32))
+
+        vec.reset()
+        horizon = config['horizon']
+        num_atns = vec.num_atns
+
+        self.observations = torch.zeros(horizon, total_agents, vec.obs_size,
+            dtype=obs_dtype, device=device)
+        self.actions = torch.zeros(horizon, total_agents, num_atns, device=device)
         self.values = torch.zeros(horizon, total_agents, device=device)
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
         self.rewards = torch.zeros(horizon, total_agents, device=device)
@@ -192,7 +142,6 @@ class PuffeRL:
 
         self.args = args
         self.config = config
-        self.vecenv = vecenv
         self.world_size = args['world_size']
         self.epoch = 0
         self.global_step = 0
@@ -231,7 +180,7 @@ class PuffeRL:
         self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
 
         horizon = config['horizon']
-        o = self.vecenv.observations
+        o = self.vec_obs
         r = torch.zeros(self.total_agents, device=device)
         d = torch.zeros(self.total_agents, device=device)
 
@@ -256,7 +205,10 @@ class PuffeRL:
                 self.values[t] = value.flatten()
 
             prof.mark(2)
-            o, r, d = self.vecenv.step(action)
+            actions_gpu = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32, device='cuda').contiguous()
+            self._vec.step(actions_gpu.data_ptr())
+            torch.cuda.synchronize()
+            o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
             prof.mark(3)
 
             prof.elapsed(P.EVAL_GPU, 1, 2)
@@ -267,7 +219,7 @@ class PuffeRL:
 
         self.global_step += self.total_agents * horizon
 
-        self.env_logs = self.vecenv.log()
+        self.env_logs = self._vec.log()
 
     def train(self):
         prof = self.profile
@@ -410,7 +362,7 @@ class PuffeRL:
         torch.save(self.policy.state_dict(), path)
 
     def close(self):
-        self.vecenv.close()
+        self._vec.close()
 
     @classmethod
     def create_pufferl(cls, args):
@@ -426,8 +378,8 @@ class PuffeRL:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
 
         args['vec']['num_buffers'] = 1
-        vecenv = load_env(args['env_name'], args)
-        policy = load_policy(args, vecenv, args['env_name'])
+        vec = _C.create_vec(args)
+        policy = load_policy(args, vec)
 
         if 'LOCAL_RANK' in os.environ:
             torch.distributed.init_process_group(backend='nccl', world_size=world_size)
@@ -440,7 +392,7 @@ class PuffeRL:
             model.initial_state = policy.initial_state
             policy = model.to(local_rank)
 
-        return cls(args, vecenv, policy)
+        return cls(args, vec, policy)
 
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
@@ -472,18 +424,14 @@ class Profile:
         self.accum = [0.0] * Profile.NUM
         return out
 
-def load_env(env_name, args):
-    return VecEnv(_C.create_vec(args))
-
-def load_policy(args, vecenv, env_name=''):
+def load_policy(args, vec):
     import pufferlib.models
     policy_kwargs = args['policy']
     network_cls = getattr(pufferlib.models, policy_kwargs['network'])
-    encoder_cls = pufferlib.models.DefaultEncoder
-    decoder_cls = pufferlib.models.DefaultDecoder
+
     network = network_cls(**policy_kwargs)
-    encoder = encoder_cls(vecenv.driver_env, policy_kwargs['hidden_size'])
-    decoder = decoder_cls(vecenv.driver_env, policy_kwargs['hidden_size'])
+    encoder = pufferlib.models.DefaultEncoder(vec.obs_size, policy_kwargs['hidden_size'])
+    decoder = pufferlib.models.DefaultDecoder(vec.act_sizes, policy_kwargs['hidden_size'])
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
     device = args['train']['device']

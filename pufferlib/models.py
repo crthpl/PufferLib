@@ -6,26 +6,25 @@ import torch.nn.functional as F
 from torch.nn import Linear
 
 class DefaultEncoder(nn.Module):
-    def __init__(self, env, hidden_size=128):
+    def __init__(self, obs_size, hidden_size=128):
         super().__init__()
-        num_obs = np.prod(env.single_observation_space.shape)
-        self.encoder = nn.Linear(num_obs, hidden_size)
+        self.encoder = nn.Linear(obs_size, hidden_size)
 
     def forward(self, observations):
         return self.encoder(observations.view(observations.shape[0], -1).float())
 
 class DefaultDecoder(nn.Module):
-    def __init__(self, env, hidden_size=128):
+    def __init__(self, nvec, hidden_size=128):
         super().__init__()
-        atn = env.single_action_space
-        self.is_continuous = hasattr(atn, 'low')  # Box space
+        self.nvec = tuple(nvec)
+        self.is_continuous = sum(nvec) == len(nvec)
 
         if self.is_continuous:
-            self.decoder_mean = nn.Linear(hidden_size, atn.shape[0])
-            self.decoder_logstd = nn.Parameter(torch.zeros(1, atn.shape[0]))
+            num_atns = len(nvec)
+            self.decoder_mean = nn.Linear(hidden_size, num_atns)
+            self.decoder_logstd = nn.Parameter(torch.zeros(1, num_atns))
         else:
-            self.action_nvec = tuple(atn.nvec)
-            self.decoder = nn.Linear(hidden_size, int(np.sum(atn.nvec)))
+            self.decoder = nn.Linear(hidden_size, int(np.sum(nvec)))
 
         self.value_function = nn.Linear(hidden_size, 1)
 
@@ -36,8 +35,8 @@ class DefaultDecoder(nn.Module):
             logits = torch.distributions.Normal(mean, torch.exp(logstd))
         else:
             logits = self.decoder(hidden)
-            if len(self.action_nvec) > 1:
-                logits = logits.split(self.action_nvec, dim=1)
+            if len(self.nvec) > 1:
+                logits = logits.split(self.nvec, dim=1)
 
         values = self.value_function(hidden)
         return logits, values
