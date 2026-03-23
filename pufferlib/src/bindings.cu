@@ -294,7 +294,7 @@ void vec_reset(VecEnv& ve) {
 // actions_ptr: data_ptr() of a (total_agents, num_atns) float64 CUDA tensor
 void vec_step(VecEnv& ve, long long actions_ptr) {
     cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
-        (size_t)ve.total_agents * ve.num_atns * sizeof(double),
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float),
         cudaMemcpyDeviceToDevice);
     {
         py::gil_scoped_release no_gil;

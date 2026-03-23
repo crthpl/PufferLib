@@ -36,13 +36,11 @@ from pufferlib.muon import Muon
 _OBS_DTYPE_MAP = {
     'ByteTensor':   torch.uint8,
     'FloatTensor':  torch.float32,
-    'DoubleTensor': torch.float64,
 }
 
 _TORCH_TO_TYPESTR = {
     torch.uint8:   '|u1',
     torch.float32: '<f4',
-    torch.float64: '<f8',
 }
 
 class _CudaPtr:
@@ -78,8 +76,7 @@ class StaticVecEnv:
         self.agents_per_batch = vec.total_agents
 
         obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
-        np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32,
-                        torch.float64: np.float64}[obs_dtype]
+        np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32}[obs_dtype]
         self._obs_dtype = obs_dtype
         self.single_observation_space = _Space((vec.obs_size,), np_obs_dtype)
         self.single_action_space = _Space((vec.num_atns,), np.float64, nvec=vec.act_sizes)
@@ -108,8 +105,9 @@ class StaticVecEnv:
             actions = actions.unsqueeze(-1)
         else:
             actions = actions.T
-        actions_gpu = actions.to(dtype=torch.float64, device='cuda').contiguous()
+        actions_gpu = actions.to(dtype=torch.float32, device='cuda').contiguous()
         v.step(actions_gpu.data_ptr())
+        torch.cuda.synchronize()
 
     def log(self):
         return self._vec.log()
