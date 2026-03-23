@@ -1,96 +1,9 @@
-from pdb import set_trace as T
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# https://arxiv.org/abs/2410.01201v1
-
-import torch
-import torch.nn.functional as F
-from torch.nn import Linear, Identity, Module
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
-
-# appendix B
-# https://github.com/glassroom/heinsen_sequence
-
-def heinsen_associative_scan_log(log_coeffs, log_values):
-    a_star = log_coeffs.cumsum(dim = 1)
-    log_h0_plus_b_star = (log_values - a_star).logcumsumexp(dim = 1)
-    log_h = a_star + log_h0_plus_b_star
-    return log_h.exp()
-
-# appendix B.3
-
-def g(x):
-    return torch.where(x >= 0, x + 0.5, x.sigmoid())
-
-def log_g(x):
-    return torch.where(x >= 0, (F.relu(x) + 0.5).log(), -F.softplus(-x))
-
-# log-space version of minGRU - B.3.1
-# they enforce the hidden states to be positive
-
-class MinGRULayer(Module):
-    def __init__(self, dim, expansion_factor=1., proj_out = None):
-        super().__init__()
-
-        dim_inner = int(dim * expansion_factor)
-        #self.proj_out = default(proj_out, expansion_factor != 1.)
-
-        self.to_hidden_and_gate = Linear(dim, dim_inner * 3, bias = False)
-        #nn.init.orthogonal_(self.to_hidden_and_gate.weight)
-
-        #self.to_out = Linear(dim_inner, dim, bias = False)
-        #nn.init.orthogonal_(self.to_out.weight)
-
-        #self.norm = torch.nn.RMSNorm(dim)
-
-    def forward(self, x, prev_hidden = None):
-        seq_len = x.shape[1]
-        hidden, gate, proj = self.to_hidden_and_gate(x).chunk(3, dim = -1)
-
-        if seq_len == 1:
-            # handle sequential
-
-            hidden = g(hidden)
-            gate = gate.sigmoid()
-            out = torch.lerp(prev_hidden, hidden, gate) if exists(prev_hidden) else (hidden * gate)
-        else:
-            # parallel
-            log_coeffs = -F.softplus(gate)
-
-            log_z = -F.softplus(-gate)
-            log_tilde_h = log_g(hidden)
-            log_values = log_z + log_tilde_h
-
-            if exists(prev_hidden):
-                log_values = torch.cat((prev_hidden.log(), log_values), dim = 1)
-                log_coeffs = F.pad(log_coeffs, (0, 0, 1, 0))
-
-            out = heinsen_associative_scan_log(log_coeffs, log_values)
-            out = out[:, -seq_len:]
-
-        next_prev_hidden = out[:, -1:]
-
-        #if self.proj_out:
-        #    out = self.to_out(out)
-
-        # Highway connection
-        proj_sigmoid = F.sigmoid(proj);
-        out = proj_sigmoid*out + (1.0 - proj_sigmoid)*x;
-
-        #out = out + x
-        #out = self.norm(out)
-
-        return out, next_prev_hidden
+from torch.nn import Linear
 
 class DefaultEncoder(nn.Module):
     def __init__(self, env, hidden_size=128):
@@ -108,11 +21,9 @@ class DefaultDecoder(nn.Module):
         self.is_continuous = hasattr(atn, 'low')  # Box space
 
         if self.is_continuous:
-            self.decoder_mean = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, atn.shape[0]), std=0.01)
+            self.decoder_mean = nn.Linear(hidden_size, atn.shape[0])
             self.decoder_logstd = nn.Parameter(torch.zeros(1, atn.shape[0]))
         else:
-            # Discrete (nvec has one entry) or MultiDiscrete (nvec has multiple)
             self.action_nvec = tuple(atn.nvec)
             self.decoder = nn.Linear(hidden_size, int(np.sum(atn.nvec)))
 
@@ -130,7 +41,6 @@ class DefaultDecoder(nn.Module):
 
         values = self.value_function(hidden)
         return logits, values
- 
 
 class Policy(nn.Module):
     def __init__(self, encoder, decoder, network):
@@ -154,6 +64,55 @@ class Policy(nn.Module):
         h = self.network.forward_train(h.reshape(B, TT, -1))
         logits, values = self.decoder(h.reshape(B*TT, -1))
         return logits, values.reshape(B, TT)
+
+class MinGRU(nn.Module):
+    # https://arxiv.org/abs/2410.01201v1
+    def __init__(self, hidden_size, num_layers=1, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([
+            Linear(hidden_size, 3 * hidden_size, bias=False) for _ in range(num_layers)
+        ])
+
+    def _g(self, x):
+        return torch.where(x >= 0, x + 0.5, x.sigmoid())
+
+    def _log_g(self, x):
+        return torch.where(x >= 0, (F.relu(x) + 0.5).log(), -F.softplus(-x))
+
+    def _highway(self, x, out, proj):
+        g = proj.sigmoid()
+        return g * out + (1.0 - g) * x
+
+    def _heinsen_scan(self, log_coeffs, log_values):
+        a_star = log_coeffs.cumsum(dim=1)
+        return (a_star + (log_values - a_star).logcumsumexp(dim=1)).exp()
+
+    def initial_state(self, batch_size, device):
+        return (torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device),)
+
+    def forward_eval(self, h, state):
+        state = state[0]
+        assert state.shape[1] == h.shape[0]
+        h = h.unsqueeze(1)
+        state_out = []
+        for i in range(self.num_layers):
+            hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)
+            out = torch.lerp(state[i:i+1].transpose(0, 1), self._g(hidden), gate.sigmoid())
+            h = self._highway(h, out, proj)
+            state_out.append(out[:, -1:])
+        return h.squeeze(1), (torch.stack(state_out, 0).squeeze(2),)
+
+    def forward_train(self, h):
+        T = h.shape[1]
+        for i in range(self.num_layers):
+            hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)
+            log_coeffs = -F.softplus(gate)
+            log_values = -F.softplus(-gate) + self._log_g(hidden)
+            out = self._heinsen_scan(log_coeffs, log_values)[:, -T:]
+            h = self._highway(h, out, proj)
+        return h
 
 class MLP(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
@@ -212,8 +171,6 @@ class LSTM(nn.Module):
         h, _ = self.lstm(h)
         return h.transpose(0, 1)
 
-Default = LSTM
-
 class GRU(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
@@ -263,216 +220,69 @@ class GRU(nn.Module):
         h = self.norm(h)
         return h.transpose(0, 1)
 
-class MinGRU(nn.Module):
-    def __init__(self, hidden_size, num_layers=1, expansion_factor=2, **kwargs):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.expansion_factor = expansion_factor
-        self.num_layers = num_layers
-        self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
-
-    def initial_state(self, batch_size, device):
-        state = torch.zeros(self.num_layers, batch_size, self.hidden_size*self.expansion_factor, device=device)
-        return (state,)
-
-    def forward_eval(self, h, state):
-        state = state[0]
-        assert state.shape[1] == h.shape[0]
-        h = h.unsqueeze(1)
-        state = state.unsqueeze(2)
-        state_out = []
-        for i in range(self.num_layers):
-            h, s = self.mingru[i](h, state[i])
-            state_out.append(s)
-        h = h.squeeze(1)
-        state = torch.stack(state_out, 0).squeeze(2)
-        return h, (state,)
-
-    def forward_train(self, h):
-        # h: [B, T, H]
-        B = h.shape[0]
-        state = self.initial_state(B, h.device)[0].unsqueeze(2)
-        for i in range(self.num_layers):
-            h, _ = self.mingru[i](h, state[i])
-        return h
-
-class Mamba(nn.Module):
-    def __init__(self, hidden_size, num_layers=1, d_state=32, d_conv=4, expand=1, **kwargs):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        from mamba_ssm import Mamba2
-        self.mamba = nn.ModuleList([Mamba2(d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(num_layers)])
-
-    def initial_state(self, batch_size, device):
-        conv_state = torch.zeros(
-            self.num_layers, batch_size,
-            self.mamba[0].d_conv, self.mamba[0].conv1d.weight.shape[0],
-            device=device, dtype=self.mamba[0].conv1d.weight.dtype,
-        ).transpose(2, 3).to(device)
-        ssm_state = torch.zeros(
-            self.num_layers, batch_size,
-            self.mamba[0].nheads, self.mamba[0].headdim, self.mamba[0].d_state,
-            device=device, dtype=self.mamba[0].in_proj.weight.dtype,
-        ).to(device)
-        return conv_state, ssm_state
-
-    def forward_eval(self, h, state):
-        h = h.unsqueeze(1)
-        conv_state, ssm_state = state
-        for i in range(self.num_layers):
-            h, conv_state[i], ssm_state[i] = self.mamba[i].step(h, conv_state[i], ssm_state[i])
-        return h.squeeze(1), (conv_state, ssm_state)
-
-    def forward_train(self, h):
-        # h: [B, T, H]
-        for i in range(self.num_layers):
-            h = self.mamba[i](h)
-        return h
-
-class LSTMWrapper(nn.Module):
-    def __init__(self, env, make_policy_fn, hidden_size=128, num_layers=1, **kwargs):
-        '''Wraps your policy with an LSTM without letting you shoot yourself in the
-        foot with bad transpose and shape operations. This saves much pain.
-        Requires that your policy define encode_observations and decode_actions.
-        See the Default policy for an example.'''
-        super().__init__()
-        self.obs_shape = env.single_observation_space.shape
-        input_size = hidden_size
-
-        # NOTE: LSTM API is changing. Should revisit this.
-        self.policy = make_policy_fn()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.is_continuous = self.policy.is_continuous
-
-        for name, param in self.named_parameters():
-            if 'layer_norm' in name:
-                continue
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name and param.ndim >= 2:
-                nn.init.orthogonal_(param, 1.0)
-
-        self.lstm = nn.LSTM(input_size, hidden_size)
-        self.cell = nn.ModuleList([torch.nn.LSTMCell(hidden_size, hidden_size) for _ in range(num_layers)])
-
-        for i in range(num_layers):
-            cell = self.cell[i]
-
-            w_ih = getattr(self.lstm, f'weight_ih_l{i}')
-            w_hh = getattr(self.lstm, f'weight_hh_l{i}')
-            b_ih = getattr(self.lstm, f'bias_ih_l{i}')
-            b_hh = getattr(self.lstm, f'bias_hh_l{i}')
-
-            nn.init.orthogonal_(w_ih, 1.0)
-            nn.init.orthogonal_(w_hh, 1.0)
-            b_ih.data.zero_()
-            b_hh.data.zero_()
-
-            cell.weight_ih = w_ih
-            cell.weight_hh = w_hh
-            cell.bias_ih = b_ih
-            cell.bias_hh = b_hh
-
-    def initial_state(self, batch_size, device):
-        h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
-        c = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
-        return h, c
-
-    def forward_eval(self, x, state):
-        '''Forward function for inference. 3x faster than using LSTM directly'''
-        assert state[0].shape[1] == state[1].shape[1] == x.shape[0], 'LSTM state must be (h, c)'
-        h = self.policy.encode_observations(x)
-        lstm_h, lstm_c = state
-        for i in range(self.num_layers):
-            h, c = self.cell[i](h, (lstm_h[i], lstm_c[i]))
-            lstm_h[i] = h
-            lstm_c[i] = c
-
-        logits, values = self.policy.decode_actions(h)
-        return logits, values, (lstm_h, lstm_c)
-
-    def forward(self, x):
-        '''Forward function for training. Uses LSTM for fast time-batching'''
-        x_shape, space_shape = x.shape, self.obs_shape
-        x_n, space_n = len(x_shape), len(space_shape)
-        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
-
-        B, TT = x_shape[:2]
-        x = x.reshape(B*TT, *space_shape)
-        h = self.policy.encode_observations(x)
-        assert h.shape == (B*TT, self.input_size)
-        h = h.reshape(B, TT, self.input_size)
-
-        h = h.transpose(0, 1)
-        h, (lstm_h, lstm_c) = self.lstm.forward(h)
-        h = h.transpose(0, 1)
-
-        flat_hidden = h.reshape(B*TT, self.hidden_size)
-        logits, values = self.policy.decode_actions(flat_hidden)
-        values = values.reshape(B, TT)
-        return logits, values
-
-class Convolutional(nn.Module):
-    def __init__(self, env, *args, framestack, flat_size,
-            input_size=512, hidden_size=512, output_size=512,
+class NatureEncoder(nn.Module):
+    '''NatureCNN encoder (Mnih et al. 2015). Returns [batch, hidden_size].'''
+    def __init__(self, env, hidden_size=512, framestack=1, flat_size=64*7*7,
             channels_last=False, downsample=1, **kwargs):
-        '''The CleanRL default NatureCNN policy used for Atari.
-        It's just a stack of three convolutions followed by a linear layer
-        
-        Takes framestack as a mandatory keyword argument. Suggested default is 1 frame
-        with LSTM or 4 frames without.'''
         super().__init__()
         self.channels_last = channels_last
         self.downsample = downsample
-
-        #TODO: Remove these from required params
-        self.hidden_size = hidden_size
-        self.is_continuous = False
-
-        self.network= nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Conv2d(framestack, 32, 8, stride=4)),
+        self.network = nn.Sequential(
+            nn.Conv2d(framestack, 32, 8, stride=4),
             nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.Conv2d(32, 64, 4, stride=2),
             nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.Conv2d(64, 64, 3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
-            pufferlib.pytorch.layer_init(nn.Linear(flat_size, hidden_size)),
+            nn.Linear(flat_size, hidden_size),
             nn.ReLU(),
         )
-        self.actor = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
-        self.value_fn = pufferlib.pytorch.layer_init(
-            nn.Linear(output_size, 1), std=1)
 
-    def forward(self, observations, state=None):
-        hidden = self.encode_observations(observations)
-        actions, value = self.decode_actions(hidden)
-        return actions, value
-
-    def forward_train(self, observations, state=None):
-        return self.forward(observations, state)
-
-    def encode_observations(self, observations, state=None):
+    def forward(self, observations):
         if self.channels_last:
             observations = observations.permute(0, 3, 1, 2)
         if self.downsample > 1:
             observations = observations[:, :, ::self.downsample, ::self.downsample]
         return self.network(observations.float() / 255.0)
 
-    def decode_actions(self, flat_hidden):
-        action = self.actor(flat_hidden)
-        value = self.value_fn(flat_hidden)
-        return action, value
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv0 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
 
-class ProcgenResnet(nn.Module):
-    '''Procgen baseline from the AICrowd NeurIPS 2020 competition
-    Based on the ResNet architecture that was used in the Impala paper.'''
-    def __init__(self, env, cnn_width=16, mlp_width=256):
+    def forward(self, x):
+        inputs = x
+        x = F.relu(x)
+        x = self.conv0(x)
+        x = F.relu(x)
+        x = self.conv1(x)
+        return x + inputs
+
+class ConvSequence(nn.Module):
+    def __init__(self, input_shape, out_channels):
+        super().__init__()
+        self._input_shape = input_shape
+        self._out_channels = out_channels
+        self.conv = nn.Conv2d(input_shape[0], out_channels, 3, padding=1)
+        self.res_block0 = ResidualBlock(out_channels)
+        self.res_block1 = ResidualBlock(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = self.res_block0(x)
+        x = self.res_block1(x)
+        return x
+
+    def get_output_shape(self):
+        _c, h, w = self._input_shape
+        return (self._out_channels, (h + 1) // 2, (w + 1) // 2)
+
+class ImpalaEncoder(nn.Module):
+    '''IMPALA ResNet encoder (Espeholt et al. 2018). Returns [batch, hidden_size].'''
+    def __init__(self, env, hidden_size=256, cnn_width=16, **kwargs):
         super().__init__()
         h, w, c = env.single_observation_space.shape
         shape = (c, h, w)
@@ -484,64 +294,10 @@ class ProcgenResnet(nn.Module):
         conv_seqs += [
             nn.Flatten(),
             nn.ReLU(),
-            nn.Linear(in_features=shape[0] * shape[1] * shape[2], out_features=mlp_width),
+            nn.Linear(shape[0] * shape[1] * shape[2], hidden_size),
             nn.ReLU(),
         ]
         self.network = nn.Sequential(*conv_seqs)
-        self.actor = pufferlib.pytorch.layer_init(
-                nn.Linear(mlp_width, env.single_action_space.n), std=0.01)
-        self.value = pufferlib.pytorch.layer_init(
-                nn.Linear(mlp_width, 1), std=1)
 
-    def forward(self, observations, state=None):
-        hidden = self.encode_observations(observations)
-        actions, value = self.decode_actions(hidden)
-        return actions, value
-
-    def forward_train(self, observations, state=None):
-        return self.forward(observations, state)
-
-    def encode_observations(self, x):
-        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)
-        return hidden
- 
-    def decode_actions(self, hidden):
-        '''linear decoder function'''
-        action = self.actor(hidden)
-        value = self.value(hidden)
-        return action, value
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv0 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
-        self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        inputs = x
-        x = nn.functional.relu(x)
-        x = self.conv0(x)
-        x = nn.functional.relu(x)
-        x = self.conv1(x)
-        return x + inputs
-
-class ConvSequence(nn.Module):
-    def __init__(self, input_shape, out_channels):
-        super().__init__()
-        self._input_shape = input_shape
-        self._out_channels = out_channels
-        self.conv = nn.Conv2d(in_channels=self._input_shape[0], out_channels=self._out_channels, kernel_size=3, padding=1)
-        self.res_block0 = ResidualBlock(self._out_channels)
-        self.res_block1 = ResidualBlock(self._out_channels)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = nn.functional.max_pool2d(x, kernel_size=3, stride=2, padding=1)
-        x = self.res_block0(x)
-        x = self.res_block1(x)
-        assert x.shape[1:] == self.get_output_shape()
-        return x
-
-    def get_output_shape(self):
-        _c, h, w = self._input_shape
-        return (self._out_channels, (h + 1) // 2, (w + 1) // 2)
+    def forward(self, observations):
+        return self.network(observations.permute(0, 3, 1, 2).float() / 255.0)
