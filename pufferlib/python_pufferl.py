@@ -149,8 +149,6 @@ class PuffeRL:
         self.last_log_time = time.time()
         self.start_time = time.time()
         self.profile = Profile()
-        self.env_logs = {}
-        self.losses = {}
         self.verbose = verbose
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -340,8 +338,8 @@ class PuffeRL:
             'agent_steps': self.global_step * self.world_size,
             'uptime': time.time() - self.start_time,
             'epoch': self.epoch,
-            'env': dict(self.env_logs),
-            'loss': dict(self.losses),
+            'env': dict(getattr(self, 'env_logs', {})),
+            'loss': dict(getattr(self, 'losses', {})),
             'perf': {
                 'rollout': perf[P.ROLLOUT],
                 'eval_gpu': perf[P.EVAL_GPU],

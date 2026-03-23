@@ -18,11 +18,11 @@ classifiers=[
 ]
 dependencies = [
     "setuptools",
-    "numpy<2.0",
+    "numpy",
     "torch>=2.9",
     "rich",
     "rich_argparse",
-    "imageio",
+    #"imageio",
     "gpytorch",
     "scikit-learn",
     "wandb",
