@@ -8,7 +8,7 @@ import pufferlib
 
 
 env_names = sorted([
-    'breakout',
+    #'breakout',
     #'impulse_wars',
     #'pacman',
     #'tetris',
@@ -17,7 +17,7 @@ env_names = sorted([
     #'pong',
     #'tower_climb',
     #'grid',
-    #'nmmo3',
+    'nmmo3',
     #'snake',
     #'tripletriad'
 ])
@@ -38,7 +38,7 @@ HYPERS = [
     'train/eps',
     'train/prio_alpha',
     'train/prio_beta0',
-    'train/horizon',
+    #'train/horizon',
     'train/replay_ratio',
     'train/minibatch_size',
     'policy/hidden_size',
@@ -50,6 +50,8 @@ METRICS = [
     'uptime',
     'env/score',
     'env/perf',
+    'tsne1',
+    'tsne2',
 ]
 
 ALL_KEYS = HYPERS + METRICS
@@ -68,6 +70,7 @@ def pareto_idx(steps, costs, scores):
 def cached_load(path, env_name, cache):
     data = {}
     num_metrics = 0
+    metric_keys = []
     for fpath in glob.glob(path):
         if fpath in cache:
             exp = cache[fpath]
@@ -81,6 +84,14 @@ def cached_load(path, env_name, cache):
 
         cache[fpath] = exp
 
+        if 'metrics' not in exp:
+            print(f'Skipping {fpath} (no metrics)')
+            continue
+
+        # Temporary: Some experiments are missing loss keys
+        for k in list(exp['metrics'].keys()):
+            if 'loss' in k:
+                del exp['metrics'][k]
         data_len = len(exp['metrics']['agent_steps'])
         if data_len > 100:
             print(f'Skipping {fpath} (len={data_len})')
@@ -88,11 +99,13 @@ def cached_load(path, env_name, cache):
 
         if num_metrics == 0:
             num_metrics = len(exp['metrics'])
+            metric_keys = list(exp['metrics'].keys())
 
         skip = False
         metrics = exp['metrics']
 
         if len(metrics) != num_metrics:
+            breakpoint()
             print(f'Skipping {fpath} (num_metrics={len(metrics)} != {num_metrics})')
             continue
 
@@ -110,13 +123,13 @@ def cached_load(path, env_name, cache):
                 break
 
         if skip:
+            breakpoint()
             print(f'Skipping {fpath} (bad data)')
             continue
 
         for k, v in metrics.items():
             data[k].append(v)
             if len(data[k]) != len(data['SPS']):
-                breakpoint()
                 pass
 
         sweep_metadata = exp['sweep']
@@ -158,13 +171,40 @@ def cached_load(path, env_name, cache):
     for k, v in data.items():
         data[k] = [item for sublist in v for item in sublist]
 
+    for k in list(data.keys()):
+        if 'sweep' in k:
+            del data[k]
+
+    # Format im millions to avoid overfloat in C
+    data['agent_steps'] = [e/1e6 for e in data['agent_steps']]
+    data['train/total_timesteps'] = [e/1e6 for e in data['train/total_timesteps']]
+    #data['metrics/agent_steps'] = [e/1e6 for e in data['metrics/agent_steps']]
+    del data['metrics/agent_steps']
+
+    '''
+    for k, v in data.items():
+        for e in v:
+            if e is None or isinstance(e, str):
+                continue
+            try:
+                if e > 1e9 or e < -1e9:
+                    breakpoint()
+            except:
+                breakpoint()
+    '''
+
     # Filter to pareto
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
+    '''
     idxs = pareto_idx(steps, costs, scores)
     for k in data:
-        data[k] = [data[k][i] for i in idxs]
+        try:
+            data[k] = [data[k][i] for i in idxs]
+        except IndexError:
+            breakpoint()
+    '''
 
     data['sweep'] = sweep_metadata
     return data
@@ -215,6 +255,16 @@ def compute_tsne():
 
         row += sz
         print(f'Env {env} has {sz} points')
+
+    for env in all_data:
+        dat = all_data[env]
+        dat = {k: v for k, v in dat.items() if k in ALL_KEYS}
+        all_data[env] = dat
+        for k, v in dat.items():
+            try:
+                print(f'{env}/{k}: {len(v), min(v), max(v)}')
+            except:
+                print(f'{env}/{k}: {len(v)}')
 
     json.dump(all_data, open('pufferlib/ocean/constellation/default.json', 'w'))
 

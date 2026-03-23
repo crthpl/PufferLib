@@ -171,32 +171,61 @@ class DefaultDecoder(nn.Module):
         return logits, values
  
 
-class Default(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
+class Policy(nn.Module):
+    def __init__(self, encoder, decoder, network):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.network = network
+
+    def initial_state(self, batch_size, device):
+        return self.network.initial_state(batch_size, device)
+
+    def forward_eval(self, x, state):
+        h = self.encoder(x)
+        h, state = self.network.forward_eval(h, state)
+        logits, values = self.decoder(h)
+        return logits, values, state
+
+    def forward(self, x):
+        B, TT = x.shape[:2]
+        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        h = self.network.forward_train(h.reshape(B, TT, -1))
+        logits, values = self.decoder(h.reshape(B*TT, -1))
+        return logits, values.reshape(B, TT)
+
+class MLP(nn.Module):
+    def __init__(self, hidden_size, num_layers=1, **kwargs):
+        super().__init__()
+
+    def initial_state(self, batch_size, device):
+        return ()
+
+    def forward_eval(self, h, state):
+        return h, state
+
+    def forward_train(self, h):
+        return h
+
+class LSTM(nn.Module):
+    def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
-        self.input_size = hidden_size
         self.num_layers = num_layers
-        self.obs_shape = env.single_observation_space.shape
-        self.encoder = DefaultEncoder(env, hidden_size)
-        self.decoder = DefaultDecoder(env, hidden_size)
 
         self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers=num_layers)
         self.cell = nn.ModuleList([torch.nn.LSTMCell(hidden_size, hidden_size) for _ in range(num_layers)])
 
         for i in range(num_layers):
             cell = self.cell[i]
-
             w_ih = getattr(self.lstm, f'weight_ih_l{i}')
             w_hh = getattr(self.lstm, f'weight_hh_l{i}')
             b_ih = getattr(self.lstm, f'bias_ih_l{i}')
             b_hh = getattr(self.lstm, f'bias_hh_l{i}')
-
             nn.init.orthogonal_(w_ih, 1.0)
             nn.init.orthogonal_(w_hh, 1.0)
             b_ih.data.zero_()
             b_hh.data.zero_()
-
             cell.weight_ih = w_ih
             cell.weight_hh = w_hh
             cell.bias_ih = b_ih
@@ -207,49 +236,28 @@ class Default(nn.Module):
         c = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
         return h, c
 
-    def forward_eval(self, x, state):
-        '''Forward function for inference. 3x faster than using LSTM directly'''
-        assert state[0].shape[1] == state[1].shape[1] == x.shape[0], 'LSTM state must be (h, c)'
-        h = self.encoder(x)
+    def forward_eval(self, h, state):
+        assert state[0].shape[1] == state[1].shape[1] == h.shape[0]
         lstm_h, lstm_c = state
         for i in range(self.num_layers):
             h, c = self.cell[i](h, (lstm_h[i], lstm_c[i]))
             lstm_h[i] = h
             lstm_c[i] = c
+        return h, (lstm_h, lstm_c)
 
-        logits, values = self.decoder(h)
-        return logits, values, (lstm_h, lstm_c)
-
-    def forward(self, x):
-        '''Forward function for training. Uses LSTM for fast time-batching'''
-        x_shape, space_shape = x.shape, self.obs_shape
-        x_n, space_n = len(x_shape), len(space_shape)
-        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
-
-        B, TT = x_shape[:2]
-        x = x.reshape(B*TT, *space_shape)
-        h = self.encoder(x)
-        assert h.shape == (B*TT, self.input_size)
-        h = h.reshape(B, TT, self.input_size)
-
+    def forward_train(self, h):
+        # h: [B, T, H]
         h = h.transpose(0, 1)
-        h, (lstm_h, lstm_c) = self.lstm.forward(h)
-        h = h.transpose(0, 1)
+        h, _ = self.lstm(h)
+        return h.transpose(0, 1)
 
-        flat_hidden = h.reshape(B*TT, self.hidden_size)
-        logits, values = self.decoder(flat_hidden)
-        values = values.reshape(B, TT)
-        return logits, values
+Default = LSTM
 
 class GRU(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, **kwargs):
+    def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
-        self.input_size = hidden_size
         self.num_layers = num_layers
-        self.obs_shape = env.single_observation_space.shape
-        self.encoder = DefaultEncoder(env, hidden_size)
-        self.decoder = DefaultDecoder(env, hidden_size)
 
         self.gru = nn.GRU(hidden_size, hidden_size, num_layers=num_layers)
         self.cell = nn.ModuleList([torch.nn.GRUCell(hidden_size, hidden_size) for _ in range(num_layers)])
@@ -257,17 +265,14 @@ class GRU(nn.Module):
 
         for i in range(num_layers):
             cell = self.cell[i]
-
             w_ih = getattr(self.gru, f'weight_ih_l{i}')
             w_hh = getattr(self.gru, f'weight_hh_l{i}')
             b_ih = getattr(self.gru, f'bias_ih_l{i}')
             b_hh = getattr(self.gru, f'bias_hh_l{i}')
-
             nn.init.orthogonal_(w_ih, 1.0)
             nn.init.orthogonal_(w_hh, 1.0)
             b_ih.data.zero_()
             b_hh.data.zero_()
-
             cell.weight_ih = w_ih
             cell.weight_hh = w_hh
             cell.bias_ih = b_ih
@@ -277,55 +282,30 @@ class GRU(nn.Module):
         h = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
         return (h,)
 
-    def forward_eval(self, x, state):
-        '''Forward function for inference. 3x faster than using LSTM directly'''
-        assert state[0].shape[1] == x.shape[0]
-        h = self.encoder(x)
+    def forward_eval(self, h, state):
+        assert state[0].shape[1] == h.shape[0]
         state = state[0]
         for i in range(self.num_layers):
-            h_in = h    
+            h_in = h
             h = self.cell[i](h, state[i])
             state[i] = h
             h = h + h_in
             h = self.norm(h)
+        return h, (state,)
 
-        logits, values = self.decoder(h)
-        return logits, values, (state,)
-
-    def forward(self, x):
-        '''Forward function for training. Uses LSTM for fast time-batching'''
-        x_shape, space_shape = x.shape, self.obs_shape
-        x_n, space_n = len(x_shape), len(space_shape)
-        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
-
-        B, TT = x_shape[:2]
-        x = x.reshape(B*TT, *space_shape)
-        h = self.encoder(x)
-        assert h.shape == (B*TT, self.input_size)
-        h = h.reshape(B, TT, self.input_size)
-
+    def forward_train(self, h):
+        # h: [B, T, H]
         h = h.transpose(0, 1)
         h_in = h
-        h, _ = self.gru.forward(h)
+        h, _ = self.gru(h)
         h = h + h_in
         h = self.norm(h)
-        h = h.transpose(0, 1)
-
-        flat_hidden = h.reshape(B*TT, self.hidden_size)
-        logits, values = self.decoder(flat_hidden)
-        values = values.reshape(B, TT)
-        return logits, values
-
+        return h.transpose(0, 1)
 
 class MinGRU(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, expansion_factor=2, **kwargs):
+    def __init__(self, hidden_size, num_layers=1, expansion_factor=2, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
-        self.input_size = hidden_size
-        self.expansion_factor = expansion_factor
-        self.obs_shape = env.single_observation_space.shape
-        self.encoder = DefaultEncoder(env, hidden_size)
-        self.decoder = DefaultDecoder(env, hidden_size)
         self.expansion_factor = expansion_factor
         self.num_layers = num_layers
         self.mingru = nn.ModuleList([MinGRULayer(hidden_size, expansion_factor) for _ in range(num_layers)])
@@ -334,53 +314,31 @@ class MinGRU(nn.Module):
         state = torch.zeros(self.num_layers, batch_size, self.hidden_size*self.expansion_factor, device=device)
         return (state,)
 
-    def forward_eval(self, x, state):
+    def forward_eval(self, h, state):
         state = state[0]
-        assert state.shape[1] == x.shape[0]
-        h = self.encoder(x)
+        assert state.shape[1] == h.shape[0]
         h = h.unsqueeze(1)
         state = state.unsqueeze(2)
         state_out = []
         for i in range(self.num_layers):
             h, s = self.mingru[i](h, state[i])
             state_out.append(s)
-
         h = h.squeeze(1)
         state = torch.stack(state_out, 0).squeeze(2)
-        logits, values = self.decoder(h)
-        return logits, values, (state,)
+        return h, (state,)
 
-    def forward(self, x):
-        '''Forward function for training. Uses LSTM for fast time-batching'''
-        x_shape, space_shape = x.shape, self.obs_shape
-        x_n, space_n = len(x_shape), len(space_shape)
-        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
-
-        B, TT = x_shape[:2]
-        x = x.reshape(B*TT, *space_shape)
-        h = self.encoder(x)
-        assert h.shape == (B*TT, self.input_size)
-        h = h.reshape(B, TT, self.input_size)
-
+    def forward_train(self, h):
+        # h: [B, T, H]
+        B = h.shape[0]
         state = self.initial_state(B, h.device)[0].unsqueeze(2)
         for i in range(self.num_layers):
             h, _ = self.mingru[i](h, state[i])
-
-        flat_hidden = h.reshape(B*TT, self.hidden_size)
-        logits, values = self.decoder(flat_hidden)
-        values = values.reshape(B, TT)
-        return logits, values
+        return h
 
 class Mamba(nn.Module):
-    def __init__(self, env, hidden_size=128, num_layers=1, d_state=32, d_conv=4, expand=1):
+    def __init__(self, hidden_size, num_layers=1, d_state=32, d_conv=4, expand=1, **kwargs):
         super().__init__()
-        self.obs_shape = env.single_observation_space.shape
         self.hidden_size = hidden_size
-        self.input_size = hidden_size
-        self.obs_shape = env.single_observation_space.shape
-        self.encoder = DefaultEncoder(env, hidden_size)
-        self.decoder = DefaultDecoder(env, hidden_size)
-
         self.num_layers = num_layers
         from mamba_ssm import Mamba2
         self.mamba = nn.ModuleList([Mamba2(d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -388,54 +346,29 @@ class Mamba(nn.Module):
 
     def initial_state(self, batch_size, device):
         conv_state = torch.zeros(
-            self.num_layers,
-            batch_size,
-            self.mamba[0].d_conv,
-            self.mamba[0].conv1d.weight.shape[0],
-            device=device,
-            dtype=self.mamba[0].conv1d.weight.dtype,
+            self.num_layers, batch_size,
+            self.mamba[0].d_conv, self.mamba[0].conv1d.weight.shape[0],
+            device=device, dtype=self.mamba[0].conv1d.weight.dtype,
         ).transpose(2, 3).to(device)
         ssm_state = torch.zeros(
-            self.num_layers,
-            batch_size,
-            self.mamba[0].nheads,
-            self.mamba[0].headdim,
-            self.mamba[0].d_state,
-            device=device,
-            dtype=self.mamba[0].in_proj.weight.dtype,
+            self.num_layers, batch_size,
+            self.mamba[0].nheads, self.mamba[0].headdim, self.mamba[0].d_state,
+            device=device, dtype=self.mamba[0].in_proj.weight.dtype,
         ).to(device)
         return conv_state, ssm_state
 
-    def forward_eval(self, x, state):
-        h = self.encoder(x)
+    def forward_eval(self, h, state):
         h = h.unsqueeze(1)
         conv_state, ssm_state = state
         for i in range(self.num_layers):
             h, conv_state[i], ssm_state[i] = self.mamba[i].step(h, conv_state[i], ssm_state[i])
+        return h.squeeze(1), (conv_state, ssm_state)
 
-        state = (conv_state, ssm_state)
-        h = h.squeeze(1)
-        logits, values = self.decoder(h)
-        return logits, values, state
-
-    def forward(self, x):
-        x_shape, space_shape = x.shape, self.obs_shape
-        x_n, space_n = len(x_shape), len(space_shape)
-        assert x_shape[-space_n:] == space_shape, f'Invalid input tensor shape {x.shape} != {space_shape}'
-
-        B, TT = x_shape[:2]
-        x = x.reshape(B*TT, *space_shape)
-        h = self.encoder(x)
-        assert h.shape == (B*TT, self.input_size)
-        h = h.reshape(B, TT, self.input_size)
-
+    def forward_train(self, h):
+        # h: [B, T, H]
         for i in range(self.num_layers):
             h = self.mamba[i](h)
-
-        flat_hidden = h.reshape(B*TT, self.hidden_size)
-        logits, values = self.decoder(flat_hidden)
-        values = values.reshape(B, TT)
-        return logits, values
+        return h
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, make_policy_fn, hidden_size=128, num_layers=1, **kwargs):

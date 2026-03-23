@@ -5,8 +5,4 @@ try:
 except ImportError:
     pass
 else:
-    from .torch import Policy
-    try:
-        from .torch import Recurrent
-    except:
-        Recurrent = None
+    from .torch import Encoder

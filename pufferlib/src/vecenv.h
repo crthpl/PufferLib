@@ -576,6 +576,7 @@ const char* get_obs_dtype(void) { return dtype_symbol; }
 size_t get_obs_elem_size(void) { return obs_element_size(); }
 
 void static_vec_step(StaticVec* vec) {
+    assert(vec->buffers == 1);
     // D2H: copy GPU actions to CPU pinned memory so envs can read them
     cudaMemcpy(vec->actions, vec->gpu_actions,
         (size_t)vec->total_agents * NUM_ATNS * sizeof(float),

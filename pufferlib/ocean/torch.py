@@ -17,7 +17,8 @@ from pufferlib.models import MinGRU, Mamba, GRU, MinGRULayer
 from pufferlib.models import DefaultEncoder, DefaultDecoder
 from pufferlib.models import Convolutional as Conv
 Recurrent = pufferlib.models.LSTMWrapper
-from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
+from pufferlib.pytorch import layer_init
+from pufferlib.torch_nativize import _nativize_dtype, nativize_tensor
 import numpy as np
 
 
