@@ -1,5 +1,4 @@
 import importlib
-import pufferlib.emulation
 
 def lazy_import(module_path, attr):
     """

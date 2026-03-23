@@ -14,7 +14,6 @@ import torch
 import torch.distributed
 
 import pufferlib
-import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.pufferl
 from pufferlib.muon import Muon
@@ -105,68 +104,40 @@ class _Space:
             self.nvec = np.array([self.n], dtype=np.int64)
 
 class VecEnv:
-    '''Unified vecenv wrapper for both _C.VecEnv (GPU) and pufferlib.vector (CPU/Python).
-    step() always accepts torch tensors, returns (obs, rewards, terminals).
-    The right step implementation is bound at init — no branching in the hot path.'''
+    '''Wraps _C.VecEnv. GPU buffer tensors created once at init (zero-copy).
+    step(actions) advances the env; obs/rewards/terminals update in-place.'''
 
-    def __init__(self, vec, static=False):
+    def __init__(self, vec):
         self._vec = vec
+        self.num_agents = vec.total_agents
+        obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
+        np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32}[obs_dtype]
+        self.single_observation_space = _Space((vec.obs_size,), np_obs_dtype)
+        self.single_action_space = _Space((vec.num_atns,), np.float64, nvec=vec.act_sizes)
+        self.driver_env = self
 
-        if static:
-            self.num_agents = vec.total_agents
-            obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
-            np_obs_dtype = {torch.uint8: np.uint8, torch.float32: np.float32}[obs_dtype]
-            self.single_observation_space = _Space((vec.obs_size,), np_obs_dtype)
-            self.single_action_space = _Space((vec.num_atns,), np.float64, nvec=vec.act_sizes)
-            self.driver_env = self
+        self.observations = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
+            (vec.total_agents, vec.obs_size), obs_dtype))
+        self.rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
+            (vec.total_agents,), torch.float32))
+        self.terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
+            (vec.total_agents,), torch.float32))
 
-            self.observations = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
-                (vec.total_agents, vec.obs_size), obs_dtype))
-            self.rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
-                (vec.total_agents,), torch.float32))
-            self.terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
-                (vec.total_agents,), torch.float32))
-
-            self.step = self._static_step
-            self.reset = self._static_reset
-            self.log = vec.log
-            self.close = vec.close
-        else:
-            self.num_agents = vec.num_envs
-            self.single_observation_space = vec.single_observation_space
-            atn = vec.single_action_space
-            self.single_action_space = _Space(atn.shape if atn.shape else (1,), atn.dtype,
-                nvec=getattr(atn, 'nvec', None))
-            self.driver_env = vec.driver_env
-            self.observations = None
-
-            self.step = self._python_step
-            self.reset = self._python_reset
-            self.log = lambda: {}
-            self.close = vec.close
-
-    def _static_reset(self, seed=0):
+    def reset(self, seed=0):
         self._vec.reset()
 
-    def _static_step(self, actions):
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(-1)
-        else:
-            actions = actions.T
+    def step(self, actions):
+        actions = actions.T if actions.dim() > 1 else actions.unsqueeze(-1)
         actions_gpu = actions.to(dtype=torch.float32, device='cuda').contiguous()
         self._vec.step(actions_gpu.data_ptr())
         torch.cuda.synchronize()
         return self.observations, self.rewards, self.terminals
 
-    def _python_reset(self, seed=0):
-        obs, _ = self._vec.reset(seed=seed)
-        self.observations = obs
+    def log(self):
+        return self._vec.log()
 
-    def _python_step(self, actions):
-        act = actions.cpu().numpy().reshape(self._vec.action_space.shape)
-        obs, rewards, terminals, truncations, infos = self._vec.step(act)
-        self.observations = obs
-        return obs, rewards, terminals
+    def close(self):
+        self._vec.close()
 
 class PuffeRL:
     def __init__(self, args, vecenv, policy, verbose=True):
@@ -490,16 +461,7 @@ class Profile:
         return out
 
 def load_env(env_name, args):
-    if args['package'] == 'ocean':
-        return VecEnv(_C.create_vec(args), static=True)
-    module_name = f'pufferlib.environments.{args["package"]}'
-    env_module = importlib.import_module(module_name)
-    make_env = env_module.env_creator(env_name)
-    vec = args['vec']
-    vec_kwargs = {k: v for k, v in vec.items()
-        if k in ('backend', 'num_envs', 'num_workers', 'batch_size', 'seed')}
-    vec_kwargs.setdefault('backend', 'Serial')
-    return VecEnv(pufferlib.vector.make(make_env, env_kwargs=args['env'], **vec_kwargs))
+    return VecEnv(_C.create_vec(args))
 
 def load_policy(args, vecenv, env_name=''):
     import pufferlib.models

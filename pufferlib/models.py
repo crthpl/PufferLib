@@ -5,8 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import pufferlib.emulation
-import pufferlib.spaces
 
 # https://arxiv.org/abs/2410.01201v1
 
@@ -97,75 +95,38 @@ class MinGRULayer(Module):
 class DefaultEncoder(nn.Module):
     def __init__(self, env, hidden_size=128):
         super().__init__()
-        try:
-            self.is_dict_obs = isinstance(env.env.observation_space, pufferlib.spaces.Dict)
-        except:
-            self.is_dict_obs = False
-
-        if self.is_dict_obs:
-            dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
-            input_size = int(sum(np.prod(v.shape) for v in env.env.observation_space.values()))
-        else:
-            num_obs = np.prod(env.single_observation_space.shape)
-            dtype = env.single_observation_space.dtype
-
-        self.dtype = dtype
-        #self.encoder = pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size))
+        num_obs = np.prod(env.single_observation_space.shape)
         self.encoder = nn.Linear(num_obs, hidden_size)
 
     def forward(self, observations):
-        batch_size = observations.shape[0]
-        if self.is_dict_obs:
-            observations = pufferlib.pytorch.nativize_tensor(observations, self.dtype)
-            observations = torch.cat([v.view(batch_size, -1) for v in observations.values()], dim=1)
-        else: 
-            observations = observations.view(batch_size, -1)
-
-        hidden = self.encoder(observations.float())
-        return hidden
-        #return F.gelu(hidden)
+        return self.encoder(observations.view(observations.shape[0], -1).float())
 
 class DefaultDecoder(nn.Module):
     def __init__(self, env, hidden_size=128):
         super().__init__()
-        self.is_multidiscrete = isinstance(env.single_action_space,
-                pufferlib.spaces.MultiDiscrete)
-        self.is_continuous = isinstance(env.single_action_space,
-                pufferlib.spaces.Box)
+        atn = env.single_action_space
+        self.is_continuous = hasattr(atn, 'low')  # Box space
 
-        if self.is_multidiscrete:
-            self.action_nvec = tuple(env.single_action_space.nvec)
-            num_atns = sum(self.action_nvec)
-            self.decoder = pufferlib.pytorch.layer_init(
-                    nn.Linear(hidden_size, num_atns), std=0.01)
-        elif not self.is_continuous:
-            num_atns = env.single_action_space.n
-            #self.decoder = pufferlib.pytorch.layer_init(
-            #    nn.Linear(hidden_size, num_atns), std=0.01)
-            self.decoder = nn.Linear(hidden_size, num_atns)
- 
-        else:
+        if self.is_continuous:
             self.decoder_mean = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, env.single_action_space.shape[0]), std=0.01)
-            self.decoder_logstd = nn.Parameter(torch.zeros(
-                1, env.single_action_space.shape[0]))
-
-        #self.value_function = pufferlib.pytorch.layer_init(
-        #    nn.Linear(hidden_size, 1), std=1)
+                nn.Linear(hidden_size, atn.shape[0]), std=0.01)
+            self.decoder_logstd = nn.Parameter(torch.zeros(1, atn.shape[0]))
+        else:
+            # Discrete (nvec has one entry) or MultiDiscrete (nvec has multiple)
+            self.action_nvec = tuple(atn.nvec)
+            self.decoder = nn.Linear(hidden_size, int(np.sum(atn.nvec)))
 
         self.value_function = nn.Linear(hidden_size, 1)
 
-
     def forward(self, hidden):
-        if self.is_multidiscrete:
-            logits = self.decoder(hidden).split(self.action_nvec, dim=1)
-        elif self.is_continuous:
+        if self.is_continuous:
             mean = self.decoder_mean(hidden)
             logstd = self.decoder_logstd.expand_as(mean)
-            std = torch.exp(logstd)
-            logits = torch.distributions.Normal(mean, std)
+            logits = torch.distributions.Normal(mean, torch.exp(logstd))
         else:
             logits = self.decoder(hidden)
+            if len(self.action_nvec) > 1:
+                logits = logits.split(self.action_nvec, dim=1)
 
         values = self.value_function(hidden)
         return logits, values

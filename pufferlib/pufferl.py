@@ -35,6 +35,17 @@ rich.traceback.install(show_locals=False)
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
+def unroll_nested_dict(d):
+    if not isinstance(d, dict):
+        return d
+
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for k2, v2 in unroll_nested_dict(v):
+                yield f"{k}/{k2}", v2
+        else:
+            yield k, v
+
 def abbreviate(num, b2, c2):
     prefixes = ['', 'K', 'M', 'B', 'T']
     for i, prefix in enumerate(prefixes):
@@ -201,7 +212,7 @@ def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbos
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
-        flat_logs = dict(pufferlib.unroll_nested_dict(backend.log(pufferl)))
+        flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
     model_path = ''
@@ -223,7 +234,7 @@ def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbos
         #    continue
 
         logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-        flat_logs = {**flat_logs, **dict(pufferlib.unroll_nested_dict(logs))}
+        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
 
         # TODO: determ without logging every epoch
         if verbose and epoch % 20 == 0:

@@ -589,7 +589,7 @@ class ImpulseWarsLSTM(Recurrent):
 class ImpulseWarsPolicy(nn.Module):
     def __init__(
         self,
-        env: pufferlib.PufferEnv,
+        env,
         cnn_channels: int = 64,
         weapon_type_embedding_dims: int = 2,
         hidden_size: int = 512,
