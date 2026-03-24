@@ -365,6 +365,18 @@ __global__ void rng_init_kernel(curandStatePhilox4_32_10_t* states, uint64_t see
     }
 }
 
+__device__ __forceinline__ float safe_logit(const precision_t* logits,
+        int logits_base, int logits_offset, int offset) {
+    float l = to_float(logits[logits_base + logits_offset + offset]);
+    if (isnan(l)) {
+        l = 0.0f;
+    }
+    if (isinf(l)) {
+        l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+    }
+    return l;
+}
+
 // Expects action logits and values to be in the same contiguous buffer. See default decoder
 __global__ void sample_logits_kernel(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
@@ -425,28 +437,14 @@ __global__ void sample_logits_kernel(
         for (int h = 0; h < num_atns; ++h) {
             int A = act_sizes[h];  // size of this action head
 
-            // Step 1: Find max for numerical stability (with nan_to_num)
+            // Step 1: Find max and sum for numerical stability (with nan_to_num)
             float max_val = -INFINITY;
-            for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) {
-                    l = 0.0f;
-                }
-                if (isinf(l)) {
-                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-                }
-                max_val = fmaxf(max_val, l);
-            }
-
-            // Step 2: Compute logsumexp for log_softmax denominator
             float sum_exp = 0.0f;
             for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) {
-                    l = 0.0f;
-                }
-                if (isinf(l)) {
-                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
+                float l = safe_logit(logits, logits_base, logits_offset, a);
+                if (l > max_val) {
+                    sum_exp *= expf(max_val - l);
+                    max_val = l;
                 }
                 sum_exp += expf(l - max_val);
             }
@@ -460,13 +458,7 @@ __global__ void sample_logits_kernel(
             int sampled_action = A - 1;  // default to last action
 
             for (int a = 0; a < A; ++a) {
-                float l = to_float(logits[logits_base + logits_offset + a]);
-                if (isnan(l)) {
-                    l = 0.0f;
-                }
-                if (isinf(l)) {
-                    l = (l > 0) ? 3.4028e+38f : -3.4028e+38f;
-                }
+                float l = safe_logit(logits, logits_base, logits_offset, a);
                 float prob = expf(l - logsumexp);
                 cumsum += prob;
                 if (rand_val < cumsum) {
@@ -476,13 +468,7 @@ __global__ void sample_logits_kernel(
             }
 
             // Step 5: Gather log probability of sampled action
-            float sampled_logit = to_float(logits[logits_base + logits_offset + sampled_action]);
-            if (isnan(sampled_logit)) {
-                sampled_logit = 0.0f;
-            }
-            if (isinf(sampled_logit)) {
-                sampled_logit = (sampled_logit > 0) ? 3.4028e+38f : -3.4028e+38f;
-            }
+            float sampled_logit = safe_logit(logits, logits_base, logits_offset, sampled_action);
             float log_prob = sampled_logit - logsumexp;
 
             // Write action for this head
