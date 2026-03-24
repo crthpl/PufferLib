@@ -25,6 +25,7 @@ dependencies = [
     "gpytorch",
     "scikit-learn",
     "wandb",
+    "pybind11",
 ]
 
 [project.scripts]
