@@ -2,14 +2,14 @@
 set -e
 
 # Usage:
-#   ./scripts/build.sh breakout              # Build _C.so with breakout statically linked
-#   ./scripts/build.sh breakout --float      # float32 precision (required for --slowly)
-#   ./scripts/build.sh breakout --debug      # Debug build
-#   ./scripts/build.sh breakout --local      # Standalone executable (debug, sanitizers)
-#   ./scripts/build.sh breakout --fast       # Standalone executable (optimized)
-#   ./scripts/build.sh breakout --web        # Emscripten web build
+#   ./build.sh breakout              # Build _C.so with breakout statically linked
+#   ./build.sh breakout --float      # float32 precision (required for --slowly)
+#   ./build.sh breakout --debug      # Debug build
+#   ./build.sh breakout --local      # Standalone executable (debug, sanitizers)
+#   ./build.sh breakout --fast       # Standalone executable (optimized)
+#   ./build.sh breakout --web        # Emscripten web build
 
-ENV=${1:?Usage: ./scripts/build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web]}
+ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web]}
 MODE=""
 PRECISION=""
 DEBUG=""
@@ -23,56 +23,81 @@ for arg in "${@:2}"; do
     esac
 done
 
+CLANG_WARN="\
+    -Wall \
+    -ferror-limit=3 \
+    -Werror=incompatible-pointer-types \
+    -Werror=return-type \
+    -Wno-error=incompatible-pointer-types-discards-qualifiers \
+    -Wno-incompatible-pointer-types-discards-qualifiers \
+    -Wno-error=array-parameter"
+
+if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
+    CLANG_OPT="-g -O0 $CLANG_WARN"
+    NVCC_OPT="-O0 -g"
+    LINK_OPT="-g"
+    [ "$PLATFORM" = "Linux" ] && CLANG_OPT="$CLANG_OPT -fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer"
+else
+    CLANG_OPT="-O2 -DNDEBUG $CLANG_WARN"
+    NVCC_OPT="-O3"
+    LINK_OPT="-O2"
+fi
+
 # ============================================================================
 # Platform + dependencies
 # ============================================================================
 
 PLATFORM="$(uname -s)"
-RAYLIB_NAME='raylib-5.5_macos'
-BOX2D_NAME='box2d-macos-arm64'
-if [ "$PLATFORM" = "Linux" ]; then
-    RAYLIB_NAME='raylib-5.5_linux_amd64'
-    BOX2D_NAME='box2d-linux-amd64'
-fi
-if [ "$MODE" = "web" ]; then
-    RAYLIB_NAME='raylib-5.5_webassembly'
-    BOX2D_NAME='box2d-web'
-fi
-
-RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
-RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
-BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
 SRC_DIR="ocean/$ENV"
 
+if [ "$PLATFORM" = "Linux" ]; then
+    RAYLIB_NAME='raylib-5.5_linux_amd64'
+else
+    RAYLIB_NAME='raylib-5.5_macos'
+fi
+
+RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
+
 download() {
-    local name=$1 ext=$2
-    if [ ! -d "$name" ]; then
-        echo "Downloading $name..."
-        if [ "$ext" = ".zip" ]; then
-            curl -sL "$3/$name$ext" -o "$name$ext" && unzip -q "$name$ext" && rm "$name$ext"
-        else
-            curl -sL "$3/$name$ext" -o "$name$ext" && tar xf "$name$ext" && rm "$name$ext"
-        fi
+    local name=$1 url=$2
+    [ -d "$name" ] && return
+    echo "Downloading $name..."
+    if [[ "$url" == *.zip ]]; then
+        curl -sL "$url" -o "$name.zip" && unzip -q "$name.zip" && rm "$name.zip"
+    else
+        curl -sL "$url" -o "$name.tar.gz" && tar xf "$name.tar.gz" && rm "$name.tar.gz"
     fi
 }
 
-download "$RAYLIB_NAME" ".tar.gz" "$RAYLIB_URL"
+# Raylib (always needed)
+if [ "$MODE" = "web" ]; then
+    RAYLIB_NAME='raylib-5.5_webassembly'
+    download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.zip"
+else
+    download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.tar.gz"
+fi
 [ ! -f "$RAYLIB_NAME/include/rlights.h" ] && \
-    curl -sL "https://raw.githubusercontent.com/raysan5/raylib/refs/heads/master/examples/shaders/rlights.h" \
+    curl -sL "https://raw.githubusercontent.com/raysan5/raylib/master/examples/shaders/rlights.h" \
         -o "$RAYLIB_NAME/include/rlights.h"
-download "$BOX2D_NAME" ".tar.gz" "$BOX2D_URL"
-[ "$MODE" = "web" ] && download "raylib-5.5_webassembly" ".zip" "$RAYLIB_URL"
-[ "$MODE" = "web" ] && download "box2d-web" ".tar.gz" "$BOX2D_URL"
 
-# Shared include paths
-INCLUDES=(-I./$RAYLIB_NAME/include -I./$BOX2D_NAME/include -I./$BOX2D_NAME/src -I./puffernet)
-
-# Box2d link archive (impulse_wars needs it)
+RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
+INCLUDES=(-I./$RAYLIB_NAME/include -I./puffernet)
 LINK_ARCHIVES="$RAYLIB_A"
-[ "$ENV" = "impulse_wars" ] && LINK_ARCHIVES="$LINK_ARCHIVES ./$BOX2D_NAME/libbox2d.a"
-
-# Extra source files
 EXTRA_SRC=""
+
+# Box2d (impulse_wars only)
+if [ "$ENV" = "impulse_wars" ]; then
+    if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
+    elif [ "$PLATFORM" = "Linux" ]; then BOX2D_NAME='box2d-linux-amd64'
+    else BOX2D_NAME='box2d-macos-arm64'
+    fi
+    BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
+    download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
+    INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src)
+    LINK_ARCHIVES="$LINK_ARCHIVES ./$BOX2D_NAME/libbox2d.a"
+fi
+
+# Constellation needs cJSON
 [ "$ENV" = "constellation" ] && EXTRA_SRC="$SRC_DIR/cJSON.c"
 
 # ============================================================================
@@ -104,30 +129,14 @@ fi
 
 if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     FLAGS=(
-        -Wall
         "${INCLUDES[@]}"
         "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$ENV"
         $LINK_ARCHIVES
         -lGL -lm -lpthread -fopenmp
         -DPLATFORM_DESKTOP
-        -ferror-limit=3
-        -Werror=incompatible-pointer-types
-        -Werror=return-type
-        -Wno-error=incompatible-pointer-types-discards-qualifiers
-        -Wno-incompatible-pointer-types-discards-qualifiers
-        -Wno-error=array-parameter
     )
-    if [ "$PLATFORM" = "Darwin" ]; then
-        FLAGS+=(-framework Cocoa -framework IOKit -framework CoreVideo)
-    fi
-    if [ "$MODE" = "local" ]; then
-        echo "Building $ENV (debug)..."
-        [ "$PLATFORM" = "Linux" ] && FLAGS+=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
-        clang -g -O0 "${FLAGS[@]}"
-    else
-        echo "Building $ENV (optimized)..."
-        clang -O2 -DNDEBUG "${FLAGS[@]}"
-    fi
+    [ "$PLATFORM" = "Darwin" ] && FLAGS+=(-framework Cocoa -framework IOKit -framework CoreVideo)
+    clang $CLANG_OPT "${FLAGS[@]}"
     echo "Built: ./$ENV"
     exit 0
 fi
@@ -145,53 +154,40 @@ NUMPY_INCLUDE=$(python -c "import numpy; print(numpy.get_include())")
 EXT_SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 OUTPUT="pufferlib/_C${EXT_SUFFIX}"
 
-if [ -n "$DEBUG" ]; then
-    OPT="-O0 -g"; LINK_OPT="-g"
-else
-    OPT="-O3"; LINK_OPT="-O2"
-fi
-
-# Step 1: Build static env library
+# Step 1: Static env library
 BINDING_SRC="ocean/$ENV/binding.c"
 STATIC_OBJ="src/libstatic_${ENV}.o"
 STATIC_LIB="src/libstatic_${ENV}.a"
-
 [ ! -f "$BINDING_SRC" ] && echo "Error: $BINDING_SRC not found" && exit 1
 
 echo "=== Building static env: $ENV ==="
-clang -c -O2 -DNDEBUG \
+clang -c $CLANG_OPT \
     -I. -Isrc -Iocean/$ENV \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
     -fPIC -fopenmp \
     "$BINDING_SRC" -o "$STATIC_OBJ"
-
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
 OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep 'Tensor$' | head -1)
-[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T in $STATIC_OBJ" && exit 1
+[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T" && exit 1
 echo "OBS_TENSOR_T=$OBS_TENSOR_T"
 
 # Step 2: Compile bindings.cu
 echo "=== Compiling bindings.cu ==="
-NVCC_CMD=(
-    $NVCC -c -Xcompiler -fPIC
-    -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1
-    -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
-    -Xcompiler=-DPLATFORM_DESKTOP
-    -std=c++17
-    -I. -Isrc
-    -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE
-    -I$CUDA_HOME/include -I$RAYLIB_NAME/include
-    -Xcompiler=-fopenmp
-    -DOBS_TENSOR_T=$OBS_TENSOR_T
-)
-[ -n "$PRECISION" ] && NVCC_CMD+=($PRECISION)
-NVCC_CMD+=($OPT src/bindings.cu -o src/bindings.o)
-
-echo "${NVCC_CMD[@]}"
-"${NVCC_CMD[@]}"
+$NVCC -c -Xcompiler -fPIC \
+    -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
+    -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
+    -Xcompiler=-DPLATFORM_DESKTOP \
+    -std=c++17 \
+    -I. -Isrc \
+    -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
+    -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+    -Xcompiler=-fopenmp \
+    -DOBS_TENSOR_T=$OBS_TENSOR_T \
+    $PRECISION $NVCC_OPT \
+    src/bindings.cu -o src/bindings.o
 
 # Step 3: Link
 echo "=== Linking $OUTPUT ==="
@@ -203,14 +199,9 @@ LINK_CMD=(
     -lnvToolsExt -lomp5
     $LINK_OPT
 )
-if [ "$PLATFORM" = "Linux" ]; then
-    LINK_CMD+=(-Bsymbolic-functions)
-elif [ "$PLATFORM" = "Darwin" ]; then
-    LINK_CMD+=(-framework Cocoa -framework OpenGL -framework IOKit)
-fi
+[ "$PLATFORM" = "Linux" ] && LINK_CMD+=(-Bsymbolic-functions)
+[ "$PLATFORM" = "Darwin" ] && LINK_CMD+=(-framework Cocoa -framework OpenGL -framework IOKit)
 LINK_CMD+=(-o "$OUTPUT")
-
-echo "${LINK_CMD[@]}"
 "${LINK_CMD[@]}"
 
 echo "=== Built: $OUTPUT ==="
