@@ -1,30 +1,12 @@
-// profile_kernels.cu
-// Kernel profiling binary.
-//
-// Build:
-//   ./build.sh breakout --profile
-//
-// Usage:
-//   ./profile <profile>
-//   ./profile kernels          # All individual kernel profiles
-//   ./profile mingrugate       # MinGRU gate kernel only
-//   ./profile logcoeffsvals    # log_coeffs_and_values fwd+bwd
-//   ./profile fusedscan        # Fused scan (checkpointed) kernel only
-//   ./profile samplelogits     # Sample logits kernel only
-//   ./profile ppoloss          # PPO loss fused fwd+bwd kernel
-//   ./profile envspeed         # Environment throughput
-//   ./profile all              # Everything
-
 #include <string>
 #include <memory>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
-#include "pufferlib.cu"
+#include <chrono>
 
-// ============================================================================
-// Profiling infrastructure
-// ============================================================================
+#include "pufferlib.cu"
+#include "ini.h"
 
 const int WARMUP_ITERS = 100;
 const int TIMING_ITERS = 1000;
@@ -37,7 +19,29 @@ const int H_ = 128;
 const int A_ = 4;
 const int INPUT_SIZE = 96;
 
+#ifndef ENV_NAME
+#error "ENV_NAME must be defined at compile time (e.g. -DENV_NAME=breakout)"
+#endif
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
 typedef void (*kernel_fn)(void*);
+
+void print_usage(const char* prog) {
+    printf("Usage: %s <profile>\n", prog);
+    printf("\nProfiles:\n");
+    printf("  kernels        - All individual kernel microbenchmarks\n");
+    printf("  mingrugate     - MinGRU gate kernel only\n");
+    printf("  logcoeffsvals  - log_coeffs_and_values fwd+bwd\n");
+    printf("  fusedscan      - Fused scan (checkpointed) kernel only\n");
+    printf("  samplelogits   - Sample logits kernel only\n");
+    printf("  ppoloss        - PPO loss fused fwd+bwd kernel\n");
+    printf("  envspeed       - Environment step throughput\n");
+    printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
+    printf("    --threads N  - Number of threads (default: 16)\n");
+    printf("    --horizon N  - Horizon length (default: %d)\n", T_);
+    printf("  all            - Run all available profiles\n");
+}
 
 inline void print_timing(const char* name, float ms, int N) {
     printf("  %-28s %8.1f us  %8.2f M elem/s\n", name, ms * 1000, N / ms / 1e3);
@@ -84,10 +88,6 @@ inline float profile_kernel(kernel_fn fn, void* args) {
     cudaDeviceSynchronize();
     return ms / TIMING_ITERS;
 }
-
-// ============================================================================
-// MinGRU gate
-// ============================================================================
 
 struct MingruGateProfile {
     PrecisionTensor state, combined, x_in, out, next_state;
@@ -138,10 +138,6 @@ void profile_mingrugate(int B, int H) {
     alloc_free(&p->alloc);
     free(p);
 }
-
-// ============================================================================
-// log_coeffs_and_values (device function — thin wrapper kernels)
-// ============================================================================
 
 __global__ void log_coeffs_and_values_fwd_kernel(
         float* log_coeff_out, float* log_value_out,
@@ -229,10 +225,6 @@ void profile_logcoeffs(int B, int T, int H) {
     alloc_free(&p->alloc);
     free(p);
 }
-
-// ============================================================================
-// Fused scan
-// ============================================================================
 
 struct FusedScanProfile {
     PrefixScan scan;
@@ -323,10 +315,6 @@ void profile_fusedscan(int B, int T, int H) {
     alloc_free(&p->alloc);
     free(p);
 }
-
-// ============================================================================
-// PPO loss (fused fwd+bwd)
-// ============================================================================
 
 struct PPOProfile {
     PPOKernelArgs ka;
@@ -476,10 +464,6 @@ void profile_ppoloss(int N, int T, int A) {
     free(p);
 }
 
-// ============================================================================
-// Sample logits
-// ============================================================================
-
 struct SampleLogitsProfile {
     PrecisionTensor dec_out, logstd;
     IntTensor act_sizes;
@@ -511,7 +495,6 @@ SampleLogitsProfile* create_samplelogits(int B, int A) {
 
     cudaMemcpy(p->act_sizes.data, &A, sizeof(int), cudaMemcpyHostToDevice);
 
-    // RNG states (separate alloc — curandState is large)
     cudaMalloc(&p->rng_states, B * sizeof(curandStatePhilox4_32_10_t));
     rng_init_kernel<<<grid_size(B), BLOCK_SIZE>>>(p->rng_states, 42, B);
     cudaDeviceSynchronize();
@@ -540,19 +523,6 @@ void profile_samplelogits(int B, int A) {
     alloc_free(&p->alloc);
     free(p);
 }
-
-// ============================================================================
-// Environment speed
-// ============================================================================
-
-#include <chrono>
-#include "ini.h"
-
-#ifndef ENV_NAME
-#error "ENV_NAME must be defined at compile time (e.g. -DENV_NAME=breakout)"
-#endif
-#define STRINGIFY(x) #x
-#define TOSTRING(x) STRINGIFY(x)
 
 static void empty_net_callback(void* ctx, int buf, int t) {
     (void)ctx; (void)buf; (void)t;
@@ -663,26 +633,6 @@ void profile_envspeed(int total_agents, int num_buffers, int num_threads, int ho
     printf("  throughput: %.2f M steps/s\n", total_steps / rollout_ms / 1e3);
     free(args);
     printf("\n");
-}
-
-// ============================================================================
-// main
-// ============================================================================
-
-void print_usage(const char* prog) {
-    printf("Usage: %s <profile>\n", prog);
-    printf("\nProfiles:\n");
-    printf("  kernels        - All individual kernel microbenchmarks\n");
-    printf("  mingrugate     - MinGRU gate kernel only\n");
-    printf("  logcoeffsvals  - log_coeffs_and_values fwd+bwd\n");
-    printf("  fusedscan      - Fused scan (checkpointed) kernel only\n");
-    printf("  samplelogits   - Sample logits kernel only\n");
-    printf("  ppoloss        - PPO loss fused fwd+bwd kernel\n");
-    printf("  envspeed       - Environment step throughput\n");
-    printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
-    printf("    --threads N  - Number of threads (default: 16)\n");
-    printf("    --horizon N  - Horizon length (default: %d)\n", T_);
-    printf("  all            - Run all available profiles\n");
 }
 
 int main(int argc, char** argv) {
