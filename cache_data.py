@@ -4,9 +4,6 @@ import json
 import glob
 import os
 
-import pufferlib
-
-
 env_names = sorted([
     #'breakout',
     #'impulse_wars',
@@ -55,6 +52,18 @@ METRICS = [
 ]
 
 ALL_KEYS = HYPERS + METRICS
+
+def unroll_nested_dict(d):
+    if not isinstance(d, dict):
+        return d
+
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for k2, v2 in unroll_nested_dict(v):
+                yield f"{k}/{k2}", v2
+        else:
+            yield k, v
+
 
 def pareto_idx(steps, costs, scores):
     idxs = []
@@ -134,7 +143,7 @@ def cached_load(path, env_name, cache):
 
         sweep_metadata = exp['sweep']
 
-        for k, v in pufferlib.unroll_nested_dict(exp):
+        for k, v in unroll_nested_dict(exp):
             if k not in data:
                 data[k] = []
 
@@ -266,7 +275,7 @@ def compute_tsne():
             except:
                 print(f'{env}/{k}: {len(v)}')
 
-    json.dump(all_data, open('pufferlib/ocean/constellation/default.json', 'w'))
+    json.dump(all_data, open('ocean/constellation/default.json', 'w'))
 
 if __name__ == '__main__':
     compute_tsne()
