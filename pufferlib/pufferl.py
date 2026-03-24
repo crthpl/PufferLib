@@ -400,11 +400,11 @@ def eval(env_name, args=None, load_path=None):
     # Resolve load path
     load_path = load_path or args.get('load_model_path')
     if load_path == 'latest':
-        data_dir = args['data_dir']
-        pattern = os.path.join(data_dir, args['env_name'], '**', '*.bin')
+        checkpoint_dir = args['checkpoint_dir']
+        pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
         candidates = glob.glob(pattern, recursive=True)
         if not candidates:
-            raise FileNotFoundError(f'No .bin checkpoints found in {data_dir}/{args["env_name"]}/')
+            raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
         load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
