@@ -227,15 +227,14 @@ def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbos
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:16d}.bin')
             backend.save_weights(pufferl, model_path)
 
-        # Rate-limit dashboard/logging to avoid overhead
-        #if time.time() < pufferl.last_log_time + 0.6 and epoch != train_epochs - 1:
-        #    continue
+        # Rate limit, but always log for eval to maintain determinism
+        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
+            continue
 
         logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
         flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
 
-        # TODO: determ without logging every epoch
-        if verbose and epoch % 20 == 0:
+        if verbose:
             print_dashboard(args, model_size, flat_logs)
 
         if target_key not in flat_logs:
@@ -270,7 +269,7 @@ def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbos
     n = args['sweep']['downsample']
     metrics = {k: [[]] for k in all_logs[0]}
     logged_timesteps = all_logs[-1]['agent_steps']
-    next_bin = logged_timesteps / (n - 1)
+    next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
     for log in all_logs:
         for k, v in log.items():
             metrics[k][-1].append(v)
