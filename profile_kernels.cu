@@ -1,676 +1,552 @@
 // profile_kernels.cu
-// Fast-compile kernel profiling binary. Links against libprofile_torch.a for
-// torch-dependent correctness checks and composite profiles.
+// Kernel profiling binary.
 //
-// Build without torch (fast):
-//   nvcc -O3 -arch=sm_89 -DPRECISION_FLOAT -I. profile_kernels.cu -o profile
-//
-// Build with torch (links static lib):
-//   python setup.py build_profiler
+// Build:
+//   ./build.sh breakout --profile
 //
 // Usage:
 //   ./profile <profile>
 //   ./profile kernels          # All individual kernel profiles
-//   ./profile trainforward     # Training forward+backward breakdown
-//   ./profile trainstep        # Full training step with Muon optimizer
-//   ./profile rolloutcopy      # Per-minibatch data prep: advantage+prio+copy
-//   ./profile forwardcall      # Inference forward pass
+//   ./profile mingrugate       # MinGRU gate kernel only
+//   ./profile logcoeffsvals    # log_coeffs_and_values fwd+bwd
+//   ./profile fusedscan        # Fused scan (checkpointed) kernel only
+//   ./profile samplelogits     # Sample logits kernel only
+//   ./profile ppoloss          # PPO loss fused fwd+bwd kernel
 //   ./profile envspeed         # Environment throughput
 //   ./profile all              # Everything
 
+#include <string>
+#include <memory>
+#include <stdexcept>
+#include <algorithm>
+#include <cmath>
+#include "pufferlib.cu"
+
 // ============================================================================
-// Section 1: Shared infrastructure + kernel includes
+// Profiling infrastructure
 // ============================================================================
 
-#include "profile_common.h"
-#include "pufferlib/src/kernels.cu"
+const int WARMUP_ITERS = 100;
+const int TIMING_ITERS = 1000;
 
-// ============================================================================
-// Section 2: MinGRU gate — raw kernel create/free/run
-// ============================================================================
+const int BUF = 2;
+const int BR = 4096;   // Rollout batch (no T dim)
+const int BT = 512;    // Train batch (with T dim)
+const int T_ = 64;     // T_ to avoid collision with PrefixScan::T
+const int H_ = 128;
+const int A_ = 4;
+const int INPUT_SIZE = 96;
 
-MingruGateArgs* create_mingrugateargs(int batch, int hidden) {
-    MingruGateArgs* args = (MingruGateArgs*)calloc(1, sizeof(MingruGateArgs));
-    args->B = batch;
-    args->H = hidden;
+typedef void (*kernel_fn)(void*);
 
-    int N_state = batch * hidden;
-    int N_combined = batch * 3 * hidden;
-
-    cudaMalloc(&args->state, N_state * sizeof(precision_t));
-    cudaMalloc(&args->combined, N_combined * sizeof(precision_t));
-    cudaMalloc(&args->out, N_state * sizeof(precision_t));
-    cudaMalloc(&args->next_state, N_state * sizeof(precision_t));
-
-    float* state_buf = (float*)malloc(N_state * sizeof(float));
-    float* combined_buf = (float*)malloc(N_combined * sizeof(float));
-
-    for (int i = 0; i < N_state; ++i) {
-        state_buf[i] = fabsf(rand1()) + 0.1f;
-    }
-    for (int b = 0; b < batch; ++b) {
-        int base = b * 3 * hidden;
-        for (int h = 0; h < hidden; ++h) {
-            combined_buf[base + h] = rand1() * 5.0f;
-            combined_buf[base + hidden + h] = rand1() * 5.0f;
-            combined_buf[base + 2 * hidden + h] = rand1() * 2.0f;
-        }
-    }
-
-    float_to_device(args->state, state_buf, N_state);
-    float_to_device(args->combined, combined_buf, N_combined);
-
-    free(state_buf);
-    free(combined_buf);
-    return args;
+inline void print_timing(const char* name, float ms, int N) {
+    printf("  %-28s %8.1f us  %8.2f M elem/s\n", name, ms * 1000, N / ms / 1e3);
 }
 
-void free_mingrugateargs(MingruGateArgs* args) {
-    cudaFree(args->state);
-    cudaFree(args->combined);
-    cudaFree(args->out);
-    cudaFree(args->next_state);
-    free(args);
+inline void warmup_gpu() {
+    float* dummy;
+    cudaMalloc(&dummy, 64 * 1024 * 1024);
+    for (int i = 0; i < 100; i++) cudaMemset(dummy, 0, 64 * 1024 * 1024);
+    cudaDeviceSynchronize();
+    cudaFree(dummy);
 }
 
-void run_mingrugate_forward(MingruGateArgs* args) {
-    mingru_gate_inference_kernel<<<grid_size(args->B * args->H), BLOCK_SIZE>>>(
-        args->out, args->next_state, args->combined, args->state,
-        args->H, args->B);
+inline float rand1() {
+    return (float)rand() / RAND_MAX * 2.0f - 1.0f;
 }
 
-void profile_mingrugate(int batch, int hidden) {
-    printf("mingru_gate (B=%d, H=%d, combined=%dx%d)\n", batch, hidden, batch, 3*hidden);
+inline void float_to_device(precision_t* dst, const float* src, int count) {
+    precision_t* tmp = (precision_t*)malloc(count * sizeof(precision_t));
+    for (int i = 0; i < count; ++i) tmp[i] = (precision_t)src[i];
+    cudaMemcpy(dst, tmp, count * sizeof(precision_t), cudaMemcpyHostToDevice);
+    free(tmp);
+}
 
-    MingruGateArgs* args = create_mingrugateargs(batch, hidden);
-    float fwd_ms = profile_kernel((kernel_fn)run_mingrugate_forward, args);
-    print_timing("forward", fwd_ms, batch);
+inline float profile_kernel(kernel_fn fn, void* args) {
+    for (int i = 0; i < WARMUP_ITERS; ++i) fn(args);
+    cudaDeviceSynchronize();
 
-#ifdef USE_TORCH
-    torch_bench_mingrugate(args);
-#endif
-    printf("\n");
-    free_mingrugateargs(args);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaProfilerStart();
+    cudaEventRecord(start);
+    for (int i = 0; i < TIMING_ITERS; ++i) fn(args);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaProfilerStop();
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaDeviceSynchronize();
+    return ms / TIMING_ITERS;
 }
 
 // ============================================================================
-// Section 3: LogCumsumExp — raw kernel create/free/run
+// MinGRU gate
 // ============================================================================
 
-LogcumsumexpArgs* create_logcumsumexpargs(int batch, int seq, int hidden) {
-    LogcumsumexpArgs* args = (LogcumsumexpArgs*)calloc(1, sizeof(LogcumsumexpArgs));
-    args->B = batch;
-    args->T = seq;
-    args->H = hidden;
-    args->N = batch * seq * hidden;
+struct MingruGateProfile {
+    PrecisionTensor state, combined, x_in, out, next_state;
+    Allocator alloc;
+    int B, H;
+};
 
-    cudaMalloc(&args->x, args->N * sizeof(precision_t));
-    cudaMalloc(&args->out, args->N * sizeof(precision_t));
-    cudaMalloc(&args->s_buf, args->N * sizeof(double));
-    cudaMalloc(&args->grad_x, args->N * sizeof(precision_t));
-    cudaMalloc(&args->grad_out, args->N * sizeof(precision_t));
+MingruGateProfile* create_mingrugate(int B, int H) {
+    auto* p = (MingruGateProfile*)calloc(1, sizeof(MingruGateProfile));
+    p->B = B; p->H = H;
+    p->state     = {.shape = {B, H}};
+    p->combined  = {.shape = {B, 3*H}};
+    p->x_in      = {.shape = {B, H}};
+    p->out       = {.shape = {B, H}};
+    p->next_state = {.shape = {B, H}};
+    p->alloc = {};
+    alloc_register(&p->alloc, &p->state);
+    alloc_register(&p->alloc, &p->combined);
+    alloc_register(&p->alloc, &p->x_in);
+    alloc_register(&p->alloc, &p->out);
+    alloc_register(&p->alloc, &p->next_state);
+    alloc_create(&p->alloc);
 
-    float* buf = (float*)malloc(args->N * sizeof(float) * 2);
-    float* x_buf = buf;
-    float* grad_out_buf = buf + args->N;
-    for (int i = 0; i < args->N; ++i) {
-        x_buf[i] = rand1();
-        grad_out_buf[i] = rand1();
-    }
-
-    float_to_device(args->x, x_buf, args->N);
-    float_to_device(args->grad_out, grad_out_buf, args->N);
-
+    int N = B * H;
+    float* buf = (float*)malloc((N + 3*N + N) * sizeof(float));
+    for (int i = 0; i < N; ++i) buf[i] = fabsf(rand1()) + 0.1f;
+    float_to_device(p->state.data, buf, N);
+    for (int i = 0; i < 3*N; ++i) buf[i] = rand1() * 5.0f;
+    float_to_device(p->combined.data, buf, 3*N);
+    for (int i = 0; i < N; ++i) buf[i] = rand1();
+    float_to_device(p->x_in.data, buf, N);
     free(buf);
-    return args;
+    return p;
 }
 
-void free_logcumsumexpargs(LogcumsumexpArgs* args) {
-    cudaFree(args->x);
-    cudaFree(args->out);
-    cudaFree(args->s_buf);
-    cudaFree(args->grad_x);
-    cudaFree(args->grad_out);
-    free(args);
+void run_mingrugate(MingruGateProfile* p) {
+    mingru_gate<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+        p->out.data, p->next_state.data, p->combined.data,
+        p->state.data, p->x_in.data, p->H, p->B);
 }
 
-void run_logcumsumexp_forward(LogcumsumexpArgs* args) {
-    logcumsumexp_forward_kernel<<<grid_size(args->B * args->H), BLOCK_SIZE>>>(
-        args->out, args->s_buf, args->x, args->T, args->H, args->B);
-}
-
-void run_logcumsumexp_backward(LogcumsumexpArgs* args) {
-    logcumsumexp_backward_kernel<<<grid_size(args->B * args->H), BLOCK_SIZE>>>(
-        args->grad_x, args->grad_out, args->x, args->s_buf, args->T, args->H, args->B);
-}
-
-void profile_logcumsumexp(int batch, int seq, int hidden) {
-    LogcumsumexpArgs* args = create_logcumsumexpargs(batch, seq, hidden);
-    printf("logcumsumexp (N=%d, %dx%dx%d)\n", args->N, batch, seq, hidden);
-
-    float fwd_ms = profile_kernel((kernel_fn)run_logcumsumexp_forward, args);
-    print_timing("forward", fwd_ms, batch*seq);
-
-    float bwd_ms = profile_kernel((kernel_fn)run_logcumsumexp_backward, args);
-    print_timing("backward", bwd_ms, batch*seq);
-
-#ifdef USE_TORCH
-    torch_bench_logcumsumexp(args);
-#endif
+void profile_mingrugate(int B, int H) {
+    printf("mingru_gate (B=%d, H=%d)\n", B, H);
+    auto* p = create_mingrugate(B, H);
+    float ms = profile_kernel((kernel_fn)run_mingrugate, p);
+    print_timing("forward", ms, B);
     printf("\n");
-    free_logcumsumexpargs(args);
+    alloc_free(&p->alloc);
+    free(p);
 }
 
 // ============================================================================
-// Section 4: Fused scan — raw kernel create/free/run
+// log_coeffs_and_values (device function — thin wrapper kernels)
 // ============================================================================
 
-FusedScanArgs* create_fusedscanargs(int batch, int seq, int hidden) {
-    FusedScanArgs* args = (FusedScanArgs*)calloc(1, sizeof(FusedScanArgs));
-    args->B = batch;
-    args->T = seq;
-    args->H = hidden;
-    args->N = batch * seq * hidden;
-
-    int N_combined = batch * seq * 3 * hidden;
-    int N_state = batch * hidden;
-    int N_buf = batch * (seq + 1) * hidden;
-
-    cudaMalloc(&args->combined, N_combined * sizeof(precision_t));
-    cudaMalloc(&args->state, N_state * sizeof(precision_t));
-    cudaMalloc(&args->out, args->N * sizeof(precision_t));
-    cudaMalloc(&args->next_state, N_state * sizeof(precision_t));
-    cudaMalloc(&args->a_star, N_buf * sizeof(float));
-    cudaMalloc(&args->s_vals, N_buf * sizeof(float));
-    cudaMalloc(&args->log_values_buf, N_buf * sizeof(float));
-    cudaMalloc(&args->grad_combined, N_combined * sizeof(precision_t));
-    cudaMalloc(&args->grad_state, N_state * sizeof(precision_t));
-    cudaMalloc(&args->grad_out, args->N * sizeof(precision_t));
-    cudaMalloc(&args->grad_next_state, N_state * sizeof(precision_t));
-
-    float* combined_buf = (float*)malloc(N_combined * sizeof(float));
-    float* state_buf = (float*)malloc(N_state * sizeof(float));
-    float* grad_out_buf = (float*)malloc(args->N * sizeof(float));
-    float* grad_next_state_buf = (float*)malloc(N_state * sizeof(float));
-
-    for (int b = 0; b < batch; ++b) {
-        for (int t = 0; t < seq; ++t) {
-            for (int h = 0; h < hidden; ++h) {
-                int base = b * seq * 3 * hidden + t * 3 * hidden;
-                combined_buf[base + h] = rand1() * 5.0f;
-                combined_buf[base + hidden + h] = rand1() * 5.0f;
-                combined_buf[base + 2 * hidden + h] = rand1() * 2.0f;
-            }
-        }
-    }
-    for (int i = 0; i < N_state; ++i) state_buf[i] = fabsf(rand1()) + 0.1f;
-    for (int i = 0; i < args->N; ++i) grad_out_buf[i] = rand1();
-    for (int i = 0; i < N_state; ++i) grad_next_state_buf[i] = rand1();
-
-    float_to_device(args->combined, combined_buf, N_combined);
-    float_to_device(args->state, state_buf, N_state);
-    float_to_device(args->grad_out, grad_out_buf, args->N);
-    float_to_device(args->grad_next_state, grad_next_state_buf, N_state);
-
-    free(combined_buf);
-    free(state_buf);
-    free(grad_out_buf);
-    free(grad_next_state_buf);
-    return args;
+__global__ void log_coeffs_and_values_fwd_kernel(
+        float* log_coeff_out, float* log_value_out,
+        const float* gate, const float* hidden, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    log_coeffs_and_values_fwd(gate[idx], hidden[idx],
+        &log_coeff_out[idx], &log_value_out[idx]);
 }
 
-void free_fusedscanargs(FusedScanArgs* args) {
-    cudaFree(args->combined);
-    cudaFree(args->state);
-    cudaFree(args->out);
-    cudaFree(args->next_state);
-    cudaFree(args->a_star);
-    cudaFree(args->s_vals);
-    cudaFree(args->log_values_buf);
-    cudaFree(args->grad_combined);
-    cudaFree(args->grad_state);
-    cudaFree(args->grad_out);
-    cudaFree(args->grad_next_state);
-    free(args);
+__global__ void log_coeffs_and_values_bwd_kernel(
+        float* grad_gate_out, float* grad_hidden_out,
+        const float* grad_log_coeffs, const float* grad_log_values,
+        const float* gate, const float* hidden, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    log_coeffs_and_values_bwd(grad_log_coeffs[idx], grad_log_values[idx],
+        gate[idx], hidden[idx], &grad_gate_out[idx], &grad_hidden_out[idx]);
 }
 
-void run_fusedscan_forward(FusedScanArgs* args) {
-    fused_scan_forward_kernel_checkpointed<<<grid_size(args->B * args->H), BLOCK_SIZE>>>(
-        args->out, args->next_state,
-        args->a_star, args->s_vals, args->log_values_buf,
-        args->combined, args->state,
-        args->T, args->H, args->B);
+struct LogCoeffsProfile {
+    FloatTensor gate, hidden, log_coeff, log_value;
+    FloatTensor grad_log_coeffs, grad_log_values, grad_gate, grad_hidden;
+    Allocator alloc;
+    int N;
+};
+
+LogCoeffsProfile* create_logcoeffs(int N) {
+    auto* p = (LogCoeffsProfile*)calloc(1, sizeof(LogCoeffsProfile));
+    p->N = N;
+    p->gate = {.shape = {N}};
+    p->hidden = {.shape = {N}};
+    p->log_coeff = {.shape = {N}};
+    p->log_value = {.shape = {N}};
+    p->grad_log_coeffs = {.shape = {N}};
+    p->grad_log_values = {.shape = {N}};
+    p->grad_gate = {.shape = {N}};
+    p->grad_hidden = {.shape = {N}};
+    p->alloc = {};
+    alloc_register(&p->alloc, &p->gate);
+    alloc_register(&p->alloc, &p->hidden);
+    alloc_register(&p->alloc, &p->log_coeff);
+    alloc_register(&p->alloc, &p->log_value);
+    alloc_register(&p->alloc, &p->grad_log_coeffs);
+    alloc_register(&p->alloc, &p->grad_log_values);
+    alloc_register(&p->alloc, &p->grad_gate);
+    alloc_register(&p->alloc, &p->grad_hidden);
+    alloc_create(&p->alloc);
+
+    float* buf = (float*)malloc(N * sizeof(float));
+    for (int i = 0; i < N; ++i) buf[i] = rand1() * 5.0f;
+    cudaMemcpy(p->gate.data, buf, N * sizeof(float), cudaMemcpyHostToDevice);
+    for (int i = 0; i < N; ++i) buf[i] = rand1() * 5.0f;
+    cudaMemcpy(p->hidden.data, buf, N * sizeof(float), cudaMemcpyHostToDevice);
+    for (int i = 0; i < N; ++i) buf[i] = rand1();
+    cudaMemcpy(p->grad_log_coeffs.data, buf, N * sizeof(float), cudaMemcpyHostToDevice);
+    for (int i = 0; i < N; ++i) buf[i] = rand1();
+    cudaMemcpy(p->grad_log_values.data, buf, N * sizeof(float), cudaMemcpyHostToDevice);
+    free(buf);
+    return p;
 }
 
-void run_fusedscan_backward(FusedScanArgs* args) {
-    fused_scan_backward_kernel_checkpointed<<<grid_size(args->B * args->H), BLOCK_SIZE>>>(
-        args->grad_combined, args->grad_state,
-        args->grad_out, args->grad_next_state,
-        args->combined, args->state,
-        args->a_star, args->s_vals, args->log_values_buf,
-        args->T, args->H, args->B);
+void run_logcoeffs_fwd(LogCoeffsProfile* p) {
+    log_coeffs_and_values_fwd_kernel<<<grid_size(p->N), BLOCK_SIZE>>>(
+        p->log_coeff.data, p->log_value.data,
+        p->gate.data, p->hidden.data, p->N);
 }
 
-void profile_fusedscan(int batch, int seq, int hidden) {
-    FusedScanArgs* args = create_fusedscanargs(batch, seq, hidden);
-    printf("fused_scan (N=%d, %dx%dx%d, combined=%dx%dx%d)\n",
-           args->N, batch, seq, hidden, batch, seq, 3*hidden);
+void run_logcoeffs_bwd(LogCoeffsProfile* p) {
+    log_coeffs_and_values_bwd_kernel<<<grid_size(p->N), BLOCK_SIZE>>>(
+        p->grad_gate.data, p->grad_hidden.data,
+        p->grad_log_coeffs.data, p->grad_log_values.data,
+        p->gate.data, p->hidden.data, p->N);
+}
 
-    float fwd_ms = profile_kernel((kernel_fn)run_fusedscan_forward, args);
-    print_timing("forward", fwd_ms, batch*seq);
-
-    float bwd_ms = profile_kernel((kernel_fn)run_fusedscan_backward, args);
-    print_timing("backward", bwd_ms, batch*seq);
-
-#ifdef USE_TORCH
-    torch_bench_fusedscan(args);
-#endif
+void profile_logcoeffs(int B, int T, int H) {
+    int N = B * T * H;
+    printf("log_coeffs_and_values (N=%d, %dx%dx%d)\n", N, B, T, H);
+    auto* p = create_logcoeffs(N);
+    float fwd = profile_kernel((kernel_fn)run_logcoeffs_fwd, p);
+    print_timing("forward", fwd, N);
+    float bwd = profile_kernel((kernel_fn)run_logcoeffs_bwd, p);
+    print_timing("backward", bwd, N);
     printf("\n");
-    free_fusedscanargs(args);
+    alloc_free(&p->alloc);
+    free(p);
 }
 
 // ============================================================================
-// Section 5: FCMax — raw kernel create/free/run
+// Fused scan
 // ============================================================================
 
-FCMaxArgs* create_fcmaxargs(int batch, int num_points, int d_in, int d_out) {
-    FCMaxArgs* args = (FCMaxArgs*)calloc(1, sizeof(FCMaxArgs));
-    args->B = batch;
-    args->N = num_points;
-    args->D_in = d_in;
-    args->D_out = d_out;
+struct FusedScanProfile {
+    PrefixScan scan;
+    PrecisionTensor grad_out, grad_next_state;
+    Allocator alloc;
+    int B, T, H;
+};
 
-    int N_x = batch * num_points * d_in;
-    int N_W = d_out * d_in;
-    int N_out = batch * d_out;
+FusedScanProfile* create_fusedscan(int B, int T, int H) {
+    auto* p = (FusedScanProfile*)calloc(1, sizeof(FusedScanProfile));
+    p->B = B; p->T = T; p->H = H;
 
-    cudaMalloc(&args->x, N_x * sizeof(precision_t));
-    cudaMalloc(&args->W, N_W * sizeof(float));
-    cudaMalloc(&args->b, d_out * sizeof(float));
-    cudaMalloc(&args->out, N_out * sizeof(precision_t));
-    cudaMalloc(&args->argmax_indices, N_out * sizeof(int));
-    cudaMalloc(&args->grad_x, N_x * sizeof(float));
-    cudaMalloc(&args->grad_W, N_W * sizeof(float));
-    cudaMalloc(&args->grad_b, d_out * sizeof(float));
-    cudaMalloc(&args->grad_out, N_out * sizeof(precision_t));
+    PrefixScan& s = p->scan;
+    s.B = B; s.T = T; s.H = H;
 
-    float* x_buf = (float*)malloc(N_x * sizeof(float));
-    float* W_buf = (float*)malloc(N_W * sizeof(float));
-    float* b_buf = (float*)malloc(d_out * sizeof(float));
-    float* grad_out_buf = (float*)malloc(N_out * sizeof(float));
+    // Allocator needs PrecisionTensor/FloatTensor, but PrefixScan uses raw ptrs
+    // for combined/state/input. Allocate those via tensors then assign.
+    PrecisionTensor combined_t = {.shape = {B, T, 3*H}};
+    PrecisionTensor state_t    = {.shape = {B, H}};
+    PrecisionTensor input_t    = {.shape = {B, T, H}};
 
-    for (int i = 0; i < N_x; ++i) x_buf[i] = rand1();
-    for (int i = 0; i < N_W; ++i) W_buf[i] = rand1() * 0.1f;
-    for (int i = 0; i < d_out; ++i) b_buf[i] = 0.0f;
-    for (int i = 0; i < N_out; ++i) grad_out_buf[i] = rand1();
+    s.out            = {.shape = {B, T, H}};
+    s.next_state     = {.shape = {B, H}};
+    s.a_star         = {.shape = {B, T+1, H}};
+    s.s_vals         = {.shape = {B, T+1, H}};
+    s.log_values_buf = {.shape = {B, T+1, H}};
+    s.grad_combined  = {.shape = {B, T, 3*H}};
+    s.grad_state     = {.shape = {B, H}};
+    s.grad_input     = {.shape = {B, T, H}};
 
-    float_to_device(args->x, x_buf, N_x);
-    cudaMemcpy(args->W, W_buf, N_W * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->b, b_buf, d_out * sizeof(float), cudaMemcpyHostToDevice);
-    float_to_device(args->grad_out, grad_out_buf, N_out);
+    p->grad_out        = {.shape = {B, T, H}};
+    p->grad_next_state = {.shape = {B, H}};
 
-    free(x_buf);
-    free(W_buf);
-    free(b_buf);
-    free(grad_out_buf);
-    return args;
+    p->alloc = {};
+    alloc_register(&p->alloc, &combined_t);
+    alloc_register(&p->alloc, &state_t);
+    alloc_register(&p->alloc, &input_t);
+    alloc_register(&p->alloc, &s.out);
+    alloc_register(&p->alloc, &s.next_state);
+    alloc_register(&p->alloc, &s.a_star);
+    alloc_register(&p->alloc, &s.s_vals);
+    alloc_register(&p->alloc, &s.log_values_buf);
+    alloc_register(&p->alloc, &s.grad_combined);
+    alloc_register(&p->alloc, &s.grad_state);
+    alloc_register(&p->alloc, &s.grad_input);
+    alloc_register(&p->alloc, &p->grad_out);
+    alloc_register(&p->alloc, &p->grad_next_state);
+    alloc_create(&p->alloc);
+
+    s.combined_ptr = combined_t.data;
+    s.state_ptr    = state_t.data;
+    s.input_ptr    = input_t.data;
+
+    int N_combined = B * T * 3 * H;
+    int N_state = B * H;
+    int N_out = B * T * H;
+    float* buf = (float*)malloc(N_combined * sizeof(float));
+    for (int i = 0; i < N_combined; ++i) buf[i] = rand1() * 5.0f;
+    float_to_device(s.combined_ptr, buf, N_combined);
+    for (int i = 0; i < N_state; ++i) buf[i] = fabsf(rand1()) + 0.1f;
+    float_to_device(s.state_ptr, buf, N_state);
+    for (int i = 0; i < N_out; ++i) buf[i] = rand1();
+    float_to_device(s.input_ptr, buf, N_out);
+    float_to_device(p->grad_out.data, buf, N_out);
+    for (int i = 0; i < N_state; ++i) buf[i] = rand1();
+    float_to_device(p->grad_next_state.data, buf, N_state);
+    free(buf);
+    return p;
 }
 
-void free_fcmaxargs(FCMaxArgs* args) {
-    cudaFree(args->x);
-    cudaFree(args->W);
-    cudaFree(args->b);
-    cudaFree(args->out);
-    cudaFree(args->argmax_indices);
-    cudaFree(args->grad_x);
-    cudaFree(args->grad_W);
-    cudaFree(args->grad_b);
-    cudaFree(args->grad_out);
-    free(args);
+void run_fusedscan_fwd(FusedScanProfile* p) {
+    fused_scan_forward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
 }
 
-void run_fcmax_forward(FCMaxArgs* args) {
-    fc_max_forward_kernel<<<grid_size(args->B * args->D_out), BLOCK_SIZE>>>(
-        args->out, args->argmax_indices,
-        args->x, args->W, args->b,
-        args->B, args->N, args->D_in, args->D_out);
+void run_fusedscan_bwd(FusedScanProfile* p) {
+    fused_scan_backward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+        p->scan, p->grad_out.data, p->grad_next_state.data);
 }
 
-void run_fcmax_backward(FCMaxArgs* args) {
-    fc_max_backward_grad_b_kernel<<<grid_size(args->D_out), BLOCK_SIZE>>>(
-        args->grad_b, args->grad_out, args->B, args->D_out);
-
-    fc_max_backward_grad_W_kernel<<<grid_size(args->D_out * args->D_in), BLOCK_SIZE>>>(
-        args->grad_W, args->grad_out, args->x, args->argmax_indices,
-        args->B, args->N, args->D_in, args->D_out);
-
-    fc_max_backward_grad_x_kernel<<<grid_size(args->B * args->D_in), BLOCK_SIZE>>>(
-        args->grad_x, args->grad_out, args->W, args->argmax_indices,
-        args->B, args->N, args->D_in, args->D_out);
-}
-
-void profile_fcmax(int batch, int num_points, int d_in, int d_out) {
-    FCMaxArgs* args = create_fcmaxargs(batch, num_points, d_in, d_out);
-
-    printf("fc_max (B=%d, N=%d, D_in=%d, D_out=%d)\n", batch, num_points, d_in, d_out);
-
-    float fwd_ms = profile_kernel((kernel_fn)run_fcmax_forward, args);
-    print_timing("forward", fwd_ms, batch);
-
-    float bwd_ms = profile_kernel((kernel_fn)run_fcmax_backward, args);
-    print_timing("backward", bwd_ms, batch);
-
-#ifdef USE_TORCH
-    torch_bench_fcmax(args);
-#endif
+void profile_fusedscan(int B, int T, int H) {
+    printf("fused_scan (N=%d, %dx%dx%d)\n", B*T*H, B, T, H);
+    auto* p = create_fusedscan(B, T, H);
+    float fwd = profile_kernel((kernel_fn)run_fusedscan_fwd, p);
+    print_timing("forward", fwd, B*T);
+    float bwd = profile_kernel((kernel_fn)run_fusedscan_bwd, p);
+    print_timing("backward", bwd, B*T);
     printf("\n");
-
-    free_fcmaxargs(args);
+    alloc_free(&p->alloc);
+    free(p);
 }
 
 // ============================================================================
-// Section 6: PPO loss — raw kernel create/free/run
+// PPO loss (fused fwd+bwd)
 // ============================================================================
 
-PPOLossArgs* create_ppolossargs(int batch, int seq, int actions) {
-    PPOLossArgs* args = (PPOLossArgs*)calloc(1, sizeof(PPOLossArgs));
-    args->N = batch;
-    args->T = seq;
-    args->A = actions;
-    args->num_atns = 1;
+struct PPOProfile {
+    PPOKernelArgs ka;
+    PPOGraphArgs ga;
+    FloatTensor loss, losses_acc, ppo_partials;
+    FloatTensor grad_logits_t, grad_values_t, adv_mean_t, adv_var_t;
+    PrecisionTensor logits_t, actions_t, old_logprobs_t, advantages_t, prio_t, values_t, returns_t;
+    PrecisionTensor ratio_t, newvalue_t;
+    IntTensor act_sizes_t;
+    Allocator alloc;
+    int N, T, A, ppo_grid;
+};
 
-    int NT = batch*seq;
-    int NTA = batch*seq * actions;
+PPOProfile* create_ppoloss(int N, int T, int A) {
+    auto* p = (PPOProfile*)calloc(1, sizeof(PPOProfile));
+    p->N = N; p->T = T; p->A = A;
 
-    cudaMalloc(&args->logits, NTA * sizeof(precision_t));
-    cudaMalloc(&args->values_pred, NT * sizeof(precision_t));
-    cudaMalloc(&args->actions, NT * sizeof(double));
-    cudaMalloc(&args->old_logprobs, NT * sizeof(precision_t));
-    cudaMalloc(&args->advantages, NT * sizeof(float));
-    cudaMalloc(&args->prio, batch * sizeof(precision_t));
-    cudaMalloc(&args->values, NT * sizeof(precision_t));
-    cudaMalloc(&args->returns, NT * sizeof(precision_t));
-    cudaMalloc(&args->adv_mean, sizeof(float));
-    cudaMalloc(&args->adv_var, sizeof(float));
-    cudaMalloc(&args->loss, sizeof(float));
-    cudaMalloc(&args->losses_acc, LOSS_N * sizeof(float));
-    cudaMemset(args->losses_acc, 0, LOSS_N * sizeof(float));
-    cudaMalloc(&args->saved_for_backward, NT * 5 * sizeof(double));
-    cudaMalloc(&args->ratio_out, NT * sizeof(precision_t));
-    cudaMalloc(&args->newvalue_out, NT * sizeof(precision_t));
-    cudaMalloc(&args->grad_logits, NTA * sizeof(float));
-    cudaMalloc(&args->grad_values_pred, NT * sizeof(float));
-    cudaMalloc(&args->grad_loss, sizeof(float));
-    cudaMalloc(&args->act_sizes, sizeof(int));
+    int NT = N * T;
+    int fused_cols = A + 1;
+    int ppo_grid = (NT + PPO_THREADS - 1) / PPO_THREADS;
+    p->ppo_grid = ppo_grid;
 
-    cudaMemcpy(args->act_sizes, &actions, sizeof(int), cudaMemcpyHostToDevice);
+    p->logits_t       = {.shape = {N, T, fused_cols}};
+    p->actions_t      = {.shape = {NT}};
+    p->old_logprobs_t = {.shape = {NT}};
+    p->advantages_t   = {.shape = {NT}};
+    p->prio_t         = {.shape = {N}};
+    p->values_t       = {.shape = {NT}};
+    p->returns_t      = {.shape = {NT}};
+    p->ratio_t        = {.shape = {NT}};
+    p->newvalue_t     = {.shape = {NT}};
+    p->grad_logits_t  = {.shape = {N, T, A}};
+    p->grad_values_t  = {.shape = {NT}};
+    p->adv_mean_t     = {.shape = {1}};
+    p->adv_var_t      = {.shape = {1}};
+    p->loss           = {.shape = {1}};
+    p->losses_acc     = {.shape = {LOSS_N + 1}};
+    p->ppo_partials   = {.shape = {ppo_grid, LOSS_N + 1}};
+    p->act_sizes_t    = {.shape = {1}};
 
-    float* buf = (float*)malloc((NTA + NT * 5 + batch) * sizeof(float));
-    float* logits_buf = buf;
-    float* values_pred_buf = buf + NTA;
-    float* old_logprobs_buf = buf + NTA + NT;
-    float* advantages_buf = buf + NTA + NT * 2;
-    float* values_buf = buf + NTA + NT * 3;
-    float* returns_buf = buf + NTA + NT * 4;
-    float* prio_buf = buf + NTA + NT * 5;
+    p->alloc = {};
+    alloc_register(&p->alloc, &p->logits_t);
+    alloc_register(&p->alloc, &p->actions_t);
+    alloc_register(&p->alloc, &p->old_logprobs_t);
+    alloc_register(&p->alloc, &p->advantages_t);
+    alloc_register(&p->alloc, &p->prio_t);
+    alloc_register(&p->alloc, &p->values_t);
+    alloc_register(&p->alloc, &p->returns_t);
+    alloc_register(&p->alloc, &p->ratio_t);
+    alloc_register(&p->alloc, &p->newvalue_t);
+    alloc_register(&p->alloc, &p->grad_logits_t);
+    alloc_register(&p->alloc, &p->grad_values_t);
+    alloc_register(&p->alloc, &p->adv_mean_t);
+    alloc_register(&p->alloc, &p->adv_var_t);
+    alloc_register(&p->alloc, &p->loss);
+    alloc_register(&p->alloc, &p->losses_acc);
+    alloc_register(&p->alloc, &p->ppo_partials);
+    alloc_register(&p->alloc, &p->act_sizes_t);
+    alloc_create(&p->alloc);
 
-    double* actions_buf = (double*)malloc(NT * sizeof(double));
+    cudaMemcpy(p->act_sizes_t.data, &A, sizeof(int), cudaMemcpyHostToDevice);
 
-    float adv_sum = 0.0f, adv_sq_sum = 0.0f;
+    // Fill with random data
+    float* buf = (float*)malloc(NT * fused_cols * sizeof(float));
+
+    // Advantages (precision_t) + compute mean/var
+    float adv_sum = 0, adv_sq = 0;
     for (int i = 0; i < NT; ++i) {
-        advantages_buf[i] = rand1();
-        adv_sum += advantages_buf[i];
-        adv_sq_sum += advantages_buf[i] * advantages_buf[i];
+        float a = rand1();
+        buf[i] = a;
+        adv_sum += a;
+        adv_sq += a * a;
     }
     float adv_mean = adv_sum / NT;
-    float adv_var = adv_sq_sum / NT - adv_mean * adv_mean;
+    float adv_var = adv_sq / NT - adv_mean * adv_mean;
+    float_to_device(p->advantages_t.data, buf, NT);
+    cudaMemcpy(p->adv_mean_t.data, &adv_mean, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(p->adv_var_t.data, &adv_var, sizeof(float), cudaMemcpyHostToDevice);
 
-    for (int i = 0; i < NTA; ++i) {
-        logits_buf[i] = rand1() * 2.0f;
-    }
-    for (int i = 0; i < NT; ++i) {
-        values_pred_buf[i] = rand1();
-        actions_buf[i] = (double)(rand() % actions);
-        old_logprobs_buf[i] = rand1() * 2.0f;
-        values_buf[i] = rand1();
-        returns_buf[i] = rand1();
-    }
-    for (int i = 0; i < batch; ++i) {
-        prio_buf[i] = (float)rand() / RAND_MAX;
-    }
-
-    float_to_device(args->logits, logits_buf, NTA);
-    float_to_device(args->values_pred, values_pred_buf, NT);
-    cudaMemcpy(args->actions, actions_buf, NT * sizeof(double), cudaMemcpyHostToDevice);
-    float_to_device(args->old_logprobs, old_logprobs_buf, NT);
-    cudaMemcpy(args->advantages, advantages_buf, NT * sizeof(float), cudaMemcpyHostToDevice);
-    float_to_device(args->prio, prio_buf, batch);
-    float_to_device(args->values, values_buf, NT);
-    float_to_device(args->returns, returns_buf, NT);
-    cudaMemcpy(args->adv_mean, &adv_mean, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(args->adv_var, &adv_var, sizeof(float), cudaMemcpyHostToDevice);
-
-    float grad_loss_val = 1.0f;
-    cudaMemcpy(args->grad_loss, &grad_loss_val, sizeof(float), cudaMemcpyHostToDevice);
-
-    args->clip_coef = 0.1f;
-    args->vf_clip_coef = 0.1f;
-    args->vf_coef = 0.5f;
-    args->ent_coef = 0.01f;
-
-    args->logits_stride_n = seq * actions;
-    args->logits_stride_t = actions;
-    args->logits_stride_a = 1;
-    args->values_stride_n = seq;
-    args->values_stride_t = 1;
-
+    // Fill logits (fused: A logit cols + 1 value col per row)
+    for (int i = 0; i < NT * fused_cols; ++i) buf[i] = rand1() * 2.0f;
+    float_to_device(p->logits_t.data, buf, NT * fused_cols);
+    // actions
+    for (int i = 0; i < NT; ++i) buf[i] = (float)(rand() % A);
+    float_to_device(p->actions_t.data, buf, NT);
+    // old_logprobs
+    for (int i = 0; i < NT; ++i) buf[i] = rand1() * 2.0f;
+    float_to_device(p->old_logprobs_t.data, buf, NT);
+    // values + returns
+    for (int i = 0; i < NT; ++i) buf[i] = rand1();
+    float_to_device(p->values_t.data, buf, NT);
+    for (int i = 0; i < NT; ++i) buf[i] = rand1();
+    float_to_device(p->returns_t.data, buf, NT);
+    // prio
+    for (int i = 0; i < N; ++i) buf[i] = (float)rand() / RAND_MAX;
+    float_to_device(p->prio_t.data, buf, N);
     free(buf);
-    free(actions_buf);
-    return args;
+
+    // Wire up kernel args
+    p->ka = {
+        .grad_logits = p->grad_logits_t.data,
+        .grad_logstd = nullptr,
+        .grad_values_pred = p->grad_values_t.data,
+        .logits = p->logits_t.data,
+        .logstd = nullptr,
+        .values_pred = p->logits_t.data + A,  // value is last col in fused layout
+        .adv_mean = p->adv_mean_t.data,
+        .adv_var = p->adv_var_t.data,
+        .act_sizes = p->act_sizes_t.data,
+        .num_atns = 1,
+        .clip_coef = 0.1f, .vf_clip_coef = 0.1f, .vf_coef = 0.5f, .ent_coef = 0.01f,
+        .T_seq = T, .A_total = A, .N = N,
+        .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
+        .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
+        .is_continuous = false,
+    };
+    p->ga = {
+        .out_ratio = p->ratio_t.data,
+        .out_newvalue = p->newvalue_t.data,
+        .actions = p->actions_t.data,
+        .old_logprobs = p->old_logprobs_t.data,
+        .advantages = p->advantages_t.data,
+        .prio = p->prio_t.data,
+        .values = p->values_t.data,
+        .returns = p->returns_t.data,
+    };
+
+    return p;
 }
 
-void free_ppolossargs(PPOLossArgs* args) {
-    cudaFree(args->logits);
-    cudaFree(args->values_pred);
-    cudaFree(args->actions);
-    cudaFree(args->old_logprobs);
-    cudaFree(args->advantages);
-    cudaFree(args->prio);
-    cudaFree(args->values);
-    cudaFree(args->returns);
-    cudaFree(args->adv_mean);
-    cudaFree(args->adv_var);
-    cudaFree(args->loss);
-    cudaFree(args->losses_acc);
-    cudaFree(args->saved_for_backward);
-    cudaFree(args->ratio_out);
-    cudaFree(args->newvalue_out);
-    cudaFree(args->grad_logits);
-    cudaFree(args->grad_values_pred);
-    cudaFree(args->grad_loss);
-    cudaFree(args->act_sizes);
-    free(args);
-}
-
-void run_ppoloss_forward(PPOLossArgs* args) {
-    int total = args->N * args->T;
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    cudaMemset(args->loss, 0, sizeof(float));
-
-    // Allocate partials buffer for deterministic reduction
-    static float* ppo_partials_buf = nullptr;
-    static int ppo_partials_cap = 0;
-    int needed = ppo_grid * (LOSS_N + 1);
-    if (!ppo_partials_buf || needed > ppo_partials_cap) {
-        if (ppo_partials_buf) cudaFree(ppo_partials_buf);
-        ppo_partials_cap = needed;
-        cudaMalloc(&ppo_partials_buf, ppo_partials_cap * sizeof(float));
-    }
-
-    ppo_loss_forward_kernel_optimized<<<ppo_grid, PPO_THREADS>>>(
-        args->loss, args->losses_acc,
-        ppo_partials_buf,
-        args->saved_for_backward,
-        args->ratio_out, args->newvalue_out,
-        args->logits,
-        nullptr,  // logstd (nullptr for discrete)
-        args->values_pred, args->actions,
-        args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_var,
-        args->act_sizes, args->num_atns,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N,
-        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
-        args->values_stride_n, args->values_stride_t,
-        false);  // is_continuous
-
+void run_ppoloss(PPOProfile* p) {
+    cudaMemset(p->loss.data, 0, sizeof(float));
+    ppo_loss_fwd_bwd_kernel<<<p->ppo_grid, PPO_THREADS>>>(
+        p->ppo_partials.data, p->ka, p->ga);
     ppo_loss_reduce_kernel<<<1, LOSS_N + 1>>>(
-        args->loss, args->losses_acc, ppo_partials_buf, ppo_grid);
+        p->loss.data, p->losses_acc.data, p->ppo_partials.data, p->ppo_grid);
 }
 
-void run_ppoloss_backward(PPOLossArgs* args) {
-    int total = args->N * args->T;
-    int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-    ppo_loss_backward_kernel_optimized<<<ppo_grid, PPO_THREADS>>>(
-        args->grad_logits,
-        nullptr,  // grad_logstd (nullptr for discrete)
-        args->grad_values_pred, args->grad_loss,
-        args->logits,
-        nullptr,  // logstd (nullptr for discrete)
-        args->values_pred, args->actions,
-        args->old_logprobs, args->advantages, args->prio,
-        args->values, args->returns, args->adv_mean, args->adv_var,
-        args->act_sizes, args->num_atns,
-        args->clip_coef, args->vf_clip_coef, args->vf_coef, args->ent_coef,
-        args->T, args->A, args->N,
-        args->logits_stride_n, args->logits_stride_t, args->logits_stride_a,
-        args->values_stride_n, args->values_stride_t,
-        false);  // is_continuous
-}
-
-void profile_ppoloss(int batch, int seq, int actions) {
-    PPOLossArgs* args = create_ppolossargs(batch, seq, actions);
-
-    int NT = batch*seq;
-    printf("ppo_loss (NT=%d, %dx%d, A=%d)\n", NT, batch, seq, actions);
-
-    float fwd_ms = profile_kernel((kernel_fn)run_ppoloss_forward, args);
-    print_timing("forward", fwd_ms, NT);
-
-    float bwd_ms = profile_kernel((kernel_fn)run_ppoloss_backward, args);
-    print_timing("backward", bwd_ms, NT);
-
-#ifdef USE_TORCH
-    torch_bench_ppoloss(args);
-#endif
+void profile_ppoloss(int N, int T, int A) {
+    int NT = N * T;
+    printf("ppo_loss_fwd_bwd (NT=%d, %dx%d, A=%d)\n", NT, N, T, A);
+    auto* p = create_ppoloss(N, T, A);
+    float ms = profile_kernel((kernel_fn)run_ppoloss, p);
+    print_timing("fwd+bwd", ms, NT);
     printf("\n");
-
-    free_ppolossargs(args);
+    alloc_free(&p->alloc);
+    free(p);
 }
 
 // ============================================================================
-// Section 7: Sample logits — raw kernel create/free/run
+// Sample logits
 // ============================================================================
 
-SampleLogitsArgs* create_samplelogitsargs(int batch, int num_actions) {
-    SampleLogitsArgs* args = (SampleLogitsArgs*)calloc(1, sizeof(SampleLogitsArgs));
-    args->B = batch;
-    args->A = num_actions;
-    args->seed = 42;
+struct SampleLogitsProfile {
+    PrecisionTensor dec_out, logstd;
+    IntTensor act_sizes;
+    PrecisionTensor actions_t, logprobs_t, value_out_t;
+    curandStatePhilox4_32_10_t* rng_states;
+    Allocator alloc;
+    int B, A;
+};
 
-    int N_logits = batch * num_actions;
-    int N_batch = batch;
+SampleLogitsProfile* create_samplelogits(int B, int A) {
+    auto* p = (SampleLogitsProfile*)calloc(1, sizeof(SampleLogitsProfile));
+    p->B = B; p->A = A;
 
-    cudaMalloc(&args->logits, N_logits * sizeof(precision_t));
-    cudaMalloc(&args->value, N_batch * sizeof(precision_t));
-    cudaMalloc(&args->actions, N_batch * sizeof(double));
-    cudaMalloc(&args->logprobs, N_batch * sizeof(precision_t));
-    cudaMalloc(&args->value_out, N_batch * sizeof(precision_t));
-    cudaMalloc(&args->offset, sizeof(int64_t));
-    cudaMalloc(&args->act_sizes, sizeof(int));
-    cudaMemset(args->offset, 0, sizeof(int64_t));
-    cudaMemcpy(args->act_sizes, &num_actions, sizeof(int), cudaMemcpyHostToDevice);
+    int fused_cols = A + 1;
+    p->dec_out     = {.shape = {B, fused_cols}};
+    p->logstd      = {.shape = {0}};  // empty for discrete
+    p->act_sizes   = {.shape = {1}};
+    p->actions_t   = {.shape = {B}};
+    p->logprobs_t  = {.shape = {B}};
+    p->value_out_t = {.shape = {B}};
 
-    float* logits_buf = (float*)malloc(N_logits * sizeof(float));
-    float* value_buf = (float*)malloc(N_batch * sizeof(float));
+    p->alloc = {};
+    alloc_register(&p->alloc, &p->dec_out);
+    alloc_register(&p->alloc, &p->act_sizes);
+    alloc_register(&p->alloc, &p->actions_t);
+    alloc_register(&p->alloc, &p->logprobs_t);
+    alloc_register(&p->alloc, &p->value_out_t);
+    alloc_create(&p->alloc);
 
-    for (int i = 0; i < N_logits; ++i) {
-        logits_buf[i] = rand1() * 5.0f;
-    }
-    for (int i = 0; i < N_batch; ++i) {
-        value_buf[i] = rand1();
-    }
+    cudaMemcpy(p->act_sizes.data, &A, sizeof(int), cudaMemcpyHostToDevice);
 
-    float_to_device(args->logits, logits_buf, N_logits);
-    float_to_device(args->value, value_buf, N_batch);
+    // RNG states (separate alloc — curandState is large)
+    cudaMalloc(&p->rng_states, B * sizeof(curandStatePhilox4_32_10_t));
+    rng_init_kernel<<<grid_size(B), BLOCK_SIZE>>>(p->rng_states, 42, B);
+    cudaDeviceSynchronize();
 
-    free(logits_buf);
-    free(value_buf);
-    return args;
+    float* buf = (float*)malloc(B * fused_cols * sizeof(float));
+    for (int i = 0; i < B * fused_cols; ++i) buf[i] = rand1() * 5.0f;
+    float_to_device(p->dec_out.data, buf, B * fused_cols);
+    free(buf);
+    return p;
 }
 
-void free_samplelogitsargs(SampleLogitsArgs* args) {
-    cudaFree(args->logits);
-    cudaFree(args->value);
-    cudaFree(args->actions);
-    cudaFree(args->logprobs);
-    cudaFree(args->value_out);
-    cudaFree(args->offset);
-    cudaFree(args->act_sizes);
-    free(args);
+void run_samplelogits(SampleLogitsProfile* p) {
+    sample_logits_kernel<<<grid_size(p->B), BLOCK_SIZE>>>(
+        p->dec_out, p->logstd, p->act_sizes,
+        p->actions_t.data, p->logprobs_t.data, p->value_out_t.data,
+        p->rng_states);
 }
 
-void run_samplelogits_forward(SampleLogitsArgs* args) {
-    sample_logits_kernel<<<grid_size(args->B), BLOCK_SIZE>>>(
-        args->actions, args->logprobs, args->value_out,
-        args->logits,
-        nullptr,  // logstd (nullptr for discrete)
-        args->value,
-        args->act_sizes, args->seed, args->offset,
-        1,  // num_atns
-        args->B,
-        args->A,  // logits_stride
-        0,        // logstd_stride (unused for discrete)
-        1,        // value_stride
-        false);   // is_continuous
-}
-
-void profile_samplelogits(int batch, int num_actions) {
-    SampleLogitsArgs* args = create_samplelogitsargs(batch, num_actions);
-
-    printf("sample_logits (B=%d, A=%d)\n", batch, num_actions);
-
-    float fwd_ms = profile_kernel((kernel_fn)run_samplelogits_forward, args);
-    print_timing("forward", fwd_ms, batch);
-
-#ifdef USE_TORCH
-    torch_bench_samplelogits(args);
-#endif
+void profile_samplelogits(int B, int A) {
+    printf("sample_logits (B=%d, A=%d)\n", B, A);
+    auto* p = create_samplelogits(B, A);
+    float ms = profile_kernel((kernel_fn)run_samplelogits, p);
+    print_timing("forward", ms, B);
     printf("\n");
-
-    free_samplelogitsargs(args);
+    cudaFree(p->rng_states);
+    alloc_free(&p->alloc);
+    free(p);
 }
 
 // ============================================================================
-// Section 8: Forward call profiling (torch only — delegated to lib)
+// Environment speed
 // ============================================================================
 
-void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atns, int num_layers) {
-#ifdef USE_TORCH
-    torch_profile_forwardcall(batch, input_size, hidden_size, num_atns, num_layers);
-#else
-    printf("forward_call: requires USE_TORCH\n\n");
-#endif
-}
-
-// ============================================================================
-// Section 9: Environment speed profiling
-// ============================================================================
-
-#ifdef USE_STATIC_ENV
-
-#include "pufferlib/src/vecenv.h"
-#include "pufferlib/src/ini.h"
+#include <chrono>
+#include "ini.h"
 
 #ifndef ENV_NAME
 #error "ENV_NAME must be defined at compile time (e.g. -DENV_NAME=breakout)"
@@ -681,27 +557,19 @@ void profile_forwardcall(int batch, int input_size, int hidden_size, int num_atn
 static void empty_net_callback(void* ctx, int buf, int t) {
     (void)ctx; (void)buf; (void)t;
 }
-
 static void empty_thread_init(void* ctx, int buf) {
     (void)ctx; (void)buf;
 }
 
 typedef struct {
     StaticVec* vec;
-    int num_envs;
-    int num_buffers;
-    int num_threads;
-    int horizon;
-    int obs_size;
-    int num_atns;
+    int num_envs, num_buffers, num_threads, horizon, obs_size, num_atns;
 } EnvSpeedArgs;
 
 static int ini_handler_env(void* user, const char* section,
                            const char* name, const char* value) {
     Dict* env_kwargs = (Dict*)user;
-    if (strcmp(section, "env") == 0) {
-        dict_set(env_kwargs, strdup(name), atof(value));
-    }
+    if (strcmp(section, "env") == 0) dict_set(env_kwargs, strdup(name), atof(value));
     return 1;
 }
 
@@ -716,141 +584,89 @@ static int ini_handler_vec(void* user, const char* section,
     return 1;
 }
 
-EnvSpeedArgs* create_envspeedargs(int total_agents, int num_buffers, int num_threads, int horizon) {
+EnvSpeedArgs* create_envspeed(int total_agents, int num_buffers, int num_threads, int horizon) {
     char ini_path[512];
-    snprintf(ini_path, sizeof(ini_path), "pufferlib/config/ocean/%s.ini", TOSTRING(ENV_NAME));
+    snprintf(ini_path, sizeof(ini_path), "config/ocean/%s.ini", TOSTRING(ENV_NAME));
 
     VecDefaults defaults = {0};
-    if (ini_parse(ini_path, ini_handler_vec, &defaults) < 0) {
-        fprintf(stderr, "Warning: Could not load config %s\n", ini_path);
-    }
-
+    ini_parse(ini_path, ini_handler_vec, &defaults);
     if (total_agents == 0) total_agents = defaults.total_agents > 0 ? defaults.total_agents : 8192;
     if (num_buffers == 0) num_buffers = defaults.num_buffers > 0 ? defaults.num_buffers : 2;
 
     Dict* env_kwargs = create_dict(64);
-    if (ini_parse(ini_path, ini_handler_env, env_kwargs) < 0) {
-        fprintf(stderr, "Warning: Could not load [env] config from %s\n", ini_path);
-    }
-
+    ini_parse(ini_path, ini_handler_env, env_kwargs);
     Dict* vec_kwargs = create_dict(8);
     dict_set(vec_kwargs, "total_agents", (double)total_agents);
     dict_set(vec_kwargs, "num_buffers", (double)num_buffers);
 
     StaticVec* vec = create_static_vec(total_agents, num_buffers, vec_kwargs, env_kwargs);
-    if (!vec) {
-        fprintf(stderr, "Failed to create environments\n");
-        return nullptr;
-    }
-    for (int i = 0; i < num_buffers; i++) {
+    if (!vec) { fprintf(stderr, "Failed to create environments\n"); return nullptr; }
+    for (int i = 0; i < num_buffers; i++)
         cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);
-    }
 
-    int num_envs = vec->size;
-    printf("Created %d envs (%s) for %d total_agents\n", num_envs, TOSTRING(ENV_NAME), total_agents);
-
+    printf("Created %d envs (%s) for %d total_agents\n", vec->size, TOSTRING(ENV_NAME), total_agents);
     create_static_threads(vec, num_threads, horizon, nullptr, empty_net_callback, empty_thread_init);
-
     static_vec_reset(vec);
     cudaDeviceSynchronize();
 
     EnvSpeedArgs* args = (EnvSpeedArgs*)calloc(1, sizeof(EnvSpeedArgs));
     args->vec = vec;
-    args->num_envs = num_envs;
+    args->num_envs = vec->size;
     args->num_buffers = num_buffers;
     args->num_threads = num_threads;
     args->horizon = horizon;
     args->obs_size = get_obs_size();
     args->num_atns = get_num_atns();
-
     return args;
-}
-
-void free_envspeedargs(EnvSpeedArgs* args) {
-    free(args);
-}
-
-void run_env_rollout(EnvSpeedArgs* args) {
-    static_vec_omp_step(args->vec);
-}
-
-float profile_env_rollout(EnvSpeedArgs* args, const char* name) {
-    const float ENV_TIMEOUT_SEC = 3.0f;
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    auto start_time = std::chrono::steady_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        run_env_rollout(args);
-        cudaDeviceSynchronize();
-        auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - start_time).count();
-        if (elapsed > ENV_TIMEOUT_SEC) break;
-    }
-
-    start_time = get_time_sec();
-    cudaProfilerStart();
-    if (name) nvtxRangePushA(name);
-    cudaEventRecord(start);
-    float completed = 0;
-    for (int i = 0; i < 1000; ++i) {
-        run_env_rollout(args);
-        completed += 1;
-        auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - start_time).count();
-        if (elapsed > ENV_TIMEOUT_SEC) break;
-    }
-    cudaDeviceSynchronize();
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    if (name) nvtxRangePop();
-    cudaProfilerStop();
-
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    return ms / completed;
 }
 
 void profile_envspeed(int total_agents, int num_buffers, int num_threads, int horizon) {
     printf("env_speed_static (total_agents=%d, buffers=%d, threads=%d, horizon=%d)\n",
            total_agents, num_buffers, num_threads, horizon);
-
-    EnvSpeedArgs* args = create_envspeedargs(total_agents, num_buffers, num_threads, horizon);
-    if (!args) {
-        printf("  Failed to create env - skipping\n\n");
-        return;
-    }
-
+    EnvSpeedArgs* args = create_envspeed(total_agents, num_buffers, num_threads, horizon);
+    if (!args) { printf("  Failed to create env - skipping\n\n"); return; }
     printf("  num_envs=%d, obs_size=%d, num_atns=%d\n", args->num_envs, args->obs_size, args->num_atns);
 
-    float rollout_ms = profile_env_rollout(args, "env_rollout");
+    // Warmup
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 10; ++i) {
+        static_vec_omp_step(args->vec);
+        cudaDeviceSynchronize();
+        float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+        if (elapsed > 3.0f) break;
+    }
+
+    // Timed
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    t0 = std::chrono::steady_clock::now();
+    cudaEventRecord(start);
+    float completed = 0;
+    for (int i = 0; i < 1000; ++i) {
+        static_vec_omp_step(args->vec);
+        completed += 1;
+        float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+        if (elapsed > 3.0f) break;
+    }
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    float rollout_ms = ms / completed;
     int total_steps = total_agents * horizon;
     printf("  rollout time: %.2f ms (%d steps)\n", rollout_ms, total_steps);
-
-    float sps = total_steps / rollout_ms * 1000.0f;
-    printf("  throughput: %.2f M steps/s\n", sps / 1e6);
-
-    free_envspeedargs(args);
+    printf("  throughput: %.2f M steps/s\n", total_steps / rollout_ms / 1e3);
+    free(args);
     printf("\n");
 }
 
-#endif  // USE_STATIC_ENV
-
 // ============================================================================
-// Section 10: Rollout copy profiling (torch only — delegated to lib)
-// ============================================================================
-
-// ============================================================================
-// Section 11: Training profiling (torch only — delegated to lib)
-// ============================================================================
-
-// ============================================================================
-// Section 12: main() dispatcher
+// main
 // ============================================================================
 
 void print_usage(const char* prog) {
@@ -858,38 +674,22 @@ void print_usage(const char* prog) {
     printf("\nProfiles:\n");
     printf("  kernels        - All individual kernel microbenchmarks\n");
     printf("  mingrugate     - MinGRU gate kernel only\n");
-    printf("  logcumsumexp   - Logcumsumexp kernel only\n");
+    printf("  logcoeffsvals  - log_coeffs_and_values fwd+bwd\n");
     printf("  fusedscan      - Fused scan (checkpointed) kernel only\n");
     printf("  samplelogits   - Sample logits kernel only\n");
-    printf("  ppoloss        - PPO loss kernel only\n");
-    printf("  fcmax          - FC+Max kernel only\n");
-#ifdef USE_TORCH
-    printf("  forwardcall    - Inference forward pass (requires torch)\n");
-    printf("  trainforward   - Training fwd+loss+bwd breakdown (requires torch)\n");
-    printf("  trainstep      - Full training step with Muon optimizer (requires torch)\n");
-    printf("  rolloutcopy    - Per-minibatch data prep: advantage+prio+copy (requires torch)\n");
-#endif
-#ifdef USE_STATIC_ENV
-    printf("  envspeed       - Environment step throughput (static linked)\n");
+    printf("  ppoloss        - PPO loss fused fwd+bwd kernel\n");
+    printf("  envspeed       - Environment step throughput\n");
     printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
     printf("    --threads N  - Number of threads (default: 16)\n");
-    printf("    --horizon N  - Horizon length (default: %d)\n", T);
-#endif
+    printf("    --horizon N  - Horizon length (default: %d)\n", T_);
     printf("  all            - Run all available profiles\n");
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return 1;
-    }
+    if (argc < 2) { print_usage(argv[0]); return 1; }
 
     const char* profile = argv[1];
-
-    // Parse optional CLI args for envspeed
-    int buffers = BUF;
-    int threads = 16;
-    int horizon = T;
+    int buffers = BUF, threads = 16, horizon = T_;
     int total_agents = BR * buffers;
     for (int i = 2; i < argc - 1; i++) {
         if (strcmp(argv[i], "--buffers") == 0) buffers = atoi(argv[++i]);
@@ -899,73 +699,30 @@ int main(int argc, char** argv) {
     }
 
     warmup_gpu();
-
-    // Using typical breakout settings: INPUT_SIZE=96, H=128, A=4
     bool run_all = strcmp(profile, "all") == 0;
 
-    // === Individual kernel microbenchmarks ===
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "mingrugate") == 0 || run_all) {
-        profile_mingrugate(BR, H);
-    }
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "logcumsumexp") == 0 || run_all) {
-        profile_logcumsumexp(BT, T, H);
-    }
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "fusedscan") == 0 || run_all) {
-        profile_fusedscan(BT, T, H);
-    }
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "samplelogits") == 0 || run_all) {
-        profile_samplelogits(BR, A);
-    }
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "ppoloss") == 0 || run_all) {
-        profile_ppoloss(BT, T, A);
-    }
-    // TODO: fc_max cuBLAS issue — investigate separately
-    // if (strcmp(profile, "kernels") == 0 || strcmp(profile, "fcmax") == 0 || run_all) {
-    //     profile_fcmax(BR, 63, 7, 128);    // partner encoder (drive)
-    //     profile_fcmax(BR, 200, 13, 128);  // road encoder (drive)
-    // }
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "mingrugate") == 0 || run_all)
+        profile_mingrugate(BR, H_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "logcoeffsvals") == 0 || run_all)
+        profile_logcoeffs(BT, T_, H_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "fusedscan") == 0 || run_all)
+        profile_fusedscan(BT, T_, H_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "samplelogits") == 0 || run_all)
+        profile_samplelogits(BR, A_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "ppoloss") == 0 || run_all)
+        profile_ppoloss(BT, T_, A_);
 
-    // === Composite profiles (require torch) ===
-#ifdef USE_TORCH
-    if (strcmp(profile, "forwardcall") == 0 || run_all) {
-        torch_profile_forwardcall(BR, INPUT_SIZE, H, A, 1);
-    }
-    if (strcmp(profile, "trainforward") == 0 || run_all) {
-        torch_profile_trainforward(BT, T, INPUT_SIZE, H, A, 1);
-    }
-    if (strcmp(profile, "trainstep") == 0 || run_all) {
-        torch_profile_trainstep(BT, T, INPUT_SIZE, H, A, 1);
-    }
-    if (strcmp(profile, "rolloutcopy") == 0 || run_all) {
-        // num_segments = BR*BUF (full rollout), minibatch_segs = BT
-        torch_profile_rolloutcopy(BR * BUF, T, BT, INPUT_SIZE, A, 1, H);
-    }
-#endif
-
-    // === Environment speed (requires static env link) ===
-#ifdef USE_STATIC_ENV
-    if (strcmp(profile, "envspeed") == 0 || strcmp(profile, "all") == 0) {
+    if (strcmp(profile, "envspeed") == 0 || run_all)
         profile_envspeed(total_agents, buffers, threads, horizon);
-    }
-#endif
 
     if (!run_all
         && strcmp(profile, "kernels") != 0
         && strcmp(profile, "mingrugate") != 0
-        && strcmp(profile, "logcumsumexp") != 0
+        && strcmp(profile, "logcoeffsvals") != 0
         && strcmp(profile, "fusedscan") != 0
         && strcmp(profile, "samplelogits") != 0
         && strcmp(profile, "ppoloss") != 0
-        && strcmp(profile, "fcmax") != 0
-#ifdef USE_TORCH
-        && strcmp(profile, "forwardcall") != 0
-        && strcmp(profile, "trainforward") != 0
-        && strcmp(profile, "trainstep") != 0
-        && strcmp(profile, "rolloutcopy") != 0
-#endif
-#ifdef USE_STATIC_ENV
         && strcmp(profile, "envspeed") != 0
-#endif
     ) {
         printf("Unknown profile: %s\n\n", profile);
         print_usage(argv[0]);
