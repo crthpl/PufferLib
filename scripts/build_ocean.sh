@@ -37,7 +37,7 @@ if [ "$MODE" = "web" ]; then
         -I./$RAYLIB_NAME/include \
         -I./$BOX2D_NAME/include \
         -I./$BOX2D_NAME/src \
-        -I./pufferlib/extensions \
+        -I./puffernet \
         -I./pufferlib \
         -L. \
         -L./$RAYLIB_NAME/lib \
@@ -69,9 +69,8 @@ FLAGS=(
     -I./$RAYLIB_NAME/include
     -I./$BOX2D_NAME/include
     -I./$BOX2D_NAME/src
-    -I./pufferlib/extensions
-    "$SRC_DIR/cJSON.c" "$SRC_DIR/$ENV.c" -o "$ENV"
-    #"$SRC_DIR/$ENV.c" -o "$ENV"
+    -I./puffernet
+    "$SRC_DIR/$ENV.c" -o "$ENV"
     $LINK_ARCHIVES
     -lGL
     -lm
@@ -87,6 +86,9 @@ FLAGS=(
     -Wno-error=array-parameter
 )
 
+if [ "$ENV" = "constellation" ]; then
+    FLAGS+=("$SRC_DIR/cJSON.c")
+fi
 
 if [ "$PLATFORM" = "Darwin" ]; then
     FLAGS+=(
