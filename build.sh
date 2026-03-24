@@ -194,7 +194,7 @@ if [ "$MODE" = "profile" ]; then
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
-        profile_kernels.cu ini.c \
+        tests/profile_kernels.cu ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
         -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn -lnvToolsExt \
         -lGL -lm -lpthread -lomp5 \

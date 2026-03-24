@@ -3,6 +3,9 @@ c_*.c
 pufferlib/extensions.c
 pufferlib/puffernet.c
 
+# Build dir
+build/
+
 # hipified cuda extensions dir [HIP/ROCM]
 pufferlib/extensions/hip/
 
