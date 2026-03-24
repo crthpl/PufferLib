@@ -794,7 +794,7 @@ void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
     
  
 int main(void) {
-    FILE *file = fopen("ocean/constellation/default.json", "r");
+    FILE *file = fopen("constellation/default.json", "r");
     if (!file) {
         printf("Error opening file\n");
         return 1;
@@ -949,17 +949,17 @@ int main(void) {
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
     Font gui_font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 14, NULL, 255);
 
-    GuiLoadStyle("ocean/constellation/puffer.rgs");
+    GuiLoadStyle("constellation/puffer.rgs");
     GuiSetFont(gui_font);
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
-    Shader shader = LoadShader(TextFormat("ocean/constellation/point_particle.vs", GLSL_VERSION),
-                               TextFormat("ocean/constellation/point_particle.fs", GLSL_VERSION));
+    Shader shader = LoadShader(TextFormat("constellation/point_particle.vs", GLSL_VERSION),
+                               TextFormat("constellation/point_particle.fs", GLSL_VERSION));
 
     Shader blur_shader = LoadShader(
-            "ocean/constellation/blur.vs",
-            "ocean/constellation/blur.fs");
+            "constellation/blur.vs",
+            "constellation/blur.fs");
 
     // Allows the vertex shader to set the point size of each particle individually
     #ifndef GRAPHICS_API_OPENGL_ES2

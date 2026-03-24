@@ -275,7 +275,7 @@ def compute_tsne():
             except:
                 print(f'{env}/{k}: {len(v)}')
 
-    json.dump(all_data, open('ocean/constellation/default.json', 'w'))
+    json.dump(all_data, open('constellation/default.json', 'w'))
 
 if __name__ == '__main__':
     compute_tsne()

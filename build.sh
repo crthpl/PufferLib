@@ -50,7 +50,13 @@ fi
 # ============================================================================
 
 PLATFORM="$(uname -s)"
-SRC_DIR="ocean/$ENV"
+if [ -d "ocean/$ENV" ]; then
+    SRC_DIR="ocean/$ENV"
+elif [ -d "$ENV" ]; then
+    SRC_DIR="$ENV"
+else
+    echo "Error: environment '$ENV' not found" && exit 1
+fi
 
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
@@ -83,7 +89,7 @@ fi
         -o "$RAYLIB_NAME/include/rlights.h"
 
 RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
-INCLUDES=(-I./$RAYLIB_NAME/include -I./puffernet)
+INCLUDES=(-I./$RAYLIB_NAME/include -I./src)
 LINK_ARCHIVES="$RAYLIB_A"
 EXTRA_SRC=""
 
@@ -100,7 +106,7 @@ if [ "$ENV" = "impulse_wars" ]; then
 fi
 
 # Constellation needs cJSON
-[ "$ENV" = "constellation" ] && EXTRA_SRC="$SRC_DIR/cJSON.c"
+[ "$ENV" = "constellation" ] && EXTRA_SRC="vendor/cJSON.c" && INCLUDES+=(-I./vendor) && OUTPUT_NAME="seethestars"
 
 # ============================================================================
 # Standalone builds: --local, --fast, --web
@@ -132,14 +138,14 @@ fi
 if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     FLAGS=(
         "${INCLUDES[@]}"
-        "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$ENV"
+        "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "${OUTPUT_NAME:-$ENV}"
         $LINK_ARCHIVES
         -lGL -lm -lpthread -fopenmp
         -DPLATFORM_DESKTOP
     )
     [ "$PLATFORM" = "Darwin" ] && FLAGS+=(-framework Cocoa -framework IOKit -framework CoreVideo)
     clang $CLANG_OPT "${FLAGS[@]}"
-    echo "Built: ./$ENV"
+    echo "Built: ./${OUTPUT_NAME:-$ENV}"
     exit 0
 fi
 
@@ -157,14 +163,14 @@ EXT_SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SU
 OUTPUT="pufferlib/_C${EXT_SUFFIX}"
 
 # Step 1: Static env library
-BINDING_SRC="ocean/$ENV/binding.c"
+BINDING_SRC="$SRC_DIR/binding.c"
 STATIC_OBJ="src/libstatic_${ENV}.o"
 STATIC_LIB="src/libstatic_${ENV}.a"
 [ ! -f "$BINDING_SRC" ] && echo "Error: $BINDING_SRC not found" && exit 1
 
 echo "=== Building static env: $ENV ==="
 clang -c $CLANG_OPT \
-    -I. -Isrc -Iocean/$ENV \
+    -I. -Isrc -I$SRC_DIR \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
@@ -181,7 +187,7 @@ if [ "$MODE" = "profile" ]; then
     ARCH=${NVCC_ARCH:-sm_89}
     echo "=== Building profile binary (arch=$ARCH) ==="
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -Iocean/$ENV \
+        -I. -Isrc -I$SRC_DIR \
         -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
