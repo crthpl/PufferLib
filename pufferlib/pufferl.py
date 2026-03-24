@@ -162,12 +162,10 @@ def validate_config(args):
     minibatch_size = args['train']['minibatch_size']
     horizon = args['train']['horizon']
     total_agents = args['vec']['total_agents']
-    if (minibatch_size % horizon) != 0:
-        raise pufferlib.APIUsageError(
-            f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}')
-    if minibatch_size > horizon * total_agents:
-        raise pufferlib.APIUsageError(
-            f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}')
+    assert (minibatch_size % horizon) == 0, \
+        f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}'
+    assert minibatch_size <= horizon * total_agents, \
+        f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}'
 
 def _train_worker(args, backend=_C):
     pufferl = backend.create_pufferl(args)
@@ -343,7 +341,7 @@ def sweep(env_name, args=None, pareto=False, backend=_C):
     try:
         sweep_cls = getattr(pufferlib.sweep, method)
     except:
-        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
+        raise ValueError(f'Invalid sweep method {method}. See pufferlib.sweep')
 
     sweep_obj = sweep_cls(sweep_config)
     num_experiments = args['sweep']['max_runs']
@@ -379,7 +377,7 @@ def sweep(env_name, args=None, pareto=False, backend=_C):
 
         try:
             validate_config(args)
-        except pufferlib.APIUsageError as e:
+        except (AssertionError, ValueError) as e:
             print(f'WARNING: {e}, skipping')
             sweep_obj.observe(args, 0, 0, is_failure=True)
             continue
@@ -449,7 +447,7 @@ def load_config(env_name):
             p.read([puffer_default_config, path])
             if env_name in p['base']['env_name'].split(): break
         else:
-            raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
+            raise ValueError('No config for env_name {}'.format(env_name))
 
     for section in p.sections():
         for key in p[section]:
@@ -487,7 +485,7 @@ def load_config(env_name):
 def main():
     err = 'Usage: puffer [train, eval, sweep, paretosweep] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
-        raise pufferlib.APIUsageError(err)
+        raise ValueError(err)
 
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
@@ -495,7 +493,7 @@ def main():
 
     backend = _C
     if args.get('slowly'):
-        from pufferlib.python_pufferl import PuffeRL
+        from pufferlib.torch_pufferl import PuffeRL
         backend = PuffeRL
 
     if 'train' in mode:
@@ -505,7 +503,7 @@ def main():
     elif 'sweep' in mode:
         sweep(env_name=env_name, args=args, pareto='pareto' in mode, backend=backend)
     else:
-        raise pufferlib.APIUsageError(err)
+        raise ValueError(err)
 
 if __name__ == '__main__':
     main()

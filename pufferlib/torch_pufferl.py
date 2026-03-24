@@ -443,7 +443,7 @@ def load_policy(args, vec):
             data_dir = artifact.download()
             path = f'{data_dir}/{max(os.listdir(data_dir))}'
         else:
-            raise pufferlib.APIUsageError('load_id requires --wandb')
+            raise ValueError('load_id requires --wandb')
 
         state_dict = torch.load(path, map_location=device)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
