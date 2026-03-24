@@ -8,8 +8,9 @@ set -e
 #   ./build.sh breakout --local      # Standalone executable (debug, sanitizers)
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
 #   ./build.sh breakout --web        # Emscripten web build
+#   ./build.sh breakout --profile    # Kernel profiling binary
 
-ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web]}
+ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile]}
 MODE=""
 PRECISION=""
 DEBUG=""
@@ -20,6 +21,7 @@ for arg in "${@:2}"; do
         --local) MODE=local ;;
         --fast)  MODE=fast ;;
         --web)   MODE=web ;;
+        --profile) MODE=profile ;;
     esac
 done
 
@@ -174,7 +176,27 @@ OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep 'Tensor$' | head -1)
 [ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T" && exit 1
 echo "OBS_TENSOR_T=$OBS_TENSOR_T"
 
-# Step 2: Compile bindings.cu
+# Step 2: Profile binary or Python bindings
+if [ "$MODE" = "profile" ]; then
+    ARCH=${NVCC_ARCH:-sm_89}
+    echo "=== Building profile binary (arch=$ARCH) ==="
+    $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
+        -I. -Isrc -Iocean/$ENV \
+        -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+        -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        -DENV_NAME=$ENV \
+        -Xcompiler=-DPLATFORM_DESKTOP \
+        $PRECISION \
+        -Xcompiler=-fopenmp \
+        profile_kernels.cu ini.c \
+        "$STATIC_LIB" "$RAYLIB_A" \
+        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn -lnvToolsExt \
+        -lGL -lm -lpthread -lomp5 \
+        -o profile
+    echo "=== Built: ./profile ==="
+    exit 0
+fi
+
 echo "=== Compiling bindings.cu ==="
 $NVCC -c -Xcompiler -fPIC \
     -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \

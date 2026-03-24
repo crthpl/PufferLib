@@ -336,17 +336,11 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
 }
 
 inline void profile_begin(const char* tag, bool enable) {
-    if (enable) {
-        cudaDeviceSynchronize();
-        nvtxRangePushA(tag);
-    }
+    if (enable) nvtxRangePushA(tag);
 }
 
 inline void profile_end(bool enable) {
-    if (enable) {
-        cudaDeviceSynchronize();
-        nvtxRangePop();
-    }
+    if (enable) nvtxRangePop();
 }
 
 // Thread-local stream for per-buffer threads (set once by thread_init_wrapper)
@@ -358,7 +352,7 @@ extern "C" void thread_init_wrapper(void* ctx, int buf) {
     tl_stream = pufferl->streams[buf];
 }
 
-__global__ void rng_init_kernel(curandStatePhilox4_32_10_t* states, uint64_t seed, int n) {
+__global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         curand_init(seed, idx, 0, &states[idx]);
@@ -378,7 +372,7 @@ __device__ __forceinline__ float safe_logit(const precision_t* logits,
 }
 
 // Expects action logits and values to be in the same contiguous buffer. See default decoder
-__global__ void sample_logits_kernel(
+__global__ void sample_logits(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
         PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
         IntTensor act_sizes_puf,              // (num_atns,) action head sizes
@@ -520,16 +514,16 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     OBS_TENSOR_T& obs_env = env.obs;
     int n = block_size * obs_env.shape[1];
     PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
-    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n);
 
     PrecisionTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     n = block_size;
-    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         rew_dst.data, env.rewards.data + start, n);
 
     PrecisionTensor term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         term_dst.data, env.terminals.data + start, n);
 
     // Policy forward pass for rollouts
@@ -546,14 +540,14 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         p_logstd = dw->logstd;
     }
 
-    sample_logits_kernel<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+    sample_logits<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
         dec_puf, p_logstd, pufferl->act_sizes_puf,
         act_slice.data, lp_slice.data, val_slice.data,
         pufferl->rng_states[buf]);
 
     // Copy actions to env
     long act_cols = env.actions.shape[1];
-    cast_kernel<<<grid_size(numel(act_slice.shape)), BLOCK_SIZE, 0, stream>>>(
+    cast<<<grid_size(numel(act_slice.shape)), BLOCK_SIZE, 0, stream>>>(
             env.actions.data + start * act_cols, act_slice.data, numel(act_slice.shape));
 
     if (capturing) {
@@ -612,7 +606,7 @@ __device__ __forceinline__ void ppo_continuous_head(
     *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
 }
 
-__global__ void ppo_loss_fwd_bwd_kernel(
+__global__ void ppo_loss_compute(
         float* __restrict__ ppo_partials,
         PPOKernelArgs a, PPOGraphArgs g) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -798,7 +792,7 @@ reduce:
 }
 
 // Deterministic reduction of per-block PPO loss partials + count increment
-__global__ void ppo_loss_reduce_kernel(
+__global__ void ppo_loss_reduce(
         float* __restrict__ loss,
         float* __restrict__ losses_acc,
         const float* __restrict__ partials,
@@ -825,7 +819,7 @@ __global__ void ppo_loss_reduce_kernel(
     }
 }
 
-__global__ void var_mean_kernel(const precision_t* __restrict__ src,
+__global__ void ppo_var_mean(const precision_t* __restrict__ src,
         float* __restrict__ var_out, float* __restrict__ mean_out, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
@@ -884,7 +878,7 @@ void ppo_loss_fwd_bwd(
 
     float* adv_var_ptr = bufs.adv_scratch.data;
     float* adv_mean_ptr = adv_var_ptr + 1;
-    var_mean_kernel<<<1, 256, 0, stream>>>(
+    ppo_var_mean<<<1, 256, 0, stream>>>(
         graph.mb_advantages.data, adv_var_ptr, adv_mean_ptr, numel(graph.mb_advantages.shape));
 
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
@@ -930,9 +924,9 @@ void ppo_loss_fwd_bwd(
         .is_continuous = is_continuous,
     };
 
-    ppo_loss_fwd_bwd_kernel<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
+    ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
 
-    ppo_loss_reduce_kernel<<<1, LOSS_N + 1, 0, stream>>>(
+    ppo_loss_reduce<<<1, LOSS_N + 1, 0, stream>>>(
         bufs.loss_output.data, losses_acc.data, ppo_partials_buf, ppo_grid);
 }
 
@@ -1015,7 +1009,7 @@ __global__ void compute_prio_imp_weights(
 }
 
 // Multinomial with replacement (uses cuRAND)
-__global__ void multinomial_with_replacement_kernel(
+__global__ void multinomial_sample(
         int* __restrict__ out_idx, const float* __restrict__ probs,
         float* __restrict__ cdf, int B, int num_samples,
         uint64_t seed, int64_t* __restrict__ offset_ptr) {
@@ -1063,7 +1057,7 @@ void prio_replay_cuda(PrecisionTensor& advantages, float prio_alpha,
     compute_prio_normalize<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
         bufs.prio_probs.data, B);
     int block = fmaxf(((minibatch_segments + 31) / 32) * 32, 32);
-    multinomial_with_replacement_kernel<<<1, block, 0, stream>>>(
+    multinomial_sample<<<1, block, 0, stream>>>(
         bufs.idx.data, bufs.prio_probs.data,
         bufs.cdf.data, B, minibatch_segments, seed, offset_ptr);
     int p3_blocks = (minibatch_segments + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
@@ -1165,7 +1159,7 @@ __device__ __forceinline__ void puff_advantage_row_vec(
     }
 }
 
-__global__ void puff_advantage_kernel(const precision_t* values, const precision_t* rewards,
+__global__ void puff_advantage(const precision_t* values, const precision_t* rewards,
         const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
@@ -1177,7 +1171,7 @@ __global__ void puff_advantage_kernel(const precision_t* values, const precision
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 
-__global__ void puff_advantage_kernel_scalar(const precision_t* values, const precision_t* rewards,
+__global__ void puff_advantage_scalar(const precision_t* values, const precision_t* rewards,
         const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
         float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
     int row = blockIdx.x*blockDim.x + threadIdx.x;
@@ -1195,14 +1189,14 @@ void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
     int num_steps = values.shape[0], horizon = values.shape[1];
     int blocks = grid_size(num_steps);
     constexpr int N = 16 / sizeof(precision_t);
-    auto kernel = (horizon % N == 0) ? puff_advantage_kernel : puff_advantage_kernel_scalar;
+    auto kernel = (horizon % N == 0) ? puff_advantage : puff_advantage_scalar;
     kernel<<<blocks, 256, 0, stream>>>(
         values.data, rewards.data, dones.data, importance.data,
         advantages.data, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
 // Minor copy bandwidth optimizations
-__global__ void index_copy_kernel(char* __restrict__ dst, const int* __restrict__ idx,
+__global__ void index_copy(char* __restrict__ dst, const int* __restrict__ idx,
         const char* __restrict__ src, int num_idx, int row_bytes) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < num_idx) {
@@ -1232,7 +1226,7 @@ __device__ __forceinline__ void copy_values_adv_returns(
     }
 }
 
-__global__ void select_copy_kernel(RolloutBuf rollouts, TrainGraph graph,
+__global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
         const int* __restrict__ idx, const precision_t* __restrict__ advantages,
         const float* __restrict__ mb_prio) {
     int mb = blockIdx.x;
@@ -1361,13 +1355,14 @@ void train_impl(PuffeRL& pufferl) {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
-            select_copy_kernel<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
+            select_copy<<<dim3(mb_segs, 5), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
         profile_end(hypers.profile);
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
+        profile_begin("train_forward_backward", hypers.profile);
         if (pufferl.train_captured) {
             cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
         } else {
@@ -1400,7 +1395,7 @@ void train_impl(PuffeRL& pufferl) {
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
-                cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+                cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
                     pufferl.param_puf.data, pufferl.master_weights.data, n);
             }
             if (capturing) {
@@ -1413,20 +1408,21 @@ void train_impl(PuffeRL& pufferl) {
             }
             pufferl.train_warmup++;
         }
+        profile_end(hypers.profile);
 
         // This version is consistent with PufferLib 3.0. One of the major algorithmic
         // questions remaining is how and when to update value and advantage estimates.
         {
             int num_idx = numel(pufferl.prio_bufs.idx.shape);
             int row_bytes = (numel(graph.mb_ratio.shape) / graph.mb_ratio.shape[0]) * sizeof(precision_t);
-            index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
+            index_copy<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
                 (char*)rollouts.ratio.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_ratio.data, num_idx, row_bytes);
         }
         {
             int num_idx = numel(pufferl.prio_bufs.idx.shape);
             int row_bytes = graph.mb_newvalue.shape[1] * sizeof(precision_t);
-            index_copy_kernel<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
+            index_copy<<<grid_size(num_idx), BLOCK_SIZE, 0, train_stream>>>(
                 (char*)rollouts.values.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_newvalue.data, num_idx, row_bytes);
         }
@@ -1638,7 +1634,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         pufferl->master_weights = {.shape = {params->total_elems}};
         cudaMalloc(&pufferl->master_weights.data, params->total_elems * sizeof(float));
         int n = numel(pufferl->param_puf.shape);
-        cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+        cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
             pufferl->master_weights.data, pufferl->param_puf.data, n);
     }
 
@@ -1647,7 +1643,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->rng_states = (curandStatePhilox4_32_10_t**)calloc(num_buffers, sizeof(curandStatePhilox4_32_10_t*));
     for (int i = 0; i < num_buffers; i++) {
         cudaMalloc(&pufferl->rng_states[i], agents_per_buf * sizeof(curandStatePhilox4_32_10_t));
-        rng_init_kernel<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
+        rng_init<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
             pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
     }
 
@@ -1714,13 +1710,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaFree(saved_momentum);
         if (USE_BF16) {
             int n = numel(pufferl->param_puf.shape);
-            cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+            cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
                 pufferl->param_puf.data, pufferl->master_weights.data, n);
         }
 
         // Re-init RNG states corrupted by warmup
         for (int i = 0; i < num_buffers; i++) {
-            rng_init_kernel<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
+            rng_init<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
                 pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
         }
         cudaDeviceSynchronize();

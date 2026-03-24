@@ -296,7 +296,7 @@ static void puf_addmm_nn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor
         a->data, b->data, out->data, stream, alpha, beta);
 }
 
-__global__ void cast_kernel(precision_t* __restrict__ dst,
+__global__ void cast(precision_t* __restrict__ dst,
         const float* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -305,7 +305,7 @@ __global__ void cast_kernel(precision_t* __restrict__ dst,
 }
 
 #ifndef PRECISION_FLOAT
-__global__ void cast_kernel(float* __restrict__ dst,
+__global__ void cast(float* __restrict__ dst,
         const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -314,7 +314,7 @@ __global__ void cast_kernel(float* __restrict__ dst,
 }
 #endif
 
-__global__ void cast_kernel(precision_t* __restrict__ dst,
+__global__ void cast(precision_t* __restrict__ dst,
         const unsigned char* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -322,7 +322,7 @@ __global__ void cast_kernel(precision_t* __restrict__ dst,
     }
 }
 
-__global__ void cast_kernel(unsigned char* __restrict__ dst,
+__global__ void cast(unsigned char* __restrict__ dst,
         const precision_t* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -363,7 +363,7 @@ void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t
     curandGenerateUniform(gen, buf, n);
     curandDestroyGenerator(gen);
     uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
-    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
     cudaFree(buf);
 }
 
@@ -379,7 +379,7 @@ void puf_normal_init(PrecisionTensor* dst, float std, ulong seed, cudaStream_t s
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
     curandDestroyGenerator(gen);
-    cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
     cudaFree(buf);
 }
 

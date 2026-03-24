@@ -150,7 +150,7 @@ struct PrefixScan {
 
 // Checkpointing trades off partial recomputation for memory bandwidth.
 #define CHECKPOINT_INTERVAL 4
-__global__ void fused_scan_forward(PrefixScan scan) {
+__global__ void mingru_scan_forward(PrefixScan scan) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
     precision_t* __restrict__ out = scan.out.data;
     precision_t* __restrict__ next_state = scan.next_state.data;
@@ -236,7 +236,7 @@ __global__ void fused_scan_forward(PrefixScan scan) {
 }
 
 // Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
-__global__ void fused_scan_backward(PrefixScan scan,
+__global__ void mingru_scan_backward(PrefixScan scan,
         const precision_t* __restrict__ grad_out,
         const precision_t* __restrict__ grad_next_state) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
@@ -398,7 +398,7 @@ __global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst,
     dst[col] = from_float(sum);
 }
 
-__global__ void assemble_decoder_grad_kernel(
+__global__ void assemble_decoder_grad(
         precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
         const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -559,7 +559,7 @@ static PrecisionTensor decoder_backward(void* w, void* activations,
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
     int od = dw->output_dim, od1 = od + 1;
-    assemble_decoder_grad_kernel<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
+    assemble_decoder_grad<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
         a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, od1);
     puf_mm_tn(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.data != nullptr) {
@@ -730,7 +730,7 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
-        fused_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
         x = a->scan_bufs[i].out;
     }
     return x;
@@ -741,7 +741,7 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
-        fused_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
+        mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
             scan, grad.data, a->grad_next_state.data);
         puf_mm_tn(&scan.grad_combined, &a->saved_inputs[i], &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);

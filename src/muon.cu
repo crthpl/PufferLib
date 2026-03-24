@@ -1,6 +1,6 @@
 #include <nccl.h>
 
-__global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
+__global__ void muon_norm_reduce(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
@@ -16,7 +16,7 @@ __global__ void norm_reduce_kernel(float* __restrict__ out, const float* __restr
     }
 }
 
-__global__ void norm_partials_kernel(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
+__global__ void muon_norm_partials(float* __restrict__ partials, const precision_t* __restrict__ src, int n) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -37,7 +37,7 @@ __global__ void norm_partials_kernel(float* __restrict__ partials, const precisi
     }
 }
 
-__global__ void norm_apply_kernel(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
+__global__ void muon_norm_apply(precision_t* __restrict__ dst, const float* __restrict__ norm_ptr, float eps, int n) {
     float inv_norm = 1.0f / fmaxf(sqrtf(*norm_ptr), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -46,7 +46,7 @@ __global__ void norm_apply_kernel(precision_t* __restrict__ dst, const float* __
 }
 
 // Nesterov with f32 momentum accumulator and precision_t gradients
-__global__ void nesterov_momentum_kernel(float* __restrict__ mb, precision_t* __restrict__ gc, float mu, int n) {
+__global__ void muon_nesterov(float* __restrict__ mb, precision_t* __restrict__ gc, float mu, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float m = mu * mb[idx] + to_float(gc[idx]);
@@ -56,7 +56,7 @@ __global__ void nesterov_momentum_kernel(float* __restrict__ mb, precision_t* __
 }
 
 // Fused weight update: wb = wb * (1 - lr*wd) - lr * scale * update
-__global__ void muon_weight_update_kernel(float* __restrict__ wb, const precision_t* __restrict__ update,
+__global__ void muon_weight_update(float* __restrict__ wb, const precision_t* __restrict__ update,
         const float* __restrict__ lr_ptr, float wd, float scale, int n) {
     float lr = *lr_ptr;
     float wd_scale = 1.0f - lr * wd;
@@ -66,7 +66,7 @@ __global__ void muon_weight_update_kernel(float* __restrict__ wb, const precisio
     }
 }
 
-__global__ void clip_by_norm_partials_kernel(precision_t* __restrict__ dst,
+__global__ void muon_clip_norm(precision_t* __restrict__ dst,
         const float* __restrict__ sum_sq_ptr, float max_norm, float eps, int n) {
     float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -165,14 +165,14 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
 
     // Clip gradients by norm
     int clip_blocks = min((int)grid_size(numel(grads.shape)), 256);
-    norm_partials_kernel<<<clip_blocks, 256, 0, stream>>>(
+    muon_norm_partials<<<clip_blocks, 256, 0, stream>>>(
         m->norm_partials.data, grads.data, numel(grads.shape));
-    norm_reduce_kernel<<<1, 256, 0, stream>>>(m->grad_norm_ptr, m->norm_partials.data, clip_blocks);
-    clip_by_norm_partials_kernel<<<grid_size(numel(grads.shape)), BLOCK_SIZE, 0, stream>>>(
+    muon_norm_reduce<<<1, 256, 0, stream>>>(m->grad_norm_ptr, m->norm_partials.data, clip_blocks);
+    muon_clip_norm<<<grid_size(numel(grads.shape)), BLOCK_SIZE, 0, stream>>>(
         grads.data, m->grad_norm_ptr, max_grad_norm, 1e-6f, numel(grads.shape));
 
     // Nesterov momentum
-    nesterov_momentum_kernel<<<grid_size(numel(m->mb_puf.shape)), BLOCK_SIZE, 0, stream>>>(
+    muon_nesterov<<<grid_size(numel(m->mb_puf.shape)), BLOCK_SIZE, 0, stream>>>(
         m->mb_puf.data, grads.data, (float)m->momentum, numel(m->mb_puf.shape));
 
     long offset = 0;
@@ -195,10 +195,10 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
             PrecisionTensor gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
 
             int nblk = min((int)grid_size(numel(x.shape)), 256);
-            norm_partials_kernel<<<nblk, 256, 0, stream>>>(
+            muon_norm_partials<<<nblk, 256, 0, stream>>>(
                 m->norm_partials.data, x.data, numel(x.shape));
-            norm_reduce_kernel<<<1, 256, 0, stream>>>(m->norm_ptr, m->norm_partials.data, nblk);
-            norm_apply_kernel<<<grid_size(numel(x.shape)), BLOCK_SIZE, 0, stream>>>(
+            muon_norm_reduce<<<1, 256, 0, stream>>>(m->norm_ptr, m->norm_partials.data, nblk);
+            muon_norm_apply<<<grid_size(numel(x.shape)), BLOCK_SIZE, 0, stream>>>(
                 x.data, m->norm_ptr, 1e-7f, numel(x.shape));
 
             cublasOperation_t gram_op_a = tall ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -220,7 +220,7 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
             scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
         }
 
-        muon_weight_update_kernel<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        muon_weight_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
             wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne);
         offset += ne;
     }

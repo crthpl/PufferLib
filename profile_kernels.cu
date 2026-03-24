@@ -296,11 +296,11 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
 }
 
 void run_fusedscan_fwd(FusedScanProfile* p) {
-    fused_scan_forward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
+    mingru_scan_forward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
 }
 
 void run_fusedscan_bwd(FusedScanProfile* p) {
-    fused_scan_backward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+    mingru_scan_backward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
         p->scan, p->grad_out.data, p->grad_next_state.data);
 }
 
@@ -447,9 +447,9 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
 
 void run_ppoloss(PPOProfile* p) {
     cudaMemset(p->loss.data, 0, sizeof(float));
-    ppo_loss_fwd_bwd_kernel<<<p->ppo_grid, PPO_THREADS>>>(
+    ppo_loss_compute<<<p->ppo_grid, PPO_THREADS>>>(
         p->ppo_partials.data, p->ka, p->ga);
-    ppo_loss_reduce_kernel<<<1, LOSS_N + 1>>>(
+    ppo_loss_reduce<<<1, LOSS_N + 1>>>(
         p->loss.data, p->losses_acc.data, p->ppo_partials.data, p->ppo_grid);
 }
 
@@ -496,7 +496,7 @@ SampleLogitsProfile* create_samplelogits(int B, int A) {
     cudaMemcpy(p->act_sizes.data, &A, sizeof(int), cudaMemcpyHostToDevice);
 
     cudaMalloc(&p->rng_states, B * sizeof(curandStatePhilox4_32_10_t));
-    rng_init_kernel<<<grid_size(B), BLOCK_SIZE>>>(p->rng_states, 42, B);
+    rng_init<<<grid_size(B), BLOCK_SIZE>>>(p->rng_states, 42, B);
     cudaDeviceSynchronize();
 
     float* buf = (float*)malloc(B * fused_cols * sizeof(float));
@@ -507,7 +507,7 @@ SampleLogitsProfile* create_samplelogits(int B, int A) {
 }
 
 void run_samplelogits(SampleLogitsProfile* p) {
-    sample_logits_kernel<<<grid_size(p->B), BLOCK_SIZE>>>(
+    sample_logits<<<grid_size(p->B), BLOCK_SIZE>>>(
         p->dec_out, p->logstd, p->act_sizes,
         p->actions_t.data, p->logprobs_t.data, p->value_out_t.data,
         p->rng_states);

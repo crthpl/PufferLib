@@ -197,7 +197,7 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     cudaMemcpy(pufferl.master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
         int n = numel(pufferl.param_puf.shape);
-        cast_kernel<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
+        cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
 }
@@ -210,7 +210,7 @@ void py_puff_advantage(
         float gamma, float lambda, float rho_clip, float c_clip) {
     constexpr int N = 16 / sizeof(precision_t);
     int blocks = grid_size(num_steps);
-    auto kernel = (horizon % N == 0) ? puff_advantage_kernel : puff_advantage_kernel_scalar;
+    auto kernel = (horizon % N == 0) ? puff_advantage : puff_advantage_scalar;
     kernel<<<blocks, 256>>>(
         (const precision_t*)values_ptr, (const precision_t*)rewards_ptr,
         (const precision_t*)dones_ptr,  (const precision_t*)importance_ptr,
