@@ -34,6 +34,10 @@ puffer = "pufferlib.pufferl:main"
 [project.urls]
 Homepage = "https://puffer.ai"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pufferlib*"]
+
 [build-system]
-requires = ["setuptools", "wheel", "Cython", "numpy<2.0", "torch", "pybind11"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
