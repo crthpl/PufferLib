@@ -1,7 +1,5 @@
-#include <math.h>
 #include <float.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 
@@ -30,6 +28,7 @@
         #define GLSL_VERSION            330
     #endif
 #else   // PLATFORM_ANDROID, PLATFORM_WEB
+    #include <GLES3/gl3.h>
     #define GLSL_VERSION            100
 #endif
 
@@ -106,6 +105,60 @@ typedef struct {
     int n;
 } Dataset;
 
+typedef struct PlotArgs {
+    float mmin[4];
+    float mmax[4];
+    int scale[4];
+    int width;
+    int height;
+    int title_font_size;
+    int axis_font_size;
+    int axis_tick_font_size;
+    int legend_font_size;
+    int line_width;
+    int tick_length;
+    int top_margin;
+    int bottom_margin;
+    int left_margin;
+    int right_margin;
+    int tick_margin;
+    Color font_color;
+    Color background_color;
+    Color axis_color;
+    char* x_label;
+    char* y_label;
+    char* z_label;
+    Font font;
+    Font font_small;
+    Camera3D camera;
+} PlotArgs;
+
+PlotArgs DEFAULT_PLOT_ARGS = {
+    .mmin = {0.0f, 0.0f, 0.0f, 0.0f},
+    .mmax = {0.0f, 0.0f, 0.0f, 0.0f},
+    .scale = {0, 0, 0, 0},
+    .width = 960,
+    .height = 540 - SETTINGS_HEIGHT,
+    .title_font_size = 32,
+    .axis_font_size = 32,
+    .axis_tick_font_size = 16,
+    .legend_font_size = 12,
+    .line_width = 2,
+    .tick_length = 8,
+    .tick_margin = 8,
+    .top_margin = 70,
+    .bottom_margin = 70,
+    .left_margin = 100,
+    .right_margin = 100,
+    .font_color = PUFF_WHITE,
+    .background_color = PUFF_BACKGROUND,
+    .axis_color = PUFF_WHITE,
+    .x_label = "Cost",
+    .y_label = "Score",
+    .z_label = "Train/Learning Rate",
+};
+
+
 Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
     for (int i = 0; i < data->n; i++) {
         if (strcmp(data->envs[i].key, env) != 0) {
@@ -120,10 +173,6 @@ Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
     printf("Error: hyper %s not found in env %s\n", hyper, env);
     exit(1);
     return NULL;
-}
-
-Color rgb(float h) {
-    return ColorFromHSV(120*(1.0 + h), 0.8f, 0.15f);
 }
 
 float safe_log10(float x) {
@@ -156,70 +205,16 @@ float unscale_val(int scale, float val) {
     return val;
 }
 
-typedef struct PlotArgs {
-    float x_min;
-    float x_max;
-    float y_min;
-    float y_max;
-    float z_min;
-    float z_max;
-    float c_min;
-    float c_max;
-    int x_scale;
-    int y_scale;
-    int z_scale;
-    int c_scale;
-    int width;
-    int height;
-    int title_font_size;
-    int axis_font_size;
-    int axis_tick_font_size;
-    int legend_font_size;
-    int line_width;
-    int tick_length;
-    int top_margin;
-    int bottom_margin;
-    int left_margin;
-    int right_margin;
-    int tick_margin;
-    Color font_color;
-    Color background_color;
-    Color axis_color;
-    char* x_label;
-    char* y_label;
-    char* z_label;
-    Font font;
-    Font font_small;
-    Camera3D camera;
-} PlotArgs;
+Color rgb(float h) {
+    return ColorFromHSV(120*(1.0 + h), 0.8f, 0.15f);
+}
 
-PlotArgs DEFAULT_PLOT_ARGS = {
-    .x_min = 0.0f,
-    .x_max = 0.0f,
-    .y_min = 0.0f,
-    .y_max = 0.0f,
-    .z_min = 0.0f,
-    .z_max = 0.0f,
-    .width = 960,
-    .height = 540 - SETTINGS_HEIGHT,
-    .title_font_size = 32,
-    .axis_font_size = 32,
-    .axis_tick_font_size = 16,
-    .legend_font_size = 12,
-    .line_width = 2,
-    .tick_length = 8,
-    .tick_margin = 8,
-    .top_margin = 70,
-    .bottom_margin = 70,
-    .left_margin = 100,
-    .right_margin = 100,
-    .font_color = PUFF_WHITE,
-    .background_color = PUFF_BACKGROUND,
-    .axis_color = PUFF_WHITE,
-    .x_label = "Cost",
-    .y_label = "Score",
-    .z_label = "Train/Learning Rate",
-};
+void draw_axes(PlotArgs args) {
+    DrawLine(args.left_margin, args.top_margin,
+        args.left_margin, args.height - args.bottom_margin, PUFF_WHITE);
+    DrawLine(args.left_margin, args.height - args.bottom_margin,
+        args.width - args.right_margin, args.height - args.bottom_margin, PUFF_WHITE);
+}
 
 const char* format_tick_label(double value) {
     static char buffer[32];
@@ -230,67 +225,61 @@ const char* format_tick_label(double value) {
     }
 
     if (fabs(value) < 0.001 || fabs(value) > 10000) {
-        snprintf(buffer, sizeof(buffer), "%.3e\0", value);
+        snprintf(buffer, sizeof(buffer), "%.3e", value);
     } else {
-        snprintf(buffer, sizeof(buffer), "%.3f\0", value);
-        //char *end = buffer + strlen(buffer) - 1;
-        //while (end > buffer && *end == '0') *end-- = '\0';
-        //if (end > buffer && *end == '.') *end = '\0';
+        snprintf(buffer, sizeof(buffer), "%.3f", value);
     }
 
     return buffer;
 }
 
-void draw_axes(PlotArgs args) {
-    DrawLine(args.left_margin, args.top_margin,
-        args.left_margin, args.height - args.bottom_margin, PUFF_WHITE);
-    DrawLine(args.left_margin, args.height - args.bottom_margin,
-        args.width - args.right_margin, args.height - args.bottom_margin, PUFF_WHITE);
+void label_ticks(char ticks[][32], PlotArgs args, int axis_idx, int tick_n) {
+    float mmin = scale_val(args.scale[axis_idx], args.mmin[axis_idx]);
+    float mmax = scale_val(args.scale[axis_idx], args.mmax[axis_idx]);
+    for (int i=0; i<tick_n; i++) {
+        float val = mmin + i*(mmax - mmin)/(tick_n - 1.0f);
+        val = unscale_val(args.scale[axis_idx], val);
+        const char* label = format_tick_label(val);
+        strcpy(ticks[i], label);
+    }
 }
 
-void draw_x_tick(char* label, float x_pos, PlotArgs args) {
-    float y_pos = args.height - args.bottom_margin;
-    DrawLine(
-        x_pos,
-        y_pos - args.tick_length,
-        x_pos,
-        y_pos + args.tick_length,
-        args.axis_color
-    );
-    Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
-    DrawTextEx(
-        args.font_small,
-        label,
-        (Vector2){
-            x_pos - this_tick_size.x/2,
-            y_pos + args.tick_length + args.tick_margin,
-        },
-        args.axis_tick_font_size,
-        0,
-        PUFF_WHITE
-    );
-}
+void draw_ticks(char x_ticks[][32], int x_n, char y_ticks[][32], int y_n, PlotArgs args) {
+    int width = args.width;
+    int height = args.height;
 
-void draw_y_tick(char* label, float y_pos, PlotArgs args) {
-    DrawLine(
-        args.left_margin - args.tick_length,
-        y_pos,
-        args.left_margin + args.tick_length,
-        y_pos,
-        args.axis_color
-    );
-    Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
-    DrawTextEx(
-        args.font_small,
-        label,
-        (Vector2){
-            args.left_margin - this_tick_size.x - args.tick_length - args.tick_margin,
-            y_pos - this_tick_size.y/2,
-        },
-        args.axis_tick_font_size,
-        0,
-        PUFF_WHITE
-    );
+    float plot_width = width - args.left_margin - args.right_margin;
+    float plot_height = height - args.top_margin - args.bottom_margin;
+ 
+    for (int i=0; i<x_n; i++) {
+        char* label = x_ticks[i];
+        float x_pos = args.left_margin + i*plot_width/(x_n - 1.0f);
+        float y_pos = args.height - args.bottom_margin;
+        DrawLine(x_pos, y_pos - args.tick_length,
+            x_pos, y_pos + args.tick_length, args.axis_color);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
+        DrawTextEx(args.font_small, label,
+            (Vector2){
+                x_pos - this_tick_size.x/2,
+                y_pos + args.tick_length + args.tick_margin,
+            },
+            args.axis_tick_font_size, 0, PUFF_WHITE
+        );
+    }
+    for (int i=0; i<y_n; i++) {
+        float y_pos = height - args.bottom_margin - i*plot_height/(y_n - 1.0f);
+        char* label = y_ticks[i];
+        DrawLine(args.left_margin - args.tick_length, y_pos,
+            args.left_margin + args.tick_length, y_pos, args.axis_color);
+        Vector2 this_tick_size = MeasureTextEx(args.font, label, args.axis_tick_font_size, 0);
+        DrawTextEx(args.font_small, label,
+            (Vector2){
+                args.left_margin - this_tick_size.x - args.tick_length - args.tick_margin,
+                y_pos - this_tick_size.y/2,
+            },
+            args.axis_tick_font_size, 0, PUFF_WHITE
+        );
+    }
 }
 
 Vector2 compute_ticks(PlotArgs args) {
@@ -307,65 +296,23 @@ Vector2 compute_ticks(PlotArgs args) {
     return (Vector2){num_x_ticks, num_y_ticks};
 }
 
-void draw_ticks(char x_ticks[][32], int x_n, char y_ticks[][32], int y_n, PlotArgs args) {
-    int width = args.width;
-    int height = args.height;
-
-    float plot_width = width - args.left_margin - args.right_margin;
-    float plot_height = height - args.top_margin - args.bottom_margin;
- 
-    for (int i=0; i<x_n; i++) {
-        char* label = x_ticks[i];
-        draw_x_tick(label, args.left_margin + i*plot_width/(x_n - 1.0f), args);
-    }
-    for (int i=0; i<y_n; i++) {
-        float y_pos = height - args.bottom_margin - i*plot_height/(y_n - 1.0f);
-        char* label = y_ticks[i];
-        draw_y_tick(label, y_pos, args);
-    }
-}
-
 void draw_all_ticks(PlotArgs args) {
     Vector2 tick_n = compute_ticks(args);
     char x_ticks[(int)tick_n.x][32];
-    float x_min = scale_val(args.x_scale, args.x_min);
-    float x_max = scale_val(args.x_scale, args.x_max);
-    for (int i=0; i<tick_n.x; i++) {
-        float val = x_min + i*(x_max - x_min)/(tick_n.x - 1.0f);
-        val = unscale_val(args.x_scale, val);
-        char* label = format_tick_label(val);
-        strcpy(x_ticks[i], label);
-    }
-
     char y_ticks[(int)tick_n.y][32];
-    float y_min = scale_val(args.y_scale, args.y_min);
-    float y_max = scale_val(args.y_scale, args.y_max);
-    for (int i=0; i<tick_n.y; i++) {
-        float val = y_min + i*(y_max - y_min)/(tick_n.y - 1.0f);
-        val = unscale_val(args.y_scale, val);
-        char* label = format_tick_label(val);
-        strcpy(y_ticks[i], label);
-    }
-
+    label_ticks(x_ticks, args, 0, tick_n.x);
+    label_ticks(y_ticks, args, 1, tick_n.y);
     draw_ticks(x_ticks, tick_n.x, y_ticks, tick_n.y, args);
 }
 
 void draw_box_ticks(char* hypers[], int hyper_count, PlotArgs args) {
     Vector2 tick_n = compute_ticks(args);
-    float x_min = scale_val(args.x_scale, args.x_min);
-    float x_max = scale_val(args.x_scale, args.x_max);
     char x_ticks[(int)tick_n.x][32];
-    for (int i=0; i<tick_n.x; i++) {
-        float val = x_min + i*(x_max - x_min)/(tick_n.x - 1.0f);
-        val = unscale_val(args.x_scale, val);
-        char* label = format_tick_label(val);
-        strcpy(x_ticks[i], label);
-    }
+    label_ticks(x_ticks, args, 0, tick_n.x);
     char fixed_hypers[hyper_count][32];
     for (int i=0; i<hyper_count; i++) {
         strncpy(fixed_hypers[hyper_count - i - 1], hypers[i], 32);
     }
-
     draw_ticks(x_ticks, tick_n.x, fixed_hypers, hyper_count, args);
 }
 
@@ -394,8 +341,8 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
     float plot_width = width - args.left_margin - args.right_margin;
     float plot_height = height - args.top_margin - args.bottom_margin;
 
-    float x_min = scale_val(x_scale, args.x_min);
-    float x_max = scale_val(x_scale, args.x_max);
+    float x_min = scale_val(x_scale, args.mmin[0]);
+    float x_max = scale_val(x_scale, args.mmax[0]);
  
     float dy = plot_height/((float)hyper_count);
 
@@ -412,8 +359,6 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
 
     mmin = scale_val(x_scale, mmin);
     mmax = scale_val(x_scale, mmax);
-    //printf("mmin %f mmax %f, x_scale %d, x_min %f, x_max %f\n", mmin, mmax, x_scale, x_min, x_max);
-    //printf("Hyper %s mmin %f mmax %f, xmin %f xmax %f, left_perc %f right_perc %f\n", hyper->key, mmin, mmax, x_min, x_max, (mmin-x_min)/(x_max - x_min), (mmax-x_min)/(x_max - x_min));
 
     float left = args.left_margin + (mmin - x_min)/(x_max - x_min)*plot_width;
     float right = args.left_margin + (mmax - x_min)/(x_max - x_min)*plot_width;
@@ -458,27 +403,6 @@ void plot_gl(Glyph* glyphs, int size, Shader* shader) {
     rlSetBlendMode(RL_BLEND_ALPHA);
 }
 
-int cleanup(Hyper *map, int map_count, cJSON *root, char *json_str) {
-    if (map) {
-        for (int i=0; i<map_count; i++) {
-            if (map[i].key) free(map[i].key);
-            if (map[i].ary) free(map[i].ary);
-        }
-    }
-    if (root) cJSON_Delete(root);
-    if (json_str) free(json_str);
-    return 1;
-}
-
-void GuiDropdownCheckbox(int x, int y, char* options, int *selection, bool *active, char *text, bool *checked) {
-    Rectangle rect = {x, y, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
-    if (GuiDropdownBox(rect, options, selection, *active)) {
-        *active = !*active;
-    }
-    Rectangle check_rect = {x + rect.width , y, SETTINGS_HEIGHT, rect.height};
-    GuiCheckBox(check_rect, text, checked);
-}
-
 void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdown_active,
         Vector2 focus, char *text1, float *text1_val, char *text2, float *text2_val) {
     Rectangle rect = {x, y, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
@@ -507,73 +431,44 @@ void apply_filter(bool* filter, Hyper* param, float min, float max) {
 }
 
 void autoscale(Point* points, int size, PlotArgs *args) {
-    float x_min = FLT_MAX;
-    float x_max = -FLT_MAX;
+    float mmin[4] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
+    float mmax[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
     for (int i=0; i<size; i++) {
-        float xi = points[i].x;
-        if (xi < x_min) x_min = xi;
-        if (xi > x_max) x_max = xi;
+        float* vals = (float*)&points[i];
+        for (int j=0; j<4; j++) {
+            float val = vals[j];
+            if (val < mmin[j]) mmin[j] = val;
+            if (val > mmax[j]) mmax[j] = val;
+        }
     }
-    args->x_min = x_min;
-    args->x_max = x_max;
-
-    float y_min = FLT_MAX;
-    float y_max = -FLT_MAX;
-    for (int i=0; i<size; i++) {
-        float yi = points[i].y;
-        if (yi < y_min) y_min = yi;
-        if (yi > y_max) y_max = yi;
+    for (int j=0; j<4; j++) {
+        args->mmin[j] = mmin[j];
+        args->mmax[j] = mmax[j];
     }
-    args->y_min = y_min;
-    args->y_max = y_max;
-
-    float z_min = FLT_MAX;
-    float z_max = -FLT_MAX;
-    for (int i=0; i<size; i++) {
-        float zi = points[i].z;
-        if (zi < z_min) z_min = zi;
-        if (zi > z_max) z_max = zi;
-    }
-    args->z_min = z_min;
-    args->z_max = z_max;
-
-    float c_min = FLT_MAX;
-    float c_max = -FLT_MAX;
-    for (int i=0; i<size; i++) {
-        float ci = points[i].c;
-        if (ci < c_min) c_min = ci;
-        if (ci > c_max) c_max = ci;
-    }
-    args->c_min = c_min;
-    args->c_max = c_max;
 }
 
 void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
-    float x_min = scale_val(args.x_scale, args.x_min);
-    float x_max = scale_val(args.x_scale, args.x_max);
-    float y_min = scale_val(args.y_scale, args.y_min);
-    float y_max = scale_val(args.y_scale, args.y_max);
-    float z_min = scale_val(args.z_scale, args.z_min);
-    float z_max = scale_val(args.z_scale, args.z_max);
-    float c_min = scale_val(args.c_scale, args.c_min);
-    float c_max = scale_val(args.c_scale, args.c_max);
-
-    float dx = x_max - x_min;
-    float dy = y_max - y_min;
-    float dz = z_max - z_min;
+    float mmin[4];
+    float mmax[4];
+    float delta[4];
+    for (int j=0; j<4; j++) {
+        mmin[j] = scale_val(args.scale[j], args.mmin[j]);
+        mmax[j] = scale_val(args.scale[j], args.mmax[j]);
+        delta[j] = mmax[j] - mmin[j];
+    }
 
     for (int i = 0; i < size; i++) {
         Point p = points[i];
-        float xi = scale_val(args.x_scale, p.x);
-        float yi = scale_val(args.y_scale, p.y);
-        float zi = scale_val(args.z_scale, p.z);
+        float xi = scale_val(args.scale[0], p.x);
+        float yi = scale_val(args.scale[1], p.y);
+        float zi = scale_val(args.scale[2], p.z);
         float px, py;
 
-        if (args.z_min != 0 || args.z_max != 0) {
+        if (args.mmin[2] != 0 || args.mmax[2] != 0) {
             Vector3 v = (Vector3){
-                (xi - x_min)/dx,
-                (yi - y_min)/dy,
-                (zi - z_min)/dz
+                (xi - mmin[0])/delta[0],
+                (yi - mmin[1])/delta[1],
+                (zi - mmin[2])/delta[2]
             };
             assert(args.camera.fovy != 0);
             Vector2 screen_pos = GetWorldToScreenEx(v, args.camera, args.width, args.height);
@@ -581,12 +476,14 @@ void toPx(Point *points, Glyph* glyphs, int size, PlotArgs args) {
             py = screen_pos.y;
         } else {
             // TODO: Check margins
-            px = args.left_margin + (xi - x_min) / dx * (args.width - args.left_margin - args.right_margin);
-            py = args.height - args.bottom_margin - (yi - y_min) / dy * (args.height - args.top_margin - args.bottom_margin);
+            px = args.left_margin + (xi - mmin[0]) / delta[0] * (args.width - args.left_margin - args.right_margin);
+            py = args.height - args.bottom_margin - (yi - mmin[1]) / delta[1] * (args.height - args.top_margin - args.bottom_margin);
         }
 
         float cmap = points[i].c;
-        cmap = scale_val(args.c_scale, cmap);
+        cmap = scale_val(args.scale[3], cmap);
+        float c_min = mmin[3];
+        float c_max = mmax[3];
         if (c_min != c_max) {
             cmap = (cmap - c_min)/(c_max - c_min);
         }
@@ -694,7 +591,7 @@ float fast_atof(char **s) {
 }
  
 int main(void) {
-    FILE *file = fopen("constellation/default.json", "r");
+    FILE *file = fopen("resources/constellation/experiments.json", "r");
     if (!file) {
         printf("Error opening file\n");
         return 1;
@@ -716,7 +613,7 @@ int main(void) {
     }
     if (!cJSON_IsObject(root)) {
         printf("Error: Root is not an object\n");
-        return cleanup(NULL, 0, root, json_str);
+        return 1;
     }
 
     // Load in dataset
@@ -743,7 +640,7 @@ int main(void) {
         for (int j=0; j<envs[i].n; j++, json_hyper=json_hyper->next) {
             envs[i].hypers[j].key = json_hyper->string;
             int capacity = 1;
-            for (char* p = json_hyper->valuestring; *p != NULL; p++) {
+            for (char* p = json_hyper->valuestring; *p; p++) {
                 if (*p == ',') {
                     capacity++;
                 }
@@ -755,7 +652,7 @@ int main(void) {
 
             int n = 0;
             char* s = json_hyper->valuestring;
-            while (*s != NULL) {
+            while (*s) {
                 envs[i].hypers[j].ary[n++] = fast_atof(&s);
                 if (*s == ',') {
                     s++;
@@ -770,8 +667,8 @@ int main(void) {
         total_points += envs[i].hypers[0].n;
     }
 
-    int hyper_count = 22;
-    char *hyper_key[22] = {
+    int hyper_count = 24;
+    char *hyper_key[24] = {
         "agent_steps",
         "uptime",
         "env/perf",
@@ -798,9 +695,6 @@ int main(void) {
         "vec/total_agents",
     };
 
-    //char* items[] = {"environment/score", "cost", "train/learning_rate", "train/gamma", "train/gae_lambda"};
-    //char options[] = "environment/score;cost;train/learning_rate;train/gamma;train/gae_lambda";
-          
     // Create options as a semicolon-separated string
     size_t options_len = 0;
     for (int i = 0; i < hyper_count; i++) {
@@ -848,17 +742,19 @@ int main(void) {
     DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
     Font gui_font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 14, NULL, 255);
 
-    GuiLoadStyle("constellation/puffer.rgs");
+    GuiLoadStyle("resources/constellation/puffer.rgs");
     GuiSetFont(gui_font);
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
-    Shader shader = LoadShader(TextFormat("constellation/point_particle.vs", GLSL_VERSION),
-                               TextFormat("constellation/point_particle.fs", GLSL_VERSION));
-
+    Shader shader = LoadShader(
+        TextFormat("resources/constellation/point_particle_%i.vs", GLSL_VERSION),
+        TextFormat("resources/constellation/point_particle_%i.fs", GLSL_VERSION)
+    );
     Shader blur_shader = LoadShader(
-            "constellation/blur.vs",
-            "constellation/blur.fs");
+        TextFormat("resources/constellation/blur_%i.vs", GLSL_VERSION),
+        TextFormat("resources/constellation/blur_%i.fs", GLSL_VERSION)
+    );
 
     // Allows the vertex shader to set the point size of each particle individually
     #ifndef GRAPHICS_API_OPENGL_ES2
@@ -872,8 +768,8 @@ int main(void) {
     args1.camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     args1.camera.fovy = 45.0f;
     args1.camera.projection = CAMERA_PERSPECTIVE;
-    args1.x_scale = 1;
-    args1.z_scale = 1;
+    args1.scale[0] = 1;
+    args1.scale[2] = 1;
     RenderTexture2D fig1 = LoadRenderTexture(args1.width, args1.height);
     RenderTexture2D fig1_overlay = LoadRenderTexture(args1.width, args1.height);
     int fig_env_idx = 0;
@@ -881,17 +777,14 @@ int main(void) {
     bool fig_x_active = false;
     int fig_x_idx = 1;
     bool fig_xscale_active = false;
-    int fig_xscale_idx = 0;
     bool fig_y_active = false;
     int fig_y_idx = 2;
     bool fig_yscale_active = false;
     bool fig_z_active = false;
     int fig_z_idx = 0;
     bool fig_zscale_active = false;
-    int fig_zscale_idx = 0;
     int fig_color_idx = 0;
     bool fig_color_active = false;
-    int fig_colorscale_idx = 0;
     bool fig_colorscale_active = false;
     bool fig_range1_active = false;
     int fig_range1_idx = 2;
@@ -913,7 +806,7 @@ int main(void) {
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
     args2.right_margin = 50;
-    args2.x_scale = 1;
+    args2.scale[0] = 1;
 
     PlotArgs args3 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig3 = LoadRenderTexture(args3.width, args3.height);
@@ -933,18 +826,6 @@ int main(void) {
     args4.right_margin = 50;
     args4.top_margin = 10;
     args4.bottom_margin = 50;
-
-    float perf_thresholds[4] = {0.5f, 0.75f, 0.9f, 0.95f};
-    int best_srci[4];
-    int best_n[4];
-    int* best_idx[4];
-    float* temp_dist[4];
-    int* temp_idx[4];
-    for (int i=0; i<4; i++) {
-        best_idx[i] = calloc(data.n, sizeof(int));
-        temp_dist[i] = calloc(data.n, sizeof(float));
-        temp_idx[i] = calloc(data.n, sizeof(int));
-    }
 
     Hyper* x;
     Hyper* y;
@@ -1039,8 +920,8 @@ int main(void) {
         // Figure 2
         x_label = hyper_key[fig_x_idx];
         y_label = hyper_key[fig_y_idx];
-        args2.x_scale = args1.x_scale;
-        args2.y_scale = args1.y_scale;
+        args2.scale[0] = args1.scale[0];
+        args2.scale[1] = args1.scale[1];
         args2.x_label = x_label;
         args2.y_label = y_label;
         args2.top_margin = 20;
@@ -1048,41 +929,9 @@ int main(void) {
         BeginTextureMode(fig2);
         ClearBackground(PUFF_BACKGROUND);
 
-        start = 0;
-        end = data.n;
-        if (fig_env_idx != 0) {
-            start = fig_env_idx - 1;
-            end = fig_env_idx;
-        }
-        size = 0;
-        for (int i=start; i<end; i++) {
-            char* env = data.envs[i].key;
-            x = get_hyper(&data, env, hyper_key[fig_x_idx]);
-            y = get_hyper(&data, env, hyper_key[fig_y_idx]);
-            if (fig_color_idx != 0) {
-                c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
-            }
-            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
-            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
-            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
- 
-            for (int j=0; j<x->n; j++) {
-                if (!filter[j]) {
-                    continue;
-                }
-                points[size] = (Point){
-                    x->ary[j],
-                    y->ary[j],
-                    0.0f,
-                    (fig_color_idx == 0) ? i/(float)data.n : c->ary[j],
-                };
-                env_indices[size] = (Vector2){i, j};
-                size++;
-            }
-        }
-
         autoscale(points, size, &args2);
+        args2.mmin[2] = 0.0f;
+        args2.mmax[2] = 0.0f;
         toPx(points, glyphs, size, args2);
         update_closest(&tooltip, env_indices, glyphs, size, fig1.texture.width, 2*SETTINGS_HEIGHT);
         plot_gl(glyphs, size, &shader);
@@ -1129,27 +978,21 @@ int main(void) {
         EndTextureMode();
 
         // Figure 4
-        args4.x_scale = fig_box_idx;
-        if (args4.x_scale == LINEAR) {
-            args4.x_min = 0.0f;
-            args4.x_max = 5.0f;
-        } else if (args4.x_scale == LOG) {
-            args4.x_min = 1.0e-5f;
-            args4.x_max = 1.0e5f;
-        } else if (args4.x_scale == LOGIT) {
-            args4.x_min = 0.5f;
-            args4.x_max = 0.999f;
+        args4.scale[0] = fig_box_idx;
+        if (args4.scale[0] == LINEAR) {
+            args4.mmin[0] = 0.0f;
+            args4.mmax[0] = 5.0f;
+        } else if (args4.scale[0] == LOG) {
+            args4.mmin[0] = 1.0e-5f;
+            args4.mmax[0] = 1.0e5f;
+        } else if (args4.scale[0] == LOGIT) {
+            args4.mmin[0] = 0.5f;
+            args4.mmax[0] = 0.999f;
         }
         BeginTextureMode(fig4);
         ClearBackground(PUFF_BACKGROUND);
         rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
-        start = 0;
-        end = data.n;
-        if (fig_env_idx != 0) {
-            start = fig_env_idx - 1;
-            end = fig_env_idx;
-        }
         Color color = Fade(PUFF_CYAN, 1.0f / (float)(end - start));
         for (int i=start; i<end; i++) {
             Env* env = &data.envs[i];
@@ -1162,7 +1005,7 @@ int main(void) {
                 }
                 apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
                 apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
-                boxplot(hyper, args4.x_scale, j, hyper_count, args4, color, filter);
+                boxplot(hyper, args4.scale[0], j, hyper_count, args4, color, filter);
             }
         }
         EndBlendMode();
@@ -1233,7 +1076,7 @@ int main(void) {
         }
         Rectangle fig_xscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
         x += TOGGLE_WIDTH + SPACER;
-        if (GuiDropdownBox(fig_xscale_rect, scale_options, &args1.x_scale, fig_xscale_active)){
+        if (GuiDropdownBox(fig_xscale_rect, scale_options, &args1.scale[0], fig_xscale_active)){
             fig_xscale_active = !fig_xscale_active;
         }
 
@@ -1248,7 +1091,7 @@ int main(void) {
         }
         Rectangle fig_yscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
         x += TOGGLE_WIDTH + SPACER;
-        if (GuiDropdownBox(fig_yscale_rect, scale_options, &args1.y_scale, fig_yscale_active)){
+        if (GuiDropdownBox(fig_yscale_rect, scale_options, &args1.scale[1], fig_yscale_active)){
             fig_yscale_active = !fig_yscale_active;
         }
 
@@ -1263,7 +1106,7 @@ int main(void) {
         }
         Rectangle fig_zscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
         x += TOGGLE_WIDTH + SPACER;
-        if (GuiDropdownBox(fig_zscale_rect, scale_options, &args1.z_scale, fig_zscale_active)){
+        if (GuiDropdownBox(fig_zscale_rect, scale_options, &args1.scale[2], fig_zscale_active)){
             fig_zscale_active = !fig_zscale_active;
         }
 
@@ -1278,14 +1121,14 @@ int main(void) {
         }
         Rectangle fig_colorscale_rect = {x, SEP, TOGGLE_WIDTH, SETTINGS_HEIGHT};
         x += TOGGLE_WIDTH + SPACER;
-        if (GuiDropdownBox(fig_colorscale_rect, scale_options, &args1.c_scale, fig_colorscale_active)){
+        if (GuiDropdownBox(fig_colorscale_rect, scale_options, &args1.scale[3], fig_colorscale_active)){
             fig_colorscale_active = !fig_colorscale_active;
         }
 
         // Temp hack
-        args2.c_scale = args1.c_scale;
-        args3.c_scale = args1.c_scale;
-        args4.c_scale = args1.c_scale;
+        args2.scale[3] = args1.scale[3];
+        args3.scale[3] = args1.scale[3];
+        args4.scale[3] = args1.scale[3];
 
         // Filters
         DrawTextEx(args1.font_small, "F1", (Vector2){x, y}, args1.axis_tick_font_size, 0, WHITE);
@@ -1315,7 +1158,6 @@ int main(void) {
 
         // Puffer
         float width = GetScreenWidth();
-        float height = GetScreenHeight();
         DrawTexturePro(
             puffer,
             (Rectangle){0, 128, 128, 128},
@@ -1334,13 +1176,8 @@ int main(void) {
         float cost = get_hyper(&data, env_key, "uptime")->ary[ary_idx];
         float score = get_hyper(&data, env_key, "env/score")->ary[ary_idx];
         float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
-        float perf = get_hyper(&data, env_key, "env/perf")->ary[ary_idx];
-        float tsne1 = get_hyper(&data, env_key, "tsne1")->ary[ary_idx];
-        float tsne2 = get_hyper(&data, env_key, "tsne2")->ary[ary_idx];
-        Vector2 tsne = (Vector2){tsne1, tsne2};
-
         if (tooltip.active) {
-            char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
+            const char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
             float x = tooltip.x;
             float y = tooltip.y;
@@ -1357,7 +1194,6 @@ int main(void) {
         EndDrawing();
 
         // Copy hypers to clipboard
-        int total_len = 0;
         if (right_clicked) {
             copy_hypers_to_clipboard(env, clipboard, ary_idx);
         }
@@ -1381,11 +1217,6 @@ int main(void) {
     free(glyphs);
     free(env_indices);
     free(filter);
-    for (int i = 0; i < 4; i++) {
-      free(best_idx[i]);
-      free(temp_dist[i]);
-      free(temp_idx[i]);
-    }
 
     // Raylib resources
     UnloadShader(shader);

@@ -2734,7 +2734,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
             if ((textBoxCursorIndex > 0) && IsKeyPressed(KEY_LEFT) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
             {
                 int offset = textBoxCursorIndex;
-                int accCodepointSize = 0;
                 int prevCodepointSize;
                 int prevCodepoint;
 
@@ -2745,7 +2744,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
                     if (!isspace(prevCodepoint & 0xff)) break;
 
                     offset -= prevCodepointSize;
-                    accCodepointSize += prevCodepointSize;
                 }
 
                 // Check characters of the same type to skip (either ASCII punctuation or anything non-whitespace)
@@ -2757,7 +2755,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
                     if ((puctuation && !ispunct(prevCodepoint & 0xff)) || (!puctuation && (isspace(prevCodepoint & 0xff) || ispunct(prevCodepoint & 0xff)))) break;
 
                     offset -= prevCodepointSize;
-                    accCodepointSize += prevCodepointSize;
                 }
 
                 textBoxCursorIndex = offset;
@@ -2772,7 +2769,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
             else if ((textLength > textBoxCursorIndex) && IsKeyPressed(KEY_RIGHT) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
             {
                 int offset = textBoxCursorIndex;
-                int accCodepointSize = 0;
                 int nextCodepointSize;
                 int nextCodepoint;
 
@@ -2785,7 +2781,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
                     if ((puctuation && !ispunct(nextCodepoint & 0xff)) || (!puctuation && (isspace(nextCodepoint & 0xff) || ispunct(nextCodepoint & 0xff)))) break;
 
                     offset += nextCodepointSize;
-                    accCodepointSize += nextCodepointSize;
                     nextCodepoint = GetCodepointNext(text + offset, &nextCodepointSize);
                 }
 
@@ -2795,7 +2790,6 @@ int GuiTextBox(Rectangle bounds, char *text, int textSize, bool editMode)
                     if (!isspace(nextCodepoint & 0xff)) break;
 
                     offset += nextCodepointSize;
-                    accCodepointSize += nextCodepointSize;
                     nextCodepoint = GetCodepointNext(text + offset, &nextCodepointSize);
                 }
 
@@ -5078,24 +5072,17 @@ static const char **GetTextLines(const char *text, int *count)
     int textSize = (int)strlen(text);
 
     lines[0] = text;
-    int len = 0;
     *count = 1;
-    //int lineSize = 0;   // Stores current line size, not returned
 
     for (int i = 0, k = 0; (i < textSize) && (*count < RAYGUI_MAX_TEXT_LINES); i++)
     {
         if (text[i] == '\n')
         {
-            //lineSize = len;
             k++;
             lines[k] = &text[i + 1];     // WARNING: next value is valid?
-            len = 0;
             *count += 1;
         }
-        else len++;
     }
-
-    //lines[*count - 1].size = len;
 
     return lines;
 }

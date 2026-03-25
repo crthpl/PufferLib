@@ -14,6 +14,7 @@ env_names = sorted([
     'pong',
     #'tower_climb',
     #'grid',
+    'connect4',
     'nmmo3',
     #'snake',
     #'tripletriad'
@@ -287,7 +288,7 @@ def compute_tsne():
                 except:
                     breakpoint()
 
-    json.dump(all_data, open('constellation/default.json', 'w'))
+    json.dump(all_data, open('resources/constellation/experiments.json', 'w'))
 
 if __name__ == '__main__':
     compute_tsne()
