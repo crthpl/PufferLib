@@ -61,7 +61,6 @@ void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
-const Color CONSTELLATION = (Color){255, 255, 255, 128};
 
 typedef struct Glyph {
     float x;
@@ -249,38 +248,6 @@ void draw_axes(PlotArgs args) {
         args.width - args.right_margin, args.height - args.bottom_margin, PUFF_WHITE);
 }
 
-void draw_labels(PlotArgs args) {
-    // X label
-    Vector2 x_font_size = MeasureTextEx(args.font, args.x_label, args.axis_font_size, 0);
-    DrawTextEx(
-        args.font,
-        args.x_label,
-        (Vector2){
-            args.width/2 - x_font_size.x/2,
-            args.height - x_font_size.y,
-        },
-        args.axis_font_size,
-        0,
-        PUFF_WHITE
-    );
-
-    // Y label
-    Vector2 y_font_size = MeasureTextEx(args.font, args.y_label, args.axis_font_size, 0);
-    DrawTextPro(
-        args.font,
-        args.y_label,
-        (Vector2){
-            0,
-            args.height/2 + y_font_size.x/2
-        },
-        (Vector2){ 0, 0 },
-        -90,
-        args.axis_font_size,
-        0,
-        PUFF_WHITE
-    );
-}
-
 void draw_x_tick(char* label, float x_pos, PlotArgs args) {
     float y_pos = args.height - args.bottom_margin;
     DrawLine(
@@ -420,44 +387,6 @@ void draw_axes3() {
     );
 }
 
-float hyper_min(Dataset *data, char* key, int start, int end) {
-    float mmin = FLT_MAX;
-    for (int env=start; env<end; env++) {
-        for (int i=0; i<data->envs[env].n; i++) {
-            Hyper* hyper = &data->envs[env].hypers[i];
-            if (strcmp(hyper->key, key) != 0) {
-                continue;
-            }
-            for (int j=0; j<hyper->n; j++) {
-                float val = hyper->ary[j];
-                if (val < mmin){
-                    mmin = val;
-                }
-            }
-        }
-    }
-    return mmin;
-}
-
-float hyper_max(Dataset *data, char* key, int start, int end) {
-    float mmax = -FLT_MAX;
-    for (int i=start; i<end; i++) {
-        for (int j=0; j<data->envs[i].n; j++) {
-            Hyper* hyper = &data->envs[i].hypers[j];
-            if (strcmp(hyper->key, key) != 0) {
-                continue;
-            }
-            for (int k=0; k<hyper->n; k++) {
-                float val = hyper->ary[k];
-                if (val > mmax){
-                    mmax = val;
-                }
-            }
-        }
-    }
-    return mmax;
-}
-
 void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
     int width = args.width;
     int height = args.height;
@@ -541,28 +470,6 @@ int cleanup(Hyper *map, int map_count, cJSON *root, char *json_str) {
     return 1;
 }
 
-typedef struct GuiAxisScale {
-    int x, y, axis_width, scale_width, height;
-    char* axis_options;
-    int axis_selection;
-    bool axis_active;
-    char* scale_options;
-    int scale_selection;
-    bool scale_active;
-    char* scale_text;
-} GuiAxisScale;
-
-void gui_axis_scale(GuiAxisScale *scale) {
-    Rectangle axis_rect = {scale->x, scale->y, scale->axis_width, scale->height};
-    if (GuiDropdownBox(axis_rect, scale->axis_options, &scale->axis_selection, scale->axis_active)) {
-        scale->axis_active = !scale->axis_active;
-    }
-    Rectangle scale_rect = {scale->x + axis_rect.width , scale->y, scale->scale_width, scale->height};
-    if (GuiDropdownBox(scale_rect, scale->scale_options, &scale->scale_selection, scale->scale_active)) {
-        scale->scale_active = !scale->scale_active;
-    }
-}
-
 void GuiDropdownCheckbox(int x, int y, char* options, int *selection, bool *active, char *text, bool *checked) {
     Rectangle rect = {x, y, DROPDOWN_WIDTH, SETTINGS_HEIGHT};
     if (GuiDropdownBox(rect, options, selection, *active)) {
@@ -597,15 +504,6 @@ void apply_filter(bool* filter, Hyper* param, float min, float max) {
             filter[i] = false;
         }
     }
-}
-
-float scale_param(float val, float min, float max, bool log) {
-    if (log) {
-        val = safe_log10(val);
-        min = safe_log10(min);
-        max = safe_log10(max);
-    }
-    return (val - min)/(max - min);
 }
 
 void autoscale(Point* points, int size, PlotArgs *args) {
@@ -758,32 +656,6 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
     buffer[0] = '\0';
     SetClipboardText(start);
 }
-
-void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
-        float env_perf, float perf_threshold, Vector2 tsne, float tsne_thresh) {
-    for (int i=0; i<data->n; i++) {
-        Env* env = &data->envs[i];
-        Hyper* perf = get_hyper(data, env->key, "env/perf");
-        Hyper* tsne1 = get_hyper(data, env->key, "tsne1");
-        Hyper* tsne2 = get_hyper(data, env->key, "tsne2");
-        for (int j=0; j<tsne1->n; j++) {
-            if (perf->ary[j] < perf_threshold) {
-                continue;
-            }
-            float t1_dist = tsne1->ary[j] - tsne.x;
-            float t2_dist = tsne2->ary[j] - tsne.y;
-            float tsne_dist = t1_dist*t1_dist + t2_dist*t2_dist;
-            if (tsne_dist > tsne_thresh) {
-                continue;
-            }
-            if (tsne_dist < env_dists[i]) {
-                env_dists[i] = tsne_dist;
-                env_idxs[i] = j;
-            }
-        }
-    }
-}
-    
 
 //strof bottlenecks loads
 float fast_atof(char **s) {
@@ -960,7 +832,7 @@ int main(void) {
         strcat(env_options, data.envs[i].key);
     }
 
-    char* clipboard = malloc(8192);
+    char* clipboard = malloc(16384);
 
     // Points
     Point* points = calloc(total_points, sizeof(Point));
@@ -993,7 +865,6 @@ int main(void) {
     glEnable(GL_PROGRAM_POINT_SIZE);
     #endif
 
-    Camera3D camera = (Camera3D){ 0 };
     PlotArgs args1 = DEFAULT_PLOT_ARGS;
     args1.camera = (Camera3D){ 0 };
     args1.camera.position = (Vector3){ 1.5f, 1.25f, 1.5f };
@@ -1039,25 +910,8 @@ int main(void) {
 
     char* scale_options = "linear;log;logit";
 
-    /*
-    GuiAxisScale fig1x_opts = {
-        .x = DROPDOWN_WIDTH,
-        .y = 0,
-        .axis_width = DROPDOWN_WIDTH,
-        .scale_width = TOGGLE_WIDTH,
-        .height = SETTINGS_HEIGHT,
-        .axis_options = options,
-        .axis_selection = 0,
-        .axis_active = false,
-        .scale_options = "log;linear",
-        .scale_selection = 0,
-        .scale_active = false,
-    };
-    */
-
     PlotArgs args2 = DEFAULT_PLOT_ARGS;
     RenderTexture2D fig2 = LoadRenderTexture(args2.width, args2.height);
-    //SetTextureFilter(fig2.texture, TEXTURE_FILTER_POINT);
     args2.right_margin = 50;
     args2.x_scale = 1;
 
@@ -1106,52 +960,7 @@ int main(void) {
 
     Vector2 focus = {0, 0};
 
-    // Find best hypers
-    float tsne_thresh = 100.0f;
-    memset(best_n, 0, sizeof(int)*4);
-    memset(best_srci, 0, sizeof(int)*4);
-    for (int env_i=0; env_i<data.n; env_i++) {
-        Env* src = &data.envs[env_i];
-        Hyper* src_perf = get_hyper(&data, src->key, "env/perf");
-        Hyper* src_tsne1 = get_hyper(&data, src->key, "tsne1");
-        Hyper* src_tsne2 = get_hyper(&data, src->key, "tsne2");
-        for (int i=0; i<src_tsne1->n; i++) {
-            float perfi = src_perf->ary[i];
-            Vector2 tsnei = (Vector2){src_tsne1->ary[i], src_tsne2->ary[i]};
-            for (int ki=0; ki<4; ki++) {
-                if (perfi < perf_thresholds[ki]) {
-                    continue;
-                }
-                for (int kj=0; kj<data.n; kj++) {
-                    temp_idx[ki][kj] = -1;
-                    temp_dist[ki][kj] = FLT_MAX;
-                }
-                compute_constellation(&data, temp_idx[ki], temp_dist[ki], perfi, perf_thresholds[ki], tsnei, tsne_thresh);
-                int temp_n = 0;
-                for (int kj=0; kj<data.n; kj++) {
-                    if (temp_idx[ki][kj] != -1) {
-                        temp_n++;
-                    }
-                }
-                if (temp_n > best_n[ki]) {
-                    best_n[ki] = temp_n;
-                    best_srci[ki] = env_i;
-                    for (int kj=0; kj<data.n; kj++) {
-                        best_idx[ki][kj] = temp_idx[ki][kj];
-                    }
-                    if (best_idx[ki][env_i] == -1) {
-                        compute_constellation(&data, temp_idx[ki], temp_dist[ki], perfi, perf_thresholds[ki], tsnei, tsne_thresh);
-                        printf("Error: Best index not found\n");
-                        exit(1);
-                    }
-                }
-            }
-        }
-    }
-
-
     while (!WindowShouldClose()) {
-        int screen_points_count = 0;
         bool right_clicked = false;
 
         BeginDrawing();
@@ -1531,16 +1340,6 @@ int main(void) {
         Vector2 tsne = (Vector2){tsne1, tsne2};
 
         if (tooltip.active) {
-            /*
-            float idx[env->n];
-            float dist[env->n];
-            compute_constellation(&data, idx, dist, perf, perf, tsne, tsne_thresh);
-            for (int i=0; i<env->n; i++) {
-                if (idx[i] == -1) {
-                    continue;
-                }
-            */
-
             char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
             float x = tooltip.x;
@@ -1564,7 +1363,39 @@ int main(void) {
         }
     }
 
+    // Cleanup
+    for (int i = 0; i < data.n; i++) {
+        for (int j = 0; j < envs[i].n; j++) {
+            free(envs[i].hypers[j].ary);
+        }
+        free(envs[i].hypers);
+    }
+    free(envs);
+    cJSON_Delete(root);
+    free(json_str);
+    free(options);
+    free(env_hyper_options);
+    free(env_options);
+    free(clipboard);
+    free(points);
+    free(glyphs);
+    free(env_indices);
+    free(filter);
+    for (int i = 0; i < 4; i++) {
+      free(best_idx[i]);
+      free(temp_dist[i]);
+      free(temp_idx[i]);
+    }
+
+    // Raylib resources
     UnloadShader(shader);
-    CloseWindow();
+    UnloadShader(blur_shader);
+    UnloadRenderTexture(fig1);
+    UnloadRenderTexture(fig1_overlay);
+    UnloadRenderTexture(fig2);
+    UnloadRenderTexture(fig3);                                                                                                   
+    UnloadRenderTexture(fig3_overlay);
+    UnloadRenderTexture(fig4);                                                                                                   
+    CloseWindow();  
     return 0;
 }
