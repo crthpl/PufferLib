@@ -1351,8 +1351,8 @@ int main(void) {
                 for (int k=0; k<hyper->n; k++) {
                     filter[k] = true;
                 }
-                //apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-                //apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+                apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+                apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
                 boxplot(hyper, args4.x_scale, j, hyper_count, args4, color, filter);
             }
         }
