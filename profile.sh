@@ -1,65 +1,30 @@
-#!/bin/bash
-#
-# Usage: ./profile.sh [timing|nsys|all]
-#   timing - Run all profiles without nsys (fast, just timings)
-#   nsys   - Run composite operations with nsys kernel breakdown
-#   all    - Run both (default)
-
-MODE=${1:-all}
-BIN="./profile_torch"
-
-if [[ ! -x "$BIN" ]]; then
-    echo "Error: $BIN not found. Build with:"
-    echo "  python setup.py build_profiler"
-    exit 1
-fi
-
-# Check if envspeed is compiled in
-HAS_ENV=0
-"$BIN" envspeed 2>&1 | grep -q "Unknown profile" || HAS_ENV=1
-
-run_timing() {
-    local name=$1
-    echo "--- $name ---"
-    "$BIN" "$name"
-}
-
-run_nsys() {
-    local name=$1
-    echo "=== $name (nsys kernel breakdown) ==="
-    nsys profile \
-        --capture-range=cudaProfilerApi \
-        --cuda-graph-trace=node \
-        --stats=false \
-        --force-overwrite=true \
-        -o nprof-"$name" \
-        "$BIN" "$name" 2>&1 | grep -v "^Generating\|^Processing"
-
-    nsys stats --report cuda_gpu_kern_sum:base --force-export=true nprof-"$name".nsys-rep 2>/dev/null | tail -n +4
-    echo ""
-}
-
-if [[ "$MODE" == "timing" || "$MODE" == "all" ]]; then
-    echo "========== TIMING ONLY =========="
-    echo ""
-    run_timing kernels
-    run_timing forwardcall
-    run_timing rolloutcopy
-    run_timing trainforward
-    run_timing trainstep
-    if [[ $HAS_ENV -eq 1 ]]; then
-        run_timing envspeed
-    fi
-fi
-
-if [[ "$MODE" == "nsys" || "$MODE" == "all" ]]; then
-    echo "========== NSYS KERNEL BREAKDOWN =========="
-    echo ""
-    run_nsys forwardcall
-    run_nsys rolloutcopy
-    run_nsys trainforward
-    run_nsys trainstep
-    if [[ $HAS_ENV -eq 1 ]]; then
-        run_nsys envspeed
-    fi
-fi
+#nsys profile --force-overwrite true --capture-range=cudaProfilerApi --cuda-graph-trace=node --sample=none -o profile python -m pufferlib.pufferl train breakout --vec.num-buffers 1 --profile True
+echo "All kernels"
+nsys stats --report cuda_gpu_kern_sum:base --force-export=true profile.nsys-rep
+echo "NVTX tags"
+nsys stats --report nvtx_sum --force-export=true profile.nsys-rep
+echo "Kernel groups"
+nsys export --type=sqlite --force-overwrite=true -o profile.sqlite profile.nsys-rep
+sqlite3 -header -column profile.sqlite "
+  SELECT
+    CASE
+      WHEN s.value LIKE '%gemm%' OR s.value LIKE '%Kernel2%' OR s.value LIKE '%splitKreduce%' THEN 'matmul'
+      WHEN s.value LIKE '%ppo_loss%' OR s.value LIKE '%ppo_var_mean%' THEN 'ppo_loss'
+      WHEN s.value LIKE '%mingru%' THEN 'mingru'
+      WHEN s.value LIKE '%muon%' THEN 'muon'
+      WHEN s.value LIKE '%cast%' OR s.value LIKE '%select_copy%' OR s.value LIKE '%index_copy%' OR s.value LIKE '%transpose%' THEN 'copy'
+      WHEN s.value LIKE '%sample_logits%' OR s.value LIKE '%multinomial%' THEN 'sample'
+      WHEN s.value LIKE '%puff_advantage%' THEN 'advantage'
+      WHEN s.value LIKE '%prio%' THEN 'prio_replay'
+      WHEN s.value LIKE '%assemble_decoder%' THEN 'decoder_grad'
+      ELSE s.value
+    END AS group_name,
+    COUNT(*) AS count,
+    ROUND(100.0 * SUM(k.end - k.start) / (SELECT SUM(end - start) FROM CUPTI_ACTIVITY_KIND_KERNEL), 1) AS 'time_%',
+    ROUND(SUM(k.end - k.start) / 1e6, 2) AS total_ms,
+    ROUND(AVG(k.end - k.start) / 1e3, 2) AS avg_us
+  FROM CUPTI_ACTIVITY_KIND_KERNEL k
+  JOIN StringIds s ON k.shortName = s.id
+  GROUP BY group_name
+  ORDER BY total_ms DESC;
+"

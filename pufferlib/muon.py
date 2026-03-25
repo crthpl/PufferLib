@@ -1,23 +1,24 @@
 """Simple Muon optimizer numerically matched to Lukas's HeavyBall implementation."""
 
-import math
-from collections.abc import MutableMapping
-from typing import Optional
-
 import torch
 from torch import Tensor
 
 from torch.optim.optimizer import (
-    _disable_dynamo_if_unsupported,
-    _params_doc,
     _to_scalar,
     Optimizer,
     ParamsT,
 )
 
-
 __all__ = ["Muon"]
 
+NS_COEFS = [
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012)
+]
+ 
 def zeropower_via_newtonschulz5(G, eps=1e-7):
     G = G.clone()
     x = G
@@ -26,14 +27,7 @@ def zeropower_via_newtonschulz5(G, eps=1e-7):
 
     x = x / torch.clamp(G.norm(dim=(-2, -1)), min=eps)
  
-    # Perform the NS iterations
-    for a, b, c in [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ]:
+    for a, b, c in NS_COEFS:
         s = x @ x.mT
         y = c * s
         y.diagonal(dim1=-2, dim2=-1).add_(b)
@@ -48,13 +42,12 @@ def zeropower_via_newtonschulz5(G, eps=1e-7):
 
 class Muon(Optimizer):
     def __init__(
-        self,
-        params: ParamsT,
-        lr: float = 0.0025,
-        weight_decay: float = 0.0,
-        momentum: float = 0.9,
-        eps: float = 1e-8,
-    ) -> None:
+            self,
+            params: ParamsT,
+            lr: float = 0.0025,
+            weight_decay: float = 0.0,
+            momentum: float = 0.9,
+            eps: float = 1e-8) -> None:
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if lr < 0.0:
@@ -72,13 +65,7 @@ class Muon(Optimizer):
         }
         super().__init__(params, defaults)
 
-    def _init_group(
-        self,
-        group: MutableMapping,
-        params_with_grad: list[Tensor],
-        grads: list[Tensor],
-        muon_momentum_bufs: list[Tensor],
-    ):
+    def _init_group(self, group, params_with_grad, grads, muon_momentum_bufs):
         for p in group["params"]:
             if p.grad is None:
                 continue

@@ -35,6 +35,17 @@ rich.traceback.install(show_locals=False)
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
+def unroll_nested_dict(d):
+    if not isinstance(d, dict):
+        return d
+
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for k2, v2 in unroll_nested_dict(v):
+                yield f"{k}/{k2}", v2
+        else:
+            yield k, v
+
 def abbreviate(num, b2, c2):
     prefixes = ['', 'K', 'M', 'B', 'T']
     for i, prefix in enumerate(prefixes):
@@ -83,7 +94,7 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
     remaining = f'{b2}A hair past a freckle{c2}'
     agent_steps = g('agent_steps')
     if g('SPS') != 0:
-        remaining = duration((args['train']['total_timesteps']*args['train']['gpus'] - agent_steps)/g('SPS'), b2, c2)
+        remaining = duration((args['train']['total_timesteps']*args['train'].get('gpus', 1) - agent_steps)/g('SPS'), b2, c2)
 
     s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
     s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
@@ -100,6 +111,7 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
     delta = rollout + train
     p = Table(box=None, expand=True, show_header=False)
     p.add_column(f"{c1}Performance", justify="left", width=10)
+    p.add_column(f"{c1}Time", justify="right", width=8)
     p.add_column(f"{c1}%", justify="right", width=4)
     p.add_row(*fmt_perf('Evaluate', b1, delta, rollout, b2, c2))
     p.add_row(*fmt_perf('  GPU', b2, delta, g('perf/eval_gpu'), b2, c2))
@@ -150,23 +162,21 @@ def validate_config(args):
     minibatch_size = args['train']['minibatch_size']
     horizon = args['train']['horizon']
     total_agents = args['vec']['total_agents']
-    if (minibatch_size % horizon) != 0:
-        raise pufferlib.APIUsageError(
-            f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}')
-    if minibatch_size > horizon * total_agents:
-        raise pufferlib.APIUsageError(
-            f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}')
+    assert (minibatch_size % horizon) == 0, \
+        f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}'
+    assert minibatch_size <= horizon * total_agents, \
+        f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}'
 
-def _train_worker(args):
-    pufferl = _C.create_pufferl(args)
+def _train_worker(args, backend=_C):
+    pufferl = backend.create_pufferl(args)
     args.pop('nccl_id', None)
     while pufferl.global_step < args['train']['total_timesteps']:
-        _C.rollouts(pufferl)
-        _C.train(pufferl)
+        backend.rollouts(pufferl)
+        backend.train(pufferl)
 
-    _C.close(pufferl)
+    backend.close(pufferl)
 
-def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
+def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     rank = args['rank']
     run_id = str(int(1000*time.time()))
@@ -189,11 +199,18 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     log_dir = os.path.join(args['log_dir'], args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
 
-    pufferl = _C.create_pufferl(args)
+    try:
+        pufferl = backend.create_pufferl(args)
+    except RuntimeError as e:
+        print(f'WARNING: {e}, skipping')
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], None, None, None))
+        return
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
-        flat_logs = dict(pufferlib.unroll_nested_dict(_C.log(pufferl)))
+        flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
     model_path = ''
@@ -201,24 +218,23 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
-        _C.rollouts(pufferl)
+        backend.rollouts(pufferl)
 
         if epoch < train_epochs:
-            _C.train(pufferl)
+            backend.train(pufferl)
 
         if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:16d}.bin')
-            _C.save_weights(pufferl, model_path)
+            backend.save_weights(pufferl, model_path)
 
-        # Rate-limit dashboard/logging to avoid overhead
-        #if time.time() < pufferl.last_log_time + 0.6 and epoch != train_epochs - 1:
-        #    continue
+        # Rate limit, but always log for eval to maintain determinism
+        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
+            continue
 
-        logs = _C.eval_log(pufferl) if epoch >= train_epochs else _C.log(pufferl)
-        flat_logs = {**flat_logs, **dict(pufferlib.unroll_nested_dict(logs))}
+        logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
+        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
 
-        # TODO: determ without logging every epoch
-        if verbose and epoch % 20 == 0:
+        if verbose:
             print_dashboard(args, model_size, flat_logs)
 
         if target_key not in flat_logs:
@@ -239,7 +255,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
 
     print_dashboard(args, model_size, flat_logs)
-    _C.close(pufferl)
+    backend.close(pufferl)
 
     if target_key not in flat_logs:
         if result_queue is not None:
@@ -253,7 +269,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     n = args['sweep']['downsample']
     metrics = {k: [[]] for k in all_logs[0]}
     logged_timesteps = all_logs[-1]['agent_steps']
-    next_bin = logged_timesteps / (n - 1)
+    next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
     for log in all_logs:
         for k, v in log.items():
             metrics[k][-1].append(v)
@@ -286,7 +302,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if result_queue is not None:
         result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
 
-def train(env_name, args=None, gpus=None, **kwargs):
+def train(env_name, args=None, gpus=None, backend=_C, **kwargs):
     args = args or load_config(env_name)
     validate_config(args)
 
@@ -305,11 +321,12 @@ def train(env_name, args=None, gpus=None, **kwargs):
         worker_args['rank'] = rank
         worker_args['gpu_id'] = gpu_id
         if rank == 0 and not subprocess:
-            _train(env_name, worker_args, verbose=True)
+            _train(env_name, worker_args, backend=backend, verbose=True)
         else:
-            ctx.Process(target=_train, args=(env_name, worker_args), kwargs=kwargs).start()
+            ctx.Process(target=_train, args=(env_name, worker_args),
+                kwargs={**kwargs, 'backend': backend}).start()
 
-def sweep(env_name, args=None, pareto=False):
+def sweep(env_name, args=None, pareto=False, backend=_C):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
@@ -323,7 +340,7 @@ def sweep(env_name, args=None, pareto=False):
     try:
         sweep_cls = getattr(pufferlib.sweep, method)
     except:
-        raise pufferlib.APIUsageError(f'Invalid sweep method {method}. See pufferlib.sweep')
+        raise ValueError(f'Invalid sweep method {method}. See pufferlib.sweep')
 
     sweep_obj = sweep_cls(sweep_config)
     num_experiments = args['sweep']['max_runs']
@@ -359,7 +376,7 @@ def sweep(env_name, args=None, pareto=False):
 
         try:
             validate_config(args)
-        except pufferlib.APIUsageError as e:
+        except (AssertionError, ValueError) as e:
             print(f'WARNING: {e}, skipping')
             sweep_obj.observe(args, 0, 0, is_failure=True)
             continue
@@ -367,7 +384,7 @@ def sweep(env_name, args=None, pareto=False):
         exp_args = deepcopy(args)
         active[gpu_id] = exp_args
         train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
-            sweep_obj=sweep_obj, result_queue=result_queue)
+            backend=backend, sweep_obj=sweep_obj, result_queue=result_queue)
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy using the native pipeline.
@@ -380,11 +397,11 @@ def eval(env_name, args=None, load_path=None):
     # Resolve load path
     load_path = load_path or args.get('load_model_path')
     if load_path == 'latest':
-        data_dir = args['data_dir']
-        pattern = os.path.join(data_dir, args['env_name'], '**', '*.bin')
+        checkpoint_dir = args['checkpoint_dir']
+        pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
         candidates = glob.glob(pattern, recursive=True)
         if not candidates:
-            raise FileNotFoundError(f'No .bin checkpoints found in {data_dir}/{args["env_name"]}/')
+            raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
         load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
@@ -409,12 +426,16 @@ def load_config(env_name):
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
+    parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
+    parser.add_argument('--save-frames', type=int, default=0)
+    parser.add_argument('--gif-path', type=str, default='eval.gif')
+    parser.add_argument('--fps', type=float, default=15)
     parser.description = f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]' \
         ' demo options. Shows valid args for your env and policy'
 
-    puffer_dir = os.path.dirname(os.path.realpath(__file__))
-    puffer_config_dir = os.path.join(puffer_dir, 'config/**/*.ini')
-    puffer_default_config = os.path.join(puffer_dir, 'config/default.ini')
+    repo_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    puffer_config_dir = os.path.join(repo_dir, 'config/**/*.ini')
+    puffer_default_config = os.path.join(repo_dir, 'config/default.ini')
     #CC: Remove the default. Just raise an error on "puffer train" etc with no env (think we already do)
     if env_name == 'default':
         p = configparser.ConfigParser()
@@ -425,7 +446,7 @@ def load_config(env_name):
             p.read([puffer_default_config, path])
             if env_name in p['base']['env_name'].split(): break
         else:
-            raise pufferlib.APIUsageError('No config for env_name {}'.format(env_name))
+            raise ValueError('No config for env_name {}'.format(env_name))
 
     for section in p.sections():
         for key in p[section]:
@@ -456,24 +477,32 @@ def load_config(env_name):
 
         prev[subkey] = value
 
+    args['env_name'] = env_name
     args['train']['use_rnn'] = args['rnn_name'] is not None
     return dict(args)
 
 def main():
     err = 'Usage: puffer [train, eval, sweep, paretosweep] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
-        raise pufferlib.APIUsageError(err)
+        raise ValueError(err)
 
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
+    args = load_config(env_name)
+
+    backend = _C
+    if args.get('slowly'):
+        from pufferlib.torch_pufferl import PuffeRL
+        backend = PuffeRL
+
     if 'train' in mode:
-        train(env_name=env_name)
+        train(env_name=env_name, args=args, backend=backend)
     elif 'eval' in mode:
-        eval(env_name=env_name)
+        eval(env_name=env_name, args=args)
     elif 'sweep' in mode:
-        sweep(env_name=env_name, pareto='pareto' in mode)
+        sweep(env_name=env_name, args=args, pareto='pareto' in mode, backend=backend)
     else:
-        raise pufferlib.APIUsageError(err)
+        raise ValueError(err)
 
 if __name__ == '__main__':
     main()
