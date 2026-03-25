@@ -34,6 +34,8 @@ CLANG_WARN="\
     -Wno-incompatible-pointer-types-discards-qualifiers \
     -Wno-error=array-parameter"
 
+PLATFORM="$(uname -s)"
+
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT="-g -O0 $CLANG_WARN"
     NVCC_OPT="-O0 -g"
@@ -48,8 +50,6 @@ fi
 # ============================================================================
 # Platform + dependencies
 # ============================================================================
-
-PLATFORM="$(uname -s)"
 if [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 elif [ -d "$ENV" ]; then

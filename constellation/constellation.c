@@ -63,9 +63,6 @@ const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 const Color CONSTELLATION = (Color){255, 255, 255, 128};
 
-#define MAX_PARTICLES 50000
-#define MAX_POINTS 50000
-
 typedef struct Glyph {
     float x;
     float y;
@@ -343,7 +340,6 @@ Vector2 compute_ticks(PlotArgs args) {
     return (Vector2){num_x_ticks, num_y_ticks};
 }
 
-
 void draw_ticks(char x_ticks[][32], int x_n, char y_ticks[][32], int y_n, PlotArgs args) {
     int width = args.width;
     int height = args.height;
@@ -406,7 +402,6 @@ void draw_box_ticks(char* hypers[], int hyper_count, PlotArgs args) {
     draw_ticks(x_ticks, tick_n.x, fixed_hypers, hyper_count, args);
 }
 
-
 void draw_axes3() {
     DrawLine3D(
         (Vector3){0, 0, 0},
@@ -463,7 +458,6 @@ float hyper_max(Dataset *data, char* key, int start, int end) {
     return mmax;
 }
 
-
 void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
     int width = args.width;
     int height = args.height;
@@ -475,8 +469,6 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
     float x_max = scale_val(x_scale, args.x_max);
  
     float dy = plot_height/((float)hyper_count);
-
-    Color faded = Fade(color, 0.15f);
 
     float* ary = hyper->ary;
     float mmin = ary[0];
@@ -500,7 +492,7 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
     // TODO - rough patch
     left = fminf(fmax(left, args.left_margin), width - args.right_margin);
     right = fmaxf(fmin(right, width - args.right_margin), 0);
-    DrawRectangle(left, args.top_margin + i*dy, right - left, dy, faded);
+    DrawRectangle(left, args.top_margin + i*dy, right - left, dy, color);
 }
 
 void plot_gl(Glyph* glyphs, int size, Shader* shader) {
@@ -792,6 +784,42 @@ void compute_constellation(Dataset *data, int* env_idxs, float* env_dists,
     }
 }
     
+
+//strof bottlenecks loads
+float fast_atof(char **s) {
+    char *p = *s;
+    float sign = 1.0f;
+    if (*p == '-') {
+        sign = -1.0f; p++;
+    }
+    float val = 0.0f;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10.0f + (*p++ - '0');
+    }
+    if (*p == '.') {
+        p++;
+        float frac = 0.1f;
+        while (*p >= '0' && *p <= '9') {
+            val += (*p++ - '0') * frac; frac *= 0.1f;
+        }
+    }
+    if (*p == 'e' || *p == 'E') {
+      p++;
+      int esign = 1;
+      if (*p == '-') {
+          esign = -1; p++;
+      } else if (*p == '+') {
+          p++;
+      }
+      int exp = 0;
+      while (*p >= '0' && *p <= '9') {
+          exp = exp * 10 + (*p++ - '0');
+      }
+      val *= powf(10.0f, esign * exp);
+  }
+  *s = p;
+  return sign * val;
+}
  
 int main(void) {
     FILE *file = fopen("constellation/default.json", "r");
@@ -832,43 +860,42 @@ int main(void) {
     json_env = root->child;
     int max_data_points = 0;
     for (int i=0; i<data.n; i++) {
-        json_env = cJSON_GetArrayItem(root, i);
         cJSON *json_hyper = json_env->child;
-        int hyper_points = 0;
         while (json_hyper) {
             envs[i].n++;
-            envs[i].key = strdup(json_env->string);
-            int nxt_hyper_points = cJSON_GetArraySize(json_hyper);
-            if (hyper_points == 0) {
-                hyper_points = nxt_hyper_points;
-            } else {
-                if (hyper_points != nxt_hyper_points) {
-                    printf("Error: hyper_points %d != nxt_hyper_points %d\n", hyper_points, nxt_hyper_points);
-                }
-                assert(hyper_points == nxt_hyper_points);
-            }
-            if (hyper_points > max_data_points) {
-                max_data_points = hyper_points;
-            }
             json_hyper = json_hyper->next;
         }
+        envs[i].key = json_env->string;
         envs[i].hypers = calloc(envs[i].n, sizeof(Hyper));
-        for (int j=0; j<envs[i].n; j++) {
-            cJSON *json_hyper = cJSON_GetArrayItem(json_env, j);
-            envs[i].hypers[j].key = strdup(json_hyper->string);
-            envs[i].hypers[j].ary = calloc(hyper_points, sizeof(float));
-            int n = cJSON_GetArraySize(json_hyper);
-            envs[i].hypers[j].n = n;
-            for (int k = 0; k < n; k++) {
-                cJSON *sub = cJSON_GetArrayItem(json_hyper, k);
-                if (cJSON_IsNumber(sub)) {
-                    envs[i].hypers[j].ary[k] = (float)sub->valuedouble;
-                } else {
-                    continue;
-                    //printf("Error: Non-number in array for key '%s' at index %d\n", map[idx].key, j);
+        json_hyper = json_env->child;
+        for (int j=0; j<envs[i].n; j++, json_hyper=json_hyper->next) {
+            envs[i].hypers[j].key = json_hyper->string;
+            int capacity = 1;
+            for (char* p = json_hyper->valuestring; *p != NULL; p++) {
+                if (*p == ',') {
+                    capacity++;
                 }
             }
+            if (capacity > max_data_points) {
+                max_data_points = capacity;
+            }
+            envs[i].hypers[j].ary = calloc(capacity, sizeof(float));
+
+            int n = 0;
+            char* s = json_hyper->valuestring;
+            while (*s != NULL) {
+                envs[i].hypers[j].ary[n++] = fast_atof(&s);
+                if (*s == ',') {
+                    s++;
+                }
+            }
+            envs[i].hypers[j].n = n;
         }
+        json_env = json_env->next;
+    }
+    int total_points = 0;
+    for (int i=0; i<data.n; i++) {
+        total_points += envs[i].hypers[0].n;
     }
 
     int hyper_count = 22;
@@ -892,7 +919,7 @@ int main(void) {
         "train/eps",
         "train/prio_alpha",
         "train/prio_beta0",
-        //"train/horizon",
+        "train/horizon",
         "train/replay_ratio",
         "train/minibatch_size",
         "policy/hidden_size",
@@ -936,9 +963,9 @@ int main(void) {
     char* clipboard = malloc(8192);
 
     // Points
-    Point* points = calloc(MAX_POINTS, sizeof(Point));
-    Glyph* glyphs = calloc(MAX_PARTICLES, sizeof(Glyph));
-    Vector2* env_indices = calloc(MAX_POINTS, sizeof(Vector2));
+    Point* points = calloc(total_points, sizeof(Point));
+    Glyph* glyphs = calloc(total_points, sizeof(Glyph));
+    Vector2* env_indices = calloc(total_points, sizeof(Vector2));
 
     // Initialize Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT);
@@ -997,17 +1024,17 @@ int main(void) {
     bool fig_colorscale_active = false;
     bool fig_range1_active = false;
     int fig_range1_idx = 2;
-    char fig_range1_min[32];
-    char fig_range1_max[32];
+    char fig_range1_min[32] = {0};
+    char fig_range1_max[32] = {0};
     float fig_range1_min_val = 0;
     float fig_range1_max_val = 1;
     bool fig_range2_active = false;
     int fig_range2_idx = 1;
-    char fig_range2_min[32];
-    char fig_range2_max[32];
+    char fig_range2_min[32] = {0};
+    char fig_range2_max[32] = {0};
     float fig_range2_min_val = FLT_MIN;
     float fig_range2_max_val = FLT_MAX;
-    int fig_box_idx = 2;
+    int fig_box_idx = LOG;
     bool fig_box_active = false;
 
     char* scale_options = "linear;log;logit";
@@ -1203,6 +1230,8 @@ int main(void) {
         // Figure 2
         x_label = hyper_key[fig_x_idx];
         y_label = hyper_key[fig_y_idx];
+        args2.x_scale = args1.x_scale;
+        args2.y_scale = args1.y_scale;
         args2.x_label = x_label;
         args2.y_label = y_label;
         args2.top_margin = 20;
@@ -1306,7 +1335,14 @@ int main(void) {
         ClearBackground(PUFF_BACKGROUND);
         rlSetBlendFactorsSeparate(0x0302, 0x0303, 1, 0x0303, 0x8006, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
-        for (int i=0; i<data.n; i++) {
+        start = 0;
+        end = data.n;
+        if (fig_env_idx != 0) {
+            start = fig_env_idx - 1;
+            end = fig_env_idx;
+        }
+        Color color = Fade(PUFF_CYAN, 1.0f / (float)(end - start));
+        for (int i=start; i<end; i++) {
             Env* env = &data.envs[i];
             Hyper* filter_param_1 = get_hyper(&data, env->key, hyper_key[fig_range1_idx]);
             Hyper* filter_param_2 = get_hyper(&data, env->key, hyper_key[fig_range2_idx]);
@@ -1317,7 +1353,7 @@ int main(void) {
                 }
                 //apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
                 //apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
-                boxplot(hyper, args4.x_scale, j, hyper_count, args4, PUFF_CYAN, filter);
+                boxplot(hyper, args4.x_scale, j, hyper_count, args4, color, filter);
             }
         }
         EndBlendMode();
@@ -1364,156 +1400,6 @@ int main(void) {
             (Rectangle){ 0, 0, fig4.texture.width, -fig4.texture.height },
             (Vector2){ fig1.texture.width, fig1.texture.height + 2*SETTINGS_HEIGHT }, WHITE
         );
-
-        // Figure 1 Overlay
-        if (fig_env_idx == 0) {
-            float x_min = scale_val(args1.x_scale, args1.x_min);
-            float x_max = scale_val(args1.x_scale, args1.x_max);
-            float y_min = scale_val(args1.y_scale, args1.y_min);
-            float y_max = scale_val(args1.y_scale, args1.y_max);
-            float z_min = scale_val(args1.z_scale, args1.z_min);
-            float z_max = scale_val(args1.z_scale, args1.z_max);
-            for (int k=0; k<4; k++) {
-                int bsi = best_srci[k];
-                char* src_env = data.envs[bsi].key;
-                int src_idx = best_idx[k][bsi];
-                x = get_hyper(&data, src_env, hyper_key[fig_x_idx]);
-                y = get_hyper(&data, src_env, hyper_key[fig_y_idx]);
-                z = get_hyper(&data, src_env, hyper_key[fig_z_idx]);
-                float xi = x->ary[src_idx];
-                float yi = y->ary[src_idx];
-                float zi = z->ary[src_idx];
-
-                xi = scale_val(args1.x_scale, xi);
-                yi = scale_val(args1.y_scale, yi);
-                zi = scale_val(args1.z_scale, zi);
-
-                Vector3 src_point = (Vector3){
-                    (xi - x_min)/(x_max - x_min),
-                    (yi - y_min)/(y_max - y_min),
-                    (zi - z_min)/(z_max - z_min)
-                };
-
-                Vector2 screen_i = GetWorldToScreenEx(src_point, args1.camera, args1.width, args1.height);
-
-                for (int i=0; i<data.n; i++) {
-                    int bdi = best_idx[k][i];
-                    if (bdi == -1 || i == bsi) {
-                        continue;
-                    }
-                    char* dst_env = data.envs[i].key;
-                    x = get_hyper(&data, dst_env, hyper_key[fig_x_idx]);
-                    y = get_hyper(&data, dst_env, hyper_key[fig_y_idx]);
-                    z = get_hyper(&data, dst_env, hyper_key[fig_z_idx]);
-                    float xj = x->ary[bdi];
-                    float yj = y->ary[bdi];
-                    float zj = z->ary[bdi];
-
-                    xj = scale_val(args1.x_scale, xj);
-                    yj = scale_val(args1.y_scale, yj);
-                    zj = scale_val(args1.z_scale, zj);
-
-                    Vector3 dst_point = (Vector3){
-                        (xj - x_min)/(x_max - x_min),
-                        (yj - y_min)/(y_max - y_min),
-                        (zj - z_min)/(z_max - z_min)
-                    };
-                    Vector2 screen_j = GetWorldToScreenEx(dst_point, args1.camera, args1.width, args1.height);
-                    DrawLineEx(
-                        (Vector2){screen_i.x, screen_i.y},
-                        (Vector2){screen_j.x, screen_j.y},
-                        2,
-                        CONSTELLATION
-                    );
-                }
-            }
-        }
-            /*
-            Rectangle bounds = {0, 0, fig1.texture.width, fig1.texture.height};
-            int env_n = data.envs[0].n;
-            Point points[4*(env_n + 1)];
-            Glyph glyphs[4*(env_n + 1)];
-            for (int k=0; k<4; k++) {
-                int bsi = best_srci[k];
-                char* src_env = data.envs[bsi].key;
-                int src_idx = best_idx[k][bsi];
-                float xx = get_hyper(&data, src_env, hyper_key[fig1_x_idx])->ary[src_idx];
-                float yy = get_hyper(&data, src_env, hyper_key[fig1_y_idx])->ary[src_idx];
-                float zz = get_hyper(&data, src_env, hyper_key[fig1_z_idx])->ary[src_idx];
-                float cc = get_hyper(&data, src_env, hyper_key[fig1_color_idx])->ary[src_idx];
-                points[k*env_n] = (Point){.x = xx, .y = yy, .z = zz, .c = cc};
-                for (int i=0; i<data.n; i++) {
-                    char* dst_env = data.envs[i].key;
-                    float xj = get_hyper(&data, dst_env, hyper_key[fig1_x_idx])->ary[i];
-                    float yj = get_hyper(&data, dst_env, hyper_key[fig1_y_idx])->ary[i];
-                    float zj = get_hyper(&data, dst_env, hyper_key[fig1_z_idx])->ary[i];
-                    float cj = get_hyper(&data, dst_env, hyper_key[fig1_color_idx])->ary[i];
-                    points[k*env_n + i] = (Point){.x = xj, .y = yj, .z = zj, .c = cj};
-                }
-            }
-            toPx(points, glyphs, 4*(env_n + 1), args1);
-            for (int k=0; k<4; k++) {
-                Glyph src = glyphs[k*env_n];
-                Vector2 src_point = (Vector2){src.x, src.y};
-                if (!CheckCollisionPointRec(src_point, bounds)) {
-                    continue;
-                }
-                for (int i=0; i<env_n + 1; i++) {
-                    Glyph dst = glyphs[k*env_n + i];
-                    Vector2 dst_point = (Vector2){dst.x, dst.y};
-                    if (!CheckCollisionPointRec(dst_point, bounds)) {
-                        continue;
-                    }
-                    DrawLineEx(
-                        (Vector2){dst.x, dst.y},
-                        (Vector2){src.x, src.y},
-                        2,
-                        CONSTELLATION
-                    );
-                }
-            }
-            */
-
-
-        // Figure 3 Overlay 
-        float offset = fig1.texture.height + 2*SETTINGS_HEIGHT;
-        for (int k=0; k<4; k++) {
-            int bsi = best_srci[k];
-            char* src_env = data.envs[bsi].key;
-            int src_idx = best_idx[k][bsi];
-            x = get_hyper(&data, src_env, "tsne1");
-            y = get_hyper(&data, src_env, "tsne2");
-            float xi = x->ary[src_idx];
-            float yi = y->ary[src_idx];
-
-            xi = args3.left_margin + args3.width*(xi - args3.x_min)/(args3.x_max - args3.x_min);
-            yi = offset + args3.height - args3.bottom_margin - args3.height*(yi - args3.y_min)/(args3.y_max - args3.y_min);
-
-            for (int i=0; i<data.n; i++) {
-                int bdi = best_idx[k][i];
-                if (bdi == -1 || i == bsi) {
-                    continue;
-                }
-                char* dst_env = data.envs[i].key;
-                x = get_hyper(&data, dst_env, "tsne1");
-                y = get_hyper(&data, dst_env, "tsne2");
-                float xj = x->ary[bdi];
-                float yj = y->ary[bdi];
-
-                xj = args3.left_margin + args3.width*(xj - args3.x_min)/(args3.x_max - args3.x_min);
-                yj = offset + args3.height - args3.bottom_margin - args3.height*(yj - args3.y_min)/(args3.y_max - args3.y_min);
-
-                DrawLineEx(
-                    (Vector2){xi, yi},
-                    (Vector2){xj, yj},
-                    2,
-                    CONSTELLATION
-                );
-            }
-
-            //float tsne_thresh_px = sqrt(tsne_thresh)*args3.width/(args3.x_max - args3.x_min);
-            //DrawCircleLines(xi, yi, tsne_thresh_px, CONSTELLATION);
-        }
 
         // UI
         float y = SEP + SETTINGS_HEIGHT/2.0f - MeasureTextEx(args1.font_small, "Env", args1.axis_tick_font_size, 0).y/2.0f;
@@ -1669,7 +1555,6 @@ int main(void) {
             DrawCircle(tooltip.x, tooltip.y, 2, PUFF_CYAN);
             DrawTextEx(args1.font_small, text, (Vector2){x + 2, y + 2}, args1.axis_tick_font_size, 0, WHITE);
         }
-        //DrawFPS(GetScreenWidth() - 95, 10);
         EndDrawing();
 
         // Copy hypers to clipboard
