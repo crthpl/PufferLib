@@ -61,6 +61,34 @@ const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 
+int hyper_count = 24;
+char *hyper_key[24] = {
+    "agent_steps",
+    "uptime",
+    "env/perf",
+    "env/score",
+    "train/learning_rate",
+    "train/ent_coef",
+    "train/gamma",
+    "train/gae_lambda",
+    "train/vtrace_rho_clip",
+    "train/vtrace_c_clip",
+    "train/clip_coef",
+    "train/vf_clip_coef",
+    "train/vf_coef",
+    "train/max_grad_norm",
+    "train/beta1",
+    "train/beta2",
+    "train/eps",
+    "train/prio_alpha",
+    "train/prio_beta0",
+    "train/horizon",
+    "train/replay_ratio",
+    "train/minibatch_size",
+    "policy/hidden_size",
+    "vec/total_agents",
+};
+
 typedef struct Glyph {
     float x;
     float y;
@@ -666,34 +694,6 @@ int main(void) {
     for (int i=0; i<data.n; i++) {
         total_points += envs[i].hypers[0].n;
     }
-
-    int hyper_count = 24;
-    char *hyper_key[24] = {
-        "agent_steps",
-        "uptime",
-        "env/perf",
-        "env/score",
-        "train/learning_rate",
-        "train/ent_coef",
-        "train/gamma",
-        "train/gae_lambda",
-        "train/vtrace_rho_clip",
-        "train/vtrace_c_clip",
-        "train/clip_coef",
-        "train/vf_clip_coef",
-        "train/vf_coef",
-        "train/max_grad_norm",
-        "train/beta1",
-        "train/beta2",
-        "train/eps",
-        "train/prio_alpha",
-        "train/prio_beta0",
-        "train/horizon",
-        "train/replay_ratio",
-        "train/minibatch_size",
-        "policy/hidden_size",
-        "vec/total_agents",
-    };
 
     // Create options as a semicolon-separated string
     size_t options_len = 0;
