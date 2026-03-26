@@ -188,23 +188,11 @@ def cached_load(path, env_name, cache):
     #data['metrics/agent_steps'] = [e/1e6 for e in data['metrics/agent_steps']]
     del data['metrics/agent_steps']
 
-    '''
-    for k, v in data.items():
-        for e in v:
-            if e is None or isinstance(e, str):
-                continue
-            try:
-                if e > 1e9 or e < -1e9:
-                    breakpoint()
-            except:
-                breakpoint()
-    '''
-
     # Filter to pareto
+    '''
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
-    '''
     idxs = pareto_idx(steps, costs, scores)
     for k in data:
         try:

@@ -256,9 +256,10 @@ struct VecEnv {
     std::vector<int> act_sizes;
     std::string obs_dtype;
     size_t obs_elem_size;
+    int gpu;
 };
 
-std::unique_ptr<VecEnv> create_vec(py::dict args) {
+std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
     py::dict vec_kwargs = args["vec"].cast<py::dict>();
     py::dict env_kwargs = args["env"].cast<py::dict>();
 
@@ -269,9 +270,10 @@ std::unique_ptr<VecEnv> create_vec(py::dict args) {
     Dict* env_dict = py_dict_to_c_dict(env_kwargs);
 
     auto ve = std::make_unique<VecEnv>();
+    ve->gpu = gpu;
     {
         py::gil_scoped_release no_gil;
-        ve->vec = create_static_vec(total_agents, num_buffers, vec_dict, env_dict);
+        ve->vec = create_static_vec(total_agents, num_buffers, gpu, vec_dict, env_dict);
     }
     ve->total_agents  = total_agents;
     ve->obs_size      = get_obs_size();
@@ -291,14 +293,22 @@ void vec_reset(VecEnv& ve) {
     static_vec_reset(ve.vec);
 }
 
-// actions_ptr: data_ptr() of a (total_agents, num_atns) float64 CUDA tensor
-void vec_step(VecEnv& ve, long long actions_ptr) {
+void gpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
     cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
         (size_t)ve.total_agents * ve.num_atns * sizeof(float),
         cudaMemcpyDeviceToDevice);
     {
         py::gil_scoped_release no_gil;
-        static_vec_step(ve.vec);
+        gpu_vec_step(ve.vec);
+    }
+}
+
+void cpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
+    memcpy(ve.vec->actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float));
+    {
+        py::gil_scoped_release no_gil;
+        cpu_vec_step(ve.vec);
     }
 }
 
@@ -512,7 +522,7 @@ PYBIND11_MODULE(_C, m) {
         return now - pufferl.start_time;
     });
     m.def("puff_advantage", &py_puff_advantage);
-    m.def("create_vec", &create_vec);
+    m.def("create_vec", &create_vec, py::arg("args"), py::arg("gpu") = 1);
     py::class_<VecEnv, std::unique_ptr<VecEnv>>(m, "VecEnv")
         .def_readonly("total_agents",  &VecEnv::total_agents)
         .def_readonly("obs_size",      &VecEnv::obs_size)
@@ -520,12 +530,18 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("act_sizes",     &VecEnv::act_sizes)
         .def_readonly("obs_dtype",     &VecEnv::obs_dtype)
         .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
+        .def_readonly("gpu",           &VecEnv::gpu)
         // GPU buffer pointers — wrap with torch.from_blob(..., device='cuda')
         .def_property_readonly("gpu_obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->gpu_observations; })
         .def_property_readonly("gpu_rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->gpu_rewards; })
         .def_property_readonly("gpu_terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->gpu_terminals; })
+        // CPU buffer pointers (same as gpu_ in CPU mode since they alias)
+        .def_property_readonly("obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->observations; })
+        .def_property_readonly("rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->rewards; })
+        .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
         .def("reset", &vec_reset)
-        .def("step",  &vec_step)
+        .def("gpu_step", &gpu_vec_step_py)
+        .def("cpu_step", &cpu_vec_step_py)
         .def("log",   &vec_log)
         .def("close", &vec_close);
 

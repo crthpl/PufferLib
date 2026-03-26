@@ -5,6 +5,7 @@
 import os
 import glob
 import time
+import ctypes
 from collections import defaultdict
 
 import numpy as np
@@ -93,6 +94,20 @@ class _CudaPtr:
             'version': 2,
         }
 
+_TORCH_TO_CTYPE = {
+    torch.uint8:   ctypes.c_uint8,
+    torch.float32: ctypes.c_float,
+}
+
+def _cpu_tensor(ptr, shape, dtype):
+    '''Zero-copy CPU tensor from a raw pointer via ctypes.'''
+    ctype = _TORCH_TO_CTYPE[dtype]
+    n = 1
+    for s in shape:
+        n *= s
+    arr = (ctype * n).from_address(ptr)
+    return torch.frombuffer(arr, dtype=dtype).reshape(shape)
+
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
@@ -103,16 +118,25 @@ class PuffeRL:
         torch.backends.cudnn.benchmark = True
 
         self._vec = vec
+        self.gpu = vec.gpu
         total_agents = vec.total_agents
         self.total_agents = total_agents
         obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
 
-        self.vec_obs = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
-            (total_agents, vec.obs_size), obs_dtype))
-        self.vec_rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
-            (total_agents,), torch.float32))
-        self.vec_terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
-            (total_agents,), torch.float32))
+        if self.gpu:
+            self.vec_obs = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
+                (total_agents, vec.obs_size), obs_dtype))
+            self.vec_rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
+                (total_agents,), torch.float32))
+            self.vec_terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
+                (total_agents,), torch.float32))
+        else:
+            self.vec_obs = _cpu_tensor(vec.obs_ptr,
+                (total_agents, vec.obs_size), obs_dtype)
+            self.vec_rewards = _cpu_tensor(vec.rewards_ptr,
+                (total_agents,), torch.float32)
+            self.vec_terminals = _cpu_tensor(vec.terminals_ptr,
+                (total_agents,), torch.float32)
 
         vec.reset()
         horizon = config['horizon']
@@ -148,7 +172,7 @@ class PuffeRL:
         self.last_log_step = 0
         self.last_log_time = time.time()
         self.start_time = time.time()
-        self.profile = Profile()
+        self.profile = Profile(gpu=self.gpu)
         self.verbose = verbose
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -203,9 +227,13 @@ class PuffeRL:
                 self.values[t] = value.flatten()
 
             prof.mark(2)
-            actions_gpu = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32, device='cuda').contiguous()
-            self._vec.step(actions_gpu.data_ptr())
-            torch.cuda.synchronize()
+            actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
+            if self.gpu:
+                actions_flat = actions_flat.cuda()
+                self._vec.gpu_step(actions_flat.data_ptr())
+                torch.cuda.synchronize()
+            else:
+                self._vec.cpu_step(actions_flat.data_ptr())
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
             prof.mark(3)
 
@@ -348,7 +376,7 @@ class PuffeRL:
                 'train_misc': perf[P.TRAIN_MISC],
                 'train_forward': perf[P.TRAIN_FORWARD],
             },
-            'util': dict(_C.get_utilization(self.args.get('gpu_id', 0))),
+            'util': dict(_C.get_utilization(self.args.get('gpu_id', 0))) if self.gpu else {},
         }
         self.last_log_time = time.time()
         self.last_log_step = self.global_step
@@ -376,7 +404,8 @@ class PuffeRL:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
 
         args['vec']['num_buffers'] = 1
-        vec = _C.create_vec(args)
+        gpu = 1 if device == 'cuda' else 0
+        vec = _C.create_vec(args, gpu)
         policy = load_policy(args, vec)
 
         if 'LOCAL_RANK' in os.environ:
@@ -395,7 +424,8 @@ class PuffeRL:
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
     num_steps, horizon = values.shape
-    _C.puff_advantage(
+    fn = _C.puff_advantage if values.is_cuda else _C.puff_advantage_cpu
+    fn(
         values.data_ptr(), rewards.data_ptr(), terminals.data_ptr(),
         ratio.data_ptr(), advantages.data_ptr(),
         num_steps, horizon,
@@ -406,16 +436,26 @@ class Profile:
     '''Matches pufferlib.cu profiling: accumulate ms, report seconds.'''
     ROLLOUT, EVAL_GPU, EVAL_ENV, TRAIN, TRAIN_MISC, TRAIN_FORWARD, NUM = range(7)
 
-    def __init__(self):
+    def __init__(self, gpu=True):
         self.accum = [0.0] * Profile.NUM
-        self._events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        self.gpu = gpu
+        if gpu:
+            self._events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        else:
+            self._stamps = [0.0] * 4
 
     def mark(self, idx):
-        self._events[idx].record()
+        if self.gpu:
+            self._events[idx].record()
+        else:
+            self._stamps[idx] = time.perf_counter()
 
     def elapsed(self, idx, start_ev, end_ev):
-        self._events[end_ev].synchronize()
-        self.accum[idx] += self._events[start_ev].elapsed_time(self._events[end_ev])
+        if self.gpu:
+            self._events[end_ev].synchronize()
+            self.accum[idx] += self._events[start_ev].elapsed_time(self._events[end_ev])
+        else:
+            self.accum[idx] += (self._stamps[end_ev] - self._stamps[start_ev]) * 1000.0
 
     def read_and_reset(self):
         out = [v / 1000.0 for v in self.accum]

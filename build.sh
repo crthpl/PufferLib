@@ -10,7 +10,7 @@ set -e
 #   ./build.sh breakout --web        # Emscripten web build
 #   ./build.sh breakout --profile    # Kernel profiling binary
 
-ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile]}
+ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile|--cpu]}
 MODE=""
 PRECISION=""
 DEBUG=""
@@ -22,6 +22,7 @@ for arg in "${@:2}"; do
         --fast)  MODE=fast ;;
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
+        --cpu)   MODE=cpu; PRECISION="-DPRECISION_FLOAT" ;;
     esac
 done
 
@@ -200,6 +201,33 @@ if [ "$MODE" = "profile" ]; then
         -lGL -lm -lpthread -lomp5 \
         -o profile
     echo "=== Built: ./profile ==="
+    exit 0
+fi
+
+if [ "$MODE" = "cpu" ]; then
+    echo "=== Compiling bindings_cpu.cpp ==="
+    g++ -c -fPIC -fopenmp \
+        -D_GLIBCXX_USE_CXX11_ABI=1 \
+        -DPLATFORM_DESKTOP \
+        -std=c++17 \
+        -I. -Isrc \
+        -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE \
+        -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        $PRECISION $LINK_OPT \
+        src/bindings_cpu.cpp -o src/bindings_cpu.o
+
+    echo "=== Linking $OUTPUT (CPU) ==="
+    LINK_CMD=(
+        g++ -shared -fPIC -fopenmp
+        src/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
+        -lm -lpthread -lomp5
+        $LINK_OPT
+    )
+    [ "$PLATFORM" = "Linux" ] && LINK_CMD+=(-Bsymbolic-functions)
+    [ "$PLATFORM" = "Darwin" ] && LINK_CMD+=(-framework Cocoa -framework OpenGL -framework IOKit)
+    LINK_CMD+=(-o "$OUTPUT")
+    "${LINK_CMD[@]}"
+    echo "=== Built: $OUTPUT (CPU) ==="
     exit 0
 fi
 
