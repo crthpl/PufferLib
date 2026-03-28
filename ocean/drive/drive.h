@@ -166,7 +166,7 @@ float relative_distance_2d(float x1, float y1, float x2, float y2){
 struct Drive {
     Client* client;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     Log log;
@@ -202,6 +202,7 @@ struct Drive {
     int spawn_immunity_timer;
     float reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn;
+    unsigned int rng;
 };
 
 void add_log(Drive* env) {
@@ -559,7 +560,7 @@ void set_means(Drive* env) {
     
 }
 
-void move_expert(Drive* env, double* actions, int agent_idx){
+void move_expert(Drive* env, float* actions, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
     agent->x = agent->traj_x[env->timestep];
     agent->y = agent->traj_y[env->timestep];
@@ -926,16 +927,10 @@ void c_close(Drive* env){
 void allocate(Drive* env){
     init(env);
     int max_obs = 7 + 7*(MAX_CARS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
-    // printf("max obs: %d\n", max_obs*env->active_agent_count);
-    // printf("num cars: %d\n", env->num_cars);
-    // printf("num static cars: %d\n", env->static_car_count);
-    // printf("active agent count: %d\n", env->active_agent_count);
-    // printf("num objects: %d\n", env->num_objects);
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
-    env->actions = (double*)calloc(env->active_agent_count*2, sizeof(double));
+    env->actions = (float*)calloc(env->active_agent_count*2, sizeof(double));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
     env->terminals = (float*)calloc(env->active_agent_count, sizeof(float));
-    // printf("allocated\n");
 }
 
 void free_allocated(Drive* env){
@@ -1297,7 +1292,7 @@ Client* make_client(Drive* env){
     client->cars[4] = LoadModel("resources/drive/GreenCar.glb");
     client->cars[5] = LoadModel("resources/drive/GreyCar.glb");
     for (int i = 0; i < MAX_CARS; i++) {
-        client->car_assignments[i] = (rand() % 4) + 1;
+        client->car_assignments[i] = (rand_r(&env->rng) % 4) + 1;
     }
     // Get initial target position from first active agent
     float map_center_x = (env->map_corners[0] + env->map_corners[2]) / 2.0f;
@@ -1717,7 +1712,7 @@ void c_render(Drive* env) {
             // FPV Camera Control
             if(IsKeyDown(KEY_SPACE) && env->human_agent_idx== agent_index){
                 if(env->entities[agent_index].reached_goal){
-                    env->human_agent_idx = rand() % env->active_agent_count;
+                    env->human_agent_idx = rand_r(&env->rng) % env->active_agent_count;
                 }
                 Vector3 camera_position = (Vector3){
                         position.x - (25.0f * cosf(heading)),
