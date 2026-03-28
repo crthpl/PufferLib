@@ -181,7 +181,7 @@ clang -c $CLANG_OPT \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
-OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep 'Tensor$' | head -1)
+OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep -o '[A-Za-z]*Tensor$' | head -1)
 [ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T" && exit 1
 echo "OBS_TENSOR_T=$OBS_TENSOR_T"
 
