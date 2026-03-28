@@ -154,7 +154,9 @@ fi
 # Default: build _C.so with env statically linked
 # ============================================================================
 
-CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}
+CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname $(dirname $(which nvcc)))}}
+CUDNN_INCLUDE=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
+CUDNN_LIB=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 NVCC="$CUDA_HOME/bin/nvcc"
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
@@ -189,7 +191,7 @@ if [ "$MODE" = "profile" ]; then
     echo "=== Building profile binary (arch=$ARCH) ==="
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR \
-        -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+        -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         -Xcompiler=-DPLATFORM_DESKTOP \
@@ -239,7 +241,7 @@ $NVCC -c -Xcompiler -fPIC \
     -std=c++17 \
     -I. -Isrc \
     -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-    -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+    -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
     -Xcompiler=-fopenmp \
     -DOBS_TENSOR_T=$OBS_TENSOR_T \
     $PRECISION $NVCC_OPT \
@@ -250,7 +252,7 @@ echo "=== Linking $OUTPUT ==="
 LINK_CMD=(
     g++ -shared -fPIC -fopenmp
     src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-    -L$CUDA_HOME/lib64
+    -L$CUDA_HOME/lib64 ${CUDNN_LIB:+-L$CUDNN_LIB}
     -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
     -lnvToolsExt -lomp5
     $LINK_OPT
