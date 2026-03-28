@@ -2,8 +2,7 @@
 #define OBS_SIZE 1848
 #define NUM_ATNS 2
 #define ACT_SIZES {7, 13}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
 
 #define MY_VEC_INIT
 #define Env Drive
@@ -25,6 +24,18 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn")->value;
     int spawn_immunity_timer = (int)dict_get(env_kwargs, "spawn_immunity_timer")->value;
     int human_agent_idx = (int)dict_get(env_kwargs, "human_agent_idx")->value;
+
+    // Verify map files exist
+    char first_map[100];
+    sprintf(first_map, "resources/drive/binaries/map_%03d.bin", 0);
+    FILE* test_fp = fopen(first_map, "rb");
+    if (!test_fp) {
+        printf("ERROR: Cannot find map files at resources/drive/binaries/. "
+               "Make sure you are running from the root directory.\n");
+        *num_envs_out = 0;
+        return NULL;
+    }
+    fclose(test_fp);
 
     // Find first map with exactly 8 agents
     int target_map_id = -1;
