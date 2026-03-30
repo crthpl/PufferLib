@@ -167,7 +167,14 @@ def validate_config(args):
     assert minibatch_size <= horizon * total_agents, \
         f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}'
 
-def _train_worker(args, backend=_C):
+def _resolve_backend(args):
+    if args.get('slowly'):
+        from pufferlib.torch_pufferl import PuffeRL
+        return PuffeRL
+    return _C
+
+def _train_worker(args):
+    backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
     args.pop('nccl_id', None)
     while pufferl.global_step < args['train']['total_timesteps']:
@@ -176,8 +183,9 @@ def _train_worker(args, backend=_C):
 
     backend.close(pufferl)
 
-def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbose=False):
+def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
+    backend = _resolve_backend(args)
     rank = args['rank']
     run_id = str(int(1000*time.time()))
     if args['wandb']:
@@ -302,7 +310,7 @@ def _train(env_name, args, backend=_C, sweep_obj=None, result_queue=None, verbos
     if result_queue is not None:
         result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
 
-def train(env_name, args=None, gpus=None, backend=_C, **kwargs):
+def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
     validate_config(args)
 
@@ -321,12 +329,12 @@ def train(env_name, args=None, gpus=None, backend=_C, **kwargs):
         worker_args['rank'] = rank
         worker_args['gpu_id'] = gpu_id
         if rank == 0 and not subprocess:
-            _train(env_name, worker_args, backend=backend, verbose=True)
+            _train(env_name, worker_args, verbose=True)
         else:
             ctx.Process(target=_train, args=(env_name, worker_args),
-                kwargs={**kwargs, 'backend': backend}).start()
+                kwargs=kwargs).start()
 
-def sweep(env_name, args=None, pareto=False, backend=_C):
+def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
@@ -384,7 +392,7 @@ def sweep(env_name, args=None, pareto=False, backend=_C):
         exp_args = deepcopy(args)
         active[gpu_id] = exp_args
         train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
-            backend=backend, sweep_obj=sweep_obj, result_queue=result_queue)
+            sweep_obj=sweep_obj, result_queue=result_queue)
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy using the native pipeline.
@@ -490,17 +498,12 @@ def main():
     env_name = sys.argv.pop(1)
     args = load_config(env_name)
 
-    backend = _C
-    if args.get('slowly'):
-        from pufferlib.torch_pufferl import PuffeRL
-        backend = PuffeRL
-
     if 'train' in mode:
-        train(env_name=env_name, args=args, backend=backend)
+        train(env_name=env_name, args=args)
     elif 'eval' in mode:
         eval(env_name=env_name, args=args)
     elif 'sweep' in mode:
-        sweep(env_name=env_name, args=args, pareto='pareto' in mode, backend=backend)
+        sweep(env_name=env_name, args=args, pareto='pareto' in mode)
     else:
         raise ValueError(err)
 

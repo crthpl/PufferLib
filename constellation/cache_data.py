@@ -5,15 +5,16 @@ import glob
 import os
 
 env_names = sorted([
-    #'breakout',
+    'breakout',
     #'impulse_wars',
     #'pacman',
     #'tetris',
     #'g2048',
     #'moba',
-    #'pong',
+    'pong',
     #'tower_climb',
     #'grid',
+    'connect4',
     'nmmo3',
     #'snake',
     #'tripletriad'
@@ -35,7 +36,7 @@ HYPERS = [
     'train/eps',
     'train/prio_alpha',
     'train/prio_beta0',
-    #'train/horizon',
+    'train/horizon',
     'train/replay_ratio',
     'train/minibatch_size',
     'policy/hidden_size',
@@ -101,10 +102,6 @@ def cached_load(path, env_name, cache):
         for k in list(exp['metrics'].keys()):
             if 'loss' in k:
                 del exp['metrics'][k]
-        data_len = len(exp['metrics']['agent_steps'])
-        if data_len > 100:
-            print(f'Skipping {fpath} (len={data_len})')
-            continue
 
         if num_metrics == 0:
             num_metrics = len(exp['metrics'])
@@ -114,7 +111,6 @@ def cached_load(path, env_name, cache):
         metrics = exp['metrics']
 
         if len(metrics) != num_metrics:
-            breakpoint()
             print(f'Skipping {fpath} (num_metrics={len(metrics)} != {num_metrics})')
             continue
 
@@ -132,7 +128,6 @@ def cached_load(path, env_name, cache):
                 break
 
         if skip:
-            breakpoint()
             print(f'Skipping {fpath} (bad data)')
             continue
 
@@ -151,31 +146,34 @@ def cached_load(path, env_name, cache):
 
         for hyper in HYPERS:
             prefix, suffix = hyper.split('/')
-            if prefix not in sweep_metadata:
-                continue
+            #if prefix not in sweep_metadata:
+            #    continue
 
             group = sweep_metadata[prefix]
-            if suffix not in group:
-                continue
+            #if suffix not in group:
+            #    continue
 
-            param = group[suffix]
 
             key = f'{prefix}/{suffix}_norm'
             if key not in data:
                 data[key] = []
 
-            mmin = param['min']
-            mmax = param['max']
-            dist = param['distribution']
-            val = exp[prefix][suffix]
+            if suffix in group:
+                param = group[suffix]
+                mmin = param['min']
+                mmax = param['max']
+                dist = param['distribution']
+                val = exp[prefix][suffix]
 
-            if 'log' in dist or 'pow2' in dist:
-                mmin = np.log(mmin)
-                mmax = np.log(mmax)
-                val = np.log(val)
+                if 'log' in dist or 'pow2' in dist:
+                    mmin = np.log(mmin)
+                    mmax = np.log(mmax)
+                    val = np.log(val)
 
-            norm = (val - mmin) / (mmax - mmin)
-            data[key].append([norm]*n)
+                norm = (val - mmin) / (mmax - mmin)
+                data[key].append([norm]*n)
+            else:
+                data[key].append([1]*n)
 
     for k, v in data.items():
         data[k] = [item for sublist in v for item in sublist]
@@ -190,23 +188,11 @@ def cached_load(path, env_name, cache):
     #data['metrics/agent_steps'] = [e/1e6 for e in data['metrics/agent_steps']]
     del data['metrics/agent_steps']
 
-    '''
-    for k, v in data.items():
-        for e in v:
-            if e is None or isinstance(e, str):
-                continue
-            try:
-                if e > 1e9 or e < -1e9:
-                    breakpoint()
-            except:
-                breakpoint()
-    '''
-
     # Filter to pareto
+    '''
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
-    '''
     idxs = pareto_idx(steps, costs, scores)
     for k in data:
         try:
@@ -255,19 +241,26 @@ def compute_tsne():
     row = 0
     for env in env_names:
         sz = len(all_data[env]['agent_steps'])
+        all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
+        all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
+
+        '''
         if reduced is not None:
             all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
             all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
         else:
             all_data[env]['tsne1'] = np.random.rand(sz).tolist()
             all_data[env]['tsne2'] = np.random.rand(sz).tolist()
+        '''
 
         row += sz
         print(f'Env {env} has {sz} points')
 
     for env in all_data:
         dat = all_data[env]
-        dat = {k: v for k, v in dat.items() if k in ALL_KEYS}
+        dat = {k: v for k, v in dat.items() if isinstance(v, list)
+                and len(v) > 0 and isinstance(v[0], (int, float))
+                and (k == 'train/max_grad_norm' or not k.endswith('_norm'))}
         all_data[env] = dat
         for k, v in dat.items():
             try:
@@ -275,7 +268,15 @@ def compute_tsne():
             except:
                 print(f'{env}/{k}: {len(v)}')
 
-    json.dump(all_data, open('constellation/default.json', 'w'))
+    for env in all_data:
+        for k, v in all_data[env].items():
+            if isinstance(v, list):
+                try:
+                    all_data[env][k] = ','.join([f'{x:.6g}' for x in v])
+                except:
+                    breakpoint()
+
+    json.dump(all_data, open('resources/constellation/experiments.json', 'w'))
 
 if __name__ == '__main__':
     compute_tsne()
