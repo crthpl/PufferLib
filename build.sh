@@ -197,7 +197,7 @@ if [ "$MODE" = "profile" ]; then
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn -lnvToolsExt \
+        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
         -lGL -lm -lpthread -lomp5 \
         -o profile
     echo "=== Built: ./profile ==="
@@ -252,7 +252,7 @@ LINK_CMD=(
     src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
     -L$CUDA_HOME/lib64
     -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
-    -lnvToolsExt -lomp5
+    -lomp5
     $LINK_OPT
 )
 [ "$PLATFORM" = "Linux" ] && LINK_CMD+=(-Bsymbolic-functions)
