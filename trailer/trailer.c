@@ -80,7 +80,7 @@ typedef struct { float r, angle, vr, brightness, size_scale; } BgStar;
 static BgStar bg_stars[NUM_BG_STARS];
 static StarVertex bg_verts[NUM_BG_STARS];
 
-#define SPIRAL_GM        8000000.0f   // gravitational constant — tune for feel
+#define SPIRAL_GM        16000000.0f   // gravitational constant — tune for feel
 #define SPIRAL_OMEGA     1.0f         // base angular velocity (rad/s)
 #define SPIRAL_OMEGA_R   300.0f       // differential rotation scale (inner faster)
 
@@ -128,7 +128,7 @@ static void init_bg_stars(void) {
     }
 }
 
-#define NOVA_GM   800000.0f   // outward repulsion strength for nova
+#define NOVA_GM   4000000.0f  // outward repulsion strength for nova
 
 // Integrate one timestep of gravitational attraction toward center
 static void update_bg_spiral(float dt) {
@@ -526,7 +526,7 @@ static void draw_anim5(float anim_t, float dt, Shader *star_sh) {
 
 // ─── Video recording ──────────────────────────────────────────────────────────
 #define RECORD_FPS   30
-#define RECORD_SECS  40   // capture this many seconds then exit
+#define RECORD_SECS  38   // capture this many seconds then exit
 
 typedef struct { int pipefd[2]; pid_t pid; } VideoRecorder;
 
@@ -642,7 +642,7 @@ int main(void) {
         /* ============================================================
            ANIMATION 5: Spiral resumes (21s+), thumbnails start at 22s
            ============================================================ */
-        else if (t < 32.0f) {
+        else if (t < 30.0f) {
             update_bg_spiral(dt);
             draw_anim5(t - 22.0f, dt, &star_shader);
         }
@@ -652,7 +652,7 @@ int main(void) {
            Text "4.0" and "puffer.ai" fade in 2s after nova
            ============================================================ */
         else {
-            float nova_t = t - 32.0f;
+            float nova_t = t - 30.0f;
             update_bg_nova(dt);
             build_bg_verts_spiral(1.0f, 1);
             draw_stars(bg_verts, bg_draw_count, &star_shader);
