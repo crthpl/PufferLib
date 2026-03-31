@@ -6,10 +6,10 @@ Step 0: Download the preprocessed JSON scenarios from HuggingFace e.g.,
   uv pip install huggingface_hub
   python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='daphne-cornelisse/pufferdrive_womd_train', repo_type='dataset', local_dir='resources/drive/data')"
 
-Step 2: Unzip to get folder with .json files
+Step 1: Unzip to get folder with .json files
     unzip -j resources/drive/data/training.zip -d resources/drive/data/training/
 
-Step 1: Process to map binaries
+Step 2: Process to map binaries
   python ocean/drive/dataset.py --data_folder resources/drive/data/training --output_dir resources/drive/binaries/training
 """
 
