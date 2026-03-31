@@ -82,20 +82,6 @@ def simplify_polyline(geometry, polyline_reduction_threshold, max_segment_length
 def save_map_binary(map_data, output_file, unique_map_id):
     """Save map data in a binary format readable by C."""
     with open(output_file, "wb") as f:
-        metadata = map_data.get("metadata", {})
-        sdc_track_index = metadata.get("sdc_track_index", -1)
-        tracks_to_predict = metadata.get("tracks_to_predict", [])
-
-        scenario_id = map_data.get("scenario_id", f"map_{unique_map_id:03d}")
-        f.write(struct.pack("16s", scenario_id.encode("utf-8")))
-
-        f.write(struct.pack("i", sdc_track_index))
-
-        f.write(struct.pack("i", len(tracks_to_predict)))
-        for track in tracks_to_predict:
-            track_index = track.get("track_index", -1)
-            f.write(struct.pack("i", track_index))
-
         num_objects = len(map_data.get("objects", []))
         num_roads = len(map_data.get("roads", []))
         f.write(struct.pack("i", num_objects))
@@ -103,8 +89,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
 
         # Write objects
         for obj in map_data.get("objects", []):
-            f.write(struct.pack("i", unique_map_id))
-
             obj_type = obj.get("type", 1)
             if obj_type == "vehicle":
                 obj_type = 1
@@ -113,7 +97,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
             elif obj_type == "cyclist":
                 obj_type = 3
             f.write(struct.pack("i", obj_type))
-            f.write(struct.pack("i", obj.get("id", 0)))
             f.write(struct.pack("i", TRAJECTORY_LENGTH))
 
             positions = obj.get("position", [])
@@ -169,8 +152,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
 
         # Write roads
         for road in map_data.get("roads", []):
-            f.write(struct.pack("i", unique_map_id))
-
             geometry = road.get("geometry", [])
             road_type = road.get("map_element_id", 0)
             road_type_word = road.get("type", 0)
@@ -199,7 +180,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
                 road_type = 10
 
             f.write(struct.pack("i", road_type))
-            f.write(struct.pack("i", road.get("id", 0)))
             f.write(struct.pack("i", size))
 
             for coord in ["x", "y", "z"]:
