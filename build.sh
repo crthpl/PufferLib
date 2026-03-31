@@ -108,6 +108,7 @@ fi
 
 # Constellation needs cJSON
 [ "$ENV" = "constellation" ] && EXTRA_SRC="vendor/cJSON.c" && INCLUDES+=(-I./vendor) && OUTPUT_NAME="seethestars"
+[ "$ENV" = "trailer" ] && INCLUDES+=(-I./vendor) && OUTPUT_NAME="trailer/trailer"
 
 # ============================================================================
 # Standalone builds: --local, --fast, --web

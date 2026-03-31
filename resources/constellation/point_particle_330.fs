@@ -3,23 +3,27 @@
 in vec4 fragColor;
 out vec4 finalColor;
 
-
 void main()
 {
+    vec2 uv = gl_PointCoord - vec2(0.5);
+    float r = length(uv);
+    float angle = atan(uv.y, uv.x);
 
-vec2 uv = gl_PointCoord - vec2(0.5);
-float dist = length(uv); // distance from center of point
+    float core   = exp(-120.0 * r * r);
+    float mid    = exp(- 30.0 * r * r) * 0.5;
+    float corona = exp(-  8.0 * r * r) * 0.35;
 
-// Soft radial falloff (tightens with higher number)
-float falloff = exp(-20.0 * dist * dist);
+    float spike_mask = pow(abs(cos(angle * 2.0)), 24.0);
+    float spike = spike_mask * exp(-18.0 * r * r) * exp(-r * 4.0) * 1.2;
 
-// Kill pixels too dark to be visible — avoids black ring
-if (falloff < 0.01)
-    discard;
+    float brightness = core + mid + corona + spike;
 
-// Final color, scaled by falloff
-vec3 color = fragColor.rgb * falloff * 5.0;
-finalColor = vec4(color, falloff);
+    if (brightness < 0.01)
+        discard;
 
+    vec3 color = fragColor.rgb * brightness * 5.0;
+    color += vec3(0.0, 0.05, 0.15) * spike;
+    color += vec3(0.0, 0.02, 0.08) * corona;
 
+    finalColor = vec4(color, clamp(brightness, 0.0, 1.0));
 }

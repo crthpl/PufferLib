@@ -15,7 +15,7 @@ void main()
 
     // Solid pixels stay fully opaque — no shader math needed
     if (c > 0.5) {
-        vec3 color = vec3(0.0, 0.87, 0.87);
+        vec3 color = vec3(0.6, 0.95, 0.95);
         finalColor = vec4(color * fadeAlpha, fadeAlpha);
         return;
     }
@@ -36,6 +36,6 @@ void main()
 
     float glow  = exp(-0.12 * min_dist);  // bright at d=1, fades over ~20px
     float halo  = glow * (0.4 + glowStrength * 0.6) * fadeAlpha;
-    vec3 color  = vec3(0.0, 0.87, 0.87);
+    vec3 color  = vec3(0.6, 0.95, 0.95);
     finalColor  = vec4(color * halo, halo);
 }

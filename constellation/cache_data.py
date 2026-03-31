@@ -7,17 +7,18 @@ import os
 env_names = sorted([
     'breakout',
     #'impulse_wars',
-    #'pacman',
-    #'tetris',
+    'pacman',
+    'tetris',
     #'g2048',
     #'moba',
     'pong',
     #'tower_climb',
     #'grid',
+    'freeway',
     'connect4',
     'nmmo3',
     #'snake',
-    #'tripletriad'
+    'tripletriad'
 ])
 
 HYPERS = [
@@ -183,7 +184,10 @@ def cached_load(path, env_name, cache):
             del data[k]
 
     # Format im millions to avoid overfloat in C
-    data['agent_steps'] = [e/1e6 for e in data['agent_steps']]
+    try:
+        data['agent_steps'] = [e/1e6 for e in data['agent_steps']]
+    except:
+        breakpoint()
     data['train/total_timesteps'] = [e/1e6 for e in data['train/total_timesteps']]
     #data['metrics/agent_steps'] = [e/1e6 for e in data['metrics/agent_steps']]
     del data['metrics/agent_steps']

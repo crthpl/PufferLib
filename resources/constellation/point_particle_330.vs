@@ -16,10 +16,10 @@ out vec4 fragColor;
 float twinkle(float idx, float t) {
     float base_size = 10.0;
     float phase = mod(idx * 137.5, 360.0);
-    float frequency = 2.5 + mod(idx, 3.0) * 1.0;
-    float amplitude = (mod(idx, 10.0) == 0.0) ? 10.0 : 2.0;
+    float frequency = 1.0 + mod(idx, 3.0) * 1.0;
+    float amplitude = (mod(idx, 20.0) == 0.0) ? 15.0 : 3.0;
     float size_variation = amplitude * sin(frequency * t + radians(phase));
-    return max(0.5, base_size + size_variation);
+    return max(10, base_size + size_variation);
 }
 
 void main()
