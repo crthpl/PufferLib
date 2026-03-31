@@ -2,8 +2,9 @@
 #define OBS_SIZE 1848
 #define NUM_ATNS 2
 #define ACT_SIZES {7, 13}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
+
+#define MAP_BINARY_DIR "resources/drive/binaries/training"
 
 #define MY_VEC_INIT
 #define Env Drive
@@ -29,8 +30,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     // Find first map with exactly 8 agents
     int target_map_id = -1;
     for (int map_id = 0; map_id < num_maps; map_id++) {
-        char map_file[100];
-        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        char map_file[512];
+        sprintf(map_file, "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
 
         Env temp_env = {0};
         temp_env.map_name = map_file;
@@ -66,8 +67,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
 
-    char map_file[100];
-    sprintf(map_file, "resources/drive/binaries/map_%03d.bin", target_map_id);
+    char map_file[512];
+    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, target_map_id);
 
     for (int i = 0; i < total_envs; i++) {
         Env* env = &envs[i];
@@ -103,8 +104,8 @@ void my_init(Env* env, Dict* kwargs) {
     int map_id = dict_get(kwargs, "map_id")->value;
     int max_agents = dict_get(kwargs, "max_agents")->value;
 
-    char map_file[100];
-    sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+    char map_file[512];
+    sprintf(map_file, "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
     env->num_agents = max_agents;
     env->map_name = strdup(map_file);
     init(env);
