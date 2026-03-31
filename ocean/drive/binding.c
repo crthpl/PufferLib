@@ -25,7 +25,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int spawn_immunity_timer = (int)dict_get(env_kwargs, "spawn_immunity_timer")->value;
     int human_agent_idx = (int)dict_get(env_kwargs, "human_agent_idx")->value;
 
-    // Verify map files exist
+    // Verify first map exists
     char first_map[100];
     sprintf(first_map, "resources/drive/binaries/map_%03d.bin", 0);
     FILE* test_fp = fopen(first_map, "rb");
@@ -37,36 +37,32 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     }
     fclose(test_fp);
 
-    // Find first map with exactly 8 agents
-    int target_map_id = -1;
-    for (int map_id = 0; map_id < num_maps; map_id++) {
+    // Probe each map to get agent counts
+    int agents_per_map[num_maps];
+    for (int m = 0; m < num_maps; m++) {
         char map_file[100];
-        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", m);
 
         Env temp_env = {0};
         temp_env.map_name = map_file;
         temp_env.num_agents = 0;
         init(&temp_env);
-
-        int agent_count = temp_env.active_agent_count;
-        int total_agent_count = temp_env.num_agents;
+        int map_agents = temp_env.active_agent_count;
         c_close(&temp_env);
 
-        if (agent_count == 8) {
-            target_map_id = map_id;
-            printf("Found map %d with 8 active agents and %d total agents\n", map_id, total_agent_count);
-            break;
-        }
+        agents_per_map[m] = map_agents < MAX_CARS ? map_agents : MAX_CARS;
+        printf("Map %d: %d active agents, using %d (MAX_CARS=%d)\n",
+               m, map_agents, agents_per_map[m], MAX_CARS);
     }
 
-    if (target_map_id < 0) {
-        printf("ERROR: No map found with exactly 8 agents\n");
-        *num_envs_out = 0;
-        return NULL;
-    }
+    // Calculate envs per buffer per map
+    // Each buffer gets copies of every map, repeated to fill agents_per_buffer
+    int agents_per_map_set = 0;
+    for (int m = 0; m < num_maps; m++)
+        agents_per_map_set += agents_per_map[m];
 
-    // Calculate how many envs we need (8 agents per env)
-    int envs_per_buffer = agents_per_buffer / 8;
+    int sets_per_buffer = agents_per_buffer / agents_per_map_set;
+    int envs_per_buffer = sets_per_buffer * num_maps;
     int total_envs = envs_per_buffer * num_buffers;
 
     // Fill buffer info
@@ -77,10 +73,11 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
 
-    char map_file[100];
-    sprintf(map_file, "resources/drive/binaries/map_%03d.bin", target_map_id);
-
     for (int i = 0; i < total_envs; i++) {
+        int map_id = i % num_maps;
+        char map_file[100];
+        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+
         Env* env = &envs[i];
         memset(env, 0, sizeof(Env));
 
@@ -91,14 +88,14 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->spawn_immunity_timer = spawn_immunity_timer;
-        env->num_agents = 0;
+        env->num_agents = agents_per_map[map_id];
 
         init(env);
-        env->num_agents = env->active_agent_count;
     }
 
-    printf("Created %d envs with %d agents each (%d total agents)\n",
-           total_envs, 8, total_envs * 8);
+    int total_agent_count = total_envs / num_maps * agents_per_map_set;
+    printf("Created %d envs across %d maps (%d total agents)\n",
+           total_envs, num_maps, total_agent_count);
 
     *num_envs_out = total_envs;
     return envs;
