@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "raylib.h"
 
@@ -67,29 +69,116 @@ static void draw_stars(StarVertex *verts, int n, Shader *sh) {
 }
 
 // ─── Shared background star field ─────────────────────────────────────────────
-#define NUM_BG_STARS 800
-typedef struct { float x, y, brightness, size_scale; } BgStar;
+#define NUM_BG_STARS   32768
+#define NUM_VISIBLE_STARS 16384 // stars with normal distribution; rest start at center
+#define BG_DENSE_R      1200.0f   // full density inside this radius
+#define BG_FADE_R      2400.0f   // density lerps to BG_SPARSE_FRAC by here
+#define BG_SPARSE_FRAC   0.02f   // density fraction beyond BG_FADE_R
+#define BG_MAX_R       4000.0f
+
+typedef struct { float r, angle, vr, brightness, size_scale; } BgStar;
 static BgStar bg_stars[NUM_BG_STARS];
 static StarVertex bg_verts[NUM_BG_STARS];
 
+#define SPIRAL_GM        8000000.0f   // gravitational constant — tune for feel
+#define SPIRAL_OMEGA     1.0f         // base angular velocity (rad/s)
+#define SPIRAL_OMEGA_R   300.0f       // differential rotation scale (inner faster)
+
+// Area of annulus [r0, r1] proportional to r1^2 - r0^2
+// We split visible stars across three zones by desired density weight:
+//   dense:  uniform area in [0, BG_DENSE_R]        weight = 1.0
+//   fade:   uniform area in [BG_DENSE_R, BG_FADE_R] weight = avg ~0.5*(1+SPARSE_FRAC)
+//   outer:  uniform area in [BG_FADE_R, BG_MAX_R]  weight = BG_SPARSE_FRAC
+// Stars per zone proportional to area * weight
 static void init_bg_stars(void) {
+    float a_dense = BG_DENSE_R * BG_DENSE_R;
+    float a_fade  = BG_FADE_R  * BG_FADE_R  - a_dense;
+    float a_outer = BG_MAX_R   * BG_MAX_R   - BG_FADE_R * BG_FADE_R;
+    float w_dense = 1.0f;
+    float w_fade  = 0.5f * (1.0f + BG_SPARSE_FRAC);
+    float w_outer = BG_SPARSE_FRAC;
+    float total   = a_dense * w_dense + a_fade * w_fade + a_outer * w_outer;
+    int n_dense   = (int)(NUM_VISIBLE_STARS * a_dense * w_dense / total);
+    int n_fade    = (int)(NUM_VISIBLE_STARS * a_fade  * w_fade  / total);
+    // remainder goes to outer
+
     for (int i = 0; i < NUM_BG_STARS; i++) {
-        bg_stars[i].x          = (float)(rand() % SCREEN_W);
-        bg_stars[i].y          = (float)(rand() % SCREEN_H);
+        float r;
+        if (i >= NUM_VISIBLE_STARS) {
+            // Hidden nova stars
+            r = 0.5f + ((float)rand() / (float)RAND_MAX) * 4.5f;
+        } else if (i < n_dense) {
+            float rnd = (float)rand() / (float)RAND_MAX;
+            r = BG_DENSE_R * sqrtf(rnd);
+        } else if (i < n_dense + n_fade) {
+            float rnd = (float)rand() / (float)RAND_MAX;
+            r = sqrtf(BG_DENSE_R*BG_DENSE_R + rnd * (BG_FADE_R*BG_FADE_R - BG_DENSE_R*BG_DENSE_R));
+        } else {
+            float rnd = (float)rand() / (float)RAND_MAX;
+            r = sqrtf(BG_FADE_R*BG_FADE_R + rnd * (BG_MAX_R*BG_MAX_R - BG_FADE_R*BG_FADE_R));
+        }
+        bg_stars[i].r          = r;
+        bg_stars[i].angle      = ((float)rand() / (float)RAND_MAX) * 2.0f * 3.14159265f;
+        bg_stars[i].vr         = 0.0f;
         bg_stars[i].brightness = 0.2f + (float)(rand() % 80) / 100.0f;
-        // Most stars small, a handful large enough to show spikes
-        float r = (float)rand() / (float)RAND_MAX;
-        bg_stars[i].size_scale = (r < 0.85f)
-            ? (0.2f + r * 0.4f) * 0.7f           // 85%: small  (0.14 – 0.38)
-            : (0.8f + (r - 0.85f) * 6.0f) * 0.7f; // 15%: larger (0.56 – 1.19)
+        float s = (float)rand() / (float)RAND_MAX;
+        bg_stars[i].size_scale = (s < 0.85f)
+            ? (0.2f + s * 0.4f) * 0.7f
+            : (0.8f + (s - 0.85f) * 6.0f) * 0.7f;
     }
 }
 
-static void build_bg_verts(void) {
+#define NOVA_GM   800000.0f   // outward repulsion strength for nova
+
+// Integrate one timestep of gravitational attraction toward center
+static void update_bg_spiral(float dt) {
     for (int i = 0; i < NUM_BG_STARS; i++) {
-        float br = bg_stars[i].brightness;
+        float r = bg_stars[i].r;
+        bg_stars[i].vr    -= SPIRAL_GM / (r * r) * dt;
+        bg_stars[i].r     += bg_stars[i].vr * dt;
+        bg_stars[i].angle += (SPIRAL_OMEGA + SPIRAL_OMEGA_R / (r + 1.0f)) * dt;
+        if (bg_stars[i].r < 1.0f) bg_stars[i].r = 1.0f;
+    }
+}
+
+// Integrate one timestep of outward nova explosion (1/r^2 repulsion)
+static void update_bg_nova(float dt) {
+    for (int i = 0; i < NUM_BG_STARS; i++) {
+        float r = fmaxf(bg_stars[i].r, 1.0f);
+        bg_stars[i].vr += NOVA_GM / (r * r) * dt;
+        bg_stars[i].r  += bg_stars[i].vr * dt;
+        // No angular update — stars fly straight outward
+    }
+}
+
+static int bg_draw_count;
+
+static void build_bg_verts_spiral(float alpha, int nova) {
+    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+    int n = nova ? NUM_BG_STARS : NUM_VISIBLE_STARS;
+    for (int i = 0; i < n; i++) {
+        float br = bg_stars[i].brightness * alpha;
         bg_verts[i] = (StarVertex){
-            .x = bg_stars[i].x, .y = bg_stars[i].y,
+            .x = cx + bg_stars[i].r * cosf(bg_stars[i].angle),
+            .y = cy + bg_stars[i].r * sinf(bg_stars[i].angle),
+            .size_scale = bg_stars[i].size_scale,
+            .r = C_WHITE.r / 255.0f * br,
+            .g = C_WHITE.g / 255.0f * br,
+            .b = C_WHITE.b / 255.0f * br,
+            .a = (float)i,
+        };
+    }
+    bg_draw_count = n;
+}
+
+static void build_bg_verts(void) {
+    bg_draw_count = NUM_VISIBLE_STARS;
+    for (int i = 0; i < NUM_VISIBLE_STARS; i++) {
+        float br = bg_stars[i].brightness;
+        float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+        bg_verts[i] = (StarVertex){
+            .x = cx + bg_stars[i].r * cosf(bg_stars[i].angle),
+            .y = cy + bg_stars[i].r * sinf(bg_stars[i].angle),
             .size_scale = bg_stars[i].size_scale,
             .r = C_WHITE.r / 255.0f * br,
             .g = C_WHITE.g / 255.0f * br,
@@ -108,7 +197,7 @@ static void build_bg_verts(void) {
 
 #define NUM_BALLS    4
 #define LANE_H       195         // 780px / 4 lanes
-#define A1_MARGIN_L  160
+#define A1_MARGIN_L  280
 #define A1_MARGIN_R  160
 #define TRACK_W      (SCREEN_W - A1_MARGIN_L - A1_MARGIN_R)
 #define TRACK_Y0     298         // 200 top + 780/8 = first lane center
@@ -153,7 +242,7 @@ static void update_anim1(float dt, Font roboto, Shader *sh) {
     }
 
     build_bg_verts();
-    draw_stars(bg_verts, NUM_BG_STARS, sh);
+    draw_stars(bg_verts, bg_draw_count, sh);
     draw_stars(ball_verts, NUM_BALLS, sh);
 
     for (int i = 0; i < NUM_BALLS; i++) {
@@ -162,7 +251,9 @@ static void update_anim1(float dt, Font roboto, Shader *sh) {
             (Color){0, 187, 187, 20});
         DrawTextEx(roboto, BALL_LABELS[i], (Vector2){100, lane_y - FONT_LABEL/2}, FONT_LABEL, 1, C_CYAN);
     }
-    DrawTextEx(roboto, "Steps Per Second", (Vector2){SCREEN_W/2 - 280, 80}, FONT_TITLE, 1, C_WHITE);
+    Vector2 t1sz = MeasureTextEx(roboto, "Steps Per Second", FONT_TITLE, 1);
+    DrawTextEx(roboto, "Steps Per Second",
+        (Vector2){SCREEN_W/2 - t1sz.x/2, 100}, FONT_TITLE, 1, C_WHITE);
 }
 
 /* ============================================================
@@ -184,7 +275,7 @@ static void update_anim1(float dt, Font roboto, Shader *sh) {
 #define BAR_GAP       76        // 780px / 5 bars = 156 per slot; 156 - 80 = 76
 
 #define BAR_STAR_SCALE  0.20f
-#define STAR_DENSITY    0.05f   // stars per square pixel
+#define STAR_DENSITY    0.075f   // stars per square pixel
 #define MAX_BAR_STARS   30000   // upper bound for static allocation
 
 typedef struct {
@@ -253,14 +344,17 @@ static void draw_anim2(float anim_t, Font roboto, Shader *sh) {
     }
 
     build_bg_verts();
-    draw_stars(bg_verts, NUM_BG_STARS, sh);
+    draw_stars(bg_verts, bg_draw_count, sh);
     draw_stars(bar_verts, n, sh);
 
     for (int e = 0; e < NUM_ENVS; e++) {
         float cy = CHART_TOP + e * (BAR_H + BAR_GAP) + BAR_H * 0.5f;
         DrawTextEx(roboto, envs[e].name, (Vector2){100, cy - FONT_LABEL/2}, FONT_LABEL, 1, C_WHITE);
     }
-    DrawTextEx(roboto, "Solve Time", (Vector2){SCREEN_W/4 - 120, 80}, FONT_TITLE, 1, C_WHITE);
+    // Anim2 title: centered in left half
+    Vector2 t2sz = MeasureTextEx(roboto, "Solve Time", FONT_TITLE, 1);
+    DrawTextEx(roboto, "Solve Time",
+        (Vector2){SCREEN_W/4 - t2sz.x/2, 100}, FONT_TITLE, 1, C_WHITE);
 }
 
 /* ============================================================
@@ -269,7 +363,7 @@ static void draw_anim2(float anim_t, Font roboto, Shader *sh) {
    edge + blurred halo is driven by cos(time) for the pulse.
    ============================================================ */
 
-static void draw_anim3(float anim_t, Shader *glow_sh, Texture2D tex, Shader *star_sh) {
+static void draw_anim3(float anim_t, Shader *glow_sh, Texture2D tex, Shader *star_sh, Font roboto) {
     float glow = 0.65f + 0.15f * cosf(anim_t * 2.5f);  // 0..1 drives the oscillating portion
 
     float fade = fminf(anim_t / 0.5f, 1.0f);
@@ -290,6 +384,187 @@ static void draw_anim3(float anim_t, Shader *glow_sh, Texture2D tex, Shader *sta
     BeginShaderMode(*glow_sh);
         DrawTexture(tex, (int)x, (int)y, WHITE);
     EndShaderMode();
+
+    // Title centered in right half, same y=100 as anim2 title
+    Color title_col = (Color){C_WHITE.r, C_WHITE.g, C_WHITE.b, (unsigned char)(fade * 255)};
+    Vector2 t3sz = MeasureTextEx(roboto, "PufferNet", FONT_TITLE, 1);
+    DrawTextEx(roboto, "PufferNet",
+        (Vector2){SCREEN_W*3/4 - t3sz.x/2, 100}, FONT_TITLE, 1, title_col);
+}
+
+/* ============================================================
+   ANIMATION 4: Spiral in (9–12s)
+   Anim2+3 fade out over 0.5s. Stars spiral in.
+   ============================================================ */
+
+static void draw_anim4(float anim_t, Font roboto, Shader *star_sh,
+                       Shader *glow_sh, Texture2D tex) {
+    float fade_out = 1.0f - fminf(anim_t / 0.5f, 1.0f);
+
+    if (fade_out > 0.0f) {
+        draw_anim2(3.0f, roboto, star_sh);
+        draw_anim3(3.0f, glow_sh, tex, star_sh, roboto);
+        DrawRectangle(0, 0, SCREEN_W, SCREEN_H,
+            (Color){BG.r, BG.g, BG.b, (unsigned char)((1.0f - fade_out) * 255)});
+    }
+
+    build_bg_verts_spiral(1.0f, 0);
+    draw_stars(bg_verts, bg_draw_count, star_sh);
+}
+
+/* ============================================================
+   ANIMATION 5: Thumbnails fade in, then spiral in (22–end)
+   Each thumbnail placed at a fixed position around the screen.
+   After .25s stagger fade-in, positions included in spiral.
+   ============================================================ */
+
+#define NUM_THUMBS 32
+
+static const char *thumb_paths[NUM_THUMBS] = {
+    "../puffer.ai/docs/assets/2048_thumbnail.png",
+    "../puffer.ai/docs/assets/blastar_thumbnail.png",
+    "../puffer.ai/docs/assets/breakout_thumbnail.png",
+    "../puffer.ai/docs/assets/cartpole_thumbnail.png",
+    "../puffer.ai/docs/assets/connect4_thumbnail.png",
+    "../puffer.ai/docs/assets/convert_thumbnail.png",
+    "../puffer.ai/docs/assets/cpr_thumbnail.png",
+    "../puffer.ai/docs/assets/drone_thumbnail.png",
+    "../puffer.ai/docs/assets/enduro_thumbnail.png",
+    "../puffer.ai/docs/assets/freeway_thumbnail.png",
+    "../puffer.ai/docs/assets/go_thumbnail.png",
+    "../puffer.ai/docs/assets/gpudrive_thumbnail.png",
+    "../puffer.ai/docs/assets/impulse_wars_thumbnail.png",
+    "../puffer.ai/docs/assets/moba_thumbnail.png",
+    "../puffer.ai/docs/assets/nmmo3_thumbnail.png",
+    "../puffer.ai/docs/assets/pacman_thumbnail.png",
+    "../puffer.ai/docs/assets/pong_thumbnail.png",
+    "../puffer.ai/docs/assets/robocode_thumbnail.png",
+    "../puffer.ai/docs/assets/rware_thumbnail.png",
+    "../puffer.ai/docs/assets/slimevolley_thumbnail.png",
+    "../puffer.ai/docs/assets/snake_thumbnail.png",
+    "../puffer.ai/docs/assets/squared_thumbnail.png",
+    "../puffer.ai/docs/assets/tactical_thumbnail.png",
+    "../puffer.ai/docs/assets/target_thumbnail.png",
+    "../puffer.ai/docs/assets/tcg_thumbnail.png",
+    "../puffer.ai/docs/assets/template_thumbnail.png",
+    "../puffer.ai/docs/assets/terraform_thumbnail.png",
+    "../puffer.ai/docs/assets/tetris_thumbnail.png",
+    "../puffer.ai/docs/assets/tower_climb_thumbnail.png",
+    "../puffer.ai/docs/assets/trash_pickup_thumbnail.png",
+    "../puffer.ai/docs/assets/tripletriad_thumbnail.png",
+    "../puffer.ai/docs/assets/whisker_racer_thumbnail.png",
+};
+
+static Texture2D thumbs[NUM_THUMBS];
+static float thumb_r[NUM_THUMBS];
+static float thumb_angle[NUM_THUMBS];
+static float thumb_vr[NUM_THUMBS];
+
+static void init_anim5(void) {
+    for (int i = 0; i < NUM_THUMBS; i++)
+        thumbs[i] = LoadTexture(thumb_paths[i]);
+
+    // Spawn in a slight outward spiral: radius grows by THUMB_SPIRAL_DR per step
+    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+    float ring_r     = 400.0f;
+    float spiral_dr  = 12.0f;   // px added to radius per thumbnail
+    for (int i = 0; i < NUM_THUMBS; i++) {
+        thumb_r[i]     = ring_r + i * spiral_dr;
+        thumb_angle[i] = (float)i / (float)NUM_THUMBS * 2.0f * 3.14159265f;
+        thumb_vr[i]    = 0.0f;
+    }
+    (void)cx; (void)cy;
+}
+
+static void unload_anim5(void) {
+    for (int i = 0; i < NUM_THUMBS; i++)
+        UnloadTexture(thumbs[i]);
+}
+
+static void draw_anim5(float anim_t, float dt, Shader *star_sh) {
+    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+
+    // Stars already integrated via update_bg_spiral each frame
+    build_bg_verts_spiral(1.0f, 0);
+    draw_stars(bg_verts, bg_draw_count, star_sh);
+
+    for (int i = 0; i < NUM_THUMBS; i++) {
+        // Stagger in reverse angular order: highest angle appears first,
+        // so each new thumbnail materialises behind the already-spiraling ones
+        int rev = NUM_THUMBS - 1 - i;
+        float fade_start = rev * 0.07f;
+        float alpha = fmaxf(0.0f, fminf((anim_t - fade_start) / 0.25f, 1.0f));
+
+        // Only integrate once visible — invisible ones stay at their start position
+        if (alpha > 0.0f) {
+            thumb_vr[i]    -= SPIRAL_GM / (thumb_r[i] * thumb_r[i]) * dt;
+            thumb_r[i]     += thumb_vr[i] * dt;
+            thumb_angle[i] += (SPIRAL_OMEGA + SPIRAL_OMEGA_R / (thumb_r[i] + 1.0f)) * dt;
+            if (thumb_r[i] < 1.0f) thumb_r[i] = 1.0f;
+        }
+
+        if (alpha <= 0.0f) continue;
+
+        float r   = thumb_r[i];
+        float ang = thumb_angle[i];
+        float px  = cx + r * cosf(ang);
+        float py  = cy + r * sinf(ang);
+
+        // Scale proportional to r so size reaches 1px at center
+        float tw = thumbs[i].width, th = thumbs[i].height;
+        float base_scale = fminf(300.0f / tw, 300.0f / th);
+        float r_frac = thumb_r[i] / (400.0f + (NUM_THUMBS - 1) * 12.0f);
+        float size_scale = fmaxf(1.0f / fmaxf(tw, th), base_scale * r_frac);
+        float dw = tw * size_scale, dh = th * size_scale;
+
+        Rectangle src  = {0, 0, tw, th};
+        Rectangle dest = {px - dw*0.5f, py - dh*0.5f, dw, dh};
+        Color tint = {255, 255, 255, (unsigned char)(alpha * 255)};
+        DrawTexturePro(thumbs[i], src, dest, (Vector2){0,0}, 0.0f, tint);
+    }
+}
+
+// ─── Video recording ──────────────────────────────────────────────────────────
+#define RECORD_FPS   30
+#define RECORD_SECS  40   // capture this many seconds then exit
+
+typedef struct { int pipefd[2]; pid_t pid; } VideoRecorder;
+
+static bool OpenVideo(VideoRecorder *rec, const char *filename, int w, int h) {
+    if (pipe(rec->pipefd) == -1) { fprintf(stderr, "pipe failed\n"); return false; }
+    rec->pid = fork();
+    if (rec->pid == -1) { fprintf(stderr, "fork failed\n"); return false; }
+    if (rec->pid == 0) {
+        close(rec->pipefd[1]);
+        dup2(rec->pipefd[0], STDIN_FILENO);
+        close(rec->pipefd[0]);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        char sz[32]; snprintf(sz, sizeof(sz), "%dx%d", w, h);
+        char fps[8]; snprintf(fps, sizeof(fps), "%d", RECORD_FPS);
+        execlp("ffmpeg", "ffmpeg", "-y",
+               "-f", "rawvideo", "-pix_fmt", "rgba",
+               "-s", sz, "-r", fps, "-i", "-",
+               "-c:v", "libx264", "-pix_fmt", "yuv420p",
+               "-preset", "medium", "-crf", "23",
+               "-loglevel", "error",
+               filename, NULL);
+        fprintf(stderr, "exec ffmpeg failed\n");
+        _exit(1);
+    }
+    close(rec->pipefd[0]);
+    return true;
+}
+
+static void WriteFrame(VideoRecorder *rec, int w, int h) {
+    rlDrawRenderBatchActive();   // flush pending RayLib draws before reading pixels
+    unsigned char *data = rlReadScreenPixels(w, h);
+    write(rec->pipefd[1], data, w * h * 4);
+    RL_FREE(data);
+}
+
+static void CloseVideo(VideoRecorder *rec) {
+    close(rec->pipefd[1]);
+    waitpid(rec->pid, NULL, 0);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -315,10 +590,16 @@ int main(void) {
     init_bg_stars();
     init_anim1();
     init_anim2();
+    init_anim5();
+
+    VideoRecorder recorder;
+    bool recording = OpenVideo(&recorder, "trailer/trailer.mp4", SCREEN_W, SCREEN_H);
+    if (!recording) fprintf(stderr, "Warning: video recording disabled\n");
 
     while (!WindowShouldClose()) {
         float t  = GetTime();
         float dt = GetFrameTime();
+        if (t > RECORD_SECS) break;
 
         BeginDrawing();
         ClearBackground(BG);
@@ -339,19 +620,69 @@ int main(void) {
             draw_anim2(anim2_t - 3.0f, roboto, &star_shader);
 
             if (t >= 6.0f) {
-                draw_anim3(t - 6.0f, &glow_shader, puffernet, &star_shader);
+                draw_anim3(t - 6.0f, &glow_shader, puffernet, &star_shader, roboto);
             }
         }
 
+        /* ============================================================
+           ANIMATION 4: Spiral in (9–11s, 2s)
+           ============================================================ */
+        else if (t < 11.0f) {
+            update_bg_spiral(dt);
+            draw_anim4(t - 9.0f, roboto, &star_shader, &glow_shader, puffernet);
+        }
+
+        /* ============================================================
+           Pause (11–21s): spiral frozen
+           ============================================================ */
+        else if (t < 21.0f) {
+            draw_anim4(2.0f, roboto, &star_shader, &glow_shader, puffernet);
+        }
+
+        /* ============================================================
+           ANIMATION 5: Spiral resumes (21s+), thumbnails start at 22s
+           ============================================================ */
+        else if (t < 32.0f) {
+            update_bg_spiral(dt);
+            draw_anim5(t - 22.0f, dt, &star_shader);
+        }
+
+        /* ============================================================
+           ANIMATION 6: Nova — stars explode outward (32s+)
+           Text "4.0" and "puffer.ai" fade in 2s after nova
+           ============================================================ */
         else {
-            break;
+            float nova_t = t - 32.0f;
+            update_bg_nova(dt);
+            build_bg_verts_spiral(1.0f, 1);
+            draw_stars(bg_verts, bg_draw_count, &star_shader);
+
+            float text_alpha = fmaxf(0.0f, fminf((nova_t - 3.0f) / 1.0f, 1.0f));
+            if (text_alpha > 0.0f) {
+                unsigned char a = (unsigned char)(text_alpha * 255);
+                Color col_cyan  = {C_CYAN.r,  C_CYAN.g,  C_CYAN.b,  a};
+                Color col_white = {C_WHITE.r, C_WHITE.g, C_WHITE.b, a};
+
+                float cy = SCREEN_H * 0.5f + 250.0f;
+                Vector2 sz1 = MeasureTextEx(roboto, "4.0",       FONT_TITLE, 1);
+                Vector2 sz2 = MeasureTextEx(roboto, "puffer.ai", FONT_TITLE, 1);
+                DrawTextEx(roboto, "4.0",
+                    (Vector2){SCREEN_W*0.5f - sz1.x*0.5f, cy}, FONT_TITLE, 1, col_cyan);
+                DrawTextEx(roboto, "puffer.ai",
+                    (Vector2){SCREEN_W*0.5f - sz2.x*0.5f, cy + FONT_TITLE + 12}, FONT_TITLE, 1, col_white);
+            }
         }
 
 
         DrawFPS(SCREEN_W - 80, 8);
+        static int frame_counter = 0;
+        if (recording && (frame_counter++ % 2 == 0))
+            WriteFrame(&recorder, SCREEN_W, SCREEN_H);
         EndDrawing();
     }
 
+    if (recording) CloseVideo(&recorder);
+    unload_anim5();
     UnloadFont(roboto);
     UnloadShader(star_shader);
     UnloadShader(glow_shader);
