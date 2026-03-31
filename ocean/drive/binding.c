@@ -58,6 +58,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     // Calculate how many envs we need (8 agents per env)
     int envs_per_buffer = agents_per_buffer / 8;
     int total_envs = envs_per_buffer * num_buffers;
+    printf("total envs: %d\n", total_envs);
 
     // Fill buffer info
     for (int b = 0; b < num_buffers; b++) {
@@ -81,10 +82,9 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->spawn_immunity_timer = spawn_immunity_timer;
-        env->num_agents = 0;
-
+        env->num_agents = 8;
         init(env);
-        env->num_agents = env->active_agent_count;
+        //env->num_agents = env->active_agent_count;
     }
 
     printf("Created %d envs with %d agents each (%d total agents)\n",

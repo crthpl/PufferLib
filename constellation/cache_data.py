@@ -193,7 +193,6 @@ def cached_load(path, env_name, cache):
     del data['metrics/agent_steps']
 
     # Filter to pareto
-    '''
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
@@ -203,7 +202,6 @@ def cached_load(path, env_name, cache):
             data[k] = [data[k][i] for i in idxs]
         except IndexError:
             breakpoint()
-    '''
 
     data['sweep'] = sweep_metadata
     return data

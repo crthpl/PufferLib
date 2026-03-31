@@ -272,6 +272,7 @@ typedef struct {
     float prio_beta0;
     // Flags
     bool use_rnn;
+    bool reset_state;
     int cudagraphs;
     bool profile;
     // Multi-GPU
@@ -1350,7 +1351,7 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        puf_zero(&graph.mb_state, train_stream);
+        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;

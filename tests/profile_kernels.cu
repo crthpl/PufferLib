@@ -569,7 +569,7 @@ EnvSpeedArgs* create_envspeed(int total_agents, int num_buffers, int num_threads
     dict_set(vec_kwargs, "total_agents", (double)total_agents);
     dict_set(vec_kwargs, "num_buffers", (double)num_buffers);
 
-    StaticVec* vec = create_static_vec(total_agents, num_buffers, vec_kwargs, env_kwargs);
+    StaticVec* vec = create_static_vec(total_agents, num_buffers, 1, vec_kwargs, env_kwargs);
     if (!vec) { fprintf(stderr, "Failed to create environments\n"); return nullptr; }
     for (int i = 0; i < num_buffers; i++)
         cudaStreamCreateWithFlags(&vec->streams[i], cudaStreamNonBlocking);

@@ -399,6 +399,8 @@ def eval(env_name, args=None, load_path=None):
     Creates a full PuffeRL instance, optionally loads weights, then
     runs rollouts in a loop with rendering on env 0.'''
     args = args or load_config(env_name)
+    args['reset_state'] = False
+    args['train']['horizon'] = 1
 
     pufferl_cpp = _C.create_pufferl(args)
 
@@ -509,4 +511,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
