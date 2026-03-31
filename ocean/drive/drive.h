@@ -959,7 +959,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         // clip acceleration & steering
         Entity* agent = &env->entities[agent_idx];
         // Extract action components directly from the multi-discrete action array
-        double (*action_array)[2] = (double(*)[2])env->actions;
+        float (*action_array)[2] = (float(*)[2])env->actions;
         int acceleration_index = action_array[action_idx][0];
         int steering_index = action_array[action_idx][1];
         float acceleration = ACCELERATION_VALUES[acceleration_index];
