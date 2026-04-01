@@ -436,24 +436,24 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
 }
  
 void c_close(MOBA* env) {
+    free(env->entities);
     free(env->reward_components);
     free(env->map->grid);
+    free(env->map->pids);
     free(env->map);
     free(env->orig_grid);
     free(env->rng->rng);
     free(env->rng);
+    free(env->ai_path_buffer);
 }
 
 void free_allocated_moba(MOBA* env) {
     free(env->rewards);
-    free(env->map->pids);
-    free(env->ai_path_buffer);
     free(env->ai_paths);
     free(env->observations);
     free(env->actions);
     free(env->terminals);
     free(env->truncations);
-    free(env->entities);
     c_close(env);
 }
 
@@ -477,30 +477,30 @@ void compute_observations(MOBA* env) {
         int x = player->x;
 
         // TODO: Add bounds debug checks asserts
-        obs_extra[0] = 2*x;
-        obs_extra[1] = 2*y;
-        obs_extra[2] = 255*player->level/30.0;
-        obs_extra[3] = 255*player->health/player->max_health;
-        obs_extra[4] = 255*player->mana/player->max_mana;
-        obs_extra[5] = player->damage / 4.0;
-        obs_extra[6] = 100*player->move_speed;
-        obs_extra[7] = player->move_modifier*100;
-        obs_extra[8] = 2*player->stun_timer;
-        obs_extra[9] = 2*player->move_timer;
-        obs_extra[10] = 2*player->q_timer;
-        obs_extra[11] = 2*player->w_timer;
-        obs_extra[12] = 2*player->e_timer;
-        obs_extra[13] = 50*player->basic_attack_timer;
-        obs_extra[14] = 50*player->basic_attack_cd;
-        obs_extra[15] = 255*player->is_hit;
-        obs_extra[16] = 255*player->team;
-        obs_extra[17 + player->hero_type] = 255;
+        obs_extra[0] = x;
+        obs_extra[1] = y;
+        obs_extra[2] = player->level;
+        obs_extra[3] = 10*player->health/player->max_health;
+        obs_extra[4] = 10*player->mana/player->max_mana;
+        obs_extra[5] = player->damage / 50.0;
+        obs_extra[6] = player->move_speed;
+        obs_extra[7] = player->move_modifier;
+        obs_extra[8] = player->stun_timer;
+        obs_extra[9] = player->move_timer;
+        obs_extra[10] = player->q_timer;
+        obs_extra[11] = player->w_timer;
+        obs_extra[12] = player->e_timer;
+        obs_extra[13] = player->basic_attack_timer;
+        obs_extra[14] = player->basic_attack_cd;
+        obs_extra[15] = player->is_hit;
+        obs_extra[16] = player->team;
+        obs_extra[17 + player->hero_type] = 1;
 
         // Assumes scaled between -1 and 1, else overflows
-        obs_extra[22] = (reward->death == 0) ? 0 : 255;
-        obs_extra[23] = (reward->xp == 0) ? 0 : 255;
-        obs_extra[24] = (reward->distance == 0) ? 0 : 255;
-        obs_extra[25] = (reward->tower == 0) ? 0 : 255;
+        obs_extra[22] = (reward->death == 0) ? 0 : 1;
+        obs_extra[23] = (reward->xp == 0) ? 0 : 1;
+        obs_extra[24] = (reward->distance == 0) ? 0 : 1;
+        obs_extra[25] = (reward->tower == 0) ? 0 : 1;
 
         for (int dy = -vis; dy <= vis; dy++) {
             for (int dx = -vis; dx <= vis; dx++) {
@@ -522,11 +522,11 @@ void compute_observations(MOBA* env) {
                     continue;
 
                 Entity* target = &env->entities[target_pid];
-                obs_map[map_idx+1] = 255*target->health/target->max_health;
+                obs_map[map_idx+1] = 10*target->health/target->max_health;
                 if (target->max_mana > 0) { // Towers do not have mana
-                    obs_map[map_idx+2] = 255*target->mana/target->max_mana;
+                    obs_map[map_idx+2] = 10*target->mana/target->max_mana;
                 }
-                obs_map[map_idx+3] = target->level/30.0;
+                obs_map[map_idx+3] = target->level;
             }
         }
     }

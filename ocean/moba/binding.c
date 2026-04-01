@@ -5,8 +5,13 @@
 #define OBS_TENSOR_T ByteTensor
 
 #define MY_VEC_INIT
+#define MY_VEC_CLOSE
 #define Env MOBA
 #include "vecenv.h"
+
+void my_vec_close(Env* envs) {
+    free(envs[0].ai_paths);
+}
 
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs) {
@@ -23,8 +28,9 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 
 
 
-    // Create shared AI path data
-    int* ai_path_buffer = calloc(3*8*128*128, sizeof(int));
+    // ai_paths (256 MB) is shared — same map, so BFS results are identical across envs.
+    // ai_path_buffer (1.5 MB) must be per-env: bfs() uses it as a scratch queue
+    // starting from index 0 on every call, so concurrent BFS calls corrupt each other.
     unsigned char* ai_paths = calloc(128*128*128*128, sizeof(unsigned char));
     for (int i = 0; i < 128*128*128*128; i++) {
         ai_paths[i] = 255;
@@ -46,7 +52,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_distance = reward_distance;
         env->reward_tower = reward_tower;
         env->script_opponents = script_opponents;
-        env->ai_path_buffer = ai_path_buffer;
+        env->ai_path_buffer = calloc(3*8*128*128, sizeof(int));
         env->ai_paths = ai_paths;
         init_moba(env, game_map_npy);
     }
