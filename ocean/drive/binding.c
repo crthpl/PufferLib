@@ -22,7 +22,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int spawn_immunity_timer = (int)dict_get(env_kwargs, "spawn_immunity_timer")->value;
     int human_agent_idx = (int)dict_get(env_kwargs, "human_agent_idx")->value;
 
-    // Verify first map exists
+    // Verify that the path has valid binaries
     char first_map[512];
     snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", MAP_BINARY_DIR, 0);
     FILE* test_fp = fopen(first_map, "rb");
@@ -45,10 +45,11 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         agents_per_map[m] = temp_env.active_agent_count < MAX_CARS
                           ? temp_env.active_agent_count : MAX_CARS;
         c_close(&temp_env);
-        //printf("  map_%03d.bin: %d agents\n", m, agents_per_map[m]);
+        //("  map_%03d.bin: %d agents\n", m, agents_per_map[m]);
     }
     printf("Scanned %d maps from %s/\n", num_maps, MAP_BINARY_DIR);
 
+    // Calculate the number of environments to initialize per buffer
     int agents_per_buffer = total_agents / num_buffers;
     int envs_per_buffer = 0;
     int agents_in_buffer = 0;
@@ -72,6 +73,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         buffer_env_counts[b] = envs_per_buffer;
     }
 
+    // Initialize the environments
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
     int actual_total_agents = 0;
 
@@ -92,7 +94,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->spawn_immunity_timer = spawn_immunity_timer;
-        env->num_agents = is_last_in_buffer ? last_map_capped_agents : agents_per_map[m];
+        // Maximum number of agents to control in this env
+        env->max_agents = is_last_in_buffer ? last_map_capped_agents : agents_per_map[m];
 
         init(env);
         actual_total_agents += env->active_agent_count;
