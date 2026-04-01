@@ -24,7 +24,7 @@ struct DroneEnv {
     float* rewards;
     float* terminals;
     int num_agents;
-    int rng;
+    unsigned int rng;
 
     int tick;
     DroneTask task;
@@ -102,15 +102,15 @@ void reset_agent(DroneEnv* env, Drone* agent, int idx) {
     agent->buffer = env->ring_buffer;
     agent->buffer_size = env->max_rings;
 
-    init_drone(agent, 0.05f);
+    init_drone(agent, &env->rng, 0.05f);
 
     agent->state.pos =
-        (Vec3){rndf(-MARGIN_X, MARGIN_X), rndf(-MARGIN_Y, MARGIN_Y), rndf(-MARGIN_Z, MARGIN_Z)};
+        (Vec3){rndf(-MARGIN_X, MARGIN_X, &env->rng), rndf(-MARGIN_Y, MARGIN_Y, &env->rng), rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
 
     if (env->task == RACE) {
         while (norm3(sub3(agent->state.pos, env->ring_buffer[0].pos)) < 2.0f * RING_RADIUS) {
-            agent->state.pos = (Vec3){rndf(-MARGIN_X, MARGIN_X), rndf(-MARGIN_Y, MARGIN_Y),
-                                      rndf(-MARGIN_Z, MARGIN_Z)};
+            agent->state.pos = (Vec3){rndf(-MARGIN_X, MARGIN_X, &env->rng), rndf(-MARGIN_Y, MARGIN_Y, &env->rng),
+                                      rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
         }
     }
 
@@ -120,13 +120,13 @@ void reset_agent(DroneEnv* env, Drone* agent, int idx) {
 
 void c_reset(DroneEnv* env) {
     if (env->task == RACE) {
-        reset_rings(env->ring_buffer, env->max_rings);
+        reset_rings(&env->rng, env->ring_buffer, env->max_rings);
     }
 
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
         reset_agent(env, agent, i);
-        set_target(env->task, env->agents, i, env->num_agents, env->hover_target_dist);
+        set_target(&env->rng, env->task, env->agents, i, env->num_agents, env->hover_target_dist);
     }
 
     compute_observations(env);
@@ -169,7 +169,7 @@ void c_step(DroneEnv* env) {
         if (reset) {
             add_log(env, i, oob, timeout);
             reset_agent(env, agent, i);
-            set_target(env->task, env->agents, i, env->num_agents, env->hover_target_dist);
+            set_target(&env->rng, env->task, env->agents, i, env->num_agents, env->hover_target_dist);
         }
     }
 
