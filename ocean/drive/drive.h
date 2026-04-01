@@ -172,6 +172,7 @@ struct Drive {
     Log log;
     Log* logs;
     int num_agents;
+    int max_agents;
     int active_agent_count;
     int* active_agent_indices;
     int human_agent_idx;
@@ -782,7 +783,7 @@ int valid_active_agent(Drive* env, int agent_idx){
     float distance_to_goal = relative_distance_2d(0, 0, rel_goal_x, rel_goal_y);
     env->entities[agent_idx].width *= 0.7f;
     env->entities[agent_idx].length *= 0.7f;
-    if(distance_to_goal >= 2.0f && env->entities[agent_idx].mark_as_expert == 0 && env->active_agent_count < env->num_agents){
+    if(distance_to_goal >= 2.0f && env->entities[agent_idx].mark_as_expert == 0 && env->active_agent_count < env->max_agents){
         return distance_to_goal;
     }
     return 0;
@@ -797,8 +798,8 @@ void set_active_agents(Drive* env){
     int static_car_indices[MAX_CARS];
     int expert_static_car_indices[MAX_CARS];
     
-    if(env->num_agents ==0){
-        env->num_agents = MAX_CARS;
+    if(env->max_agents ==0){
+        env->max_agents = MAX_CARS;
     }
     int first_agent_id = env->num_objects-1;
     float distance_to_goal = valid_active_agent(env, first_agent_id);
@@ -824,7 +825,7 @@ void set_active_agents(Drive* env){
             static_car_indices[env->static_car_count] = i;
             env->static_car_count++;
             env->entities[i].active_agent = 0;
-            if(env->entities[i].mark_as_expert == 1 || (distance_to_goal >=2.0f && env->active_agent_count == env->num_agents)){
+            if(env->entities[i].mark_as_expert == 1 || (distance_to_goal >=2.0f && env->active_agent_count == env->max_agents)){
                 expert_static_car_indices[env->expert_static_car_count] = i;
                 env->expert_static_car_count++;
                 env->entities[i].mark_as_expert = 1;
@@ -928,7 +929,7 @@ void allocate(Drive* env){
     init(env);
     int max_obs = 7 + 7*(MAX_CARS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
-    env->actions = (float*)calloc(env->active_agent_count*2, sizeof(double));
+    env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
     env->terminals = (float*)calloc(env->active_agent_count, sizeof(float));
 }
@@ -1170,7 +1171,7 @@ void respawn_agent(Drive* env, int agent_idx){
 
 void c_step(Drive* env){
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
-    memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
+    memset(env->terminals, 0, env->active_agent_count * sizeof(float));
     env->timestep++;
     if(env->timestep == TRAJECTORY_LENGTH){
         add_log(env);

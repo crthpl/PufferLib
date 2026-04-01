@@ -64,6 +64,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int last_map_capped_agents = agents_per_map[last_map_idx] - excess;
 
     int total_envs = envs_per_buffer * num_buffers;
+    printf("total envs: %d\n", total_envs);
 
     // Fill buffer info
     for (int b = 0; b < num_buffers; b++) {

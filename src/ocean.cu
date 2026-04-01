@@ -233,24 +233,36 @@ __global__ void im2col_kernel(
     col[idx] = input[b * IC * IH * IW + ic * IH * IW + ih * IW + iw];
 }
 
-// Backward: col2im — scatter-add from col back to input gradient
+// Backward: col2im — input-centric gather to avoid atomics.
+// Each thread owns one (b, ic, ih, iw) element and sums contributions from all
+// (oh, ow, kh, kw) patches that map to it.
 __global__ void col2im_kernel(
     const precision_t* __restrict__ col, precision_t* __restrict__ grad_input,
     int B, int IC, int IH, int IW, int K, int S, int OH, int OW
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * OH * OW * IC * K * K;
+    int total = B * IC * IH * IW;
     if (idx >= total) return;
-    int col_w = IC * K * K;
-    int row = idx / col_w;
-    int c = idx % col_w;
-    int b = row / (OH * OW);
-    int rem = row % (OH * OW);
-    int oh = rem / OW, ow = rem % OW;
-    int ic = c / (K * K), kk = c % (K * K);
-    int kh = kk / K, kw = kk % K;
-    int ih = oh * S + kh, iw = ow * S + kw;
-    atomicAdd_precision(&grad_input[b * IC * IH * IW + ic * IH * IW + ih * IW + iw], col[idx]);
+    int iw = idx % IW;
+    int ih = (idx / IW) % IH;
+    int ic = (idx / (IW * IH)) % IC;
+    int b  = idx / (IW * IH * IC);
+    float sum = 0.0f;
+    for (int kh = 0; kh < K; kh++) {
+        int ih_off = ih - kh;
+        if (ih_off < 0 || ih_off % S != 0) continue;
+        int oh = ih_off / S;
+        if (oh >= OH) continue;
+        for (int kw = 0; kw < K; kw++) {
+            int iw_off = iw - kw;
+            if (iw_off < 0 || iw_off % S != 0) continue;
+            int ow = iw_off / S;
+            if (ow >= OW) continue;
+            int col_idx = (b * OH * OW + oh * OW + ow) * (IC * K * K) + ic * K * K + kh * K + kw;
+            sum += to_float(col[col_idx]);
+        }
+    }
+    grad_input[idx] = from_float(sum);
 }
 
 // Transpose (B, OC, OH, OW) -> (B*OH*OW, OC)  [NCHW to row-major spatial-first]
@@ -352,8 +364,7 @@ static void gemm_conv_backward(
     // Input grad (optional): mm_buf (B*OH*OW, OC) @ weight (OC, IC*K*K) = col_grad (B*OH*OW, IC*K*K)
     if (input_grad) {
         puf_mm_nn(&mm_t, weight, &col_t, stream);  // reuse col_buf as col_grad
-        cudaMemsetAsync(input_grad, 0, (int64_t)B * IC * IH * IW * sizeof(precision_t), stream);
-        col2im_kernel<<<grid_size(total_col), BLOCK_SIZE, 0, stream>>>(
+        col2im_kernel<<<grid_size(B * IC * IH * IW), BLOCK_SIZE, 0, stream>>>(
             col_buf, input_grad, B, IC, IH, IW, K, S, OH, OW);
     }
 }
