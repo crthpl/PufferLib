@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import pufferlib
+from pufferlib.pufferl import unroll_nested_dict
 
 import torch
 import gpytorch

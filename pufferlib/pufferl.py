@@ -352,7 +352,9 @@ def sweep(env_name, args=None, pareto=False):
 
     sweep_obj = sweep_cls(sweep_config)
     num_experiments = args['sweep']['max_runs']
-    ts_config = sweep_config['train']['total_timesteps']
+    ts_default = args['train']['total_timesteps']
+    ts_config = sweep_config.get('train', {}).get('total_timesteps', {'min': ts_default, 'max': ts_default})
+    
     all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
     result_queue = mp.get_context('spawn').Queue()
 
