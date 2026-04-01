@@ -158,8 +158,8 @@ void c_step(DroneEnv* env) {
         agent->prev_potential = curr;
 
         float h = check_hover(agent, env->hover_dist, env->hover_omega, env->hover_vel);
-        agent->hover_score += h;
         agent->hover_ema = (1.0f - 0.02f) * agent->hover_ema + 0.02f * h;
+        agent->hover_score += curr;
         agent->episode_return += reward;
         env->rewards[i] = reward;
 
