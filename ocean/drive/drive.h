@@ -72,7 +72,7 @@
 #define OBS_POSITION_SCALE 0.02f
 
 // Distance thresholds
-#define MIN_DISTANCE_TO_GOAL 2.0f
+#define MIN_DISTANCE_TO_GOAL 5.0f
 #define COLLISION_DIST_SQ 225.0f
 #define OBS_DIST_SQ 2500.0f
 #define COLLISION_BOX_SCALE 0.7f
