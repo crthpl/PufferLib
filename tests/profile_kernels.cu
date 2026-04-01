@@ -36,6 +36,7 @@ void print_usage(const char* prog) {
     printf("  fusedscan      - Fused scan (checkpointed) kernel only\n");
     printf("  samplelogits   - Sample logits kernel only\n");
     printf("  ppoloss        - PPO loss fused fwd+bwd kernel\n");
+    printf("  im2col         - im2col + col2im (nmmo3 conv sizes, B=1024)\n");
     printf("  envspeed       - Environment step throughput\n");
     printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
     printf("    --threads N  - Number of threads (default: 16)\n");
@@ -524,6 +525,63 @@ void profile_samplelogits(int B, int A) {
     free(p);
 }
 
+struct Im2ColProfile {
+    PrecisionTensor input, col, grad_input;
+    Allocator alloc;
+    int B, IC, IH, IW, K, S, OH, OW;
+};
+
+Im2ColProfile* create_im2col(int B, int IC, int IH, int IW, int K, int S, int OH, int OW) {
+    auto* p = (Im2ColProfile*)calloc(1, sizeof(Im2ColProfile));
+    p->B = B; p->IC = IC; p->IH = IH; p->IW = IW;
+    p->K = K; p->S = S; p->OH = OH; p->OW = OW;
+    int in_size  = B * IC * IH * IW;
+    int col_size = B * OH * OW * IC * K * K;
+    p->input      = {.shape = {in_size}};
+    p->col        = {.shape = {col_size}};
+    p->grad_input = {.shape = {in_size}};
+    p->alloc = {};
+    alloc_register(&p->alloc, &p->input);
+    alloc_register(&p->alloc, &p->col);
+    alloc_register(&p->alloc, &p->grad_input);
+    alloc_create(&p->alloc);
+    float* buf = (float*)malloc(std::max(in_size, col_size) * sizeof(float));
+    for (int i = 0; i < in_size; ++i) buf[i] = rand1();
+    float_to_device(p->input.data, buf, in_size);
+    for (int i = 0; i < col_size; ++i) buf[i] = rand1();
+    float_to_device(p->col.data, buf, col_size);
+    free(buf);
+    return p;
+}
+
+void run_im2col(Im2ColProfile* p) {
+    int total = p->B * p->OH * p->OW * p->IC * p->K * p->K;
+    im2col_kernel<<<grid_size(total), BLOCK_SIZE>>>(
+        p->input.data, p->col.data,
+        p->B, p->IC, p->IH, p->IW, p->K, p->S, p->OH, p->OW);
+}
+
+void run_col2im(Im2ColProfile* p) {
+    int total = p->B * p->IC * p->IH * p->IW;
+    col2im_kernel<<<grid_size(total), BLOCK_SIZE>>>(
+        p->col.data, p->grad_input.data,
+        p->B, p->IC, p->IH, p->IW, p->K, p->S, p->OH, p->OW);
+}
+
+void profile_im2col(int B, int IC, int IH, int IW, int K, int S, int OH, int OW) {
+    int total = B * OH * OW * IC * K * K;
+    printf("im2col/col2im (B=%d, IC=%d, %dx%d, K=%d, S=%d -> %dx%d)\n",
+           B, IC, IH, IW, K, S, OH, OW);
+    auto* p = create_im2col(B, IC, IH, IW, K, S, OH, OW);
+    float fwd = profile_kernel((kernel_fn)run_im2col, p);
+    print_timing("im2col", fwd, total);
+    float bwd = profile_kernel((kernel_fn)run_col2im, p);
+    print_timing("col2im", bwd, total);
+    printf("\n");
+    alloc_free(&p->alloc);
+    free(p);
+}
+
 static void empty_net_callback(void* ctx, int buf, int t) {
     (void)ctx; (void)buf; (void)t;
 }
@@ -661,6 +719,10 @@ int main(int argc, char** argv) {
         profile_samplelogits(BR, A_);
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "ppoloss") == 0 || run_all)
         profile_ppoloss(BT, T_, A_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "im2col") == 0 || run_all) {
+        profile_im2col(1024, N3_C1_IC, N3_MAP_H, N3_MAP_W, N3_C1_K, N3_C1_S, N3_C1_OH, N3_C1_OW);
+        profile_im2col(1024, N3_C2_IC, N3_C1_OH, N3_C1_OW, N3_C2_K, N3_C2_S, N3_C2_OH, N3_C2_OW);
+    }
 
     if (strcmp(profile, "envspeed") == 0 || run_all)
         profile_envspeed(total_agents, buffers, threads, horizon);
@@ -672,6 +734,7 @@ int main(int argc, char** argv) {
         && strcmp(profile, "fusedscan") != 0
         && strcmp(profile, "samplelogits") != 0
         && strcmp(profile, "ppoloss") != 0
+        && strcmp(profile, "im2col") != 0
         && strcmp(profile, "envspeed") != 0
     ) {
         printf("Unknown profile: %s\n\n", profile);

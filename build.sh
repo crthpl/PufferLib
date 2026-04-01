@@ -182,8 +182,8 @@ clang -c $CLANG_OPT \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
-OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep -o '[A-Za-z]*Tensor$' | head -1)
-[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T" && exit 1
+OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
+[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC" && exit 1
 echo "OBS_TENSOR_T=$OBS_TENSOR_T"
 
 # Step 2: Profile binary or Python bindings
@@ -191,14 +191,14 @@ if [ "$MODE" = "profile" ]; then
     ARCH=${NVCC_ARCH:-sm_89}
     echo "=== Building profile binary (arch=$ARCH) ==="
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -I$SRC_DIR \
+        -I. -Isrc -I$SRC_DIR -I./vendor \
         -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
-        tests/profile_kernels.cu ini.c \
+        tests/profile_kernels.cu vendor/ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
         -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
         -lGL -lm -lpthread -lomp5 \

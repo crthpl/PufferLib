@@ -1,4 +1,5 @@
 #nsys profile --force-overwrite true --capture-range=cudaProfilerApi --cuda-graph-trace=node --sample=none -o profile python -m pufferlib.pufferl train breakout --vec.num-buffers 1 --profile True
+nsys profile --force-overwrite true --capture-range=cudaProfilerApi --cuda-graph-trace=node --sample=none -o profile python -m pufferlib.pufferl train nmmo3 --vec.num-buffers 1 --profile True
 echo "All kernels"
 nsys stats --report cuda_gpu_kern_sum:base --force-export=true profile.nsys-rep
 echo "NVTX tags"

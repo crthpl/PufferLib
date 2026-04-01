@@ -4,7 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include <time.h> // xxd -i game_map.npy > game_map.h #include "game_map.h"
+#include <time.h> // xxd -i game_map.npy > game_map.h
+#include "game_map.h"
 
 #include "raylib.h"
 
@@ -341,7 +342,6 @@ struct MOBA {
     GameRenderer* client;
     int vision_range;
     float agent_speed;
-    bool discretize;
     bool script_opponents;
     int obs_size;
     int creep_idx;
@@ -353,7 +353,7 @@ struct MOBA {
     unsigned char* ai_paths;
     int* ai_path_buffer;
     unsigned char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     unsigned char* truncations;
@@ -382,6 +382,7 @@ struct MOBA {
 
 void add_log(MOBA* env, int radiant_victory, int dire_victory) {
     Log* log = &env->log;
+    int num_agents = env->script_opponents ? 5 : NUM_PLAYERS;
     log->n += 1;
     log->score += radiant_victory;
     log->perf += radiant_victory;
@@ -401,6 +402,15 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
         } else {
             log->dire_towers_alive += tower->health > 0;
         }
+    }
+
+    for (int i = 0; i < num_agents; i++) {
+        PlayerLog* pl = &env->player_logs[i];
+        log->episode_return += pl->episode_return;
+        log->reward_death += pl->reward_death;
+        log->reward_xp += pl->reward_xp;
+        log->reward_distance += pl->reward_distance;
+        log->reward_tower += pl->reward_tower;
     }
 
     PlayerLog* radiant_support = &env->player_logs[0];
@@ -1490,11 +1500,11 @@ void step_players(MOBA* env) {
             }
             */
         } else {
-            double (*actions)[6] = (double(*)[6])env->actions;
+            float (*actions)[6] = (float(*)[6])env->actions;
             //float vel_y = (actions[pid][0] > 0) ? 1 : -1;
             //float vel_x = (actions[pid][1] > 0) ? 1 : -1;
-            float vel_y = actions[pid][0] / 300.0;
-            float vel_x = actions[pid][1] / 300.0;
+            float vel_y = (actions[pid][0] - 3.0f) / 3.0f;
+            float vel_x = (actions[pid][1] - 3.0f) / 3.0f;
             float mag = sqrtf(vel_y*vel_y + vel_x*vel_x);
             if (mag > 1) {
                 vel_y /= mag;
@@ -1789,12 +1799,11 @@ MOBA* allocate_moba(MOBA* env) {
     // TODO: Don't hardcode sizes
     int agents = (env->script_opponents) ? NUM_PLAYERS/2 : NUM_PLAYERS;
     env->observations = calloc(agents*(11*11*4 + 26), sizeof(unsigned char));
-    env->actions = calloc(agents*6, sizeof(double));
+    env->actions = calloc(agents*6, sizeof(float));
     env->rewards = calloc(agents, sizeof(float));
     env->terminals = calloc(agents, sizeof(float));
     env->truncations = calloc(agents, sizeof(unsigned char));
 
-    unsigned char* game_map_npy = read_file("resources/moba/game_map.npy");
     env->ai_path_buffer = calloc(3*8*128*128, sizeof(int));
     env->ai_paths = calloc(128*128*128*128, sizeof(unsigned char));
     for (int i = 0; i < 128*128*128*128; i++) {
@@ -1802,7 +1811,6 @@ MOBA* allocate_moba(MOBA* env) {
     }
 
     init_moba(env, game_map_npy);
-    free(game_map_npy);
     return env;
 }
  
@@ -2116,9 +2124,7 @@ GameRenderer* init_game_renderer(int cell_size, int width, int height) {
     return renderer;
 }
 
-//def render(self, grid, pids, entities, obs_players, actions, discretize, frames):
 #define FRAMES 12
-
 void draw_bars(Entity* entity, int x, int y, int width, int height, bool draw_text) {
     float health_bar = entity->health / entity->max_health;
     float mana_bar = entity->mana / entity->max_mana;
@@ -2193,7 +2199,7 @@ int c_render(MOBA* env) {
 
     int human = renderer->human_player;
     bool HUMAN_CONTROL = IsKeyDown(KEY_LEFT_SHIFT);
-    double (*actions)[6] = (double(*)[6])env->actions;
+    float (*actions)[6] = (float(*)[6])env->actions;
 
     // Clears so as to not let the nn spam actions
     if (HUMAN_CONTROL && frame % 12 == 0) {
