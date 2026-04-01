@@ -153,7 +153,7 @@ void trigger_banner(Client* client, int type);
 struct CTowerClimb {
     Client* client;
     unsigned char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     unsigned char* truncations;
@@ -182,6 +182,7 @@ struct CTowerClimb {
     float visitedTimes[100];    // Time when each position was visited
     int visitedCount;
     int visitedIndex;
+    unsigned int rng;
 };
 
 void add_log(CTowerClimb* env) {
@@ -236,16 +237,15 @@ CTowerClimb* allocate() {
     CTowerClimb* env = (CTowerClimb*)calloc(1, sizeof(CTowerClimb));
     init(env);
     env->observations = (unsigned char*)calloc(OBS_VISION+PLAYER_OBS, sizeof(unsigned char));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
     return env;
 }
 
 void c_close(CTowerClimb* env) {
-	free_level(env->level);
-	free_puzzle_state(env->state);
-    free(env);
+    free_level(env->level);
+    free_puzzle_state(env->state);
 }
 
 void free_allocated(CTowerClimb* env) {
@@ -254,6 +254,7 @@ void free_allocated(CTowerClimb* env) {
     free(env->terminals);
     free(env->rewards);
     c_close(env);
+    free(env);
 }
 
 void calculate_window_bounds(int* bounds, int center_pos, int window_size, int max_size) {
@@ -341,7 +342,7 @@ void c_reset(CTowerClimb* env) {
     // Always use pre-generated maps (ensure at least 1 exists during initialization)
     // printf("num maps: %d\n", env->num_maps);
     if (env->num_maps > 0) {
-        int idx = rand() % env->num_maps;
+        int idx = rand_r(&env->rng) % env->num_maps;
         setPuzzle(env, &env->all_puzzles[idx], &env->all_levels[idx]);
     } else {
         // Emergency fallback: use a simple default level
@@ -1130,7 +1131,7 @@ int verify_level(Level* level, int max_moves, int min_moves){
     return solvable;
 }
 
-void gen_level(Level* lvl, int goal_level) {
+void gen_level(Level* lvl, int goal_level, unsigned int* rng) {
     // Initialize an illegal level in case we need to return early
     int legal_width_size = 8;
     int legal_depth_size = 8;
@@ -1146,7 +1147,7 @@ void gen_level(Level* lvl, int goal_level) {
                 int within_legal_bounds = x>=1 && x < legal_width_size && z >= 1 && z < legal_depth_size && y>=1 && y < goal_level;
                 int allowed_block_placement = within_legal_bounds && (z <= (legal_depth_size - y));
                 if (allowed_block_placement){
-                    int chance = (rand() % 2 ==0) ? 1 : 0;
+                    int chance = (rand_r(rng) % 2 ==0) ? 1 : 0;
                     if (chance) SET_BIT(lvl->map, block_index);
                     // create spawn point above an existing block
                     if (spawn_created == 0 && y == 2 && TEST_BIT(lvl->map, block_index - area)){
@@ -1160,7 +1161,7 @@ void gen_level(Level* lvl, int goal_level) {
                      TEST_BIT(lvl->map, block_index - 1 - area) || 
                      TEST_BIT(lvl->map, block_index + 1 - area))) {
                     // 33% chance to place goal here, unless we're at the last valid position
-                    if (rand() % 3 == 0 || (x == col_max-1 && z == 0)) {
+                    if (rand_r(rng) % 3 == 0 || (x == col_max-1 && z == 0)) {
                         goal_created = 1;
                         goal_index = block_index;
                     }
@@ -1183,26 +1184,23 @@ void gen_level(Level* lvl, int goal_level) {
 }
 
 void init_random_level(CTowerClimb* env, int goal_level, int max_moves, int min_moves, int seed) {
-	time_t t;
-    srand((unsigned) time(&t) + seed); // Increment seed for each level
     reset_level(env->level);
-    gen_level(env->level, goal_level);
+    gen_level(env->level, goal_level, &env->rng);
     // guarantee a map is created
     while(env->level->spawn_location == 0 || env->level->goal_location == 999 || verify_level(env->level,max_moves, min_moves) == 0){
         reset_level(env->level);
-        gen_level(env->level,goal_level);
+        gen_level(env->level, goal_level, &env->rng);
     }
     levelToPuzzleState(env->level, env->state);
 }
 
 void cy_init_random_level(Level* level, int goal_level, int max_moves, int min_moves, int seed) {
-    time_t t;
-    srand((unsigned) time(&t) + seed); // Increment seed for each level
-    gen_level(level, goal_level);
+    unsigned int rng = (unsigned int)seed;
+    gen_level(level, goal_level, &rng);
     // guarantee a map is created
     while(level->spawn_location == 0 || level->goal_location == 999 || verify_level(level,max_moves, min_moves) == 0){
         reset_level(level);
-        gen_level(level, goal_level);
+        gen_level(level, goal_level, &rng);
     }
 }
 
