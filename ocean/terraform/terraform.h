@@ -41,8 +41,6 @@ const unsigned char TARGET = 2;
 #define OBSERVATION_SIZE (2*VISION + 1)
 #define TOTAL_OBS (OBSERVATION_SIZE*OBSERVATION_SIZE + 4)
 #define DOZER_STEP_HEIGHT 5.0f 
-struct timespec ts;
-
 typedef struct Log Log;
 struct Log {
     float perf;
@@ -76,7 +74,7 @@ typedef struct Terraform {
     Client* client;
     Dozer* dozers;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* returns;
     float* terminals;
@@ -102,10 +100,11 @@ typedef struct Terraform {
     float* volume_deltas;
     float* quadrant_volume_deltas;
     float* quadrant_centroids;
+    unsigned int rng;
 } Terraform;
 
-float randf(float min, float max) {
-    return min + (max - min)*(float)rand()/(float)RAND_MAX;
+float randf(unsigned int* rng, float min, float max) {
+    return min + (max - min)*(float)rand_r(rng)/(float)RAND_MAX;
 }
 
 void perlin_noise(float* map, int width, int height,
@@ -265,22 +264,16 @@ void init(Terraform* env) {
         env->dozers[i].quadrant_progress = 0.0f;
         env->dozers[i].highest_quadrant_progress = 0.0f;
     }
-    clock_gettime(CLOCK_REALTIME, &ts);
-    unsigned int base_seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ getpid());
-    unsigned int seed1 = base_seed;
-    unsigned int seed2 = base_seed + 99991;
-    srand(seed1);
-    int offset_x1 = rand() % 10000;
-    int offset_y1 = rand() % 10000;
-    srand(seed2);
-    int offset_x2 = rand() % 10000;
-    int offset_y2 = rand() % 10000;
+    int offset_x1 = rand_r(&env->rng) % 10000;
+    int offset_y1 = rand_r(&env->rng) % 10000;
+    int offset_x2 = rand_r(&env->rng) % 10000;
+    int offset_y2 = rand_r(&env->rng) % 10000;
     perlin_noise(env->orig_map, env->size, env->size, 1.0/(env->size / 4.0), 8, offset_x1, offset_y1, MAX_DIRT_HEIGHT+20);
     // perlin_noise(env->target_map, env->size, env->size, 1.0/(env->size / 4.0), 8, offset_x2, offset_y2, MAX_DIRT_HEIGHT+55);
     env->returns = calloc(env->num_agents, sizeof(float));
     calculate_total_delta(env);
     env->stuck_count = calloc(env->num_agents, sizeof(int));
-    env->tick = rand() % 512;
+    env->tick = rand_r(&env->rng) % 512;
     env->quadrants_solved = 0.0f;
 }
 
@@ -386,7 +379,7 @@ void c_reset(Terraform* env) {
     memcpy(env->quadrant_volume_deltas, env->volume_deltas, env->num_quadrants*sizeof(float));
     memset(env->complete_quadrants, 0, env->num_quadrants*sizeof(int));
 
-    int num_quadrants_to_precomplete = rand() % 5 + 25; // e.g. 30 to 34
+    int num_quadrants_to_precomplete = rand_r(&env->rng) % 5 + 25; // e.g. 30 to 34
     
     // Create array of available quadrants
     int available[env->num_quadrants];
@@ -451,8 +444,8 @@ void c_reset(Terraform* env) {
         temp.load_indices = env->dozers[i].load_indices;
         env->dozers[i] = temp;
         do {
-            env->dozers[i].x = rand() % env->size;
-            env->dozers[i].y = rand() % env->size;
+            env->dozers[i].x = rand_r(&env->rng) % env->size;
+            env->dozers[i].y = rand_r(&env->rng) % env->size;
         } while (env->map[map_idx(env, env->dozers[i].x, env->dozers[i].y)] != 0.0f);
         for (int j = 0; j < (2*SCOOP_SIZE + 1)*(2*SCOOP_SIZE + 1); j++) {
             env->dozers[i].load_indices[j] = -1;
@@ -578,11 +571,11 @@ void c_step(Terraform* env) {
 
     memset(env->terminals, 0, env->num_agents*sizeof(float));
     memset(env->rewards, 0, env->num_agents*sizeof(float));
-    double (*actions)[3] = (double(*)[3])env->actions;
+    float (*actions)[3] = (float(*)[3])env->actions;
     for (int i = 0; i < env->num_agents; i++) {
         env->agent_logs[i].episode_length = env->tick;
         Dozer* dozer = &env->dozers[i];
-        double* atn = actions[i];
+        float* atn = actions[i];
         float accel = (atn[0] - 2.0) / 2.0; // Discrete(5) -> [-1, 1]
         float steer = (atn[1] - 2.0) / 10.0; // Discrete(5) -> [-0.2, 0.2]
         int bucket_atn = (int)atn[2];
@@ -676,8 +669,8 @@ void c_step(Terraform* env) {
         // Teleportitis
         if (env->tick % 512 == 0) {
              do {
-                 env->dozers[i].x = rand() % env->size;
-                 env->dozers[i].y = rand() % env->size;
+                 env->dozers[i].x = rand_r(&env->rng) % env->size;
+                 env->dozers[i].y = rand_r(&env->rng) % env->size;
                  env->stuck_count[i] = 0;
              } while (env->map[map_idx(env, env->dozers[i].x, env->dozers[i].y)] != 0.0f);
         }
