@@ -18,26 +18,22 @@ typedef struct Client Client;
 typedef struct DroneEnv DroneEnv;
 
 struct DroneEnv {
+    Log log;
     float* observations;
     float* actions;
     float* rewards;
-    unsigned char* terminals;
-
-    Log log;
-    int tick;
-
-    DroneTask task;
-    char* task_arg;
+    float* terminals;
     int num_agents;
+    int rng;
+
+    int tick;
+    DroneTask task;
     Drone* agents;
 
     int max_rings;
     Target* ring_buffer;
 
     Client* client;
-
-    int env_index;
-    int num_envs;
 
     // reward scaling
     float alpha_dist;
@@ -50,17 +46,9 @@ struct DroneEnv {
     float hover_dist;
     float hover_omega;
     float hover_vel;
-
-    int num_obs;
 };
 
 void init(DroneEnv* env) {
-    if (env->task_arg) {
-        env->task = get_task(env->task_arg);
-    } else {
-        env->task = HOVER;
-    }
-
     env->agents = (Drone*)calloc(env->num_agents, sizeof(Drone));
     env->ring_buffer = (Target*)calloc(env->max_rings, sizeof(Target));
 
@@ -70,7 +58,7 @@ void init(DroneEnv* env) {
     }
 
     env->log = (Log){0};
-    env->tick = (HORIZON * env->env_index) / env->num_envs;
+    env->tick = 0;
 }
 
 void add_log(DroneEnv* env, int idx, bool oob, bool timeout) {
@@ -98,7 +86,7 @@ void add_log(DroneEnv* env, int idx, bool oob, bool timeout) {
 
 void compute_observations(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++) {
-        compute_drone_observations(&env->agents[i], env->observations + i*env->num_obs);
+        compute_drone_observations(&env->agents[i], env->observations + i*23);
     }
 }
 
@@ -176,7 +164,7 @@ void c_step(DroneEnv* env) {
         env->rewards[i] = reward;
 
         bool reset = oob || timeout;
-        env->terminals[i] = reset ? 1 : 0;
+        env->terminals[i] = reset ? 1.0f : 0.0f;
 
         if (reset) {
             add_log(env, i, oob, timeout);

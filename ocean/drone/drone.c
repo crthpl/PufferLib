@@ -164,15 +164,12 @@ int main() {
     env->hover_dist = 0.05f;
     env->hover_omega = 0.05;
     env->hover_vel = 0.01;
-    env->num_obs = obs_size;
-    env->num_envs = 1;
-    env->env_index = 0;
     init(env);
 
     env->observations = (float*)calloc(env->num_agents * obs_size, sizeof(float));
     env->actions = (float*)calloc(env->num_agents * act_size, sizeof(float));
     env->rewards = (float*)calloc(env->num_agents, sizeof(float));
-    env->terminals = (unsigned char*)calloc(env->num_agents, sizeof(float));
+    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 
     Weights* weights = load_weights("resources/drone/puffer_drone_weights.bin", 4841);
     int logit_sizes[1] = {4};
