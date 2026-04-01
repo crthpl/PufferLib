@@ -233,7 +233,6 @@ void demo() {
         .reward_vehicle_collision = -0.1f,
         .reward_offroad_collision = -0.1f,
 	    .map_name = "resources/drive/binaries/map_942.bin",
-        .spawn_immunity_timer = 50
     };
     allocate(&env);
     c_reset(&env);

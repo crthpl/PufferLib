@@ -19,7 +19,6 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_offroad_collision = dict_get(env_kwargs, "reward_offroad_collision")->value;
     float reward_goal_post_respawn = dict_get(env_kwargs, "reward_goal_post_respawn")->value;
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn")->value;
-    int spawn_immunity_timer = (int)dict_get(env_kwargs, "spawn_immunity_timer")->value;
     int human_agent_idx = (int)dict_get(env_kwargs, "human_agent_idx")->value;
 
     // Verify that the path has valid binaries
@@ -42,8 +41,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         temp_env.map_name = map_file;
         temp_env.num_agents = 0;
         init(&temp_env);
-        agents_per_map[m] = temp_env.active_agent_count < MAX_CARS
-                          ? temp_env.active_agent_count : MAX_CARS;
+        agents_per_map[m] = temp_env.active_agent_count < MAX_AGENTS
+                          ? temp_env.active_agent_count : MAX_AGENTS;
         c_close(&temp_env);
         //("  map_%03d.bin: %d agents\n", m, agents_per_map[m]);
     }
@@ -93,7 +92,6 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_offroad_collision = reward_offroad_collision;
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
-        env->spawn_immunity_timer = spawn_immunity_timer;
         // Maximum number of agents to control in this env
         env->max_agents = is_last_in_buffer ? last_map_capped_agents : agents_per_map[m];
 
@@ -114,7 +112,6 @@ void my_init(Env* env, Dict* kwargs) {
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision")->value;
     env->reward_goal_post_respawn = dict_get(kwargs, "reward_goal_post_respawn")->value;
     env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn")->value;
-    env->spawn_immunity_timer = dict_get(kwargs, "spawn_immunity_timer")->value;
     int map_id = dict_get(kwargs, "map_id")->value;
     int max_agents = dict_get(kwargs, "max_agents")->value;
 
