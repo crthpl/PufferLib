@@ -64,6 +64,9 @@ struct Log {
     float timeout;
     float score;
     float perf;
+    float ema_dist;
+    float ema_vel;
+    float ema_omega;
     float n;
 };
 
@@ -146,6 +149,9 @@ typedef struct {
     float hover_score;
     float prev_potential;
     float hover_ema;
+    float ema_dist;
+    float ema_vel;
+    float ema_omega;
 } Drone;
 
 static inline float clampf(float v, float min, float max) {
@@ -542,13 +548,12 @@ float check_hover(Drone* agent, float hover_dist, float hover_omega, float hover
     float vel = norm3(agent->state.vel);
     float omega = norm3(agent->state.omega);
 
-    if (dist >= hover_dist || vel >= hover_vel || omega >= hover_omega)
-        return 0.0f;
+    float d = dist / (hover_dist * 10.0f);
+    float v = vel / (hover_vel * 10.0f);
+    float w = omega / (hover_omega * 10.0f);
 
-    return 1.0f
-        - 0.7f * (dist / hover_dist)
-        - 0.15f * (vel / hover_vel)
-        - 0.15f * (omega / hover_omega);
+    float score = 1.0f - 0.7f * d - 0.15f * v - 0.15f * w;
+    return score > 0.0f ? score : 0.0f;
 }
 
 void compute_drone_observations(Drone* agent, float* observations) {
