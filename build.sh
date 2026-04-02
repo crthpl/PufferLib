@@ -4,18 +4,22 @@ set -e
 # Usage:
 #   ./build.sh breakout              # Build _C.so with breakout statically linked
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
-#   ./buils.sh breakout --cpu        # CPU fallback, torch only
+#   ./build.sh breakout --cpu        # CPU fallback, torch only
 #   ./build.sh breakout --debug      # Debug build
 #   ./build.sh breakout --local      # Standalone executable (debug, sanitizers)
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
 #   ./build.sh breakout --web        # Emscripten web build
 #   ./build.sh breakout --profile    # Kernel profiling binary
+#   ./build.sh all                   # Build all envs with default and --float
 
-ENV=${1:?Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile|--cpu]}
-MODE=""
-PRECISION=""
-DEBUG=""
-for arg in "${@:2}"; do
+if [ -z "$1" ]; then
+    echo "Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile|--cpu|--all]"
+    exit 1
+fi
+ENV=$1
+shift
+
+for arg in "$@"; do
     case $arg in
         --float) PRECISION="-DPRECISION_FLOAT" ;;
         --debug) DEBUG=1 ;;
@@ -28,76 +32,83 @@ for arg in "${@:2}"; do
     esac
 done
 
-CLANG_WARN="\
-    -Wall \
-    -ferror-limit=3 \
-    -Werror=incompatible-pointer-types \
-    -Werror=return-type \
-    -Wno-error=incompatible-pointer-types-discards-qualifiers \
-    -Wno-incompatible-pointer-types-discards-qualifiers \
-    -Wno-error=array-parameter"
+if [ "$ENV" = "all" ]; then
+    FAILED=""
+    for env_dir in ocean/*/; do
+        env=$(basename "$env_dir")
+        if bash "$0" "$env" && bash "$0" "$env" --float; then
+            echo "OK: $env"
+        else
+            echo "FAIL: $env"
+            FAILED="$FAILED\n  $env"
+        fi
+    done
 
+    if [ -n "$FAILED" ]; then
+        echo -e "\nFailed builds:$FAILED"
+        exit 1
+    fi
+    exit 0
+fi
+
+# Linux/mac
 PLATFORM="$(uname -s)"
-
-if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
-    CLANG_OPT="-g -O0 $CLANG_WARN"
-    NVCC_OPT="-O0 -g"
-    LINK_OPT="-g"
-    [ "$PLATFORM" = "Linux" ] && CLANG_OPT="$CLANG_OPT -fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer"
-else
-    CLANG_OPT="-O2 -DNDEBUG $CLANG_WARN"
-    NVCC_OPT="-O3"
-    LINK_OPT="-O2"
-fi
-
-# ============================================================================
-# Platform + dependencies
-# ============================================================================
-if [ -d "ocean/$ENV" ]; then
-    SRC_DIR="ocean/$ENV"
-elif [ -d "$ENV" ]; then
-    SRC_DIR="$ENV"
-else
-    echo "Error: environment '$ENV' not found" && exit 1
-fi
-
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
+    OMP_LIB=-lomp5
+    SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
+    STANDALONE_LDFLAGS=(-lGL)
+    SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
+    OMP_LIB=-lomp
+    SANITIZE_FLAGS=()
+    STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
+    SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
 fi
 
-RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
+CLANG_WARN=(
+    -Wall
+    -ferror-limit=3
+    -Werror=incompatible-pointer-types
+    -Werror=return-type
+    -Wno-error=incompatible-pointer-types-discards-qualifiers
+    -Wno-incompatible-pointer-types-discards-qualifiers
+    -Wno-error=array-parameter
+)
 
 download() {
     local name=$1 url=$2
     [ -d "$name" ] && return
     echo "Downloading $name..."
-    if [[ "$url" == *.zip ]]; then
-        curl -sL "$url" -o "$name.zip" && unzip -q "$name.zip" && rm "$name.zip"
-    else
-        curl -sL "$url" -o "$name.tar.gz" && tar xf "$name.tar.gz" && rm "$name.tar.gz"
-    fi
+    case "$url" in
+        *.zip) curl -sL "$url" -o "$name.zip" && unzip -q "$name.zip" && rm "$name.zip" ;;
+        *)     curl -sL "$url" -o "$name.tar.gz" && tar xf "$name.tar.gz" && rm "$name.tar.gz" ;;
+    esac
 }
 
-# Raylib (always needed)
+RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
 if [ "$MODE" = "web" ]; then
     RAYLIB_NAME='raylib-5.5_webassembly'
     download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.zip"
 else
     download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.tar.gz"
 fi
-[ ! -f "$RAYLIB_NAME/include/rlights.h" ] && \
-    curl -sL "https://raw.githubusercontent.com/raysan5/raylib/master/examples/shaders/rlights.h" \
-        -o "$RAYLIB_NAME/include/rlights.h"
 
 RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
-INCLUDES=(-I./$RAYLIB_NAME/include -I./src)
-LINK_ARCHIVES="$RAYLIB_A"
+INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
+LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
 
-# Box2d (impulse_wars only)
-if [ "$ENV" = "impulse_wars" ]; then
+if [ "$ENV" = "constellation" ]; then
+    SRC_DIR="constellation"
+    EXTRA_SRC="vendor/cJSON.c"
+    OUTPUT_NAME="seethestars"
+elif [ "$ENV" = "trailer" ]; then
+    SRC_DIR="trailer"
+    OUTPUT_NAME="trailer/trailer"
+elif [ "$ENV" = "impulse_wars" ]; then
+    SRC_DIR="ocean/$ENV"
     if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
     elif [ "$PLATFORM" = "Linux" ]; then BOX2D_NAME='box2d-linux-amd64'
     else BOX2D_NAME='box2d-macos-arm64'
@@ -105,27 +116,49 @@ if [ "$ENV" = "impulse_wars" ]; then
     BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
     download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
     INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src)
-    LINK_ARCHIVES="$LINK_ARCHIVES ./$BOX2D_NAME/libbox2d.a"
+    LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
+elif [ -d "ocean/$ENV" ]; then
+    SRC_DIR="ocean/$ENV"
+else
+    echo "Error: environment '$ENV' not found" && exit 1
 fi
 
-# Constellation needs cJSON
-[ "$ENV" = "constellation" ] && EXTRA_SRC="vendor/cJSON.c" && INCLUDES+=(-I./vendor) && OUTPUT_NAME="seethestars"
-[ "$ENV" = "trailer" ] && INCLUDES+=(-I./vendor) && OUTPUT_NAME="trailer/trailer"
+OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 
-# ============================================================================
-# Standalone builds: --local, --fast, --web
-# ============================================================================
-
-if [ "$MODE" = "web" ]; then
-    [ ! -f "minshell.html" ] && \
+# Standalone environment build
+if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
+    CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}")
+    NVCC_OPT="-O0 -g"
+    LINK_OPT="-g"
+else
+    CLANG_OPT=(-O2 -DNDEBUG "${CLANG_WARN[@]}")
+    NVCC_OPT="-O2 --threads 0"
+    LINK_OPT="-O2"
+fi
+if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
+    FLAGS=(
+        "${INCLUDES[@]}"
+        "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
+        "${LINK_ARCHIVES[@]}"
+        "${STANDALONE_LDFLAGS[@]}"
+        -lm -lpthread -fopenmp
+        -DPLATFORM_DESKTOP
+    )
+    echo "Compiling $ENV..."
+    ${CC:-clang} "${CLANG_OPT[@]}" "${FLAGS[@]}"
+    echo "Built: ./$OUTPUT_NAME"
+    exit 0
+elif [ "$MODE" = "web" ]; then
+    if [ ! -f "minshell.html" ]; then
         curl -sL "https://raw.githubusercontent.com/raysan5/raylib/master/src/minshell.html" -o minshell.html
+    fi
     mkdir -p "build_web/$ENV"
-    echo "Building $ENV for web..."
+    echo "Compiling $ENV for web..."
     emcc \
         -o "build_web/$ENV/game.html" \
         "$SRC_DIR/$ENV.c" $EXTRA_SRC \
         -O3 -Wall \
-        $LINK_ARCHIVES \
+        "${LINK_ARCHIVES[@]}" \
         "${INCLUDES[@]}" \
         -L. -L./$RAYLIB_NAME/lib \
         -sASSERTIONS=2 -gsource-map \
@@ -139,28 +172,31 @@ if [ "$MODE" = "web" ]; then
     exit 0
 fi
 
-if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
-    FLAGS=(
-        "${INCLUDES[@]}"
-        "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "${OUTPUT_NAME:-$ENV}"
-        $LINK_ARCHIVES
-        -lGL -lm -lpthread -fopenmp
-        -DPLATFORM_DESKTOP
-    )
-    [ "$PLATFORM" = "Darwin" ] && FLAGS+=(-framework Cocoa -framework IOKit -framework CoreVideo)
-    clang $CLANG_OPT "${FLAGS[@]}"
-    echo "Built: ./${OUTPUT_NAME:-$ENV}"
-    exit 0
+# Find cuDNN path
+CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
+CUDNN_IFLAG=""
+CUDNN_LFLAG=""
+for dir in /usr/local/cuda/include /usr/include; do
+    if [ -f "$dir/cudnn.h" ]; then
+        CUDNN_IFLAG="-I$dir"
+        break
+    fi
+done
+for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
+    if [ -f "$dir/libcudnn.so" ]; then
+        CUDNN_LFLAG="-L$dir"
+        break
+    fi
+done
+if [ -z "$CUDNN_IFLAG" ]; then
+    CUDNN_IFLAG=$(python -c "import nvidia.cudnn, os; print('-I' + os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
+fi
+if [ -z "$CUDNN_LFLAG" ]; then
+    CUDNN_LFLAG=$(python -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
-# ============================================================================
-# Default: build _C.so with env statically linked
-# ============================================================================
-
-CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname $(dirname $(which nvcc)))}}
-CUDNN_INCLUDE=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
-CUDNN_LIB=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
-NVCC="$CUDA_HOME/bin/nvcc"
+NVCC="ccache $CUDA_HOME/bin/nvcc"
+ARCH=${NVCC_ARCH:-native}
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
 PYBIND_INCLUDE=$(python -c "import pybind11; print(pybind11.get_include())")
@@ -168,14 +204,17 @@ NUMPY_INCLUDE=$(python -c "import numpy; print(numpy.get_include())")
 EXT_SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 OUTPUT="pufferlib/_C${EXT_SUFFIX}"
 
-# Step 1: Static env library
 BINDING_SRC="$SRC_DIR/binding.c"
 STATIC_OBJ="src/libstatic_${ENV}.o"
 STATIC_LIB="src/libstatic_${ENV}.a"
-[ ! -f "$BINDING_SRC" ] && echo "Error: $BINDING_SRC not found" && exit 1
 
-echo "=== Building static env: $ENV ==="
-clang -c $CLANG_OPT \
+if [ ! -f "$BINDING_SRC" ]; then
+    echo "Error: $BINDING_SRC not found"
+    exit 1
+fi
+
+echo "Compiling static library for $ENV..."
+${CC:-clang} -c "${CLANG_OPT[@]}" \
     -I. -Isrc -I$SRC_DIR \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
@@ -185,33 +224,42 @@ clang -c $CLANG_OPT \
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
-[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC" && exit 1
-echo "OBS_TENSOR_T=$OBS_TENSOR_T"
-
-# Step 2: Profile binary or Python bindings
-if [ "$MODE" = "profile" ]; then
-    ARCH=${NVCC_ARCH:-sm_89}
-    echo "=== Building profile binary (arch=$ARCH) ==="
-    $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -I$SRC_DIR -I./vendor \
-        -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
-        -DOBS_TENSOR_T=$OBS_TENSOR_T \
-        -DENV_NAME=$ENV \
-        -Xcompiler=-DPLATFORM_DESKTOP \
-        $PRECISION \
-        -Xcompiler=-fopenmp \
-        tests/profile_kernels.cu vendor/ini.c \
-        "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
-        -lGL -lm -lpthread -lomp5 \
-        -o profile
-    echo "=== Built: ./profile ==="
-    exit 0
+if [ -z "$OBS_TENSOR_T" ]; then
+    echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC"
+    exit 1
 fi
 
-if [ "$MODE" = "cpu" ]; then
-    echo "=== Compiling bindings_cpu.cpp ==="
-    g++ -c -fPIC -fopenmp \
+if [ -z "$MODE" ]; then
+    echo "Compiling CUDA ($ARCH) training backend..."
+    $NVCC -c -arch=$ARCH -Xcompiler -fPIC \
+        -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
+        -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
+        -Xcompiler=-DPLATFORM_DESKTOP \
+        -std=c++17 \
+        -I. -Isrc \
+        -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
+        -I$CUDA_HOME/include $CUDNN_IFLAG -I$RAYLIB_NAME/include \
+        -Xcompiler=-fopenmp \
+        -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        -DENV_NAME=$ENV \
+        $PRECISION $NVCC_OPT \
+        src/bindings.cu -o src/bindings.o
+
+    LINK_CMD=(
+        ${CXX:-g++} -shared -fPIC -fopenmp
+        src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
+        -L$CUDA_HOME/lib64 $CUDNN_LFLAG
+        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
+        $OMP_LIB $LINK_OPT
+        "${SHARED_LDFLAGS[@]}"
+        -o "$OUTPUT"
+    )
+    "${LINK_CMD[@]}"
+    echo "Built: $OUTPUT"
+
+elif [ "$MODE" = "cpu" ]; then
+    echo "Compiling CPU training backend..."
+    ${CXX:-g++} -c -fPIC -fopenmp \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -221,50 +269,30 @@ if [ "$MODE" = "cpu" ]; then
         -DENV_NAME=$ENV \
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o src/bindings_cpu.o
-
-    echo "=== Linking $OUTPUT (CPU) ==="
     LINK_CMD=(
-        g++ -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC -fopenmp
         src/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
-        -lm -lpthread -lomp5
-        $LINK_OPT
+        -lm -lpthread $OMP_LIB $LINK_OPT
+        "${SHARED_LDFLAGS[@]}"
+        -o "$OUTPUT"
     )
-    [ "$PLATFORM" = "Linux" ] && LINK_CMD+=(-Bsymbolic-functions)
-    [ "$PLATFORM" = "Darwin" ] && LINK_CMD+=(-framework Cocoa -framework OpenGL -framework IOKit)
-    LINK_CMD+=(-o "$OUTPUT")
     "${LINK_CMD[@]}"
-    echo "=== Built: $OUTPUT (CPU) ==="
-    exit 0
+    echo "Built: $OUTPUT"
+
+elif [ "$MODE" = "profile" ]; then
+    echo "Compiling profile binary ($ARCH)..."
+    $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
+        -I. -Isrc -I$SRC_DIR -I./vendor \
+        -I$CUDA_HOME/include $CUDNN_IFLAG -I$RAYLIB_NAME/include \
+        -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        -DENV_NAME=$ENV \
+        -Xcompiler=-DPLATFORM_DESKTOP \
+        $PRECISION \
+        -Xcompiler=-fopenmp \
+        tests/profile_kernels.cu vendor/ini.c \
+        "$STATIC_LIB" "$RAYLIB_A" \
+        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
+        -lGL -lm -lpthread $OMP_LIB \
+        -o profile
+    echo "Built: ./profile"
 fi
-
-echo "=== Compiling bindings.cu ==="
-$NVCC -c -Xcompiler -fPIC \
-    -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
-    -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
-    -Xcompiler=-DPLATFORM_DESKTOP \
-    -std=c++17 \
-    -I. -Isrc \
-    -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-    -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
-    -Xcompiler=-fopenmp \
-    -DOBS_TENSOR_T=$OBS_TENSOR_T \
-    -DENV_NAME=$ENV \
-    $PRECISION $NVCC_OPT \
-    src/bindings.cu -o src/bindings.o
-
-# Step 3: Link
-echo "=== Linking $OUTPUT ==="
-LINK_CMD=(
-    g++ -shared -fPIC -fopenmp
-    src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-    -L$CUDA_HOME/lib64 ${CUDNN_LIB:+-L$CUDNN_LIB}
-    -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
-    -lomp5
-    $LINK_OPT
-)
-[ "$PLATFORM" = "Linux" ] && LINK_CMD+=(-Bsymbolic-functions)
-[ "$PLATFORM" = "Darwin" ] && LINK_CMD+=(-framework Cocoa -framework OpenGL -framework IOKit)
-LINK_CMD+=(-o "$OUTPUT")
-"${LINK_CMD[@]}"
-
-echo "=== Built: $OUTPUT ==="
