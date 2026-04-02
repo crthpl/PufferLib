@@ -4,6 +4,7 @@ set -e
 # Usage:
 #   ./build.sh breakout              # Build _C.so with breakout statically linked
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
+#   ./buils.sh breakout --cpu        # CPU fallback, torch only
 #   ./build.sh breakout --debug      # Debug build
 #   ./build.sh breakout --local      # Standalone executable (debug, sanitizers)
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
@@ -23,6 +24,7 @@ for arg in "${@:2}"; do
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
         --cpu)   MODE=cpu; PRECISION="-DPRECISION_FLOAT" ;;
+        *) echo "Error: unknown argument '$arg'" && exit 1 ;;
     esac
 done
 
@@ -216,6 +218,7 @@ if [ "$MODE" = "cpu" ]; then
         -I. -Isrc \
         -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        -DENV_NAME=$ENV \
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o src/bindings_cpu.o
 
@@ -245,6 +248,7 @@ $NVCC -c -Xcompiler -fPIC \
     -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
     -Xcompiler=-fopenmp \
     -DOBS_TENSOR_T=$OBS_TENSOR_T \
+    -DENV_NAME=$ENV \
     $PRECISION $NVCC_OPT \
     src/bindings.cu -o src/bindings.o
 

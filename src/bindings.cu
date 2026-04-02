@@ -4,6 +4,9 @@
 #include <pybind11/stl.h>
 #include "pufferlib.cu"
 
+#define _PUFFER_STRINGIFY(x) #x
+#define PUFFER_STRINGIFY(x) _PUFFER_STRINGIFY(x)
+
 namespace py = pybind11;
 
 // Wrapper functions for Python bindings
@@ -373,8 +376,6 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     // Priority
     hypers.prio_alpha = get_config(train_kwargs, "prio_alpha");
     hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
-    // Flags (use_rnn injected into train by Python)
-    hypers.use_rnn = get_config(train_kwargs, "use_rnn");
     hypers.reset_state = get_config(args, "reset_state");
     // Base-level config ([base] section becomes top-level in args)
     hypers.cudagraphs = get_config(args, "cudagraphs");
@@ -386,6 +387,10 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.nccl_id = args["nccl_id"].cast<std::string>();
     // Seed
     hypers.seed = get_config(args, "seed");
+
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    assert(device_count > 0 && "CUDA is not available");
 
     std::string env_name = args["env_name"].cast<std::string>();
     Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
@@ -448,6 +453,8 @@ PYBIND11_MODULE(_C, m) {
     });
 
     m.attr("precision_bytes") = (int)sizeof(precision_t);
+    m.attr("env_name") = PUFFER_STRINGIFY(ENV_NAME);
+    m.attr("gpu") = 1;
 
     // Core functions
     m.def("log", &puf_log);
@@ -492,7 +499,6 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("vtrace_c_clip", &HypersT::vtrace_c_clip)
         .def_readwrite("prio_alpha", &HypersT::prio_alpha)
         .def_readwrite("prio_beta0", &HypersT::prio_beta0)
-        .def_readwrite("use_rnn", &HypersT::use_rnn)
         .def_readwrite("cudagraphs", &HypersT::cudagraphs)
         .def_readwrite("profile", &HypersT::profile)
         .def_readwrite("rank", &HypersT::rank)
@@ -545,6 +551,7 @@ PYBIND11_MODULE(_C, m) {
         .def("reset", &vec_reset)
         .def("gpu_step", &gpu_vec_step_py)
         .def("cpu_step", &cpu_vec_step_py)
+        .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log",   &vec_log)
         .def("close", &vec_close);
 

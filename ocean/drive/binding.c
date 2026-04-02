@@ -1,5 +1,4 @@
 #include "drive.h"
-#define OBS_SIZE 1848
 #define NUM_ATNS 2
 #define ACT_SIZES {7, 13}
 #define OBS_TENSOR_T FloatTensor
@@ -14,6 +13,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int num_maps = (int)dict_get(env_kwargs, "num_maps")->value;
+    int agents_per_buffer = total_agents / num_buffers;
 
     float reward_vehicle_collision = dict_get(env_kwargs, "reward_vehicle_collision")->value;
     float reward_offroad_collision = dict_get(env_kwargs, "reward_offroad_collision")->value;
@@ -32,58 +32,76 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     }
     fclose(test_fp);
 
-    // Check the number of controllable agents per map
+    // Scan all maps for agent counts; collect valid (>0) ones
     int agents_per_map[num_maps];
+    int valid_map_ids[num_maps];
+    int num_valid_maps = 0;
     for (int m = 0; m < num_maps; m++) {
         char map_file[512];
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
         Env temp_env = {0};
         temp_env.map_name = map_file;
-        temp_env.num_agents = 0;
         init(&temp_env);
         agents_per_map[m] = temp_env.active_agent_count < MAX_AGENTS
                           ? temp_env.active_agent_count : MAX_AGENTS;
         c_close(&temp_env);
-        //("  map_%03d.bin: %d agents\n", m, agents_per_map[m]);
+        if (agents_per_map[m] > 0) {
+            valid_map_ids[num_valid_maps++] = m;
+        }
     }
-    printf("Scanned %d maps from %s/\n", num_maps, MAP_BINARY_DIR);
+    printf("Scanned %d maps from %s/, %d valid\n", num_maps, MAP_BINARY_DIR, num_valid_maps);
 
-    // Calculate the number of environments to initialize per buffer
-    int agents_per_buffer = total_agents / num_buffers;
-    int envs_per_buffer = 0;
-    int agents_in_buffer = 0;
-    while (agents_in_buffer < agents_per_buffer) {
-        int m = envs_per_buffer % num_maps;
-        agents_in_buffer += agents_per_map[m];
-        envs_per_buffer++;
+    if (num_valid_maps == 0) {
+        printf("ERROR: No valid maps found\n");
+        *num_envs_out = 0;
+        return NULL;
     }
 
-    // How many excess agents are in the last map of each buffer?
-    int excess = agents_in_buffer - agents_per_buffer;
-    int last_map_idx = (envs_per_buffer - 1) % num_maps;
-    int last_map_capped_agents = agents_per_map[last_map_idx] - excess;
+    // Build per-env layout. Each buffer advances the global cursor so different
+    // buffers get different maps. If the next full map would overflow a buffer,
+    // pack remaining slots with 1-agent envs advancing the cursor each time.
+    int max_envs = agents_per_buffer * num_buffers; // upper bound (all 1-agent)
+    int* env_map_ids = (int*)malloc(max_envs * sizeof(int));
+    int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
+    int total_envs = 0;
+    int cursor = 0; // advances across buffers
 
-    int total_envs = envs_per_buffer * num_buffers;
-    printf("total envs: %d\n", total_envs);
-
-    // Fill buffer info
     for (int b = 0; b < num_buffers; b++) {
-        buffer_env_starts[b] = b * envs_per_buffer;
-        buffer_env_counts[b] = envs_per_buffer;
+        buffer_env_starts[b] = total_envs;
+        int buffer_agents = 0;
+        while (buffer_agents < agents_per_buffer) {
+            int m = valid_map_ids[cursor % num_valid_maps];
+            int cap = agents_per_map[m];
+            int remaining = agents_per_buffer - buffer_agents;
+            if (cap <= remaining) {
+                // Full map fits
+                env_map_ids[total_envs] = m;
+                env_max_agents[total_envs] = cap;
+                buffer_agents += cap;
+                total_envs++;
+                cursor++;
+            } else {
+                // Pack remaining slots as 1-agent envs, one map each
+                while (buffer_agents < agents_per_buffer) {
+                    int mm = valid_map_ids[cursor % num_valid_maps];
+                    env_map_ids[total_envs] = mm;
+                    env_max_agents[total_envs] = 1;
+                    buffer_agents++;
+                    total_envs++;
+                    cursor++;
+                }
+            }
+        }
+        buffer_env_counts[b] = total_envs - buffer_env_starts[b];
     }
 
-    // Initialize the environments
+    printf("total envs: %d (%d maps cycled)\n", total_envs, cursor);
+
+    // Initialize all envs
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
-    int actual_total_agents = 0;
-
     for (int i = 0; i < total_envs; i++) {
-        int local_idx = i % envs_per_buffer;
-        int m = local_idx % num_maps;
-        int is_last_in_buffer = (local_idx == envs_per_buffer - 1);
-
         char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
-
+        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, env_map_ids[i]);
         Env* env = &envs[i];
         memset(env, 0, sizeof(Env));
         env->map_name = strdup(map_file);
@@ -92,15 +110,16 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_offroad_collision = reward_offroad_collision;
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
-        // Maximum number of agents to control in this env
-        env->max_agents = is_last_in_buffer ? last_map_capped_agents : agents_per_map[m];
-
+        env->max_agents = env_max_agents[i];
         init(env);
-        actual_total_agents += env->active_agent_count;
+        env->num_agents = env->active_agent_count;
     }
 
-    printf("Created %d envs (%d per buffer x %d buffers), %d agents per buffer, %d total agents (target %d)\n",
-           total_envs, envs_per_buffer, num_buffers, agents_in_buffer, actual_total_agents, total_agents);
+    free(env_map_ids);
+    free(env_max_agents);
+
+    printf("Created %d envs, %d total agents (target %d)\n",
+           total_envs, total_agents, total_agents);
 
     *num_envs_out = total_envs;
     return envs;
@@ -116,7 +135,7 @@ void my_init(Env* env, Dict* kwargs) {
     int max_agents = dict_get(kwargs, "max_agents")->value;
 
     char map_file[512];
-    sprintf(map_file, "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
+    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
     env->num_agents = max_agents;
     env->map_name = strdup(map_file);
     init(env);

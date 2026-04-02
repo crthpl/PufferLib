@@ -3,7 +3,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import Linear
+
+class Policy(nn.Module):
+    def __init__(self, encoder, decoder, network):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.network = network
+
+    def initial_state(self, batch_size, device):
+        return self.network.initial_state(batch_size, device)
+
+    def forward_eval(self, x, state):
+        h = self.encoder(x)
+        h, state = self.network.forward_eval(h, state)
+        logits, values = self.decoder(h)
+        return logits, values, state
+
+    def forward(self, x):
+        B, TT = x.shape[:2]
+        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        h = self.network.forward_train(h.reshape(B, TT, -1))
+        logits, values = self.decoder(h.reshape(B*TT, -1))
+        return logits, values.reshape(B, TT)
 
 class DefaultEncoder(nn.Module):
     def __init__(self, obs_size, hidden_size=128):
@@ -41,28 +63,22 @@ class DefaultDecoder(nn.Module):
         values = self.value_function(hidden)
         return logits, values
 
-class Policy(nn.Module):
-    def __init__(self, encoder, decoder, network):
+class MLP(nn.Module):
+    def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.network = network
+        layers = []
+        for _ in range(num_layers):
+            layers += [nn.Linear(hidden_size, hidden_size), nn.GELU()]
+        self.net = nn.Sequential(*layers)
 
     def initial_state(self, batch_size, device):
-        return self.network.initial_state(batch_size, device)
+        return ()
 
-    def forward_eval(self, x, state):
-        h = self.encoder(x)
-        h, state = self.network.forward_eval(h, state)
-        logits, values = self.decoder(h)
-        return logits, values, state
+    def forward_eval(self, h, state):
+        return self.net(h), state
 
-    def forward(self, x):
-        B, TT = x.shape[:2]
-        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
-        h = self.network.forward_train(h.reshape(B, TT, -1))
-        logits, values = self.decoder(h.reshape(B*TT, -1))
-        return logits, values.reshape(B, TT)
+    def forward_train(self, h):
+        return self.net(h)
 
 class MinGRU(nn.Module):
     # https://arxiv.org/abs/2410.01201v1
@@ -71,7 +87,7 @@ class MinGRU(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.layers = nn.ModuleList([
-            Linear(hidden_size, 3 * hidden_size, bias=False) for _ in range(num_layers)
+            nn.Linear(hidden_size, 3 * hidden_size, bias=False) for _ in range(num_layers)
         ])
 
     def _g(self, x):
@@ -111,19 +127,6 @@ class MinGRU(nn.Module):
             log_values = -F.softplus(-gate) + self._log_g(hidden)
             out = self._heinsen_scan(log_coeffs, log_values)[:, -T:]
             h = self._highway(h, out, proj)
-        return h
-
-class MLP(nn.Module):
-    def __init__(self, hidden_size, num_layers=1, **kwargs):
-        super().__init__()
-
-    def initial_state(self, batch_size, device):
-        return ()
-
-    def forward_eval(self, h, state):
-        return h, state
-
-    def forward_train(self, h):
         return h
 
 class LSTM(nn.Module):

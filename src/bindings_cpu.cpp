@@ -2,6 +2,9 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#define _PUFFER_STRINGIFY(x) #x
+#define PUFFER_STRINGIFY(x) _PUFFER_STRINGIFY(x)
 #include <cstring>
 
 // vecenv.h header section gives us StaticVec, Dict, cudaStream_t typedef
@@ -159,6 +162,8 @@ static void vec_close(VecEnv& ve) {
 
 PYBIND11_MODULE(_C, m) {
     m.attr("precision_bytes") = 4;
+    m.attr("env_name") = PUFFER_STRINGIFY(ENV_NAME);
+    m.attr("gpu") = 0;
 
     m.def("puff_advantage_cpu", &py_puff_advantage_cpu);
     m.def("create_vec", &create_vec, py::arg("args"), py::arg("gpu") = 0);
@@ -176,6 +181,7 @@ PYBIND11_MODULE(_C, m) {
         .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
         .def("reset", &vec_reset)
         .def("cpu_step", &cpu_vec_step_py)
+        .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log", &vec_log)
         .def("close", &vec_close);
 }

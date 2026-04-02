@@ -21,7 +21,7 @@ from pufferlib import _C
 if _C.precision_bytes != 4:
     raise RuntimeError(
         f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
-        'The PyTorch backend requires float32. Rebuild with: pip install -e . --no-build-isolation --config-settings="--build-option=--precision=float"'
+        'The PyTorch backend requires float32. Rerun build.sh with --float'
     )
 
 _OBS_DTYPE_MAP = {
@@ -111,7 +111,8 @@ def _cpu_tensor(ptr, shape, dtype):
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
-        device = config['device']
+        device = 'cuda' if _C.gpu else 'cpu'
+        self.device = device
 
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.deterministic = True
@@ -197,11 +198,10 @@ class PuffeRL:
     def rollouts(self):
         prof = self.profile
         config = self.config
-        device = config['device']
+        device = self.device
+        horizon = config['horizon']
 
         self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
-
-        horizon = config['horizon']
         o = self.vec_obs
         r = torch.zeros(self.total_agents, device=device)
         d = torch.zeros(self.total_agents, device=device)
@@ -234,24 +234,22 @@ class PuffeRL:
                 torch.cuda.synchronize()
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())
+
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
             prof.mark(3)
-
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
 
         prof.mark(1)
         prof.elapsed(P.ROLLOUT, 0, 1)
-
         self.global_step += self.total_agents * horizon
-
         self.env_logs = self._vec.log()
 
     def train(self):
         prof = self.profile
         losses = defaultdict(float)
         config = self.config
-        device = config['device']
+        device = self.device
 
         b0 = config['prio_beta0']
         a = config['prio_alpha']
@@ -387,15 +385,23 @@ class PuffeRL:
     def save_weights(self, path):
         torch.save(self.policy.state_dict(), path)
 
+    def load_weights(self, path):
+        state_dict = torch.load(path, map_location=self.device)
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        self.policy.load_state_dict(state_dict)
+
+    def render(self, env_id=0):
+        self._vec.render(env_id)
+
     def close(self):
+        self.vec_obs = None
+        self.vec_rewards = None
+        self.vec_terminals = None
         self._vec.close()
 
     @classmethod
     def create_pufferl(cls, args):
         '''Matches _C.create_pufferl(args) interface.'''
-        device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-        args['train']['device'] = device
-
         # DDP setup
         if 'LOCAL_RANK' in os.environ:
             world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -404,8 +410,7 @@ class PuffeRL:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
 
         args['vec']['num_buffers'] = 1
-        gpu = 1 if device == 'cuda' else 0
-        vec = _C.create_vec(args, gpu)
+        vec = _C.create_vec(args, _C.gpu)
         policy = load_policy(args, vec)
 
         if 'LOCAL_RANK' in os.environ:
@@ -465,14 +470,16 @@ class Profile:
 def load_policy(args, vec):
     import pufferlib.models
     policy_kwargs = args['policy']
-    network_cls = getattr(pufferlib.models, policy_kwargs['network'])
+    network_cls = getattr(pufferlib.models, args['torch']['network'])
+    encoder_cls = getattr(pufferlib.models, args['torch']['encoder'])
+    decoder_cls = getattr(pufferlib.models, args['torch']['decoder'])
 
     network = network_cls(**policy_kwargs)
-    encoder = pufferlib.models.DefaultEncoder(vec.obs_size, policy_kwargs['hidden_size'])
-    decoder = pufferlib.models.DefaultDecoder(vec.act_sizes, policy_kwargs['hidden_size'])
+    encoder = encoder_cls(vec.obs_size, policy_kwargs['hidden_size'])
+    decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
-    device = args['train']['device']
+    device = 'cuda' if _C.gpu else 'cpu'
     policy = policy.to(device)
 
     load_id = args['load_id']
@@ -491,7 +498,9 @@ def load_policy(args, vec):
 
     load_path = args['load_model_path']
     if load_path == 'latest':
-        load_path = max(glob.glob(f"experiments/{env_name}*.pt"), key=os.path.getctime)
+        pattern = os.path.join(args['checkpoint_dir'], args['env_name'], '**', '*.bin')
+        candidates = glob.glob(pattern, recursive=True)
+        load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
         state_dict = torch.load(load_path, map_location=device)

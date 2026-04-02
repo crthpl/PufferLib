@@ -271,7 +271,6 @@ typedef struct {
     float prio_alpha;
     float prio_beta0;
     // Flags
-    bool use_rnn;
     bool reset_state;
     int cudagraphs;
     bool profile;

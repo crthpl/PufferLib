@@ -168,6 +168,9 @@ def validate_config(args):
         f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}'
 
 def _resolve_backend(args):
+    compiled_env = getattr(_C, 'env_name', None)
+    assert compiled_env is None or compiled_env == args['env_name'], \
+        f'build.sh was run for {compiled_env}, not {args["env_name"]}'
     if args.get('slowly'):
         from pufferlib.torch_pufferl import PuffeRL
         return PuffeRL
@@ -232,7 +235,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             backend.train(pufferl)
 
         if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
-            model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:16d}.bin')
+            model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
 
         # Rate limit, but always log for eval to maintain determinism
@@ -397,14 +400,13 @@ def sweep(env_name, args=None, pareto=False):
             sweep_obj=sweep_obj, result_queue=result_queue)
 
 def eval(env_name, args=None, load_path=None):
-    '''Evaluate a trained policy using the native pipeline.
-    Creates a full PuffeRL instance, optionally loads weights, then
-    runs rollouts in a loop with rendering on env 0.'''
+    '''Evaluate a trained policy. Supports both native and --slowly torch backends.'''
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
 
-    pufferl_cpp = _C.create_pufferl(args)
+    backend = _resolve_backend(args)
+    pufferl = backend.create_pufferl(args)
 
     # Resolve load path
     load_path = load_path or args.get('load_model_path')
@@ -417,14 +419,14 @@ def eval(env_name, args=None, load_path=None):
         load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
-        _C.load_weights(pufferl_cpp, load_path)
+        backend.load_weights(pufferl, load_path)
         print(f'Loaded weights from {load_path}')
 
     while True:
-        _C.render(pufferl_cpp, 0)
-        _C.rollouts(pufferl_cpp)
+        backend.render(pufferl, 0)
+        backend.rollouts(pufferl)
 
-    _C.close(pufferl_cpp)
+    backend.close(pufferl)
 
 def load_config(env_name):
     parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
@@ -490,7 +492,6 @@ def load_config(env_name):
         prev[subkey] = value
 
     args['env_name'] = env_name
-    args['train']['use_rnn'] = args['rnn_name'] is not None
     return dict(args)
 
 def main():

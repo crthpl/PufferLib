@@ -483,10 +483,11 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
 void static_vec_close(StaticVec* vec) {
     Env* envs = (Env*)vec->envs;
 
-    // Ask threads to stop. todo: robustify
-    atomic_store(&vec->threading->shutdown, 1);
-    for (int i = 0; i < vec->buffers; i++) {
-        pthread_join(vec->threading->threads[i], NULL);
+    if (vec->threading != NULL) {
+        atomic_store(&vec->threading->shutdown, 1);
+        for (int i = 0; i < vec->buffers; i++) {
+            pthread_join(vec->threading->threads[i], NULL);
+        }
     }
 
     for (int i = 0; i < vec->size; i++) {
@@ -496,10 +497,12 @@ void static_vec_close(StaticVec* vec) {
 
     my_vec_close(envs);
     free(vec->envs);
-    free(vec->threading->buffer_states);
-    free(vec->threading->threads);
-    free(vec->threading->accum);
-    free(vec->threading);
+    if (vec->threading != NULL) {
+        free(vec->threading->buffer_states);
+        free(vec->threading->threads);
+        free(vec->threading->accum);
+        free(vec->threading);
+    }
     free(vec->buffer_env_starts);
     free(vec->buffer_env_counts);
 
