@@ -2,8 +2,7 @@
 #define OBS_SIZE 319
 #define NUM_ATNS 3
 #define ACT_SIZES {5, 5, 3}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
 
 #define Env Terraform
 #include "vecenv.h"

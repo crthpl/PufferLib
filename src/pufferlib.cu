@@ -272,6 +272,7 @@ typedef struct {
     float prio_beta0;
     // Flags
     bool use_rnn;
+    bool reset_state;
     int cudagraphs;
     bool profile;
     // Multi-GPU
@@ -698,7 +699,7 @@ __global__ void ppo_loss_compute(
     } else {
         for (int h = 0; h < a.num_atns; ++h) {
             float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
-            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
+            float log_std = to_float(a.logstd[h]);
             float action = float(g.actions[nt * a.num_atns + h]);
             float lp, ent;
             ppo_continuous_head(mean, log_std, action, &lp, &ent);
@@ -747,14 +748,14 @@ __global__ void ppo_loss_compute(
     } else {
         for (int h = 0; h < a.num_atns; ++h) {
             float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
-            float log_std = to_float(a.logstd[logits_base + h * a.logits_stride_a]);
+            float log_std = to_float(a.logstd[h]);
             float std = __expf(log_std);
             float var = std * std;
             float action = float(g.actions[nt * a.num_atns + h]);
             float diff = action - mean;
 
             a.grad_logits[grad_logits_base + h] = d_new_logp * diff / var;
-            a.grad_logstd[grad_logits_base + h] = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
+            a.grad_logstd[nt * a.num_atns + h] = d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
         }
     }
 
@@ -1350,7 +1351,7 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        puf_zero(&graph.mb_state, train_stream);
+        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;

@@ -212,7 +212,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
         if result_queue is not None:
-            result_queue.put((args['gpu_id'], None, None, None))
+            result_queue.put((args['gpu_id'], [], [], []))
         return
 
     args.pop('nccl_id', None)
@@ -352,7 +352,9 @@ def sweep(env_name, args=None, pareto=False):
 
     sweep_obj = sweep_cls(sweep_config)
     num_experiments = args['sweep']['max_runs']
-    ts_config = sweep_config['train']['total_timesteps']
+    ts_default = args['train']['total_timesteps']
+    ts_config = sweep_config.get('train', {}).get('total_timesteps', {'min': ts_default, 'max': ts_default})
+    
     all_timesteps = np.geomspace(ts_config['min'], ts_config['max'], sweep_gpus)
     result_queue = mp.get_context('spawn').Queue()
 
@@ -399,6 +401,8 @@ def eval(env_name, args=None, load_path=None):
     Creates a full PuffeRL instance, optionally loads weights, then
     runs rollouts in a loop with rendering on env 0.'''
     args = args or load_config(env_name)
+    args['reset_state'] = False
+    args['train']['horizon'] = 1
 
     pufferl_cpp = _C.create_pufferl(args)
 
@@ -509,4 +513,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

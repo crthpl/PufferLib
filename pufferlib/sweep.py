@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import pufferlib
+from pufferlib.pufferl import unroll_nested_dict
 
 import torch
 import gpytorch
@@ -22,6 +23,18 @@ from scipy.spatial import KDTree
 from sklearn.linear_model import LogisticRegression
 
 EPSILON = 1e-6
+
+# TODO: move
+def unroll_nested_dict(d):
+    if not isinstance(d, dict):
+        return d
+
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for k2, v2 in unroll_nested_dict(v):
+                yield f"{k}/{k2}", v2
+        else:
+            yield k, v
 
 @contextmanager
 def default_tensor_dtype(dtype):
@@ -173,7 +186,7 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 class Hyperparameters:
     def __init__(self, config, verbose=True):
         self.spaces = _params_from_puffer_sweep(config)
-        self.flat_spaces = dict(pufferlib.unroll_nested_dict(self.spaces))
+        self.flat_spaces = dict(unroll_nested_dict(self.spaces))
         self.num = len(self.flat_spaces)
 
         self.metric = config['metric']
@@ -213,7 +226,7 @@ class Hyperparameters:
         return np.clip(samples, self.min_bounds, self.max_bounds)
 
     def from_dict(self, params):
-        flat_params = dict(pufferlib.unroll_nested_dict(params))
+        flat_params = dict(unroll_nested_dict(params))
         values = []
         for key, space in self.flat_spaces.items():
             assert key in flat_params, f'Missing hyperparameter {key}'

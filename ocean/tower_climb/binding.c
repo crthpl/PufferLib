@@ -2,15 +2,16 @@
 #define OBS_SIZE 228
 #define NUM_ATNS 1
 #define ACT_SIZES {6}
-#define OBS_TYPE UNSIGNED_CHAR
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T ByteTensor
 
 #define MY_VEC_INIT
 #define Env CTowerClimb
 #include "vecenv.h"
 
-Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
     int num_envs = (int)dict_get(vec_kwargs, "total_agents")->value;
+    int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
 
     float reward_climb_row = dict_get(env_kwargs, "reward_climb_row")->value;
     float reward_fall_row = dict_get(env_kwargs, "reward_fall_row")->value;
@@ -36,6 +37,7 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
 
     for (int i = 0; i < num_envs; i++) {
         Env* env = &envs[i];
+        env->rng = i;
         env->num_agents = 1;
         env->reward_climb_row = reward_climb_row;
         env->reward_fall_row = reward_fall_row;
@@ -45,6 +47,22 @@ Env* my_vec_init(int* num_envs_out, Dict* vec_kwargs, Dict* env_kwargs) {
         env->all_puzzles = puzzle_states;
         env->num_maps = num_maps;
         init(env);
+    }
+
+    int agents_per_buffer = num_envs / num_buffers;
+    int buf = 0;
+    int buf_agents = 0;
+    buffer_env_starts[0] = 0;
+    buffer_env_counts[0] = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].num_agents;
+        buffer_env_counts[buf]++;
+        if (buf_agents >= agents_per_buffer && buf < num_buffers - 1) {
+            buf++;
+            buffer_env_starts[buf] = i + 1;
+            buffer_env_counts[buf] = 0;
+            buf_agents = 0;
+        }
     }
 
     *num_envs_out = num_envs;

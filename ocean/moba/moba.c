@@ -114,7 +114,6 @@ void demo() {
     MOBA env = {
         .vision_range = 5,
         .agent_speed = 1.0,
-        .discretize = true,
         .reward_death = -1.0,
         .reward_xp = 0.006,
         .reward_distance = 0.05,
@@ -128,7 +127,7 @@ void demo() {
     while (!WindowShouldClose()) {
         if (frame % 12 == 0) {
             c_step(&env);
-            forward(net, env.observations, env.actions);
+            //forward(net, env.observations, env.actions);
         }
         c_render(&env);
         frame = (frame + 1) % 12;
@@ -146,7 +145,6 @@ void test_performance(float test_time) {
     MOBA env = {
         .vision_range = 5,
         .agent_speed = 1.0,
-        .discretize = true,
         .reward_death = -1.0,
         .reward_xp = 0.006,
         .reward_distance = 0.05,
@@ -181,7 +179,6 @@ void test_bugs(float test_time) {
     MOBA env = {
         .vision_range = 5,
         .agent_speed = 1.0,
-        .discretize = true,
         .reward_death = -1.0,
         .reward_xp = 0.006,
         .reward_distance = 0.05,
@@ -195,7 +192,7 @@ void test_bugs(float test_time) {
     int i = 0;
     while (time(NULL) - start < test_time) {
         c_step(&env);
-        forward(net, env.observations, env.actions);
+        //forward(net, env.observations, env.actions);
         i++;
     }
     int end = time(NULL);

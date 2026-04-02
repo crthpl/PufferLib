@@ -494,6 +494,7 @@ void static_vec_close(StaticVec* vec) {
         c_close(env);
     }
 
+    my_vec_close(envs);
     free(vec->envs);
     free(vec->threading->buffer_states);
     free(vec->threading->threads);

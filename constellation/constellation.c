@@ -416,7 +416,8 @@ void plot_gl(Glyph* glyphs, int size, Shader* shader) {
     glBindVertexArray(0);
 
     rlDrawRenderBatchActive();
-    rlSetBlendMode(RL_BLEND_ADDITIVE);
+    rlSetBlendFactors(GL_ONE, GL_ONE, GL_MAX);
+    rlSetBlendMode(RL_BLEND_CUSTOM);
     int currentTimeLoc = GetShaderLocation(*shader, "currentTime");
     glUseProgram(shader->id);
         glUniform1f(currentTimeLoc, GetTime());
@@ -729,6 +730,7 @@ int main(void) {
     char* clipboard = malloc(16384);
 
     // Points
+    printf("total points: %d", total_points);
     Point* points = calloc(total_points, sizeof(Point));
     Glyph* glyphs = calloc(total_points, sizeof(Glyph));
     Vector2* env_indices = calloc(total_points, sizeof(Vector2));

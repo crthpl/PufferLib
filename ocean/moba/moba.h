@@ -4,7 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include <time.h> // xxd -i game_map.npy > game_map.h #include "game_map.h"
+#include <time.h> // xxd -i game_map.npy > game_map.h
+#include "game_map.h"
 
 #include "raylib.h"
 
@@ -341,7 +342,6 @@ struct MOBA {
     GameRenderer* client;
     int vision_range;
     float agent_speed;
-    bool discretize;
     bool script_opponents;
     int obs_size;
     int creep_idx;
@@ -353,7 +353,7 @@ struct MOBA {
     unsigned char* ai_paths;
     int* ai_path_buffer;
     unsigned char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     unsigned char* truncations;
@@ -382,6 +382,7 @@ struct MOBA {
 
 void add_log(MOBA* env, int radiant_victory, int dire_victory) {
     Log* log = &env->log;
+    int num_agents = env->script_opponents ? 5 : NUM_PLAYERS;
     log->n += 1;
     log->score += radiant_victory;
     log->perf += radiant_victory;
@@ -401,6 +402,15 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
         } else {
             log->dire_towers_alive += tower->health > 0;
         }
+    }
+
+    for (int i = 0; i < num_agents; i++) {
+        PlayerLog* pl = &env->player_logs[i];
+        log->episode_return += pl->episode_return;
+        log->reward_death += pl->reward_death;
+        log->reward_xp += pl->reward_xp;
+        log->reward_distance += pl->reward_distance;
+        log->reward_tower += pl->reward_tower;
     }
 
     PlayerLog* radiant_support = &env->player_logs[0];
@@ -426,24 +436,24 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
 }
  
 void c_close(MOBA* env) {
+    free(env->entities);
     free(env->reward_components);
     free(env->map->grid);
+    free(env->map->pids);
     free(env->map);
     free(env->orig_grid);
     free(env->rng->rng);
     free(env->rng);
+    free(env->ai_path_buffer);
 }
 
 void free_allocated_moba(MOBA* env) {
     free(env->rewards);
-    free(env->map->pids);
-    free(env->ai_path_buffer);
     free(env->ai_paths);
     free(env->observations);
     free(env->actions);
     free(env->terminals);
     free(env->truncations);
-    free(env->entities);
     c_close(env);
 }
 
@@ -467,30 +477,30 @@ void compute_observations(MOBA* env) {
         int x = player->x;
 
         // TODO: Add bounds debug checks asserts
-        obs_extra[0] = 2*x;
-        obs_extra[1] = 2*y;
-        obs_extra[2] = 255*player->level/30.0;
-        obs_extra[3] = 255*player->health/player->max_health;
-        obs_extra[4] = 255*player->mana/player->max_mana;
-        obs_extra[5] = player->damage / 4.0;
-        obs_extra[6] = 100*player->move_speed;
-        obs_extra[7] = player->move_modifier*100;
-        obs_extra[8] = 2*player->stun_timer;
-        obs_extra[9] = 2*player->move_timer;
-        obs_extra[10] = 2*player->q_timer;
-        obs_extra[11] = 2*player->w_timer;
-        obs_extra[12] = 2*player->e_timer;
-        obs_extra[13] = 50*player->basic_attack_timer;
-        obs_extra[14] = 50*player->basic_attack_cd;
-        obs_extra[15] = 255*player->is_hit;
-        obs_extra[16] = 255*player->team;
-        obs_extra[17 + player->hero_type] = 255;
+        obs_extra[0] = x;
+        obs_extra[1] = y;
+        obs_extra[2] = player->level;
+        obs_extra[3] = 10*player->health/player->max_health;
+        obs_extra[4] = 10*player->mana/player->max_mana;
+        obs_extra[5] = player->damage / 50.0;
+        obs_extra[6] = player->move_speed;
+        obs_extra[7] = player->move_modifier;
+        obs_extra[8] = player->stun_timer;
+        obs_extra[9] = player->move_timer;
+        obs_extra[10] = player->q_timer;
+        obs_extra[11] = player->w_timer;
+        obs_extra[12] = player->e_timer;
+        obs_extra[13] = player->basic_attack_timer;
+        obs_extra[14] = player->basic_attack_cd;
+        obs_extra[15] = player->is_hit;
+        obs_extra[16] = player->team;
+        obs_extra[17 + player->hero_type] = 1;
 
         // Assumes scaled between -1 and 1, else overflows
-        obs_extra[22] = (reward->death == 0) ? 0 : 255;
-        obs_extra[23] = (reward->xp == 0) ? 0 : 255;
-        obs_extra[24] = (reward->distance == 0) ? 0 : 255;
-        obs_extra[25] = (reward->tower == 0) ? 0 : 255;
+        obs_extra[22] = (reward->death == 0) ? 0 : 1;
+        obs_extra[23] = (reward->xp == 0) ? 0 : 1;
+        obs_extra[24] = (reward->distance == 0) ? 0 : 1;
+        obs_extra[25] = (reward->tower == 0) ? 0 : 1;
 
         for (int dy = -vis; dy <= vis; dy++) {
             for (int dx = -vis; dx <= vis; dx++) {
@@ -512,11 +522,11 @@ void compute_observations(MOBA* env) {
                     continue;
 
                 Entity* target = &env->entities[target_pid];
-                obs_map[map_idx+1] = 255*target->health/target->max_health;
+                obs_map[map_idx+1] = 10*target->health/target->max_health;
                 if (target->max_mana > 0) { // Towers do not have mana
-                    obs_map[map_idx+2] = 255*target->mana/target->max_mana;
+                    obs_map[map_idx+2] = 10*target->mana/target->max_mana;
                 }
-                obs_map[map_idx+3] = target->level/30.0;
+                obs_map[map_idx+3] = target->level;
             }
         }
     }
@@ -1490,11 +1500,11 @@ void step_players(MOBA* env) {
             }
             */
         } else {
-            double (*actions)[6] = (double(*)[6])env->actions;
+            float (*actions)[6] = (float(*)[6])env->actions;
             //float vel_y = (actions[pid][0] > 0) ? 1 : -1;
             //float vel_x = (actions[pid][1] > 0) ? 1 : -1;
-            float vel_y = actions[pid][0] / 300.0;
-            float vel_x = actions[pid][1] / 300.0;
+            float vel_y = (actions[pid][0] - 3.0f) / 3.0f;
+            float vel_x = (actions[pid][1] - 3.0f) / 3.0f;
             float mag = sqrtf(vel_y*vel_y + vel_x*vel_x);
             if (mag > 1) {
                 vel_y /= mag;
@@ -1789,12 +1799,11 @@ MOBA* allocate_moba(MOBA* env) {
     // TODO: Don't hardcode sizes
     int agents = (env->script_opponents) ? NUM_PLAYERS/2 : NUM_PLAYERS;
     env->observations = calloc(agents*(11*11*4 + 26), sizeof(unsigned char));
-    env->actions = calloc(agents*6, sizeof(double));
+    env->actions = calloc(agents*6, sizeof(float));
     env->rewards = calloc(agents, sizeof(float));
     env->terminals = calloc(agents, sizeof(float));
     env->truncations = calloc(agents, sizeof(unsigned char));
 
-    unsigned char* game_map_npy = read_file("resources/moba/game_map.npy");
     env->ai_path_buffer = calloc(3*8*128*128, sizeof(int));
     env->ai_paths = calloc(128*128*128*128, sizeof(unsigned char));
     for (int i = 0; i < 128*128*128*128; i++) {
@@ -1802,7 +1811,6 @@ MOBA* allocate_moba(MOBA* env) {
     }
 
     init_moba(env, game_map_npy);
-    free(game_map_npy);
     return env;
 }
  
@@ -2116,9 +2124,7 @@ GameRenderer* init_game_renderer(int cell_size, int width, int height) {
     return renderer;
 }
 
-//def render(self, grid, pids, entities, obs_players, actions, discretize, frames):
 #define FRAMES 12
-
 void draw_bars(Entity* entity, int x, int y, int width, int height, bool draw_text) {
     float health_bar = entity->health / entity->max_health;
     float mana_bar = entity->mana / entity->max_mana;
@@ -2193,7 +2199,7 @@ int c_render(MOBA* env) {
 
     int human = renderer->human_player;
     bool HUMAN_CONTROL = IsKeyDown(KEY_LEFT_SHIFT);
-    double (*actions)[6] = (double(*)[6])env->actions;
+    float (*actions)[6] = (float(*)[6])env->actions;
 
     // Clears so as to not let the nn spam actions
     if (HUMAN_CONTROL && frame % 12 == 0) {

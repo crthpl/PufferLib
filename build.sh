@@ -108,6 +108,7 @@ fi
 
 # Constellation needs cJSON
 [ "$ENV" = "constellation" ] && EXTRA_SRC="vendor/cJSON.c" && INCLUDES+=(-I./vendor) && OUTPUT_NAME="seethestars"
+[ "$ENV" = "trailer" ] && INCLUDES+=(-I./vendor) && OUTPUT_NAME="trailer/trailer"
 
 # ============================================================================
 # Standalone builds: --local, --fast, --web
@@ -154,7 +155,9 @@ fi
 # Default: build _C.so with env statically linked
 # ============================================================================
 
-CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}
+CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname $(dirname $(which nvcc)))}}
+CUDNN_INCLUDE=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
+CUDNN_LIB=$(python -c "import nvidia.cudnn; import os; print(os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 NVCC="$CUDA_HOME/bin/nvcc"
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
@@ -179,8 +182,8 @@ clang -c $CLANG_OPT \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
-OBS_TENSOR_T=$(strings "$STATIC_OBJ" | grep 'Tensor$' | head -1)
-[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T" && exit 1
+OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
+[ -z "$OBS_TENSOR_T" ] && echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC" && exit 1
 echo "OBS_TENSOR_T=$OBS_TENSOR_T"
 
 # Step 2: Profile binary or Python bindings
@@ -188,14 +191,14 @@ if [ "$MODE" = "profile" ]; then
     ARCH=${NVCC_ARCH:-sm_89}
     echo "=== Building profile binary (arch=$ARCH) ==="
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -I$SRC_DIR \
-        -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+        -I. -Isrc -I$SRC_DIR -I./vendor \
+        -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
-        tests/profile_kernels.cu ini.c \
+        tests/profile_kernels.cu vendor/ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
         -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
         -lGL -lm -lpthread -lomp5 \
@@ -239,7 +242,7 @@ $NVCC -c -Xcompiler -fPIC \
     -std=c++17 \
     -I. -Isrc \
     -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-    -I$CUDA_HOME/include -I$RAYLIB_NAME/include \
+    -I$CUDA_HOME/include ${CUDNN_INCLUDE:+-I$CUDNN_INCLUDE} -I$RAYLIB_NAME/include \
     -Xcompiler=-fopenmp \
     -DOBS_TENSOR_T=$OBS_TENSOR_T \
     $PRECISION $NVCC_OPT \
@@ -250,7 +253,7 @@ echo "=== Linking $OUTPUT ==="
 LINK_CMD=(
     g++ -shared -fPIC -fopenmp
     src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-    -L$CUDA_HOME/lib64
+    -L$CUDA_HOME/lib64 ${CUDNN_LIB:+-L$CUDNN_LIB}
     -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
     -lomp5
     $LINK_OPT

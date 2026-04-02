@@ -80,9 +80,19 @@ typedef struct { float r, angle, vr, brightness, size_scale; } BgStar;
 static BgStar bg_stars[NUM_BG_STARS];
 static StarVertex bg_verts[NUM_BG_STARS];
 
+// Text layout anchors
+#define HAIKU_Y          60.0f    // top of first haiku line
+#define FOOTER_Y         860.0f   // top of "PufferLib 4.0" line
+
+// Spiral/nova epicenter — midpoint between bottom of haiku line 3 and top of footer
+// line3_bottom = HAIKU_Y + (FONT_TITLE+16)*2 + FONT_TITLE = 60+176+72 = 308
+// footer_top   = FOOTER_Y = 860  →  mid = (308+860)/2 = 584
+#define SPIRAL_CX        (SCREEN_W * 0.5f)
+#define SPIRAL_CY        584.0f
+
 #define SPIRAL_GM        16000000.0f   // gravitational constant — tune for feel
-#define SPIRAL_OMEGA     1.0f         // base angular velocity (rad/s)
-#define SPIRAL_OMEGA_R   300.0f       // differential rotation scale (inner faster)
+#define SPIRAL_OMEGA     0.1f         // base angular velocity (rad/s)
+#define SPIRAL_OMEGA_R   1000.0f       // differential rotation scale (inner faster)
 
 // Area of annulus [r0, r1] proportional to r1^2 - r0^2
 // We split visible stars across three zones by desired density weight:
@@ -128,7 +138,7 @@ static void init_bg_stars(void) {
     }
 }
 
-#define NOVA_GM   4000000.0f  // outward repulsion strength for nova
+#define NOVA_GM   5000000.0f  // outward repulsion strength for nova
 
 // Integrate one timestep of gravitational attraction toward center
 static void update_bg_spiral(float dt) {
@@ -136,7 +146,7 @@ static void update_bg_spiral(float dt) {
         float r = bg_stars[i].r;
         bg_stars[i].vr    -= SPIRAL_GM / (r * r) * dt;
         bg_stars[i].r     += bg_stars[i].vr * dt;
-        bg_stars[i].angle += (SPIRAL_OMEGA + SPIRAL_OMEGA_R / (r + 1.0f)) * dt;
+        bg_stars[i].angle += SPIRAL_OMEGA * SPIRAL_OMEGA_R / (r + SPIRAL_OMEGA_R) * dt;
         if (bg_stars[i].r < 1.0f) bg_stars[i].r = 1.0f;
     }
 }
@@ -154,7 +164,7 @@ static void update_bg_nova(float dt) {
 static int bg_draw_count;
 
 static void build_bg_verts_spiral(float alpha, int nova) {
-    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+    float cx = SPIRAL_CX, cy = SPIRAL_CY;
     int n = nova ? NUM_BG_STARS : NUM_VISIBLE_STARS;
     for (int i = 0; i < n; i++) {
         float br = bg_stars[i].brightness * alpha;
@@ -175,7 +185,7 @@ static void build_bg_verts(void) {
     bg_draw_count = NUM_VISIBLE_STARS;
     for (int i = 0; i < NUM_VISIBLE_STARS; i++) {
         float br = bg_stars[i].brightness;
-        float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+        float cx = SPIRAL_CX, cy = SPIRAL_CY;
         bg_verts[i] = (StarVertex){
             .x = cx + bg_stars[i].r * cosf(bg_stars[i].angle),
             .y = cy + bg_stars[i].r * sinf(bg_stars[i].angle),
@@ -209,7 +219,8 @@ static const float SPEEDS[NUM_BALLS] = {
     SPEED_20M * (1.0f  / 20.0f),
     SPEED_20M * (0.03f / 20.0f),
 };
-static const char *BALL_LABELS[NUM_BALLS] = {"20M", "4M", "1M", "30k"};
+static const char *BALL_LABELS[NUM_BALLS]   = {"20M", "4M", "1M", "30k"};
+static const char *BALL_VERSIONS[NUM_BALLS] = {"v4",  "v3", "v2", "v1"};
 
 #define BALL_STAR_SCALE 5.28f
 
@@ -249,11 +260,17 @@ static void update_anim1(float dt, Font roboto, Shader *sh) {
         int lane_y = TRACK_Y0 + i * LANE_H;
         DrawLine(A1_MARGIN_L, lane_y, A1_MARGIN_L + TRACK_W, lane_y,
             (Color){0, 187, 187, 20});
-        DrawTextEx(roboto, BALL_LABELS[i], (Vector2){100, lane_y - FONT_LABEL/2}, FONT_LABEL, 1, C_CYAN);
+        DrawTextEx(roboto, BALL_VERSIONS[i], (Vector2){40,  lane_y - FONT_LABEL/2}, FONT_LABEL, 1, C_CYAN);
+        DrawTextEx(roboto, BALL_LABELS[i],   (Vector2){140, lane_y - FONT_LABEL/2}, FONT_LABEL, 1, C_WHITE);
     }
-    Vector2 t1sz = MeasureTextEx(roboto, "Steps Per Second", FONT_TITLE, 1);
-    DrawTextEx(roboto, "Steps Per Second",
-        (Vector2){SCREEN_W/2 - t1sz.x/2, 100}, FONT_TITLE, 1, C_WHITE);
+    const char *title    = "Steps Per Second";
+    const char *subtitle = "(1/1,000,000 scale)";
+    Vector2 tsz = MeasureTextEx(roboto, title,    FONT_TITLE, 1);
+    Vector2 ssz = MeasureTextEx(roboto, subtitle, FONT_LABEL, 1);
+    DrawTextEx(roboto, title,
+        (Vector2){SCREEN_W/2 - tsz.x/2, 100}, FONT_TITLE, 1, C_WHITE);
+    DrawTextEx(roboto, subtitle,
+        (Vector2){SCREEN_W/2 - ssz.x/2, 100 + FONT_TITLE + 4}, FONT_LABEL, 1, C_WHITE);
 }
 
 /* ============================================================
@@ -379,7 +396,7 @@ static void draw_anim3(float anim_t, Shader *glow_sh, Texture2D tex, Shader *sta
 
     // Center image in the right half of the screen
     float x = SCREEN_W/2 + (SCREEN_W/2 - tex.width)  * 0.5f;
-    float y = (SCREEN_H - tex.height) * 0.5f;
+    float y = (SCREEN_H - tex.height) * 0.5f + 70;
 
     BeginShaderMode(*glow_sh);
         DrawTexture(tex, (int)x, (int)y, WHITE);
@@ -410,6 +427,49 @@ static void draw_anim4(float anim_t, Font roboto, Shader *star_sh,
 
     build_bg_verts_spiral(1.0f, 0);
     draw_stars(bg_verts, bg_draw_count, star_sh);
+}
+
+// ─── Text overlay helpers ─────────────────────────────────────────────────────
+
+// Returns 0..1 alpha: starts fading in at `start`, fully opaque after `fade` seconds
+static float fade_in(float t, float start, float fade) {
+    return fmaxf(0.0f, fminf((t - start) / fade, 1.0f));
+}
+
+// Draw centered text at (SCREEN_W/2, y) with given color and 0..1 alpha
+static void draw_centered(Font f, const char *text, float y, Color col, float alpha) {
+    if (alpha <= 0.0f) return;
+    col.a = (unsigned char)(alpha * 255);
+    Vector2 sz = MeasureTextEx(f, text, FONT_TITLE, 1);
+    DrawTextEx(f, text, (Vector2){SCREEN_W * 0.5f - sz.x * 0.5f, y}, FONT_TITLE, 1, col);
+}
+
+// Draw two strings side-by-side, centered together, at y
+static void draw_centered2(Font f,
+                           const char *s1, Color c1,
+                           const char *s2, Color c2,
+                           float y, float alpha) {
+    if (alpha <= 0.0f) return;
+    c1.a = c2.a = (unsigned char)(alpha * 255);
+    Vector2 sz1 = MeasureTextEx(f, s1, FONT_TITLE, 1);
+    Vector2 sz2 = MeasureTextEx(f, s2, FONT_TITLE, 1);
+    float x = SCREEN_W * 0.5f - (sz1.x + sz2.x) * 0.5f;
+    DrawTextEx(f, s1, (Vector2){x,          y}, FONT_TITLE, 1, c1);
+    DrawTextEx(f, s2, (Vector2){x + sz1.x,  y}, FONT_TITLE, 1, c2);
+}
+
+// ─── Haiku + title overlay (called every frame from anim5 onward) ─────────────
+#define T_NOVA  30.0f
+
+static void draw_haiku_overlay(float t, Font roboto) {
+    float lh = FONT_TITLE + 16;  // line height
+    draw_centered(roboto, "Every thought is a star",   HAIKU_Y,        C_WHITE, fade_in(t, 25.0f, 0.5f));
+    draw_centered(roboto, "Few form a constellation",  HAIKU_Y + lh,   C_WHITE, fade_in(t, 27.0f, 0.5f));
+    draw_centered(roboto, "But they shine brightest",  HAIKU_Y + lh*2, C_WHITE, fade_in(t, T_NOVA, 0.5f));
+    draw_centered2(roboto, "PufferLib ", C_WHITE, "4.0", C_CYAN,
+                   FOOTER_Y, fade_in(t, T_NOVA + 2.0f, 0.5f));
+    draw_centered2(roboto, "Download now at ", C_WHITE, "puffer.ai", C_CYAN,
+                   FOOTER_Y + lh, fade_in(t, T_NOVA + 4.0f, 0.5f));
 }
 
 /* ============================================================
@@ -465,7 +525,7 @@ static void init_anim5(void) {
         thumbs[i] = LoadTexture(thumb_paths[i]);
 
     // Spawn in a slight outward spiral: radius grows by THUMB_SPIRAL_DR per step
-    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+    float cx = SPIRAL_CX, cy = SPIRAL_CY;
     float ring_r     = 400.0f;
     float spiral_dr  = 12.0f;   // px added to radius per thumbnail
     for (int i = 0; i < NUM_THUMBS; i++) {
@@ -482,7 +542,7 @@ static void unload_anim5(void) {
 }
 
 static void draw_anim5(float anim_t, float dt, Shader *star_sh) {
-    float cx = SCREEN_W * 0.5f, cy = SCREEN_H * 0.5f;
+    float cx = SPIRAL_CX, cy = SPIRAL_CY;
 
     // Stars already integrated via update_bg_spiral each frame
     build_bg_verts_spiral(1.0f, 0);
@@ -499,7 +559,7 @@ static void draw_anim5(float anim_t, float dt, Shader *star_sh) {
         if (alpha > 0.0f) {
             thumb_vr[i]    -= SPIRAL_GM / (thumb_r[i] * thumb_r[i]) * dt;
             thumb_r[i]     += thumb_vr[i] * dt;
-            thumb_angle[i] += (SPIRAL_OMEGA + SPIRAL_OMEGA_R / (thumb_r[i] + 1.0f)) * dt;
+            thumb_angle[i] += SPIRAL_OMEGA * SPIRAL_OMEGA_R / (thumb_r[i] + SPIRAL_OMEGA_R) * dt;
             if (thumb_r[i] < 1.0f) thumb_r[i] = 1.0f;
         }
 
@@ -645,6 +705,7 @@ int main(void) {
         else if (t < 30.0f) {
             update_bg_spiral(dt);
             draw_anim5(t - 22.0f, dt, &star_shader);
+            draw_haiku_overlay(t, roboto);
         }
 
         /* ============================================================
@@ -652,25 +713,10 @@ int main(void) {
            Text "4.0" and "puffer.ai" fade in 2s after nova
            ============================================================ */
         else {
-            float nova_t = t - 30.0f;
             update_bg_nova(dt);
             build_bg_verts_spiral(1.0f, 1);
             draw_stars(bg_verts, bg_draw_count, &star_shader);
-
-            float text_alpha = fmaxf(0.0f, fminf((nova_t - 3.0f) / 1.0f, 1.0f));
-            if (text_alpha > 0.0f) {
-                unsigned char a = (unsigned char)(text_alpha * 255);
-                Color col_cyan  = {C_CYAN.r,  C_CYAN.g,  C_CYAN.b,  a};
-                Color col_white = {C_WHITE.r, C_WHITE.g, C_WHITE.b, a};
-
-                float cy = SCREEN_H * 0.5f + 250.0f;
-                Vector2 sz1 = MeasureTextEx(roboto, "4.0",       FONT_TITLE, 1);
-                Vector2 sz2 = MeasureTextEx(roboto, "puffer.ai", FONT_TITLE, 1);
-                DrawTextEx(roboto, "4.0",
-                    (Vector2){SCREEN_W*0.5f - sz1.x*0.5f, cy}, FONT_TITLE, 1, col_cyan);
-                DrawTextEx(roboto, "puffer.ai",
-                    (Vector2){SCREEN_W*0.5f - sz2.x*0.5f, cy + FONT_TITLE + 12}, FONT_TITLE, 1, col_white);
-            }
+            draw_haiku_overlay(t, roboto);  // lines 1+2 already faded in; line 3 + title continue here
         }
 
 

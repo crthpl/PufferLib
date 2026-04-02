@@ -132,8 +132,10 @@ void rollouts(pybind11::object pufferl_obj) {
     double t0 = wall_clock();
 
     // Zero state buffers
-    for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-        puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
+    if (pufferl.hypers.reset_state) {
+        for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+            puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
+        }
     }
 
     static_vec_omp_step(pufferl.vec);
@@ -373,6 +375,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
     // Flags (use_rnn injected into train by Python)
     hypers.use_rnn = get_config(train_kwargs, "use_rnn");
+    hypers.reset_state = get_config(args, "reset_state");
     // Base-level config ([base] section becomes top-level in args)
     hypers.cudagraphs = get_config(args, "cudagraphs");
     hypers.profile = get_config(args, "profile");
