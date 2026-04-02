@@ -212,7 +212,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
         if result_queue is not None:
-            result_queue.put((args['gpu_id'], None, None, None))
+            result_queue.put((args['gpu_id'], [], [], []))
         return
 
     args.pop('nccl_id', None)
