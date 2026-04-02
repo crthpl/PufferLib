@@ -5,7 +5,7 @@
 #include "rlgl.h"
 
 #define RLIGHTS_IMPLEMENTATION
-#include "include/rlights.h"
+#include "rlights.h"
 
 #include "helpers.h"
 
