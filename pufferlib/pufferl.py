@@ -492,6 +492,8 @@ def load_config(env_name):
         prev[subkey] = value
 
     args['env_name'] = env_name
+    for section in p.sections():
+        args.setdefault(section, {})
     return dict(args)
 
 def main():

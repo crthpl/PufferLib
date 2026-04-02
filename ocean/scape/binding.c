@@ -1,11 +1,10 @@
-#include "target.h"
+#include "scape.h"
 #define OBS_SIZE 28
 #define NUM_ATNS 2
 #define ACT_SIZES {9, 5}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
 
-#define Env Target
+#define Env Scape
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {

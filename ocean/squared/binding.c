@@ -2,8 +2,7 @@
 #define OBS_SIZE 121
 #define NUM_ATNS 1
 #define ACT_SIZES {5}
-#define OBS_TYPE UNSIGNED_CHAR
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T ByteTensor
 
 #define Env Squared
 #include "vecenv.h"
