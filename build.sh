@@ -149,9 +149,6 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     echo "Built: ./$OUTPUT_NAME"
     exit 0
 elif [ "$MODE" = "web" ]; then
-    if [ ! -f "minshell.html" ]; then
-        curl -sL "https://raw.githubusercontent.com/raysan5/raylib/master/src/minshell.html" -o minshell.html
-    fi
     mkdir -p "build_web/$ENV"
     echo "Compiling $ENV for web..."
     emcc \
@@ -163,7 +160,7 @@ elif [ "$MODE" = "web" ]; then
         -L. -L./$RAYLIB_NAME/lib \
         -sASSERTIONS=2 -gsource-map \
         -sUSE_GLFW=3 -sUSE_WEBGL2=1 -sASYNCIFY -sFILESYSTEM -sFORCE_FILESYSTEM=1 \
-        --shell-file ./minshell.html \
+        --shell-file vendor/minshell.html \
         -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=512KB \
         -DNDEBUG -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
         --preload-file resources/$ENV@resources/$ENV \
@@ -223,6 +220,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
+# Brittle hack: have to extract the tensor type from the static lib to build trainer
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
 if [ -z "$OBS_TENSOR_T" ]; then
     echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC"
@@ -282,7 +280,7 @@ elif [ "$MODE" = "cpu" ]; then
 elif [ "$MODE" = "profile" ]; then
     echo "Compiling profile binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -I$SRC_DIR -I./vendor \
+        -I. -Isrc -I$SRC_DIR \
         -I$CUDA_HOME/include $CUDNN_IFLAG -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
