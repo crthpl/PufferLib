@@ -34,4 +34,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "timeout", log->timeout);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "ema_dist", log->ema_dist);
+    dict_set(out, "ema_vel", log->ema_vel);
+    dict_set(out, "ema_omega", log->ema_omega);
 }
