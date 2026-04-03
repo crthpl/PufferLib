@@ -193,7 +193,15 @@ if [ -z "$CUDNN_LFLAG" ]; then
 fi
 
 NVCC="ccache $CUDA_HOME/bin/nvcc"
-ARCH=${NVCC_ARCH:-native}
+if [ -n "$NVCC_ARCH" ]; then
+    ARCH=$NVCC_ARCH
+elif command -v nvidia-smi &>/dev/null; then
+    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    ARCH=${CC:+sm_$CC}
+    ARCH=${ARCH:-native}
+else
+    ARCH=native
+fi
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
 PYBIND_INCLUDE=$(python -c "import pybind11; print(pybind11.get_include())")
