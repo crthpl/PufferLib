@@ -192,6 +192,7 @@ if [ -z "$CUDNN_LFLAG" ]; then
 fi
 
 NVCC="ccache $CUDA_HOME/bin/nvcc"
+CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 if [ -n "$NVCC_ARCH" ]; then
     ARCH=$NVCC_ARCH
 elif command -v nvidia-smi &>/dev/null; then
