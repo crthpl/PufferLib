@@ -614,7 +614,7 @@ static int ini_handler_vec(void* user, const char* section,
 
 EnvSpeedArgs* create_envspeed(int total_agents, int num_buffers, int num_threads, int horizon) {
     char ini_path[512];
-    snprintf(ini_path, sizeof(ini_path), "config/ocean/%s.ini", TOSTRING(ENV_NAME));
+    snprintf(ini_path, sizeof(ini_path), "config/%s.ini", TOSTRING(ENV_NAME));
 
     VecDefaults defaults = {0};
     ini_parse(ini_path, ini_handler_vec, &defaults);

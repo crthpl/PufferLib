@@ -1,6 +1,5 @@
-## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
+## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full details
 # This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
-# Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
 
 import warnings
 warnings.filterwarnings('error', category=RuntimeWarning)
@@ -484,10 +483,10 @@ def load_config(env_name):
     parsed = vars(parser.parse_args())
     args = defaultdict(dict)
     for key, value in parsed.items():
-        next = args
+        nxt = args
         for subkey in key.split('.'):
-            prev = next
-            next = next.setdefault(subkey, {})
+            prev = nxt
+            nxt = nxt.setdefault(subkey, {})
 
         prev[subkey] = value
 

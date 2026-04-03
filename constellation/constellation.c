@@ -572,11 +572,13 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
         }
 
         char* suffix = slash + 1;
-        float val = hyper->ary[ary_idx];
-        if ((int)val == val) {
-            buffer += sprintf(buffer, "%s = %d\n", suffix, (int)val);
+        double val = hyper->ary[ary_idx];
+        if (strcmp(suffix, "agent_steps") == 0 || strcmp(suffix, "total_timesteps") == 0) {
+            buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)(val * 1e6));
+        } else if (val == (long long)val) {
+            buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)val);
         } else {
-            buffer += sprintf(buffer, "%s = %f\n", suffix, val);
+            buffer += sprintf(buffer, "%s = %g\n", suffix, val);
         }
     }
     buffer[0] = '\0';
@@ -793,7 +795,7 @@ int main(void) {
     char fig_range1_min[32] = {0};
     char fig_range1_max[32] = {0};
     float fig_range1_min_val = 0;
-    float fig_range1_max_val = 1;
+    float fig_range1_max_val = FLT_MAX;
     bool fig_range2_active = false;
     int fig_range2_idx = 1;
     char fig_range2_min[32] = {0};

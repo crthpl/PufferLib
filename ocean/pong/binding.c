@@ -3,7 +3,6 @@
 #define NUM_ATNS 1
 #define ACT_SIZES {3}
 #define OBS_TENSOR_T FloatTensor
-#define ACT_TYPE DOUBLE
 
 #define Env Pong
 #include "vecenv.h"

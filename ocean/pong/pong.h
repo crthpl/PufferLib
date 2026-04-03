@@ -18,7 +18,7 @@ struct Pong {
     Client* client;
     Log log;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -69,7 +69,7 @@ void init(Pong* env) {
 void allocate(Pong* env) {
     init(env);
     env->observations = (float*)calloc(8, sizeof(float));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
 }
@@ -195,7 +195,7 @@ void c_step(Pong* env) {
                 // collision with paddle
                 env->ball_vx = -env->ball_vx;
                 env->n_bounces += 1;
-		env->rewards[0] = 0.1; // agent bounced the ball
+		//env->rewards[0] = 0.1; // agent bounced the ball
                 // ball speed change
                 env->ball_vy += env->ball_speed_y_increment * env->paddle_dir;
                 env->ball_vy = fminf(fmaxf(env->ball_vy, -env->ball_max_speed_y), env->ball_max_speed_y);

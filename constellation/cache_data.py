@@ -1,25 +1,9 @@
+# Merges log files + filters to pareto-optimal points wrt steps, wall-clock, and score. Comment that if you want the full dataset. Also does TSNE, which is why I haven't bothered porting to C.
 import numpy as np
 
 import json
 import glob
 import os
-
-env_names = sorted([
-    'breakout',
-    #'impulse_wars',
-    'pacman',
-    'tetris',
-    #'g2048',
-    #'moba',
-    'pong',
-    #'tower_climb',
-    #'grid',
-    'freeway',
-    'connect4',
-    'nmmo3',
-    #'snake',
-    'tripletriad'
-])
 
 HYPERS = [
     'train/learning_rate',
@@ -147,14 +131,7 @@ def cached_load(path, env_name, cache):
 
         for hyper in HYPERS:
             prefix, suffix = hyper.split('/')
-            #if prefix not in sweep_metadata:
-            #    continue
-
             group = sweep_metadata[prefix]
-            #if suffix not in group:
-            #    continue
-
-
             key = f'{prefix}/{suffix}_norm'
             if key not in data:
                 data[key] = []
@@ -184,15 +161,12 @@ def cached_load(path, env_name, cache):
             del data[k]
 
     # Format im millions to avoid overfloat in C
-    try:
-        data['agent_steps'] = [e/1e6 for e in data['agent_steps']]
-    except:
-        breakpoint()
+    data['agent_steps'] = [e/1e6 for e in data['agent_steps']]
     data['train/total_timesteps'] = [e/1e6 for e in data['train/total_timesteps']]
-    #data['metrics/agent_steps'] = [e/1e6 for e in data['metrics/agent_steps']]
     del data['metrics/agent_steps']
 
     # Filter to pareto
+    '''
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
@@ -201,7 +175,8 @@ def cached_load(path, env_name, cache):
         try:
             data[k] = [data[k][i] for i in idxs]
         except IndexError:
-            breakpoint()
+            continue
+    '''
 
     data['sweep'] = sweep_metadata
     return data
@@ -215,8 +190,10 @@ def compute_tsne():
     if os.path.exists(cache_file):
         cache = json.load(open(cache_file, 'r'))
 
+    env_names = sorted(os.listdir('logs'))
     for env in env_names:
-        all_data[env] = cached_load(f'logs/puffer_{env}/*.json', env, cache)
+        print('Loading: ', env)
+        all_data[env] = cached_load(f'logs/{env}/*.json', env, cache)
 
     with open(cache_file, 'w') as f:
         json.dump(cache, f)
@@ -234,11 +211,7 @@ def compute_tsne():
 
     from sklearn.manifold import TSNE
     proj = TSNE(n_components=2)
-    reduced = None
-    try:
-        reduced = proj.fit_transform(normed)
-    except ValueError:
-        print('Warning: TSNE failed. Skipping TSNE')
+    reduced = proj.fit_transform(normed)
 
     row = 0
     for env in env_names:
@@ -246,17 +219,7 @@ def compute_tsne():
         all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
         all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
 
-        '''
-        if reduced is not None:
-            all_data[env]['tsne1'] = reduced[row:row+sz, 0].tolist()
-            all_data[env]['tsne2'] = reduced[row:row+sz, 1].tolist()
-        else:
-            all_data[env]['tsne1'] = np.random.rand(sz).tolist()
-            all_data[env]['tsne2'] = np.random.rand(sz).tolist()
-        '''
-
         row += sz
-        print(f'Env {env} has {sz} points')
 
     for env in all_data:
         dat = all_data[env]
@@ -264,19 +227,15 @@ def compute_tsne():
                 and len(v) > 0 and isinstance(v[0], (int, float))
                 and (k == 'train/max_grad_norm' or not k.endswith('_norm'))}
         all_data[env] = dat
+        print(f'Env {env} has {len(dat['env/perf'])} points')
         for k, v in dat.items():
-            try:
-                print(f'{env}/{k}: {len(v), min(v), max(v)}')
-            except:
-                print(f'{env}/{k}: {len(v)}')
+            if 'env/perf' in k or 'score' in k:
+                print(f'{env}/{k}: min={min(v)}, max={max(v)}')
 
     for env in all_data:
         for k, v in all_data[env].items():
             if isinstance(v, list):
-                try:
-                    all_data[env][k] = ','.join([f'{x:.6g}' for x in v])
-                except:
-                    breakpoint()
+                all_data[env][k] = ','.join([f'{x:.6g}' for x in v])
 
     json.dump(all_data, open('resources/constellation/experiments.json', 'w'))
 

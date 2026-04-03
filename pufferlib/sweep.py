@@ -7,7 +7,6 @@ from contextlib import contextmanager
 
 import numpy as np
 import pufferlib
-from pufferlib.pufferl import unroll_nested_dict
 
 import torch
 import gpytorch
@@ -24,7 +23,6 @@ from sklearn.linear_model import LogisticRegression
 
 EPSILON = 1e-6
 
-# TODO: move
 def unroll_nested_dict(d):
     if not isinstance(d, dict):
         return d
