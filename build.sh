@@ -195,8 +195,8 @@ NVCC="ccache $CUDA_HOME/bin/nvcc"
 if [ -n "$NVCC_ARCH" ]; then
     ARCH=$NVCC_ARCH
 elif command -v nvidia-smi &>/dev/null; then
-    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
-    ARCH=${CC:+sm_$CC}
+    GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    ARCH=${GPU_CC:+sm_$GPU_CC}
     ARCH=${ARCH:-native}
 else
     ARCH=native
