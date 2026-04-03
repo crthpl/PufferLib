@@ -148,10 +148,10 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     echo "Built: ./$OUTPUT_NAME"
     exit 0
 elif [ "$MODE" = "web" ]; then
-    mkdir -p "build_web/$ENV"
+    mkdir -p "build/web/$ENV"
     echo "Compiling $ENV for web..."
     emcc \
-        -o "build_web/$ENV/game.html" \
+        -o "build/web/$ENV/game.html" \
         "$SRC_DIR/$ENV.c" $EXTRA_SRC \
         -O3 -Wall \
         "${LINK_ARCHIVES[@]}" \
@@ -164,7 +164,7 @@ elif [ "$MODE" = "web" ]; then
         -DNDEBUG -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
         --preload-file resources/$ENV@resources/$ENV \
         --preload-file resources/shared@resources/shared
-    echo "Built: build_web/$ENV/game.html"
+    echo "Built: build/web/$ENV/game.html"
     exit 0
 fi
 
@@ -191,6 +191,9 @@ if [ -z "$CUDNN_LFLAG" ]; then
     CUDNN_LFLAG=$(python -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
+export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+export CCACHE_BASEDIR="$(pwd)"
+export CCACHE_COMPILERCHECK=content
 NVCC="ccache $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 if [ -n "$NVCC_ARCH" ]; then
@@ -210,8 +213,9 @@ EXT_SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SU
 OUTPUT="pufferlib/_C${EXT_SUFFIX}"
 
 BINDING_SRC="$SRC_DIR/binding.c"
-STATIC_OBJ="src/libstatic_${ENV}.o"
-STATIC_LIB="src/libstatic_${ENV}.a"
+mkdir -p build
+STATIC_OBJ="build/libstatic_${ENV}.o"
+STATIC_LIB="build/libstatic_${ENV}.a"
 
 if [ ! -f "$BINDING_SRC" ]; then
     echo "Error: $BINDING_SRC not found"
@@ -249,11 +253,11 @@ if [ -z "$MODE" ]; then
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         $PRECISION $NVCC_OPT \
-        src/bindings.cu -o src/bindings.o
+        src/bindings.cu -o build/bindings.o
 
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        src/bindings.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
         $OMP_LIB $LINK_OPT
@@ -274,10 +278,10 @@ elif [ "$MODE" = "cpu" ]; then
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         $PRECISION $LINK_OPT \
-        src/bindings_cpu.cpp -o src/bindings_cpu.o
+        src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        src/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         -lm -lpthread $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
