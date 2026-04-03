@@ -419,7 +419,7 @@ static void draw_anim4(float anim_t, Font roboto, Shader *star_sh,
     float fade_out = 1.0f - fminf(anim_t / 0.5f, 1.0f);
 
     if (fade_out > 0.0f) {
-        draw_anim2(3.0f, roboto, star_sh);
+        // draw_anim2(3.0f, roboto, star_sh);
         draw_anim3(3.0f, glow_sh, tex, star_sh, roboto);
         DrawRectangle(0, 0, SCREEN_W, SCREEN_H,
             (Color){BG.r, BG.g, BG.b, (unsigned char)((1.0f - fade_out) * 255)});
@@ -676,8 +676,9 @@ int main(void) {
            ANIMATION 3: PufferNet glow on right half, overlaps 3–6s
            ============================================================ */
         else if (t < 9.0f) {
-            float anim2_t = (t < 6.0f) ? t : 6.0f;
-            draw_anim2(anim2_t - 3.0f, roboto, &star_shader);
+            // draw_anim2(anim2_t - 3.0f, roboto, &star_shader);
+            build_bg_verts();
+            draw_stars(bg_verts, bg_draw_count, &star_shader);
 
             if (t >= 6.0f) {
                 draw_anim3(t - 6.0f, &glow_shader, puffernet, &star_shader, roboto);
@@ -720,7 +721,7 @@ int main(void) {
         }
 
 
-        DrawFPS(SCREEN_W - 80, 8);
+        //DrawFPS(SCREEN_W - 80, 8);
         static int frame_counter = 0;
         if (recording && (frame_counter++ % 2 == 0))
             WriteFrame(&recorder, SCREEN_W, SCREEN_H);
