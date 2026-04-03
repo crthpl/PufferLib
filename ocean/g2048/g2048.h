@@ -53,7 +53,7 @@ typedef struct Log {
 typedef struct Game {
     Log log;                        // Required
     unsigned char* observations;    // Cheaper in memory if encoded in uint_8
-    double* actions;                // Required
+    float* actions;                 // Required
     float* rewards;                 // Required
     float* terminals;               // Required
     int num_agents;                 // Required for env_binding

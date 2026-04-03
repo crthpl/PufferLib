@@ -3,7 +3,6 @@
 #define NUM_ATNS 1
 #define ACT_SIZES {4}
 #define OBS_TENSOR_T ByteTensor
-#define ACT_TYPE DOUBLE
 
 #define Env Game
 #include "vecenv.h"
