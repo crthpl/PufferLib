@@ -4,6 +4,8 @@ pufferlib/extensions.c
 pufferlib/puffernet.c
 src/libstatic*
 
+logs/
+
 # Build dir
 build/
 build_web/
