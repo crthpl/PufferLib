@@ -280,7 +280,7 @@ elif [ "$MODE" = "cpu" ]; then
 elif [ "$MODE" = "profile" ]; then
     echo "Compiling profile binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
-        -I. -Isrc -I$SRC_DIR \
+        -I. -Isrc -I$SRC_DIR -Ivendor \
         -I$CUDA_HOME/include $CUDNN_IFLAG -I$RAYLIB_NAME/include \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
