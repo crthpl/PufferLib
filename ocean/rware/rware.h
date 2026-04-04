@@ -151,7 +151,7 @@ struct MovementGraph {
 struct CRware {
     Client* client;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     Log* agent_logs;
@@ -172,6 +172,7 @@ struct CRware {
     int grid_square_size;
     int* original_shelve_locations;
     MovementGraph* movement_graph;
+    unsigned int rng;
 };
 
 void add_log(CRware* env, Log* agent_log) {
@@ -197,7 +198,7 @@ void place_agent(CRware* env, int agent_idx) {
     
     int found_valid_position = 0;
     while (!found_valid_position) {
-        int random_pos = rand() % map_size;
+        int random_pos = rand_r(&env->rng) % map_size;
         
         // Skip if position is not empty
         if (env->warehouse_states[random_pos] != EMPTY) {
@@ -213,7 +214,7 @@ void place_agent(CRware* env, int agent_idx) {
         // Position is valid, place the agent
         env->old_agent_locations[agent_idx] = random_pos;
         env->agent_locations[agent_idx] = random_pos;
-        env->agent_directions[agent_idx] = rand() % 4;
+        env->agent_directions[agent_idx] = rand_r(&env->rng) % 4;
         env->agent_states[agent_idx] = 0;
         found_valid_position = 1;
     }
@@ -232,7 +233,7 @@ int request_new_shelf(CRware* env) {
         total_shelves = 144;
         shelf_locations = medium_shelf_locations;
     }
-    int random_index = rand() % total_shelves;
+    int random_index = rand_r(&env->rng) % total_shelves;
     int shelf_location = shelf_locations[random_index];
     if (env->warehouse_states[shelf_location] == SHELF ) {
         env->warehouse_states[shelf_location] = REQUESTED_SHELF;
@@ -296,7 +297,7 @@ void init(CRware* env) {
 void allocate(CRware* env) {
     init(env);
     env->observations = (float*)calloc(env->num_agents*(SELF_OBS+VISION_OBS), sizeof(float));
-    env->actions = (double*)calloc(env->num_agents, sizeof(double));
+    env->actions = (float*)calloc(env->num_agents, sizeof(float));
     env->rewards = (float*)calloc(env->num_agents, sizeof(float));
     env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 }
@@ -529,26 +530,14 @@ void calculate_weights(CRware* env) {
     }
 }
 
-void update_movement_graph(CRware* env, int agent_idx) {
+void reset_movement_graph(CRware* env) {
     MovementGraph* graph = env->movement_graph;
-    int new_position = get_new_position(env, agent_idx);
-    if (new_position == -1) {
-        return;
-    }
-    graph->target_positions[agent_idx] = new_position;
-
-    // reset cycle and weights
     for (int i = 0; i < env->num_agents; i++) {
+        graph->target_positions[i] = -1;
         graph->cycle_ids[i] = -1;
         graph->weights[i] = 0;
     }
     graph->num_cycles = 0;
-
-    // detect cycles with Floyd algorithm
-    detect_cycles(env);
-
-    // calculate weights for tree
-    calculate_weights(env);
 }
 
 void move_agent(CRware* env, int agent_idx) {
@@ -585,7 +574,6 @@ void move_agent(CRware* env, int agent_idx) {
         env->warehouse_states[new_position] = SHELF;
     }
     env->agent_locations[agent_idx] = new_position;
-    env->movement_graph->target_positions[agent_idx] = -1;
 }
 
 void pickup_shelf(CRware* env, int agent_idx) {
@@ -620,9 +608,23 @@ void pickup_shelf(CRware* env, int agent_idx) {
         env->rewards[agent_idx] = 0.5;
         env->agent_logs[agent_idx].episode_return += 0.5;
         env->agent_logs[agent_idx].score = 1.0;
+        // Try random selection first, then fall back to linear scan to avoid infinite loop
+        // when all shelves are currently being carried (warehouse_states == EMPTY).
+        int total_shelves;
+        const int* shelf_locations;
+        if (env->map_choice == 1) { total_shelves = 32; shelf_locations = tiny_shelf_locations; }
+        else if (env->map_choice == 2) { total_shelves = 80; shelf_locations = small_shelf_locations; }
+        else { total_shelves = 144; shelf_locations = medium_shelf_locations; }
         int shelf_count = 0;
-        while (shelf_count < 1) {
+        for (int attempt = 0; attempt < total_shelves && !shelf_count; attempt++) {
             shelf_count += request_new_shelf(env);
+        }
+        if (shelf_count) return;
+        for (int i = 0; i < total_shelves && !shelf_count; i++) {
+            if (env->warehouse_states[shelf_locations[i]] == SHELF) {
+                env->warehouse_states[shelf_locations[i]] = REQUESTED_SHELF;
+                shelf_count = 1;
+            }
         }
     }
 }
@@ -684,12 +686,17 @@ void process_tree_movements(CRware* env, MovementGraph* graph) {
 void c_step(CRware* env) {
     memset(env->rewards, 0, env->num_agents * sizeof(float));
     MovementGraph* graph = env->movement_graph;
+
+    // Reset movement graph so stale targets from previous steps don't
+    // create phantom cycles in Floyd's detection or the weight propagation loop.
+    reset_movement_graph(env);
+
+    int is_movement = 0;
     for (int i = 0; i < env->num_agents; i++) {
         env->old_agent_locations[i] = env->agent_locations[i];
         env->agent_logs[i].episode_length += 1;
         int action = (int)env->actions[i];
-        
-	    // Handle direction changes and non-movement actions
+
         if (action != NOOP && action != TOGGLE_LOAD) {
             env->agent_directions[i] = get_direction(env, action, i);
         }
@@ -697,17 +704,20 @@ void c_step(CRware* env) {
             pickup_shelf(env, i);
         }
         if (action == FORWARD) {
-            update_movement_graph(env, i);
+            int new_pos = get_new_position(env, i);
+            if (new_pos != -1) {
+                graph->target_positions[i] = new_pos;
+                is_movement++;
+            }
         }
     }
-    int is_movement=0;
-    for(int i=0; i<env->num_agents; i++) {
-        if ((int)env->actions[i] == FORWARD) is_movement++;
-    }
-    if (is_movement>=1) {
-        // Process movements in cycles first
+
+    if (is_movement >= 1) {
+        // Run cycle detection and weight calculation once with the complete graph.
+        // Per-agent incremental updates caused stale intermediate state.
+        detect_cycles(env);
+        calculate_weights(env);
         process_cycle_movements(env, graph);
-        // process tree movements
         process_tree_movements(env, graph);
     }
 
