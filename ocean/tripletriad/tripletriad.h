@@ -40,7 +40,7 @@ typedef struct Client Client;
 typedef struct CTripleTriad CTripleTriad;
 struct CTripleTriad {
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -65,6 +65,7 @@ struct CTripleTriad {
     float episode_return;
     float episode_length;
     Client* client;
+    unsigned int rng;
 };
 
 void add_log(CTripleTriad* env) {
@@ -89,7 +90,7 @@ void generate_cards_in_hand(CTripleTriad* env) {
     for(int i=0; i< 2; i++) {
         for(int j=0; j< 5; j++) {
             for(int k=0; k< 4; k++) {
-                env->cards_in_hand[i][j][k] = (rand() % 7) + 1;
+                env->cards_in_hand[i][j][k] = (rand_r(&env->rng) % 7) + 1;
             }
         }
     }
@@ -172,7 +173,7 @@ void init_ctripletriad(CTripleTriad* env) {
 }
 
 void allocate_ctripletriad(CTripleTriad* env) {
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->observations = (float*)calloc(env->width*env->height, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
@@ -265,7 +266,7 @@ void c_reset(CTripleTriad* env) {
     for(int i=0; i< 2; i++) {
         for(int j=0; j< 5; j++) {
             for(int k=0; k< 4; k++) {
-                env->cards_in_hand[i][j][k] = (rand() % 7) + 1;
+                env->cards_in_hand[i][j][k] = (rand_r(&env->rng) % 7) + 1;
             }
         }
     }
@@ -379,7 +380,7 @@ int get_bot_card_placement(CTripleTriad* env) {
     
     // Randomly select a valid placement
     if (num_valid_placements > 0) {
-        return valid_placements[rand() % num_valid_placements];
+        return valid_placements[rand_r(&env->rng) % num_valid_placements];
     }
 
     // If no valid placements, return 0 (this should not happen in a normal game)
@@ -399,7 +400,7 @@ int get_bot_card_selection(CTripleTriad* env) {
 
     // Randomly select a valid card
     if (num_valid_selections > 0) {
-        return valid_selections[rand() % num_valid_selections];
+        return valid_selections[rand_r(&env->rng) % num_valid_selections];
     }
 
     // If no valid selections, return 0 (this should not happen in a normal game)

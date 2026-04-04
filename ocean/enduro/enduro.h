@@ -181,7 +181,7 @@ typedef struct Enduro {
     Client* client;
     Log log;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -272,6 +272,7 @@ typedef struct Enduro {
     int currentDayTimeIndex;
     int previousDayTimeIndex;
     // RNG
+    unsigned int rng;
     unsigned int rng_state;
     int reset_count;
     // Rewards
@@ -709,7 +710,7 @@ void init(Enduro* env) {
 
 void allocate(Enduro* env) {
     env->observations = (float*)calloc(env->obs_size, sizeof(float));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
 }
@@ -912,9 +913,9 @@ void add_enemy_car(Enduro* env) {
     }
 
     // Randomly select a lane
-    int lane = possible_lanes[rand() % num_possible_lanes];
+    int lane = possible_lanes[rand_r(&env->rng) % num_possible_lanes];
     // Preferentially spawn in the last_spawned_lane 30% of the time
-    if (rand() % 100 < 60 && env->last_spawned_lane != -1) {
+    if (rand_r(&env->rng) % 100 < 60 && env->last_spawned_lane != -1) {
         lane = env->last_spawned_lane;
     }
     env->last_spawned_lane = lane;
@@ -926,14 +927,14 @@ void add_enemy_car(Enduro* env) {
         .last_x = car_x_in_lane(env, lane, VANISHING_POINT_Y),
         .last_y = VANISHING_POINT_Y,
         .passed = false,
-        .colorIndex = rand() % 6
+        .colorIndex = rand_r(&env->rng) % 6
     };
     // Ensure minimum spacing between cars in the same lane
     float depth = (car.y - VANISHING_POINT_Y) / (PLAYABLE_AREA_BOTTOM - VANISHING_POINT_Y);
     float scale = fmax(0.1f, 0.9f * depth + 0.1f);
     float scaled_car_length = CAR_HEIGHT * scale;
     // Randomize min spacing between 1.0f and 6.0f car lengths
-    float dynamic_spacing_factor = (rand() / (float)RAND_MAX) * 6.0f + 0.5f;
+    float dynamic_spacing_factor = (rand_r(&env->rng) / (float)RAND_MAX) * 6.0f + 0.5f;
     float min_spacing = dynamic_spacing_factor * scaled_car_length;
     for (int i = 0; i < env->numEnemies; i++) {
         Car* existing_car = &env->enemyCars[i];
@@ -1357,8 +1358,8 @@ void c_step(Enduro* env) {
             int num_to_spawn = 1;
 
             // Randomly decide to spawn more cars in a clump
-            if ((rand() / (float)RAND_MAX) < clump_probability) {
-                num_to_spawn = 1 + rand() % 2; // Spawn 1 to 3 cars
+            if ((rand_r(&env->rng) / (float)RAND_MAX) < clump_probability) {
+                num_to_spawn = 1 + rand_r(&env->rng) % 2; // Spawn 1 to 3 cars
             }
 
             // Track occupied lanes to prevent over-blocking
@@ -1368,7 +1369,7 @@ void c_step(Enduro* env) {
                 // Find an unoccupied lane
                 int lane;
                 do {
-                    lane = rand() % NUM_LANES;
+                    lane = rand_r(&env->rng) % NUM_LANES;
                 } while (occupied_lanes[lane]);
 
                 // Mark the lane as occupied
@@ -1594,14 +1595,14 @@ void update_road_curve(Enduro* env) {
 
     for (int i = 0; i < 3; i++) {
         // Generate random step thresholds
-        step_thresholds[i] = 1500 + rand() % 3801; // Random value between 1500 and 3800
+        step_thresholds[i] = 1500 + rand_r(&env->rng) % 3801; // Random value between 1500 and 3800
 
         // Generate a random curve direction (-1, 0, 1) with rules
         int direction_choices[] = {-1, 0, 1};
         int next_direction;
 
         do {
-            next_direction = direction_choices[rand() % 3];
+            next_direction = direction_choices[rand_r(&env->rng) % 3];
         } while ((last_direction == -1 && next_direction == 1) || (last_direction == 1 && next_direction == -1));
 
         curve_directions[i] = next_direction;
