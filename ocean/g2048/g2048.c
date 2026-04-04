@@ -1,5 +1,5 @@
 #include "g2048.h"
-#include "g2048_net.h"
+#include "puffernet.h"
 
 #define OBS_DIM 16
 #define HIDDEN_DIM 512
@@ -8,7 +8,6 @@
 #define NO_RENDER false
 #define NUM_EVAL_RUNS 200
 
-/*
 void demo() {
     srand(time(NULL));
     Game env = {
@@ -17,8 +16,8 @@ void demo() {
     init(&env);
 
     unsigned char observations[OBS_DIM] = {0};
-    unsigned char terminals[1] = {0};
-    int actions[1] = {0};
+    float terminals[1] = {0};
+    float actions[1] = {0};
     float rewards[1] = {0};
 
     env.observations = observations;
@@ -27,7 +26,8 @@ void demo() {
     env.rewards = rewards;
 
     Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 3466859);
-    G2048Net* net = make_g2048net(weights, HIDDEN_DIM);
+    int logit_sizes[1] = {4};
+    PufferNet* net = make_puffernet(weights, 1, OBS_DIM, HIDDEN_DIM, 5, logit_sizes, 1);
     c_reset(&env);
     if (!NO_RENDER) c_render(&env);
     printf("Starting...\n");
@@ -53,7 +53,9 @@ void demo() {
             continue;
         } else {
             action = 1;
-            forward_g2048net(net, env.observations, env.actions);
+            float obs_f[OBS_DIM];
+            for (int i = 0; i < OBS_DIM; i++) obs_f[i] = (float)env.observations[i];
+            forward_puffernet(net, obs_f, env.actions);
         }
 
         if (action > 0) {
@@ -86,13 +88,11 @@ void demo() {
         if (NO_RENDER && trial > NUM_EVAL_RUNS) break;
     }
 
-    free_g2048net(net);
+    free_puffernet(net);
     free(weights);
     c_close(&env);
     printf("Finished %d trials.\n", NUM_EVAL_RUNS);
-    return 0;
 }
-*/
 
 void perftest() {
 
@@ -104,7 +104,7 @@ void perftest() {
 
     unsigned char observations[OBS_DIM] = {0};
     float terminals[1] = {0};
-    double actions[1] = {0};
+    float actions[1] = {0};
     float rewards[1] = {0};
 
     env.observations = observations;
@@ -135,4 +135,3 @@ int main() {
     perftest();
     return 0;
 }
- 
