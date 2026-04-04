@@ -1,15 +1,18 @@
 #include "go.h"
-#define OBS_SIZE 100
+// 9x9 - obs 326, act 82
+// 13x13 - obs 678, act 170
+// 19x19 - obs 1446, act 362
+#define OBS_SIZE 678
 #define NUM_ATNS 1
-#define ACT_SIZES {50}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define ACT_SIZES {170}
+#define OBS_TENSOR_T FloatTensor
 
 #define Env CGo
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
+    env->selfplay = dict_get(kwargs, "selfplay")->value;
     env->width = dict_get(kwargs, "width")->value;
     env->height = dict_get(kwargs, "height")->value;
     env->grid_size = dict_get(kwargs, "grid_size")->value;
