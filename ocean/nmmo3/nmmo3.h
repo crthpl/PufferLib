@@ -759,6 +759,9 @@ void add_player_log(MMO* env, int pid) {
     log->perf = log->min_comb_prof / (float)env->levels;
     log->n++;
     *ret = (Reward){0};
+    if (pid < env->num_agents) {
+        env->terminals[pid] = 1.0f;
+    }
 }
 
 void init(MMO* env) {
