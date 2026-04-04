@@ -70,7 +70,7 @@ struct Freeway {
     Client* client;
     Log log;
     float* observations;
-    double* actions;
+    float* actions;
     int* human_actions;
     float* rewards;
     float* terminals;
@@ -102,6 +102,7 @@ struct Freeway {
     int use_dense_rewards;
     int env_randomization;
     int enable_human_player;
+    unsigned int rng;
 };
 
 void load_level(Freeway* env, int level) {
@@ -153,7 +154,7 @@ void init(Freeway* env) {
     env->enemies = (FreewayEnemy*)calloc(NUM_LANES*MAX_ENEMIES_PER_LANE, sizeof(FreewayEnemy));
     env->human_actions = (int*)calloc(1, sizeof(int));
     if ((env->level < 0) || (env->level >= NUM_LEVELS)) {
-        env->level = rand() % NUM_LEVELS;
+        env->level = rand_r(&env->rng) % NUM_LEVELS;
     }
     load_level(env, env->level);
 }
@@ -161,7 +162,7 @@ void init(Freeway* env) {
 void allocate(Freeway* env) {
     init(env);
     env->observations = (float*)calloc(4 + NUM_LANES*MAX_ENEMIES_PER_LANE, sizeof(float));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
 }
@@ -214,7 +215,7 @@ void spawn_enemies(Freeway* env) {
     float lane_offset_x;
     FreewayEnemy* enemy;
     for (int lane = 0; lane < NUM_LANES; lane++) {
-        lane_offset_x =  env->width * (rand() / (float) RAND_MAX);
+        lane_offset_x =  env->width * (rand_r(&env->rng) / (float) RAND_MAX);
         for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++){
             enemy = &env->enemies[lane * MAX_ENEMIES_PER_LANE + i];
             if (enemy->is_enabled){
@@ -295,7 +296,7 @@ void clip_enemy_position(Freeway* env, FreewayEnemy* enemy){
 void randomize_enemy_speed(Freeway* env) {
     FreewayEnemy* enemy;
     for (int lane = 0; lane < NUM_LANES; lane++) {
-        int delta_speed = (rand() % 3) - 1; // Randomly increase or decrease speed
+        int delta_speed = (rand_r(&env->rng) % 3) - 1; // Randomly increase or decrease speed
         for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++) {
             enemy = &env->enemies[lane*MAX_ENEMIES_PER_LANE + i];
             if (enemy->speed_randomization) {

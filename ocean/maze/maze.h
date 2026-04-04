@@ -97,27 +97,27 @@ struct Grid{
     Log log;
     unsigned int rng;
     Agent* agents;
-    unsigned char* grid;
+    unsigned char* maze;
     int* counts;
     unsigned char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
 };
 
-void init_grid(Grid* env) {
+void init_maze(Grid* env) {
     env->num_agents = 1;
     env->vision = 5;
     env->speed = 1;
     env->discretize = true;
     env->obs_size = 2*env->vision + 1;
     int env_mem= env->max_size * env->max_size;
-    env->grid = calloc(env_mem, sizeof(unsigned char));
+    env->maze = calloc(env_mem, sizeof(unsigned char));
     env->counts = calloc(env_mem, sizeof(int));
     env->agents = calloc(env->num_agents, sizeof(Agent));
 }
 
-Grid* allocate_grid(int max_size, int num_agents, int horizon,
+Grid* allocate_maze(int max_size, int num_agents, int horizon,
         int vision, float speed, bool discretize) {
     Grid* env = (Grid*)calloc(1, sizeof(Grid));
     env->max_size = max_size;
@@ -132,17 +132,17 @@ Grid* allocate_grid(int max_size, int num_agents, int horizon,
     env->actions = calloc(num_agents, sizeof(double));
     env->rewards = calloc(num_agents, sizeof(float));
     env->terminals = calloc(num_agents, sizeof(float));
-    init_grid(env);
+    init_maze(env);
     return env;
 }
 
 void c_close(Grid* env) {
-    free(env->grid);
+    free(env->maze);
     free(env->counts);
     free(env->agents);
 }
 
-void free_allocated_grid(Grid* env) {
+void free_allocated_maze(Grid* env) {
     free(env->observations);
     free(env->actions);
     free(env->rewards);
@@ -155,7 +155,7 @@ bool in_bounds(Grid* env, int y, int c) {
         && c >= 0 && c <= env->width);
 }
 
-int grid_offset(Grid* env, int y, int x) {
+int maze_offset(Grid* env, int y, int x) {
     return y*env->max_size + x;
 }
 
@@ -199,8 +199,8 @@ void compute_observations(Grid* env) {
                 int r_idx = r - y + env->vision;
                 int c_idx = c - x + env->vision;
                 int obs_adr = obs_offset + r_idx*env->obs_size + c_idx;
-                int adr = grid_offset(env, r, c);
-                env->observations[obs_adr] = env->grid[adr];
+                int adr = maze_offset(env, r, c);
+                env->observations[obs_adr] = env->maze[adr];
             }
         }
         /*
@@ -218,16 +218,16 @@ void compute_observations(Grid* env) {
 
 void make_border(Grid*env) {
     for (int r = 0; r < env->height; r++) {
-        int adr = grid_offset(env, r, 0);
-        env->grid[adr] = WALL;
-        adr = grid_offset(env, r, env->width-1);
-        env->grid[adr] = WALL;
+        int adr = maze_offset(env, r, 0);
+        env->maze[adr] = WALL;
+        adr = maze_offset(env, r, env->width-1);
+        env->maze[adr] = WALL;
     }
     for (int c = 0; c < env->width; c++) {
-        int adr = grid_offset(env, 0, c);
-        env->grid[adr] = WALL;
-        adr = grid_offset(env, env->height-1, c);
-        env->grid[adr] = WALL;
+        int adr = maze_offset(env, 0, c);
+        env->maze[adr] = WALL;
+        adr = maze_offset(env, env->height-1, c);
+        env->maze[adr] = WALL;
     }
 }
 
@@ -236,15 +236,15 @@ void spawn_agent(Grid* env, int idx, int x, int y) {
     int spawn_y = y;
     int spawn_x = x;
     assert(in_bounds(env, spawn_y, spawn_x));
-    int adr = grid_offset(env, spawn_y, spawn_x);
-    assert(env->grid[adr] == EMPTY);
+    int adr = maze_offset(env, spawn_y, spawn_x);
+    assert(env->maze[adr] == EMPTY);
     agent->spawn_y = spawn_y;
     agent->spawn_x = spawn_x;
     agent->y = agent->spawn_y;
     agent->x = agent->spawn_x;
     agent->prev_y = agent->y;
     agent->prev_x = agent->x;
-    env->grid[adr] = agent->color;
+    env->maze[adr] = agent->color;
     agent->direction = 0;
     agent->held = -1;
     agent->color = AGENT;
@@ -255,17 +255,17 @@ struct State {
     int height;
     int num_agents;
     Agent* agents;
-    unsigned char* grid;
+    unsigned char* maze;
 };
 
 void init_state(State* state, int max_size, int num_agents) {
     state->agents = calloc(num_agents, sizeof(Agent));
-    state->grid = calloc(max_size*max_size, sizeof(unsigned char));
+    state->maze = calloc(max_size*max_size, sizeof(unsigned char));
 }
 
 void free_state(State* state) {
     free(state->agents);
-    free(state->grid);
+    free(state->maze);
     free(state);
 }
 
@@ -274,7 +274,7 @@ void get_state(Grid* env, State* state) {
     state->height = env->height;
     state->num_agents = env->num_agents;
     memcpy(state->agents, env->agents, env->num_agents*sizeof(Agent));
-    memcpy(state->grid, env->grid, env->max_size*env->max_size);
+    memcpy(state->maze, env->maze, env->max_size*env->max_size);
 }
 
 void set_state(Grid* env, State* state) {
@@ -283,11 +283,11 @@ void set_state(Grid* env, State* state) {
     env->horizon = 2*env->width*env->height;
     env->num_agents = state->num_agents;
     memcpy(env->agents, state->agents, env->num_agents*sizeof(Agent));
-    memcpy(env->grid, state->grid, env->max_size*env->max_size);
+    memcpy(env->maze, state->maze, env->max_size*env->max_size);
 }
 
 void c_reset(Grid* env) {
-    memset(env->grid, 0, env->max_size*env->max_size);
+    memset(env->maze, 0, env->max_size*env->max_size);
     memset(env->counts, 0, env->max_size*env->max_size*sizeof(int));
     env->tick = 0;
     int idx = rand_r(&env->rng) % env->num_maps;
@@ -301,8 +301,8 @@ int move_to(Grid* env, int agent_idx, float y, float x) {
         return 1;
     }
 
-    int adr = grid_offset(env, round(y), round(x));
-    int dest = env->grid[adr];
+    int adr = maze_offset(env, round(y), round(x));
+    int dest = env->maze[adr];
     if (dest == WALL) {
         return 1;
     } else if (dest == REWARD || dest == GOAL) {
@@ -317,15 +317,15 @@ int move_to(Grid* env, int agent_idx, float y, float x) {
     } else if (is_locked_door(dest)) { if (!is_correct_key(agent->held, dest)) { return 1;
         }
         agent->held = -1;
-        env->grid[adr] = EMPTY;
+        env->maze[adr] = EMPTY;
     }
 
     int start_y = round(agent->y);
     int start_x = round(agent->x);
-    int start_adr = grid_offset(env, start_y, start_x);
-    env->grid[start_adr] = EMPTY;
+    int start_adr = maze_offset(env, start_y, start_x);
+    env->maze[start_adr] = EMPTY;
 
-    env->grid[adr] = agent->color;
+    env->maze[adr] = agent->color;
     agent->y = y;
     agent->x = x;
     return 0;
@@ -397,7 +397,7 @@ bool step_agent(Grid* env, int idx) {
 
     int x_int = agent->x;
     int y_int = agent->y;
-    int adr = grid_offset(env, y_int, x_int);
+    int adr = maze_offset(env, y_int, x_int);
     env->counts[adr]++;
     //env->rewards[idx] += 0.01 / (float)env->counts[adr];
     //env->log.episode_return += 0.01 / (float)env->counts[adr];
@@ -508,7 +508,7 @@ void c_render(Grid* env) {
     Agent* agent = &env->agents[0];
     int r = agent->y;
     int c = agent->x;
-    int adr = grid_offset(env, r, c);
+    int adr = maze_offset(env, r, c);
     //renderer->overlay[adr] = overlay;
     //renderer->overlay[adr] -= 0.1;
     //renderer->overlay[adr] = -1 + 1.0/(float)env->counts[adr];
@@ -519,8 +519,8 @@ void c_render(Grid* env) {
     int ts = renderer->cell_size;
     for (int r = 0; r < env->height; r++) {
         for (int c = 0; c < env->width; c++){
-            adr = grid_offset(env, r, c);
-            int tile = env->grid[adr];
+            adr = maze_offset(env, r, c);
+            int tile = env->maze[adr];
             if (tile == EMPTY) {
                 continue;
                 overlay = renderer->overlay[adr];
@@ -598,44 +598,44 @@ void generate_locked_room(Grid* env) {
     make_border(env);
 
     for (int r = 0; r < env->height; r++) {
-        int adr = grid_offset(env, r, 7);
-        env->grid[adr] = WALL;
-        adr = grid_offset(env, r, 11);
-        env->grid[adr] = WALL;
+        int adr = maze_offset(env, r, 7);
+        env->maze[adr] = WALL;
+        adr = maze_offset(env, r, 11);
+        env->maze[adr] = WALL;
     }
     for (int c = 0; c < 7; c++) {
-        int adr = grid_offset(env, 6, c);
-        env->grid[adr] = WALL;
-        adr = grid_offset(env, 12, c);
-        env->grid[adr] = WALL;
+        int adr = maze_offset(env, 6, c);
+        env->maze[adr] = WALL;
+        adr = maze_offset(env, 12, c);
+        env->maze[adr] = WALL;
     }
     for (int c = 11; c < env->width; c++) {
-        int adr = grid_offset(env, 6, c);
-        env->grid[adr] = WALL;
-        adr = grid_offset(env, 12, c);
-        env->grid[adr] = WALL;
+        int adr = maze_offset(env, 6, c);
+        env->maze[adr] = WALL;
+        adr = maze_offset(env, 12, c);
+        env->maze[adr] = WALL;
     }
-    int adr = grid_offset(env, 3, 7);
-    env->grid[adr] = DOOR_OPEN;
-    adr = grid_offset(env, 9, 7);
-    env->grid[adr] = DOOR_OPEN + 1;
-    adr = grid_offset(env, 15, 7);
-    env->grid[adr] = DOOR_OPEN + 2;
-    adr = grid_offset(env, 3, 11);
-    env->grid[adr] = DOOR_OPEN + 3;
-    adr = grid_offset(env, 9, 11);
-    env->grid[adr] = DOOR_OPEN + 4;
-    adr = grid_offset(env, 15, 11);
-    env->grid[adr] = DOOR_LOCKED + 5;
+    int adr = maze_offset(env, 3, 7);
+    env->maze[adr] = DOOR_OPEN;
+    adr = maze_offset(env, 9, 7);
+    env->maze[adr] = DOOR_OPEN + 1;
+    adr = maze_offset(env, 15, 7);
+    env->maze[adr] = DOOR_OPEN + 2;
+    adr = maze_offset(env, 3, 11);
+    env->maze[adr] = DOOR_OPEN + 3;
+    adr = maze_offset(env, 9, 11);
+    env->maze[adr] = DOOR_OPEN + 4;
+    adr = maze_offset(env, 15, 11);
+    env->maze[adr] = DOOR_LOCKED + 5;
 
-    adr = grid_offset(env, 4, 15);
-    env->grid[adr] = KEY + 5;
+    adr = maze_offset(env, 4, 15);
+    env->maze[adr] = KEY + 5;
 
-    adr = grid_offset(env, 16, 17);
-    env->grid[adr] = GOAL;
+    adr = maze_offset(env, 16, 17);
+    env->maze[adr] = GOAL;
 }
 
-void generate_growing_tree_maze(unsigned char* grid,
+void generate_growing_tree_maze(unsigned char* maze,
         int width, int height, int max_size, float difficulty, int seed) {
     unsigned int rng = seed;
     int dx[4] = {-1, 0, 1, 0};
@@ -647,12 +647,12 @@ void generate_growing_tree_maze(unsigned char* grid,
     bool visited[width*height];
     memset(visited, false, width*height);
 
-    memset(grid, WALL, max_size*height);
+    memset(maze, WALL, max_size*height);
     for (int r = 0; r < height; r++) {
         for (int c = 0; c < width; c++) {
             int adr = r*max_size + c;
             if (r % 2 == 1 && c % 2 == 1) {
-                grid[adr] = EMPTY;
+                maze[adr] = EMPTY;
             }
         }
     }
@@ -724,7 +724,7 @@ void generate_growing_tree_maze(unsigned char* grid,
             ny = y + dy[dir];
 
             int adr = ny*max_size + nx;
-            grid[adr] = EMPTY;
+            maze[adr] = EMPTY;
             num_cells++;
 
             made_path = true;
@@ -739,7 +739,7 @@ void generate_growing_tree_maze(unsigned char* grid,
             for (int r = 0; r < height; r++) {
                 for (int c = 0; c < width; c++){
                     int adr = r*max_size + c;
-                    int tile = grid[adr];
+                    int tile = maze[adr];
                     if (tile == WALL) {
                         DrawRectangle(c*cell, r*cell, cell, cell, color);
                     }
@@ -759,9 +759,9 @@ void generate_growing_tree_maze(unsigned char* grid,
 void create_maze_level(Grid* env, int width, int height, float difficulty, int seed) {
     env->width = width;
     env->height = height;
-    generate_growing_tree_maze(env->grid, width, height, env->max_size, difficulty, seed);
+    generate_growing_tree_maze(env->maze, width, height, env->max_size, difficulty, seed);
     make_border(env);
     spawn_agent(env, 0, 1, 1);
-    int goal_adr = grid_offset(env, env->height - 2, env->width - 2);
-    env->grid[goal_adr] = GOAL;
+    int goal_adr = maze_offset(env, env->height - 2, env->width - 2);
+    env->maze[goal_adr] = GOAL;
 }

@@ -7,8 +7,6 @@
 #define WIN_CONDITION 4
 const int PLAYER_WIN = 1.0;
 const int ENV_WIN = -1.0;
-const unsigned char DONE = 1;
-const unsigned char NOT_DONE = 0;
 const int ROWS = 6;
 const int COLUMNS = 7;
 const int WIDTH = 672;
@@ -30,11 +28,11 @@ struct Log {
 };
 
 typedef struct Client Client;
-typedef struct CConnect4 CConnect4;
-struct CConnect4 {
+typedef struct Connect4 Connect4;
+struct Connect4 {
     // Pufferlib inputs / outputs
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -48,35 +46,36 @@ struct CConnect4 {
     uint64_t env_pieces;
 
     int tick;
+    int end_game;
+    unsigned int rng;
 };
 
-void allocate_cconnect4(CConnect4* env) {
+void allocate_cconnect4(Connect4* env) {
     env->observations = (float*)calloc(42, sizeof(float));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
 }
 
-void free_allocated_cconnect4(CConnect4* env) {
+void free_allocated_cconnect4(Connect4* env) {
     free(env->actions);
     free(env->observations);
     free(env->terminals);
     free(env->rewards);
 }
 
-void c_close(CConnect4* env) {
+void c_close(Connect4* env) {
 }
 
-void add_log(CConnect4* env) {
+void add_log(Connect4* env) {
     env->log.perf += (float)(env->rewards[0] == PLAYER_WIN);
     env->log.score += env->rewards[0];
     env->log.episode_return += env->rewards[0];
-    env->log.episode_length += env->log.episode_length;
+    env->log.episode_length += env->tick;
     env->log.n += 1;
 }
 
-void init(CConnect4* env) {
-    env->log = (Log){0};
+void init(Connect4* env) {
     env->tick = 0;
 }
 
@@ -163,7 +162,7 @@ float negamax(uint64_t pieces, uint64_t other_pieces, int depth) {
     return value;
 }
 
-int compute_env_move(CConnect4* env) {
+int compute_env_move(Connect4* env) {
     uint64_t piece_mask = env->player_pieces | env->env_pieces;
     uint64_t hash = env->player_pieces + piece_mask + c_bottom();
 
@@ -206,7 +205,8 @@ int compute_env_move(CConnect4* env) {
         }
     }
     //printf("Values: %f, %f, %f, %f, %f, %f, %f\n", values[0], values[1], values[2], values[3], values[4], values[5], values[6]);
-    int best_tie = rand() % num_ties;
+    //int best_tie = rand() % num_ties;
+    int best_tie = rand_r(&env->rng) % num_ties;
     for (uint64_t column = 0; column < 7; column ++) {
         if (values[column] == best_value) {
             if (best_tie == 0) {
@@ -219,7 +219,7 @@ int compute_env_move(CConnect4* env) {
     return 0;
 }
 
-void compute_observation(CConnect4* env) {
+void compute_observation(Connect4* env) {
     // Populate observations from bitstring game representation
     // http://blog.gamesolver.org/solving-connect-four/06-bitboard/
     uint64_t player_pieces = env->player_pieces;
@@ -244,9 +244,10 @@ void compute_observation(CConnect4* env) {
     }
 }
 
-void c_reset(CConnect4* env) {
-    env->log = (Log){0};
-    env->terminals[0] = NOT_DONE;
+void c_reset(Connect4* env) {
+    env->end_game = 0;
+    env->tick=0;
+    env->terminals[0] = 0;
     env->player_pieces = 0;
     env->env_pieces = 0;
     for (int i = 0; i < 42; i ++) {
@@ -254,24 +255,25 @@ void c_reset(CConnect4* env) {
     }
 }
 
-void finish_game(CConnect4* env, float reward) {
+void finish_game(Connect4* env, float reward) {
     env->rewards[0] = reward;
-    env->terminals[0] = DONE;
+    env->terminals[0] = 1;
     add_log(env);
-    compute_observation(env);
+    env->end_game = 1;
 }
 
-void c_step(CConnect4* env) {
-    env->log.episode_length += 1;
+void c_step(Connect4* env) {
+    env->tick+=1;
     env->rewards[0] = 0.0;
+    env->terminals[0] = 0;
 
-    if (env->terminals[0] == DONE) {
+    if(env->end_game == 1) {
         c_reset(env);
         return;
     }
 
     // Player action (PLAYER_WIN)
-    uint64_t column = env->actions[0];
+    uint64_t column = (uint64_t)env->actions[0];
     uint64_t piece_mask = env->player_pieces | env->env_pieces;
     if (invalid_move(column, piece_mask)) {
         finish_game(env, ENV_WIN);
@@ -325,7 +327,7 @@ Client* make_client() {
     return client;
 }
 
-void c_render(CConnect4* env) {
+void c_render(Connect4* env) {
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
     }

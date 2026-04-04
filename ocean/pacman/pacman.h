@@ -119,7 +119,7 @@ typedef struct PacmanEnv {
         int chase_mode_length;
 
         float *observations;
-        double *actions;
+        float *actions;
         float *rewards;
         float *terminals;
         int num_agents;
@@ -151,6 +151,7 @@ typedef struct PacmanEnv {
         bool player_caught;
 
         Ghost ghosts[NUM_GHOSTS];
+        unsigned int rng;
 } PacmanEnv;
 
 void add_log(PacmanEnv *env) {
@@ -230,7 +231,7 @@ void init(PacmanEnv *env) {
 void allocate(PacmanEnv *env) {
     init(env);
     env->observations = (float *)calloc(OBSERVATIONS_COUNT, sizeof(float));
-    env->actions = (double *)calloc(1, sizeof(double));
+    env->actions = (float *)calloc(1, sizeof(float));
     env->rewards = (float *)calloc(1, sizeof(float));
     env->terminals = (float *)calloc(1, sizeof(float));
 }
@@ -330,7 +331,7 @@ static inline void reset_round(PacmanEnv *env) {
     }
 
     if (env->randomize_starting_position) {
-        int player_randomizer = rand() % NUM_DOTS;
+        int player_randomizer = rand_r(&env->rng) % NUM_DOTS;
         env->player_pos = env->possible_spawn_pos[player_randomizer];
     } else {
         env->player_pos = env->player_spawn_pos;
@@ -427,7 +428,7 @@ static inline int ghost_direction(PacmanEnv *env, Ghost *ghost) {
     }
 
     if (ghost->frightened) {
-        int random_index = rand() % option_count;
+        int random_index = rand_r(&env->rng) % option_count;
         return directions[random_index];
     }
 

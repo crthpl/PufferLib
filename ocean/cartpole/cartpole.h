@@ -31,7 +31,7 @@ struct Client {
 typedef struct Cartpole Cartpole;
 struct Cartpole {
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     unsigned char* truncations;
@@ -51,6 +51,7 @@ struct Cartpole {
     float tau;
     int continuous;
     float episode_return;
+    unsigned int rng;
 };
 
 void add_log(Cartpole* env) {
@@ -75,7 +76,7 @@ void init(Cartpole* env) {
 void allocate(Cartpole* env) {
     init(env);
     env->observations = (float*)calloc(4, sizeof(float));
-    env->actions = (double*)calloc(1, sizeof(double));
+    env->actions = (float*)calloc(1, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
 }
@@ -142,10 +143,10 @@ void compute_observations(Cartpole* env) {
 
 void c_reset(Cartpole* env) {
     env->episode_return = 0.0f;
-    env->x = ((float)rand() / (float)RAND_MAX) * 0.08f - 0.04f;
-    env->x_dot = ((float)rand() / (float)RAND_MAX) * 0.08f - 0.04f;
-    env->theta = ((float)rand() / (float)RAND_MAX) * 0.08f - 0.04f;
-    env->theta_dot = ((float)rand() / (float)RAND_MAX) * 0.08f - 0.04f;
+    env->x = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
+    env->x_dot = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
+    env->theta = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
+    env->theta_dot = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
     env->tick = 0;
     
     compute_observations(env);

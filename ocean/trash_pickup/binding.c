@@ -2,8 +2,7 @@
 #define OBS_SIZE 605
 #define NUM_ATNS 1
 #define ACT_SIZES {4}
-#define OBS_TYPE CHAR
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T ByteTensor
 
 #define Env CTrashPickupEnv
 #include "vecenv.h"
