@@ -5,6 +5,7 @@
  * get faster builds and better error messages
  */
 #include "slimevolley.h"
+#include "puffernet.h"
 #include <stdio.h>
 
 
@@ -20,12 +21,12 @@ void abranti_simple_policy(float* obs, float* action) {
 }
 
 void random_policy(float* obs, float* action) {
-    action[0] = 2*randf() - 1;
-    action[1] = 2*randf() - 1;
-    action[2] = 2*randf() - 1;
+    action[0] = 2.0f*randf() - 1.0f;
+    action[1] = 2.0f*randf() - 1.0f;
+    action[2] = 2.0f*randf() - 1.0f;
 }
 
-int main() {
+void demo() {
     int num_obs = 12;
     int num_actions = 3;
     SlimeVolley env = {.num_agents = 1};
@@ -33,7 +34,12 @@ int main() {
     env.observations = (float*)calloc(env.num_agents*num_obs, sizeof(float));
     env.actions = (float*)calloc(num_actions*env.num_agents, sizeof(float));
     env.rewards = (float*)calloc(env.num_agents, sizeof(float));
-    env.terminals = (unsigned char*)calloc(env.num_agents, sizeof(unsigned char));
+    env.terminals = (float*)calloc(env.num_agents, sizeof(float));
+
+    Weights* weights = load_weights("resources/slimevolley/slimevolley_weights.bin", 0);
+    int logit_sizes[3] = {2, 2, 2};
+    PufferNet* net = make_puffernet(weights, 1, num_obs, 64, 2, logit_sizes, 3);
+
     // Always call reset and render first
     c_reset(&env);
     c_render(&env);
@@ -41,13 +47,13 @@ int main() {
     fprintf(stderr, "num agents: %d\n", env.num_agents);
 
     while (!WindowShouldClose()) {
-        env.actions[0] = 0.0;
-        env.actions[1] = 0.0;
-        env.actions[2] = 0.0;
+        env.actions[0] = 0.0f;
+        env.actions[1] = 0.0f;
+        env.actions[2] = 0.0f;
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) env.actions[0] = 1.0;
-            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) env.actions[1] = 1.0;
-            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W) || IsKeyDown(KEY_SPACE)) env.actions[2] = 1.0;
+            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) env.actions[0] = 1.0f;
+            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) env.actions[1] = 1.0f;
+            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W) || IsKeyDown(KEY_SPACE)) env.actions[2] = 1.0f;
         } else {
             abranti_simple_policy(env.observations, env.actions);
         }
@@ -55,10 +61,18 @@ int main() {
         c_render(&env);
     }
 
+    free_puffernet(net);
+    free(weights);
+    
     // Try to clean up after yourself
     free(env.observations);
     free(env.actions);
     free(env.rewards);
     free(env.terminals);
     c_close(&env);
+}
+
+int main() {
+    demo();
+    return 0;
 }

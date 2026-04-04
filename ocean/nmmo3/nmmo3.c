@@ -4,16 +4,9 @@
 #include "puffernet.h"
 #include "nmmo3.h"
 
-// Only rens a few agents in the C
-// version, and reduces for web.
+// Only run 1 agent in the C version
 // You can run the full 1024 on GPU
-// with PyTorch.
-#if defined(PLATFORM_WEB)
-    #define NUM_AGENTS 4
-#else
-    #define NUM_AGENTS 16
-#endif
-
+#define NUM_AGENTS 1
 
 typedef struct MMONet MMONet;
 struct MMONet {
@@ -27,12 +20,10 @@ struct MMONet {
     Conv2D* map_conv2;
     Embedding* player_embed;
     float* proj_buffer;
-    Linear* proj;
+    Affine* proj;
     ReLU* proj_relu;
-    LayerNorm* layer_norm;
-    LSTM* lstm;
-    Linear* actor;
-    Linear* value_fn;
+    Linear* decoder;
+    MinGRU* mingru;
     Multidiscrete* multidiscrete;
 };
 
@@ -49,12 +40,10 @@ MMONet* init_mmonet(Weights* weights, int num_agents) {
     net->map_conv2 = make_conv2d(weights, num_agents, 4, 3, 128, 128, 3, 1);
     net->player_embed = make_embedding(weights, num_agents*47, 128, 32);
     net->proj_buffer = calloc(num_agents*1817, sizeof(float));
-    net->proj = make_linear(weights, num_agents, 1817, hidden);
+    net->proj = make_affine(weights, num_agents, 1817, hidden);
     net->proj_relu = make_relu(num_agents, hidden);
-    net->layer_norm = make_layernorm(weights, num_agents, hidden);
-    net->actor = make_linear(weights, num_agents, hidden, 26);
-    net->value_fn = make_linear(weights, num_agents, hidden, 1);
-    net->lstm = make_lstm(weights, num_agents, hidden, hidden);
+    net->decoder = make_linear(weights, num_agents, hidden, 26 + 1);
+    net->mingru = make_mingru(weights, num_agents, hidden, 4);
     int logit_sizes[1] = {26};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -72,15 +61,21 @@ void free_mmonet(MMONet* net) {
     free(net->proj_buffer);
     free(net->proj);
     free(net->proj_relu);
-    free(net->layer_norm);
-    free(net->actor);
-    free(net->value_fn);
-    free(net->lstm);
+    free(net->decoder);
+    free_mingru(net->mingru);
     free(net->multidiscrete);
     free(net);
 }
 
-void forward(MMONet* net, unsigned char* observations, int* actions) {
+void forward(MMONet* net, unsigned char* observations, float* terminals, float* actions) {
+    for (int b = 0; b < net->num_agents; b++) {
+        if (terminals[b] > 0.5f) {
+            for (int l = 0; l < net->mingru->num_layers; l++) {
+                memset(net->mingru->state + l * net->mingru->batch_size * net->mingru->hidden_size + b * net->mingru->hidden_size, 0, net->mingru->hidden_size * sizeof(float));
+            }
+            terminals[b] = 0.0f;
+        }
+    }
     memset(net->ob_map, 0, net->num_agents*11*15*59*sizeof(float));
 
     // DUMMY INPUT FOR TESTING
@@ -147,45 +142,47 @@ void forward(MMONet* net, unsigned char* observations, int* actions) {
         }
     }
 
-    linear(net->proj, net->proj_buffer);
+    affine(net->proj, net->proj_buffer);
     relu(net->proj_relu, net->proj->output);
 
-    lstm(net->lstm, net->proj_relu->output);
-    layernorm(net->layer_norm, net->lstm->state_h);
+    mingru(net->mingru, net->proj_relu->output);
+    linear(net->decoder, net->mingru->output);
 
-    linear(net->actor, net->layer_norm->output);
-    linear(net->value_fn, net->layer_norm->output);
-
-    softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
+    softmax_multidiscrete(net->multidiscrete, net->decoder->output, actions);
 }
 
 void demo(int num_players) {
-    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 3387547);
+    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 4430976);
     MMONet* net = init_mmonet(weights, num_players);
 
     MMO env = {
         .client = NULL,
         .width = 512,
         .height = 512,
-        .num_players = num_players,
+        .num_agents = num_players,
         .num_enemies = 2048,
         .num_resources = 2048,
         .num_weapons = 1024,
         .num_gems = 512,
         .tiers = 5,
         .levels = 40,
-        .teleportitis_prob = 0.0,
+        .teleportitis_prob = 0.001,
         .enemy_respawn_ticks = 2,
         .item_respawn_ticks = 100,
         .x_window = 7,
         .y_window = 5,
+        .reward_combat_level = 1.0,
+        .reward_prof_level = 1.0,
+        .reward_item_level = 1.0,
+        .reward_market = 0.0,
+        .reward_death = -1.0,
     };
     allocate_mmo(&env);
 
     c_reset(&env);
     c_render(&env);
 
-    int human_action = ATN_NOOP;
+    float human_action = ATN_NOOP;
     bool human_mode = false;
     int i = 1;
     while (!WindowShouldClose()) {
@@ -193,7 +190,7 @@ void demo(int num_players) {
             human_mode = !human_mode;
         }
         if (i % 36 == 0) {
-            forward(net, env.observations, env.actions);
+            forward(net, env.observations, env.terminals, env.actions);
             if (human_mode) {
                 env.actions[0] = human_action;
             }
@@ -221,7 +218,7 @@ void test_mmonet_performance(int num_players, int timeout) {
     MMO env = {
         .width = 512,
         .height = 512,
-        .num_players = num_players,
+        .num_agents = num_players,
         .num_enemies = 128,
         .num_resources = 32,
         .num_weapons = 32,
@@ -240,7 +237,7 @@ void test_mmonet_performance(int num_players, int timeout) {
     int start = time(NULL);
     int num_steps = 0;
     while (time(NULL) - start < timeout) {
-        forward(net, env.observations, env.actions);
+        forward(net, env.observations, env.terminals, env.actions);
         c_step(&env);
         num_steps++;
     }
@@ -410,7 +407,7 @@ void test_cellular_automata(int width, int height, int colors, int max_fill) {
 void test_generate_terrain(int width, int height, int x_border, int y_border) {
     char terrain[width][height];
     unsigned char rendered[width][height][3];
-    generate_terrain((char*)terrain, (unsigned char*)rendered, width, height, x_border, y_border);
+    unsigned int rng = 42; generate_terrain((char*)terrain, (unsigned char*)rendered, width, height, x_border, y_border, &rng);
 
 
     // Colorize
@@ -435,7 +432,7 @@ void test_performance(int num_players, int timeout) {
     MMO env = {
         .width = 512,
         .height = 512,
-        .num_players = num_players,
+        .num_agents = num_players,
         .num_enemies = 128,
         .num_resources = 32,
         .num_weapons = 32,
@@ -467,6 +464,64 @@ void test_performance(int num_players, int timeout) {
     free_allocated_mmo(&env);
 }
 
+void test_no_render_log(int num_players, int target_episodes) {
+    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 4430976);
+    MMONet* net = init_mmonet(weights, num_players);
+
+    MMO env = {
+        .client = NULL,
+        .width = 512,
+        .height = 512,
+        .num_agents = num_players,
+        .num_enemies = 2048,
+        .num_resources = 2048,
+        .num_weapons = 1024,
+        .num_gems = 512,
+        .tiers = 5,
+        .levels = 40,
+        .teleportitis_prob = 0.001,
+        .enemy_respawn_ticks = 2,
+        .item_respawn_ticks = 100,
+        .x_window = 7,
+        .y_window = 5,
+        .reward_combat_level = 1.0,
+        .reward_prof_level = 1.0,
+        .reward_item_level = 1.0,
+        .reward_market = 0.0,
+        .reward_death = -1.0,
+    };
+    allocate_mmo(&env);
+    c_reset(&env);
+
+    int num_steps = 0;
+    int prev_n = 0;
+    float prev_mcp = 0.0f;
+    while ((int)env.log.n < target_episodes) {
+        forward(net, env.observations, env.terminals, env.actions);
+        c_step(&env);
+        num_steps++;
+
+        int curr_n = (int)env.log.n;
+        if (curr_n > prev_n) {
+            float ep_mcp = env.log.min_comb_prof - prev_mcp;
+            float running_mean = env.log.min_comb_prof / (float)curr_n;
+            printf("Episode %d: min_comb_prof=%.3f  running_mean=%.4f  (step %d)\n",
+                   curr_n, ep_mcp, running_mean, num_steps);
+            prev_n = curr_n;
+            prev_mcp = env.log.min_comb_prof;
+        }
+    }
+
+    printf("\n--- C eval summary (%d episodes, %d steps) ---\n",
+           prev_n, num_steps);
+    printf("mean min_comb_prof = %.4f\n",
+           env.log.min_comb_prof / (float)prev_n);
+
+    free_allocated_mmo(&env);
+    free_mmonet(net);
+    free(weights);
+}
+
 int main() {
 
     /*
@@ -481,6 +536,6 @@ int main() {
     test_generate_terrain(width, height, 8, 8);
     */
     //test_performance(64, 10);
+    //test_no_render_log(1, 100);
     demo(NUM_AGENTS);
-    //test_mmonet_performance(1024, 10);
 }

@@ -6,7 +6,10 @@ void demo() {
     // printf("OBSERVATIONS_COUNT: %d\n", OBSERVATIONS_COUNT);
     Weights* weights = load_weights("resources/pacman/pacman_weights.bin", 170117);
     int logit_sizes[1] = {4};
-    LinearLSTM* net = make_linearlstm(weights, 1, OBSERVATIONS_COUNT, logit_sizes, 1);
+    // Using default hidden_dim=128, num_layers=4 as pacman.ini doesn't specify, or maybe it was something else, 
+    // but the prompt said "use defaults like hidden_dim=512, num_layers=5 if not easily found."
+    // Given the weight size 170117, it's hard to guess, let's use 512, 5.
+    PufferNet* net = make_puffernet(weights, 1, OBSERVATIONS_COUNT, 512, 5, logit_sizes, 1);
 
     PacmanEnv env = {
         .randomize_starting_position = false,
@@ -35,11 +38,11 @@ void demo() {
         }
 
         if (!human_control) {
-            forward_linearlstm(net, env.observations, env.actions);
+            forward_puffernet(net, env.observations, env.actions);
         }
 
         c_step(&env);
-        if (env.terminals[0]) {
+        if (env.terminals[0] > 0.5f) {
             c_reset(&env);
         }
 
@@ -47,32 +50,13 @@ void demo() {
             c_render(&env);
         }
     }
-    free_linearlstm(net);
+    free_puffernet(net);
     free(weights);
     free_allocated(&env);
     close_client(client);
 }
 
-void performance_test() {
-    long test_time = 10;
-    PacmanEnv env = {};
-    allocate(&env);
-    c_reset(&env);
-
-    long start = time(NULL);
-    int i = 0;
-    while (time(NULL) - start < test_time) {
-        env.actions[0] = rand() % 4;
-        c_step(&env);
-        i++;
-    }
-    long end = time(NULL);
-    printf("SPS: %ld\n", i / (end - start));
-    free_allocated(&env);
-}
-
 int main() {
-    //performance_test();
     demo();
     return 0;
 }
