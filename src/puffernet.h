@@ -66,6 +66,16 @@ float* get_weights(Weights* weights, int num_weights) {
     return data;
 }
 
+// Advances index aligned to 16-byte (4-float) boundary after reading,
+// matching the native backend's Allocator padding between tensors.
+float* get_weights_aligned(Weights* weights, int num_weights) {
+    float* data = &weights->data[weights->idx];
+    weights->idx += num_weights;
+    weights->idx = (weights->idx + 3) & ~3;
+    assert(weights->idx <= weights->size);
+    return data;
+}
+
 // PufferNet implementation of PyTorch functions
 // These are tested against the PyTorch implementation
 void _relu(float* input, float* output, int size) {
@@ -296,19 +306,22 @@ void _cat_dim1(float* x, float* y, float* output, int batch_size, int x_size, in
     }
 }
 
-void _argmax_multidiscrete(float* input, int* output, int batch_size, int logit_sizes[], int num_actions) {
-    int in_adr = 0;
+void _argmax_multidiscrete(float* input, float* output, int batch_size, int logit_sizes[], int num_actions) {
+    int atn_sum = 0;
+    for (int a = 0; a < num_actions; a++) atn_sum += logit_sizes[a];
     for (int b = 0; b < batch_size; b++) {
+        // +1 skips the value head fused into the decoder output
+        int in_adr = b * (atn_sum + 1);
         for (int a = 0; a < num_actions; a++) {
             int out_adr = b*num_actions + a;
             float max_logit = input[in_adr];
-            output[out_adr] = 0;
+            output[out_adr] = 0.0f;
             int num_action_types = logit_sizes[a];
             for (int i = 1; i < num_action_types; i++) {
                 float out = input[in_adr + i];
                 if (out > max_logit) {
                     max_logit = out;
-                    output[out_adr] = i;
+                    output[out_adr] = (float)i;
                 }
             }
             in_adr += num_action_types;
@@ -316,9 +329,12 @@ void _argmax_multidiscrete(float* input, int* output, int batch_size, int logit_
     }
 }
 
-void _softmax_multidiscrete(float* input, int* output, int batch_size, int logit_sizes[], int num_actions) {
-    int in_adr = 0;
+void _softmax_multidiscrete(float* input, float* output, int batch_size, int logit_sizes[], int num_actions) {
+    int atn_sum = 0;
+    for (int a = 0; a < num_actions; a++) atn_sum += logit_sizes[a];
     for (int b = 0; b < batch_size; b++) {
+        // +1 skips the value head fused into the decoder output
+        int in_adr = b * (atn_sum + 1);
         for (int a = 0; a < num_actions; a++) {
             int out_adr = b*num_actions + a;
             float logit_exp_sum = 0;
@@ -328,11 +344,11 @@ void _softmax_multidiscrete(float* input, int* output, int batch_size, int logit
             }
             float prob = rand() / (float)RAND_MAX;
             float logit_prob = 0;
-            output[out_adr] = 0;
+            output[out_adr] = 0.0f;
             for (int i = 0; i < num_action_types; i++) {
                 logit_prob += expf(input[in_adr + i]) / logit_exp_sum;
                 if (prob < logit_prob) {
-                    output[out_adr] = i;
+                    output[out_adr] = (float)i;
                     break;
                 }
             }
@@ -357,8 +373,8 @@ void _max_dim1(float* input, float* output, int batch_size, int seq_len, int fea
 }
 
 // User API. Provided to help organize layers
-typedef struct Linear Linear;
-struct Linear {
+typedef struct Affine Affine;
+struct Affine {
     float* output;
     float* weights;
     float* bias;
@@ -367,10 +383,10 @@ struct Linear {
     int output_dim;
 };
 
-Linear* make_linear(Weights* weights, int batch_size, int input_dim, int output_dim) {
+Affine* make_affine(Weights* weights, int batch_size, int input_dim, int output_dim) {
     size_t buffer_size = batch_size*output_dim*sizeof(float);
-    Linear* layer = calloc(1, sizeof(Linear) + buffer_size);
-    *layer = (Linear){
+    Affine* layer = calloc(1, sizeof(Affine) + buffer_size);
+    *layer = (Affine){
         .output = (float*)(layer + 1),
         .weights = get_weights(weights, output_dim*input_dim),
         .bias = get_weights(weights, output_dim),
@@ -381,14 +397,47 @@ Linear* make_linear(Weights* weights, int batch_size, int input_dim, int output_
     return layer;
 }
 
-void linear(Linear* layer, float* input) {
+void affine(Affine* layer, float* input) {
     _linear(input, layer->weights, layer->bias, layer->output,
         layer->batch_size, layer->input_dim, layer->output_dim);
 }
 
-void linear_accumulate(Linear* layer, float* input) {
+void affine_accumulate(Affine* layer, float* input) {
     _linear_accumulate(input, layer->weights, layer->bias, layer->output,
         layer->batch_size, layer->input_dim, layer->output_dim);
+}
+
+typedef struct Linear Linear;
+struct Linear {
+    float* output;
+    float* weights;
+    int batch_size;
+    int input_dim;
+    int output_dim;
+};
+
+Linear* make_linear(Weights* weights, int batch_size, int input_dim, int output_dim) {
+    size_t buffer_size = batch_size*output_dim*sizeof(float);
+    Linear* layer = calloc(1, sizeof(Linear) + buffer_size);
+    *layer = (Linear){
+        .output = (float*)(layer + 1),
+        .weights = get_weights_aligned(weights, output_dim*input_dim),
+        .batch_size = batch_size,
+        .input_dim = input_dim,
+        .output_dim = output_dim,
+    };
+    return layer;
+}
+
+void linear(Linear* layer, float* input) {
+    for (int b = 0; b < layer->batch_size; b++) {
+        for (int o = 0; o < layer->output_dim; o++) {
+            float sum = 0.0f;
+            for (int i = 0; i < layer->input_dim; i++)
+                sum += input[b*layer->input_dim + i] * layer->weights[o*layer->input_dim + i];
+            layer->output[b*layer->output_dim + o] = sum;
+        }
+    }
 }
 
 typedef struct ReLU ReLU;
@@ -698,11 +747,11 @@ Multidiscrete* make_multidiscrete(int batch_size, int logit_sizes[], int num_act
     return layer;
 }
 
-void argmax_multidiscrete(Multidiscrete* layer, float* input, int* output) {
+void argmax_multidiscrete(Multidiscrete* layer, float* input, float* output) {
     _argmax_multidiscrete(input, output, layer->batch_size, layer->logit_sizes, layer->num_actions);
 }
 
-void softmax_multidiscrete(Multidiscrete* layer, float* input, int* output) {
+void softmax_multidiscrete(Multidiscrete* layer, float* input, float* output) {
     _softmax_multidiscrete(input, output, layer->batch_size, layer->logit_sizes, layer->num_actions);
 }
 
@@ -712,10 +761,10 @@ typedef struct Default Default;
 struct Default {
     int num_agents;
     float* obs;
-    Linear* encoder;
+    Affine* encoder;
     ReLU* relu1;
-    Linear* actor;
-    Linear* value_fn;
+    Affine* actor;
+    Affine* value_fn;
     Multidiscrete* multidiscrete;
 };
 
@@ -723,10 +772,10 @@ Default* make_default(Weights* weights, int num_agents, int input_dim, int hidde
     Default* net = calloc(1, sizeof(Default));
     net->num_agents = num_agents;
     net->obs = (float*)calloc(num_agents*input_dim, sizeof(float));
-    net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
+    net->encoder = make_affine(weights, num_agents, input_dim, hidden_dim);
     net->relu1 = make_relu(num_agents, hidden_dim);
-    net->actor = make_linear(weights, num_agents, hidden_dim, action_dim);
-    net->value_fn = make_linear(weights, num_agents, hidden_dim, 1);
+    net->actor = make_affine(weights, num_agents, hidden_dim, action_dim);
+    net->value_fn = make_affine(weights, num_agents, hidden_dim, 1);
     int logit_sizes[1] = {action_dim};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -742,11 +791,11 @@ void free_default(Default* net) {
     free(net);
 }
 
-void forward_default(Default* net, float* observations, int* actions) {
-    linear(net->encoder, observations);
+void forward_default(Default* net, float* observations, float* actions) {
+    affine(net->encoder, observations);
     relu(net->relu1, net->encoder->output);
-    linear(net->actor, net->relu1->output);
-    linear(net->value_fn, net->relu1->output);
+    affine(net->actor, net->relu1->output);
+    affine(net->value_fn, net->relu1->output);
     softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
 }
 
@@ -754,11 +803,11 @@ typedef struct LinearLSTM LinearLSTM;
 struct LinearLSTM {
     int num_agents;
     float* obs;
-    Linear* encoder;
+    Affine* encoder;
     GELU* gelu1;
     LSTM* lstm;
-    Linear* actor;
-    Linear* value_fn;
+    Affine* actor;
+    Affine* value_fn;
     Multidiscrete* multidiscrete;
 };
 
@@ -766,14 +815,14 @@ LinearLSTM* make_linearlstm(Weights* weights, int num_agents, int input_dim, int
     LinearLSTM* net = calloc(1, sizeof(LinearLSTM));
     net->num_agents = num_agents;
     net->obs = calloc(num_agents*input_dim, sizeof(float));
-    net->encoder = make_linear(weights, num_agents, input_dim, 128);
+    net->encoder = make_affine(weights, num_agents, input_dim, 128);
     net->gelu1 = make_gelu(num_agents, 128);
     int atn_sum = 0;
     for (int i = 0; i < num_actions; i++) {
         atn_sum += logit_sizes[i];
     }
-    net->actor = make_linear(weights, num_agents, 128, atn_sum);
-    net->value_fn = make_linear(weights, num_agents, 128, 1);
+    net->actor = make_affine(weights, num_agents, 128, atn_sum);
+    net->value_fn = make_affine(weights, num_agents, 128, 1);
     net->lstm = make_lstm(weights, num_agents, 128, 128);
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, num_actions);
     return net;
@@ -790,12 +839,12 @@ void free_linearlstm(LinearLSTM* net) {
     free(net);
 }
 
-void forward_linearlstm(LinearLSTM* net, float* observations, int* actions) {
-    linear(net->encoder, observations);
+void forward_linearlstm(LinearLSTM* net, float* observations, float* actions) {
+    affine(net->encoder, observations);
     gelu(net->gelu1, net->encoder->output);
     lstm(net->lstm, net->gelu1->output);
-    linear(net->actor, net->lstm->state_h);
-    linear(net->value_fn, net->lstm->state_h);
+    affine(net->actor, net->lstm->state_h);
+    affine(net->value_fn, net->lstm->state_h);
     softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
 }
 
@@ -806,10 +855,10 @@ typedef struct ConvLSTM ConvLSTM; struct ConvLSTM {
     ReLU* relu1;
     Conv2D* conv2;
     ReLU* relu2;
-    Linear* linear;
+    Affine* linear;
     LSTM* lstm;
-    Linear* actor;
-    Linear* value_fn;
+    Affine* actor;
+    Affine* value_fn;
     Multidiscrete* multidiscrete;
 };
 
@@ -823,9 +872,9 @@ ConvLSTM* make_convlstm(Weights* weights, int num_agents, int input_dim,
     net->relu1 = make_relu(num_agents, hidden_dim*3*3);
     net->conv2 = make_conv2d(weights, num_agents, 3, 3, cnn_channels, cnn_channels, 3, 1);
     net->relu2 = make_relu(num_agents, hidden_dim);
-    net->linear = make_linear(weights, num_agents, cnn_channels, hidden_dim);
-    net->actor = make_linear(weights, num_agents, hidden_dim, action_dim);
-    net->value_fn = make_linear(weights, num_agents, hidden_dim, 1);
+    net->linear = make_affine(weights, num_agents, cnn_channels, hidden_dim);
+    net->actor = make_affine(weights, num_agents, hidden_dim, action_dim);
+    net->value_fn = make_affine(weights, num_agents, hidden_dim, 1);
     net->lstm = make_lstm(weights, num_agents, hidden_dim, hidden_dim);
     int logit_sizes[1] = {action_dim};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
@@ -846,14 +895,126 @@ void free_convlstm(ConvLSTM* net) {
     free(net);
 }
 
-void forward_convlstm(ConvLSTM* net, float* observations, int* actions) {
+void forward_convlstm(ConvLSTM* net, float* observations, float* actions) {
     conv2d(net->conv1, observations);
     relu(net->relu1, net->conv1->output);
     conv2d(net->conv2, net->relu1->output);
     relu(net->relu2, net->conv2->output);
-    linear(net->linear, net->relu2->output);
+    affine(net->linear, net->relu2->output);
     lstm(net->lstm, net->linear->output);
-    linear(net->actor, net->lstm->state_h);
-    linear(net->value_fn, net->lstm->state_h);
+    affine(net->actor, net->lstm->state_h);
+    affine(net->value_fn, net->lstm->state_h);
     softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
+}
+
+// MinGRU: inference-only single-step recurrent layer (no parallel scan).
+// Matches the fused gate + highway connection in models.cu mingru_gate kernel.
+// Each layer has a bias-free projection (hidden -> 3*hidden).
+// State layout: (num_layers, batch_size, hidden_size).
+typedef struct MinGRU MinGRU;
+struct MinGRU {
+    float* state;    // (num_layers, batch_size, hidden_size) - persists across steps
+    float* output;   // (batch_size, hidden_size)
+    Linear** proj;   // [num_layers], each projects hidden -> 3*hidden
+    int batch_size;
+    int hidden_size;
+    int num_layers;
+};
+
+MinGRU* make_mingru(Weights* weights, int batch_size, int hidden_size, int num_layers) {
+    MinGRU* layer = calloc(1, sizeof(MinGRU));
+    layer->state  = calloc(num_layers * batch_size * hidden_size, sizeof(float));
+    layer->output = calloc(batch_size * hidden_size, sizeof(float));
+    layer->proj   = calloc(num_layers, sizeof(Linear*));
+    layer->batch_size  = batch_size;
+    layer->hidden_size = hidden_size;
+    layer->num_layers  = num_layers;
+    for (int l = 0; l < num_layers; l++) {
+        layer->proj[l] = make_linear(weights, batch_size, hidden_size, 3 * hidden_size);
+    }
+    return layer;
+}
+
+void mingru(MinGRU* layer, float* input) {
+    int B = layer->batch_size;
+    int H = layer->hidden_size;
+    float* x = input;
+    for (int l = 0; l < layer->num_layers; l++) {
+        float* state_l = layer->state + l * B * H;
+        linear(layer->proj[l], x);
+        float* combined = layer->proj[l]->output;
+        for (int b = 0; b < B; b++) {
+            float* cb = combined + b * 3 * H;
+            float* sb = state_l + b * H;
+            float* xb = x + b * H;
+            float* ob = layer->output + b * H;
+            for (int h = 0; h < H; h++) {
+                float hidden     = cb[h];
+                float gate       = cb[H + h];
+                float hw         = cb[2*H + h];
+                float s          = sb[h];
+                float gate_s     = _sigmoid(gate);
+                float h_tilde    = (hidden >= 0.0f) ? hidden + 0.5f : _sigmoid(hidden);
+                float mingru_out = s + gate_s * (h_tilde - s);
+                float hw_s       = _sigmoid(hw);
+                ob[h] = hw_s * mingru_out + (1.0f - hw_s) * xb[h];
+                sb[h] = mingru_out;
+            }
+        }
+        x = layer->output;
+    }
+}
+
+void free_mingru(MinGRU* layer) {
+    for (int l = 0; l < layer->num_layers; l++) free(layer->proj[l]);
+    free(layer->state);
+    free(layer->output);
+    free(layer->proj);
+    free(layer);
+}
+
+// PufferNet: default policy matching the native backend Policy in models.cu.
+// Architecture: Linear encoder -> N x MinGRU -> Linear decoder (fused value).
+// Weight file order (matches policy_weights_create reg_params call order):
+//   encoder weight (hidden_dim x input_dim)
+//   decoder weight ((atn_sum+1) x hidden_dim, last output is value)
+//   mingru weights[0..num_layers-1] (3*hidden_dim x hidden_dim each)
+typedef struct PufferNet PufferNet;
+struct PufferNet {
+    int num_agents;
+    float* obs;
+    Linear* encoder;
+    MinGRU* mingru;
+    Linear* decoder;   // output_dim = atn_sum+1; last element is value
+    Multidiscrete* multidiscrete;
+};
+
+PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
+        int hidden_dim, int num_layers, int logit_sizes[], int num_actions) {
+    PufferNet* net = calloc(1, sizeof(PufferNet));
+    net->num_agents = num_agents;
+    net->obs = calloc(num_agents * input_dim, sizeof(float));
+    int atn_sum = 0;
+    for (int i = 0; i < num_actions; i++) atn_sum += logit_sizes[i];
+    net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
+    net->decoder = make_linear(weights, num_agents, hidden_dim, atn_sum + 1);
+    net->mingru  = make_mingru(weights, num_agents, hidden_dim, num_layers);
+    net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, num_actions);
+    return net;
+}
+
+void forward_puffernet(PufferNet* net, float* observations, float* actions) {
+    linear(net->encoder, observations);
+    mingru(net->mingru, net->encoder->output);
+    linear(net->decoder, net->mingru->output);
+    softmax_multidiscrete(net->multidiscrete, net->decoder->output, actions);
+}
+
+void free_puffernet(PufferNet* net) {
+    free(net->obs);
+    free(net->encoder);
+    free(net->decoder);
+    free_mingru(net->mingru);
+    free(net->multidiscrete);
+    free(net);
 }

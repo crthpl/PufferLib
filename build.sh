@@ -196,15 +196,7 @@ export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
 NVCC="ccache $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
-if [ -n "$NVCC_ARCH" ]; then
-    ARCH=$NVCC_ARCH
-elif command -v nvidia-smi &>/dev/null; then
-    GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
-    ARCH=${GPU_CC:+sm_$GPU_CC}
-    ARCH=${ARCH:-native}
-else
-    ARCH=native
-fi
+ARCH=${NVCC_ARCH:-native}
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
 PYBIND_INCLUDE=$(python -c "import pybind11; print(pybind11.get_include())")

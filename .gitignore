@@ -2,13 +2,10 @@
 c_*.c
 pufferlib/extensions.c
 pufferlib/puffernet.c
-src/libstatic*
-
 logs/
 
 # Build dir
 build/
-build_web/
 
 # hipified cuda extensions dir [HIP/ROCM]
 pufferlib/extensions/hip/
