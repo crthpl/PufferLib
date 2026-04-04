@@ -1,9 +1,8 @@
-#include "grid.h"
+#include "maze.h"
 #define OBS_SIZE 121
 #define NUM_ATNS 1
 #define ACT_SIZES {5}
 #define OBS_TENSOR_T ByteTensor
-#define ACT_TYPE DOUBLE
 
 #define MY_VEC_INIT
 #define MY_VEC_CLOSE
@@ -32,7 +31,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     // Temporary env used to generate maps
     Grid temp_env;
     temp_env.max_size = max_size;
-    init_grid(&temp_env);
+    init_maze(&temp_env);
 
     unsigned int map_rng = 42;
     for (int i = 0; i < num_maps; i++) {
@@ -52,7 +51,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     }
 
     // Free temp env internal allocations
-    free(temp_env.grid);
+    free(temp_env.maze);
     free(temp_env.counts);
     free(temp_env.agents);
 
@@ -71,7 +70,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->num_maps = num_maps;
         env->num_agents = 1;
         env->levels = levels;
-        init_grid(env);
+        init_maze(env);
 
         buf_agents += env->num_agents;
         buffer_env_counts[buf]++;
@@ -95,7 +94,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->max_size = (int)dict_get(kwargs, "max_size")->value;
     env->num_maps = (int)dict_get(kwargs, "num_maps")->value;
     env->num_agents = 1;
-    init_grid(env);
+    init_maze(env);
 }
 
 void my_log(Log* log, Dict* out) {

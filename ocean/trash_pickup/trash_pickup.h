@@ -51,7 +51,7 @@ typedef struct {
     // Interface for PufferLib
     Client* client;
     char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -75,6 +75,7 @@ typedef struct {
     Entity* entities; // Indicies (0 - num_agents) for agents, (num_agents - num_bins) for bins, (num_bins - num_trash) for trash.
 
     bool do_human_control;
+    unsigned int rng;
 } CTrashPickupEnv;
 
 void add_log(CTrashPickupEnv* env, Log* log) {
@@ -190,8 +191,8 @@ void place_random_entities(CTrashPickupEnv* env, int count, int item_type, int g
     int placed = 0;
     while (placed < count) 
     {
-        int x = rand() % env->grid_size;
-        int y = rand() % env->grid_size;
+        int x = rand_r(&env->rng) % env->grid_size;
+        int y = rand_r(&env->rng) % env->grid_size;
 
         GridCell* gridCell = &env->grid[get_grid_index(env, x, y)];
 
@@ -361,7 +362,7 @@ void initialize_env(CTrashPickupEnv* env) {
 void allocate(CTrashPickupEnv* env) {
     initialize_env(env);
     env->observations = (char*)calloc(env->total_num_obs, sizeof(char));
-    env->actions = (double*)calloc(env->num_agents, sizeof(double));
+    env->actions = (float*)calloc(env->num_agents, sizeof(float));
     env->rewards = (float*)calloc(env->num_agents, sizeof(float));
     env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 }

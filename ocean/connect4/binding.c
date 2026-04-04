@@ -2,14 +2,15 @@
 #define OBS_SIZE 42
 #define NUM_ATNS 1
 #define ACT_SIZES {7}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
 
-#define Env CConnect4
+#define Env Connect4
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
+    env->player_pieces = dict_get(kwargs, "player_pieces")->value;
+    env->env_pieces = dict_get(kwargs, "env_pieces")->value;
     init(env);
 }
 

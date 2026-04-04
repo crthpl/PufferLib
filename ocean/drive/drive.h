@@ -1087,6 +1087,7 @@ void c_reset(Drive* env) {
         env->entities[agent_idx].reached_goal = 0;
         env->entities[agent_idx].collided_before_goal = 0;
         env->entities[agent_idx].reached_goal_this_episode = 0;
+
         collision_check(env, agent_idx);
     }
     compute_observations(env);

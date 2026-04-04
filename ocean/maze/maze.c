@@ -1,4 +1,4 @@
-#include "grid.h"
+#include "maze.h"
 
 int main() {
     int max_size = 32;
@@ -13,7 +13,7 @@ int main() {
     int render_cell_size = 32;
     int seed = 0;
 
-    Grid* env = allocate_grid(max_size, num_agents, horizon,
+    Grid* env = allocate_maze(max_size, num_agents, horizon,
         vision, speed, discretize);
 
     //env->width = 32;
@@ -43,8 +43,8 @@ int main() {
     env->agents[0].spawn_x = 1;
     env->agents[0].spawn_y = 1;
     reset(env, seed);
-    generate_growing_tree_maze(env->grid, env->width, env->height, max_size, 0.85, 0);
-    env->grid[(env->height-2)*env->max_size + (env->width - 2)] = GOAL;
+    generate_growing_tree_maze(env->maze, env->width, env->height, max_size, 0.85, 0);
+    env->maze[(env->height-2)*env->max_size + (env->width - 2)] = GOAL;
     */
  
     int tick = 0;
@@ -87,7 +87,7 @@ int main() {
         }
         c_render(env);
     }
-    free_allocated_grid(env);
+    free_allocated_maze(env);
     return 0;
 }
 

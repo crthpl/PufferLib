@@ -67,10 +67,6 @@ float to_y_pixel(float y){
     return WINDOW_HEIGHT - y * FACTOR;
 }
 
-float randf() {
-    return (float)rand() / (float)RAND_MAX;
-}
-
 // OBJECTS
 typedef struct {
     float x;
@@ -294,7 +290,7 @@ void agent_display(Agent *agent, float bx, float by) {
     }
 }
 
-void agent_set_action(Agent* agent, double* action){
+void agent_set_action(Agent* agent, float* action){
     bool forward = false;
     bool backward = false;
     bool jump = false;
@@ -389,16 +385,20 @@ typedef struct {
     Ball* ball;
     int delay_frames; // frames to wait before starting
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
-    double* actions; // Required. double* for new API
+    float* actions; // Required.
     float* rewards; // Required
     float* terminals; // Required
     int num_agents; // Number of agents being trained. Either 1 or 2. If 1, the first agent is trained and the second is a bot.
     float* bot_observations; // Optional, for bot control
-    double* bot_actions; // Optional, for bot control
+    float* bot_actions; // Optional, for bot control
     int tick;
     Texture2D puffers;
+    unsigned int rng;
 } SlimeVolley;
 
+float randf(SlimeVolley* env) {
+    return (float)rand_r(&env->rng) / (float)RAND_MAX;
+}
 
 /* Recommended to have an init function of some kind if you allocate 
 * extra memory. This should be freed by c_close. Don't forget to call
@@ -415,7 +415,7 @@ void init(SlimeVolley* env) {
     env->ball = malloc(sizeof(Ball));
     if (env->num_agents == 1) {
         env->bot_observations = calloc(12, sizeof(float));
-        env->bot_actions = calloc(3, sizeof(double));
+        env->bot_actions = calloc(3, sizeof(float));
     }
 }
 
@@ -423,8 +423,8 @@ void init(SlimeVolley* env) {
 void c_reset(SlimeVolley* env) {
     env->tick = 0;
     env->delay_frames = INIT_DELAY_FRAMES;
-    float ball_vx = 40.0f*randf() - 20.0f;
-    float ball_vy = 15.0f*randf() + 10.0f;
+    float ball_vx = 40.0f*randf(env) - 20.0f;
+    float ball_vy = 15.0f*randf(env) + 10.0f;
     *env->ball = (Ball){
         .x = 0,
         .y = REF_W/4,
@@ -470,8 +470,8 @@ float clip(float val, float min, float max) {
 }
 
 void new_match(SlimeVolley* env) {
-    float ball_vx = 40.0f*randf() - 20.0f;
-    float ball_vy = 15.0f*randf() + 10.0f;
+    float ball_vx = 40.0f*randf(env) - 20.0f;
+    float ball_vy = 15.0f*randf(env) + 10.0f;
     *env->ball = (Ball){
         .x = 0,
         .y = REF_W/4,
@@ -483,7 +483,7 @@ void new_match(SlimeVolley* env) {
     env->delay_frames = INIT_DELAY_FRAMES;
 }
 
-void abranti_simple_bot(float* obs, double* action) {
+void abranti_simple_bot(float* obs, float* action) {
     // the bot policy. just 7 params but hard to beat.
     float x_agent = obs[0];
     float x_ball = obs[4];

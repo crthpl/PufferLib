@@ -245,7 +245,7 @@ void demo() {
     while (!WindowShouldClose()) {
         // Handle camera controls
         double(*actions)[2] = (double(*)[2])env.actions;
-        forward(net, env.observations, env.actions);
+        //forward(net, env.observations, env.actions);
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             actions[env.human_agent_idx][0] = 3;
             actions[env.human_agent_idx][1] = 6;
@@ -329,7 +329,7 @@ void performance_test() {
 }
 
 int main() {
-    demo();
-    //performance_test();
+    //demo();
+    performance_test();
     return 0;
 }

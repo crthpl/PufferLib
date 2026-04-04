@@ -71,7 +71,7 @@ typedef struct Tetris {
 	Client *client;
 	Log log;
 	float *observations;
-	double *actions;
+	float *actions;
 	float *rewards;
 	float *terminals;
 	int num_agents;
@@ -110,6 +110,7 @@ typedef struct Tetris {
 	int atn_count_rotate;
 	int atn_count_hold;
 	int tetromino_counts[NUM_TETROMINOES];
+    unsigned int rng;
 } Tetris;
 
 void init(Tetris *env) {
@@ -128,7 +129,7 @@ void allocate(Tetris *env) {
 	// grid, 6 floats, 4 one-hot tetrominoes encode (current, previews, hold) + self-inflicting noisy action bits
 	env->dim_obs = env->n_cols * env->n_rows + NUM_FLOAT_OBS + NUM_TETROMINOES * (NUM_PREVIEW + 2) + env->n_noise_obs;
 	env->observations = (float *)calloc(env->dim_obs, sizeof(float));
-	env->actions = (double *)calloc(1, sizeof(double));
+	env->actions = (float *)calloc(1, sizeof(float));
 	env->rewards = (float *)calloc(1, sizeof(float));
 	env->terminals = (float *)calloc(1, sizeof(float));
 }
@@ -206,13 +207,13 @@ void compute_observations(Tetris *env) {
 
 	// Turn off noise bits, one-by-one.
 	if (env->n_noise_obs > 0) {
-		env->observations[offset + rand() % env->n_noise_obs] = 0;
+		env->observations[offset + rand_r(&env->rng) % env->n_noise_obs] = 0;
 	}
 }
 
 void restore_grid(Tetris *env) { memset(env->grid, 0, env->n_rows * env->n_cols * sizeof(int)); }
 
-void refill_and_shuffle(int *array) {
+void refill_and_shuffle(Tetris* env, int *array) {
 	// Hold can change the deck distribution, so need to refill
 	for (int i = 0; i < NUM_TETROMINOES; i++) {
 		array[i] = i;
@@ -220,7 +221,7 @@ void refill_and_shuffle(int *array) {
 
 	// Fisher-Yates shuffle
 	for (int i = NUM_TETROMINOES - 1; i > 0; i--) {
-		int j = rand() % (i + 1);
+		int j = rand_r(&env->rng) % (i + 1);
 		int temp = array[i];
 		array[i] = array[j];
 		array[j] = temp;
@@ -229,8 +230,8 @@ void refill_and_shuffle(int *array) {
 
 void initialize_deck(Tetris *env) {
 	// Implements a 7-bag system. The deck is composed of two bags.
-	refill_and_shuffle(env->tetromino_deck); // First bag
-	refill_and_shuffle(env->tetromino_deck + NUM_TETROMINOES); // Second bag
+	refill_and_shuffle(env, env->tetromino_deck); // First bag
+	refill_and_shuffle(env, env->tetromino_deck + NUM_TETROMINOES); // Second bag
 	env->cur_position_in_deck = 0;
 	env->cur_tetromino = env->tetromino_deck[env->cur_position_in_deck];
 }
@@ -242,10 +243,10 @@ void spawn_new_tetromino(Tetris *env) {
 
 	if (env->cur_position_in_deck == 0) {
 		// Now using the first bag, so shuffle the second bag
-		refill_and_shuffle(env->tetromino_deck + NUM_TETROMINOES);
+		refill_and_shuffle(env, env->tetromino_deck + NUM_TETROMINOES);
 	} else if (env->cur_position_in_deck == NUM_TETROMINOES) {
 		// Now using the second bag, so shuffle the first bag
-		refill_and_shuffle(env->tetromino_deck);
+		refill_and_shuffle(env, env->tetromino_deck);
 	}
 
 	env->cur_tetromino_col = env->n_cols / 2;
@@ -391,7 +392,7 @@ void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
 	for (int r = env->n_rows - num_lines; r < env->n_rows; r++) {
 		// First, fill the entire row with garbage
 		for (int c = 0; c < env->n_cols; c++) {
-			env->grid[r * env->n_cols + c] = -(rand() % NUM_TETROMINOES + 1);
+			env->grid[r * env->n_cols + c] = -(rand_r(&env->rng) % NUM_TETROMINOES + 1);
 		}
 
 		// Create holes by selecting distinct columns
@@ -401,7 +402,7 @@ void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
 		}
 		// Shuffle column indices
 		for (int i = env->n_cols - 1; i > 0; i--) {
-			int j = rand() % (i + 1);
+			int j = rand_r(&env->rng) % (i + 1);
 			int temp = cols[i];
 			cols[i] = cols[j];
 			cols[j] = temp;
