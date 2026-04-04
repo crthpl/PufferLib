@@ -1,137 +1,58 @@
+#include <time.h>
 #include "g2048.h"
 #include "puffernet.h"
 
-#define OBS_DIM 16
-#define HIDDEN_DIM 512
-
-// Set NO_RENDER to true to run evals without the render
-#define NO_RENDER false
-#define NUM_EVAL_RUNS 200
-
 void demo() {
-    srand(time(NULL));
+    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 3466859);
+    int logit_sizes[1] = {4};
+    PufferNet* net = make_puffernet(weights, 1, 16, 512, 5, logit_sizes, 1);
+
     Game env = {
         .scaffolding_ratio = 0.0,
     };
     init(&env);
 
-    unsigned char observations[OBS_DIM] = {0};
-    float terminals[1] = {0};
+    unsigned char observations[16] = {0};
     float actions[1] = {0};
     float rewards[1] = {0};
+    float terminals[1] = {0};
 
     env.observations = observations;
-    env.terminals = terminals;
     env.actions = actions;
     env.rewards = rewards;
+    env.terminals = terminals;
 
-    Weights* weights = load_weights("resources/g2048/g2048_weights.bin", 3466859);
-    int logit_sizes[1] = {4};
-    PufferNet* net = make_puffernet(weights, 1, OBS_DIM, HIDDEN_DIM, 5, logit_sizes, 1);
     c_reset(&env);
-    if (!NO_RENDER) c_render(&env);
-    printf("Starting...\n");
-    
-    clock_t start_time = clock();
+    SetTargetFPS(60);
 
-    // Main game loop
-    int trial = 1;
-    int frame = 0;
-    int action = -1;
-    while (NO_RENDER || !WindowShouldClose()) {
-        if (!NO_RENDER) c_render(&env); // Render at the start of the loop
-        frame++;
-        
+    while (!WindowShouldClose()) {
+        // User can take control
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            action = -1;
-            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) action = UP;
-            else if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) action = DOWN;
-            else if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) action = LEFT;
-            else if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) action = RIGHT;
-            env.actions[0] = action - 1;
-        } else if (frame % 1 != 0) {
-            continue;
-        } else {
-            action = 1;
-            float obs_f[OBS_DIM];
-            for (int i = 0; i < OBS_DIM; i++) obs_f[i] = (float)env.observations[i];
-            forward_puffernet(net, obs_f, env.actions);
-        }
-
-        if (action > 0) {
-            step_without_reset(&env);
-        }
-
-        if (env.terminals[0] == 1) { 
-            clock_t end_time = clock();
-            double time_taken = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-            printf("Trial: %d, Ticks: %d, Max Tile: %d, Merge Score: %d, Time: %.2fs\n",
-                trial++, env.tick, 1 << env.max_tile, env.score, time_taken);
+            bool pressed = false;
+            if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) { env.actions[0] = 0; pressed = true; }
+            else if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S)) { env.actions[0] = 1; pressed = true; }
+            else if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A)) { env.actions[0] = 2; pressed = true; }
+            else if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) { env.actions[0] = 3; pressed = true; }
             
-            if (!NO_RENDER) {
-                // Reached the 65536 tile, so full stop. Savor the moment!
-                if (env.max_tile >= 16) WaitTime(100000);
-                WaitTime(10);
+            if (pressed) {
+                c_step(&env);
             }
-
-            c_reset(&env);
-            if (!NO_RENDER) c_render(&env);
-            start_time = clock();
-            frame = 0;
+        } else {
+            float obs_f[16];
+            for (int i = 0; i < 16; i++) obs_f[i] = (float)env.observations[i];
+            forward_puffernet(net, obs_f, env.actions);
+            c_step(&env);
         }
 
-        if (!NO_RENDER && IsKeyDown(KEY_LEFT_SHIFT) && action > 0) {
-            // Don't need to be super reactive
-            WaitTime(0.1);
-        }
-
-        if (NO_RENDER && trial > NUM_EVAL_RUNS) break;
+        c_render(&env);
     }
-
+    
     free_puffernet(net);
     free(weights);
     c_close(&env);
-    printf("Finished %d trials.\n", NUM_EVAL_RUNS);
-}
-
-void perftest() {
-
-    srand(time(NULL));
-    Game env = {
-        .scaffolding_ratio = 0.0,
-    };
-    init(&env);
-
-    unsigned char observations[OBS_DIM] = {0};
-    float terminals[1] = {0};
-    float actions[1] = {0};
-    float rewards[1] = {0};
-
-    env.observations = observations;
-    env.terminals = terminals;
-    env.actions = actions;
-    env.rewards = rewards;
-
-    c_reset(&env);
-
-    int timeout = 5;
-    int start = time(NULL);
-    int num_steps = 0;
-    while (time(NULL) - start < timeout) {
-        for (int i = 0; i < 1000; i++) {
-            env.actions[0] = rand() % 4;
-            c_step(&env);
-            num_steps++;
-        }
-    }
-
-    int end = time(NULL);
-    float sps = num_steps / (end - start);
-    printf("Test Environment SPS: %f\n", sps);
 }
 
 int main() {
-    //demo();
-    perftest();
+    demo();
     return 0;
 }

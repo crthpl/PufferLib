@@ -7,29 +7,40 @@
  */
 
 #include "squared.h"
+#include "puffernet.h"
 
-int main() {
+void demo() {
     Squared env = {.size = 11};
     env.observations = (unsigned char*)calloc(env.size*env.size, sizeof(unsigned char));
-    env.actions = (int*)calloc(1, sizeof(int));
+    env.actions = (float*)calloc(1, sizeof(float));
     env.rewards = (float*)calloc(1, sizeof(float));
-    env.terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env.terminals = (float*)calloc(1, sizeof(float));
+
+    Weights* weights = load_weights("resources/squared/squared_weights.bin", 0);
+    int logit_sizes[1] = {5};
+    PufferNet* net = make_puffernet(weights, 1, 121, 128, 1, logit_sizes, 1);
 
     c_reset(&env);
     c_render(&env);
     while (!WindowShouldClose()) {
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            env.actions[0] = 0;
+            env.actions[0] = 0.0f;
             if (IsKeyDown(KEY_UP)    || IsKeyDown(KEY_W)) env.actions[0] = UP;
             if (IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S)) env.actions[0] = DOWN;
             if (IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A)) env.actions[0] = LEFT;
             if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) env.actions[0] = RIGHT;
         } else {
-            env.actions[0] = rand() % 5;
+            float obs_f[121];
+            for(int i=0; i<121; i++) obs_f[i] = (float)env.observations[i];
+            forward_puffernet(net, obs_f, env.actions);
         }
         c_step(&env);
         c_render(&env);
     }
+    
+    free_puffernet(net);
+    free(weights);
+
     free(env.observations);
     free(env.actions);
     free(env.rewards);
@@ -37,3 +48,7 @@ int main() {
     c_close(&env);
 }
 
+int main() {
+    demo();
+    return 0;
+}

@@ -4,10 +4,10 @@
 
 const unsigned char NOOP = 8;
 
-void interactive() {
+void demo() {
     Weights* weights = load_weights("resources/connect4/connect4_weights.bin", 138632);
     int logit_sizes[] = {7};
-    LinearLSTM* net = make_linearlstm(weights, 1, 42, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 42, 64, 2, logit_sizes, 1);
 
     CConnect4 env = {
     };
@@ -15,8 +15,6 @@ void interactive() {
     c_reset(&env);
  
     env.client = make_client();
-    float observations[42] = {0};
-    int actions[1] = {0};
 
     int tick = 0;
     while (!WindowShouldClose()) {
@@ -31,11 +29,7 @@ void interactive() {
             if(IsKeyPressed(KEY_SIX)) env.actions[0] = 5;
             if(IsKeyPressed(KEY_SEVEN)) env.actions[0] = 6;
         } else if (tick % 30 == 0) {
-            for (int i = 0; i < 42; i++) {
-                observations[i] = env.observations[i];
-            }
-            forward_linearlstm(net, (float*)&observations, (int*)&actions);
-            env.actions[0] = actions[0];
+            forward_puffernet(net, env.observations, env.actions);
         }
 
         tick = (tick + 1) % 60;
@@ -45,33 +39,13 @@ void interactive() {
 
         c_render(&env);
     }
-    free_linearlstm(net);
+    free_puffernet(net);
     free(weights);
     close_client(env.client);
     free_allocated_cconnect4(&env);
 }
 
-void performance_test() {
-    long test_time = 10;
-    CConnect4 env = {
-    };
-    allocate_cconnect4(&env);
-    c_reset(&env);
- 
-    long start = time(NULL);
-    int i = 0;
-    while (time(NULL) - start < test_time) {
-        env.actions[0] = rand() % 7;
-        c_step(&env);
-        i++;
-    }
-    long end = time(NULL);
-    printf("SPS: %ld\n", i / (end - start));
-    free_allocated_cconnect4(&env);
-}
-
 int main() {
-    // performance_test();
-    interactive();
+    demo();
     return 0;
 }

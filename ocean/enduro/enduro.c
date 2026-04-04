@@ -35,7 +35,7 @@ void get_input(Enduro* env) {
 int demo() {
     Weights* weights = load_weights("resources/enduro/enduro_weights.bin", 142218);
     int logit_sizes[1] = {9};
-    LinearLSTM* net = make_linearlstm(weights, 1, 68, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 68, 64, 2, logit_sizes, 1);
 
     Enduro env = {
         .num_envs = 1,
@@ -53,45 +53,20 @@ int demo() {
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             get_input(&env);
         } else {
-            forward_linearlstm(net, env.observations, env.actions);
+            forward_puffernet(net, env.observations, env.actions);
         }
 
         c_step(&env);
         c_render(&env);
     }
 
-    free_linearlstm(net);
+    free_puffernet(net);
     free(weights);
     free_allocated(&env);
     return 0;
 }
 
-void perftest(float test_time) {
-    Enduro env = {
-        .num_envs = 1,
-        .max_enemies = MAX_ENEMIES,
-        .obs_size = OBSERVATIONS_MAX_SIZE
-    };
-
-    allocate(&env);
-    init(&env);
-    c_reset(&env);
-
-    int start = time(NULL);
-    int i = 0;
-    while (time(NULL) - start < test_time) {
-        env.actions[0] = rand()%9;
-        c_step(&env);
-        i++;
-    }
-
-    int end = time(NULL);
-    printf("SPS: %f\n", i / (float)(end - start));
-    free_allocated(&env);
-}
-
 int main() {
    demo();
-   //perftest(10.0f);
    return 0;
 }
