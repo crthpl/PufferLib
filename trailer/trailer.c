@@ -419,8 +419,7 @@ static void draw_anim4(float anim_t, Font roboto, Shader *star_sh,
     float fade_out = 1.0f - fminf(anim_t / 0.5f, 1.0f);
 
     if (fade_out > 0.0f) {
-        // draw_anim2(3.0f, roboto, star_sh);
-        draw_anim3(3.0f, glow_sh, tex, star_sh, roboto);
+        draw_anim3(5.5f, glow_sh, tex, star_sh, roboto);
         DrawRectangle(0, 0, SCREEN_W, SCREEN_H,
             (Color){BG.r, BG.g, BG.b, (unsigned char)((1.0f - fade_out) * 255)});
     }
@@ -459,12 +458,12 @@ static void draw_centered2(Font f,
 }
 
 // ─── Haiku + title overlay (called every frame from anim5 onward) ─────────────
-#define T_NOVA  30.0f
+#define T_NOVA  31.5f
 
 static void draw_haiku_overlay(float t, Font roboto) {
     float lh = FONT_TITLE + 16;  // line height
-    draw_centered(roboto, "Every thought is a star",   HAIKU_Y,        C_WHITE, fade_in(t, 25.0f, 0.5f));
-    draw_centered(roboto, "Few form a constellation",  HAIKU_Y + lh,   C_WHITE, fade_in(t, 27.0f, 0.5f));
+    draw_centered(roboto, "Each thought is a star",   HAIKU_Y,        C_WHITE, fade_in(t, 26.5f, 0.5f));
+    draw_centered(roboto, "Few form a constellation",  HAIKU_Y + lh,   C_WHITE, fade_in(t, 28.5f, 0.5f));
     draw_centered(roboto, "But they shine brightest",  HAIKU_Y + lh*2, C_WHITE, fade_in(t, T_NOVA, 0.5f));
     draw_centered2(roboto, "PufferLib ", C_WHITE, "4.0", C_CYAN,
                    FOOTER_Y, fade_in(t, T_NOVA + 2.0f, 0.5f));
@@ -586,7 +585,6 @@ static void draw_anim5(float anim_t, float dt, Shader *star_sh) {
 
 // ─── Video recording ──────────────────────────────────────────────────────────
 #define RECORD_FPS   30
-#define RECORD_SECS  38   // capture this many seconds then exit
 
 typedef struct { int pipefd[2]; pid_t pid; } VideoRecorder;
 
@@ -653,75 +651,61 @@ int main(void) {
     init_anim5();
 
     VideoRecorder recorder;
-    bool recording = OpenVideo(&recorder, "trailer/trailer.mp4", SCREEN_W, SCREEN_H);
+    int phase = 0;
+    float phase_time = 0;
+    bool recording = OpenVideo(&recorder, "trailer/v1.mp4", SCREEN_W, SCREEN_H);
     if (!recording) fprintf(stderr, "Warning: video recording disabled\n");
 
     while (!WindowShouldClose()) {
-        float t  = GetTime();
         float dt = GetFrameTime();
-        if (t > RECORD_SECS) break;
+        phase_time += dt;
+
+        if (phase == 0 && phase_time > 10.0f) {
+            if (recording) CloseVideo(&recorder);
+            phase = 1;
+            phase_time = 0;
+            recording = OpenVideo(&recorder, "trailer/v2.mp4", SCREEN_W, SCREEN_H);
+            init_bg_stars(); // Reset stars for the second video
+        }
+
+        if (phase == 1 && phase_time > 42.5f) break;
 
         BeginDrawing();
         ClearBackground(BG);
 
-        /* ============================================================
-           ANIMATION 1: Speed Comparison (0–3s)
-           ============================================================ */
-        if (t < 3.0f) {
+        if (phase == 0) {
             update_anim1(dt, roboto, &star_shader);
-        }
-
-        /* ============================================================
-           ANIMATION 2: Bar chart (0–3s), then held final state (3–6s)
-           ANIMATION 3: PufferNet glow on right half, overlaps 3–6s
-           ============================================================ */
-        else if (t < 9.0f) {
-            // draw_anim2(anim2_t - 3.0f, roboto, &star_shader);
-            build_bg_verts();
-            draw_stars(bg_verts, bg_draw_count, &star_shader);
-
-            if (t >= 6.0f) {
-                draw_anim3(t - 6.0f, &glow_shader, puffernet, &star_shader, roboto);
+        } else {
+            float t = phase_time;
+            if (t < 5.0f) {
+                build_bg_verts();
+                draw_stars(bg_verts, bg_draw_count, &star_shader);
+            }
+            else if (t < 10.5f) {
+                build_bg_verts();
+                draw_stars(bg_verts, bg_draw_count, &star_shader);
+                draw_anim3(t - 5.0f, &glow_shader, puffernet, &star_shader, roboto);
+            }
+            else if (t < 12.5f) {
+                update_bg_spiral(dt);
+                draw_anim4(t - 10.5f, roboto, &star_shader, &glow_shader, puffernet);
+            }
+            else if (t < 22.5f) {
+                draw_anim4(2.0f, roboto, &star_shader, &glow_shader, puffernet);
+            }
+            else if (t < 31.5f) {
+                update_bg_spiral(dt);
+                draw_anim5(t - 22.5f, dt, &star_shader);
+                draw_haiku_overlay(t, roboto);
+            }
+            else {
+                update_bg_nova(dt);
+                build_bg_verts_spiral(1.0f, 1);
+                draw_stars(bg_verts, bg_draw_count, &star_shader);
+                draw_haiku_overlay(t, roboto);
             }
         }
 
-        /* ============================================================
-           ANIMATION 4: Spiral in (9–11s, 2s)
-           ============================================================ */
-        else if (t < 11.0f) {
-            update_bg_spiral(dt);
-            draw_anim4(t - 9.0f, roboto, &star_shader, &glow_shader, puffernet);
-        }
-
-        /* ============================================================
-           Pause (11–21s): spiral frozen
-           ============================================================ */
-        else if (t < 21.0f) {
-            draw_anim4(2.0f, roboto, &star_shader, &glow_shader, puffernet);
-        }
-
-        /* ============================================================
-           ANIMATION 5: Spiral resumes (21s+), thumbnails start at 22s
-           ============================================================ */
-        else if (t < 30.0f) {
-            update_bg_spiral(dt);
-            draw_anim5(t - 22.0f, dt, &star_shader);
-            draw_haiku_overlay(t, roboto);
-        }
-
-        /* ============================================================
-           ANIMATION 6: Nova — stars explode outward (32s+)
-           Text "4.0" and "puffer.ai" fade in 2s after nova
-           ============================================================ */
-        else {
-            update_bg_nova(dt);
-            build_bg_verts_spiral(1.0f, 1);
-            draw_stars(bg_verts, bg_draw_count, &star_shader);
-            draw_haiku_overlay(t, roboto);  // lines 1+2 already faded in; line 3 + title continue here
-        }
-
-
-        //DrawFPS(SCREEN_W - 80, 8);
         static int frame_counter = 0;
         if (recording && (frame_counter++ % 2 == 0))
             WriteFrame(&recorder, SCREEN_W, SCREEN_H);
