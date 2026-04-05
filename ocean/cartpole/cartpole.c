@@ -8,7 +8,6 @@
 #include "cartpole.h"
 #include "puffernet.h"
 
-#define NUM_WEIGHTS 133123
 #define OBSERVATIONS_SIZE 4
 #define ACTIONS_SIZE 2
 #define CONTINUOUS 0
@@ -24,18 +23,23 @@ float movement(float action, int userControlMode) {
 }
 
 void demo() {
-    Weights* weights = load_weights(WEIGHTS_PATH, NUM_WEIGHTS);
+    Weights* weights = load_weights(WEIGHTS_PATH);
     
     int logit_sizes[1] = {ACTIONS_SIZE};
-    PufferNet* net = make_puffernet(weights, 1, OBSERVATIONS_SIZE, 64, 2, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, OBSERVATIONS_SIZE, 32, 2, logit_sizes, 1);
     
-    Cartpole env = {0};
-    env.continuous = CONTINUOUS;
+    Cartpole env = {
+        .continuous = CONTINUOUS,
+        .cart_mass = 1.0f,
+        .pole_mass = 0.1f,
+        .pole_length = 0.5f,
+        .gravity = 9.8f,
+        .force_mag = 10.0f,
+        .tau = 0.02f,
+    };
     allocate(&env);
     c_reset(&env);
     c_render(&env);
-
-    SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
         int userControlMode = IsKeyDown(KEY_LEFT_SHIFT);
@@ -48,11 +52,7 @@ void demo() {
         }   
 
         c_step(&env);
-
-        BeginDrawing();
-        ClearBackground(RAYWHITE);
         c_render(&env);
-        EndDrawing();
 
         if (env.terminals[0] > 0.5f) {
             c_reset(&env);

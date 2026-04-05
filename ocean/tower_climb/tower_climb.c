@@ -101,7 +101,7 @@ void free_tower_climb_net(TowerClimbNet* net) {
 }
 
 void demo() {   
-    Weights* weights = load_weights("resources/tower_climb/tower_climb_weights.bin", 560407);
+    Weights* weights = load_weights("resources/tower_climb/tower_climb_weights.bin");
     TowerClimbNet* net = init_tower_climb_net(weights, 1);
     const char* path = "resources/tower_climb/maps.bin";
 

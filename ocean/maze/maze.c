@@ -2,31 +2,41 @@
 #include "puffernet.h"
 
 void demo() {
-    Weights* weights = load_weights("resources/maze/maze_weights.bin", 0); // 0 is dummy if no weights
+    Weights* weights = load_weights("resources/maze/maze_weights.bin");
     int logit_sizes[1] = {5};
-    PufferNet* net = make_puffernet(weights, 1, 121, 64, 2, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 121, 512, 5, logit_sizes, 1);
 
-    int max_size = 32;
+    int max_size = 47;
+    int num_maps = 64;
     int num_agents = 1;
-    int horizon = 128;
+    int horizon = 256;
     float speed = 1;
     int vision = 5;
     bool discretize = true;
 
-    int seed = 0;
-
     Grid* env = allocate_maze(max_size, num_agents, horizon,
         vision, speed, discretize);
 
-    State* levels = calloc(1, sizeof(State));
+    // Generate maps matching binding.c: random odd sizes, random difficulty
+    State* levels = calloc(num_maps, sizeof(State));
+    Grid temp_env;
+    temp_env.max_size = max_size;
+    init_maze(&temp_env);
+    unsigned int map_rng = 42;
+    for (int i = 0; i < num_maps; i++) {
+        int sz = 5 + (rand_r(&map_rng) % (max_size - 5));
+        if (sz % 2 == 0) sz -= 1;
+        float difficulty = (float)rand_r(&map_rng) / (float)(RAND_MAX);
+        create_maze_level(&temp_env, sz, sz, difficulty, i);
+        init_state(&levels[i], max_size, num_agents);
+        get_state(&temp_env, &levels[i]);
+    }
+    free(temp_env.maze);
 
-    create_maze_level(env, 31, 31, 0.85, seed);
-    init_state(levels, max_size, num_agents);
-    get_state(env, levels);
-    env->num_maps = 1;
+    env->num_maps = num_maps;
     env->levels = levels;
- 
-    int tick = 0;
+
+    c_reset(env);
     c_render(env);
     while (!WindowShouldClose()) {
         env->actions[0] = ATN_PASS;
@@ -49,19 +59,19 @@ void demo() {
                 env->actions[0] = ATN_PASS;
             }
         } else {
-            forward_puffernet(net, env->observations, env->actions);
+            float obs[121];
+            for (int i = 0; i < 121; i++) obs[i] = env->observations[i];
+            forward_puffernet(net, obs, env->actions);
         }
 
-        tick = (tick + 1)%12;
-        if (tick % 1 == 0) {
-            c_step(env);
-        }
+        c_step(env);
         c_render(env);
     }
     
     free_puffernet(net);
     free(weights);
     free_allocated_maze(env);
+    for (int i = 0; i < num_maps; i++) free_state(&levels[i]);
     free(levels);
 }
 

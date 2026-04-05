@@ -3,7 +3,7 @@
 
 void demo() {
     // encoder(64x510=32640) + decoder(24x64=1536) + 5x mingru(192x64=12288) = 95616
-    Weights* weights = load_weights("resources/moba/moba_weights.bin", 95616);
+    Weights* weights = load_weights("resources/moba/moba_weights.bin");
 
     int logit_sizes[6] = {7, 7, 3, 2, 2, 2};
     PufferNet* net = make_puffernet(weights, 5, 510, 64, 5, logit_sizes, 6);

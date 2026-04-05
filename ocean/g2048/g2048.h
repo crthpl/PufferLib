@@ -440,7 +440,7 @@ void c_render(Game* game) {
     
     if (!window_initialized) {
         InitWindow(px * SIZE, px * SIZE + 50, "2048");
-        SetTargetFPS(30); // Increased for smoother rendering
+        SetTargetFPS(30);
         window_initialized = true;
     }
     

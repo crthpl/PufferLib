@@ -14,9 +14,9 @@ void demo() {
     env.client = make_client(&env);
     c_reset(&env);
 
-    Weights* weights = load_weights("resources/tetris/tetris_weights.bin", 588552);
+    Weights* weights = load_weights("resources/tetris/tetris_weights.bin");
     int logit_sizes[1] = {7};
-    PufferNet* net = make_puffernet(weights, 1, 234, 128, 1, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 234, 512, 2, logit_sizes, 1);
 
     static bool rotate_key_was_down = false;
     static bool hard_drop_key_was_down = false;

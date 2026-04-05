@@ -100,6 +100,7 @@ def cached_load(path, env_name, cache):
             continue
 
         n = len(metrics['agent_steps'])
+
         for k, v in metrics.items():
             if len(v) != n:
                 skip = True
@@ -124,6 +125,9 @@ def cached_load(path, env_name, cache):
         sweep_metadata = exp['sweep']
 
         for k, v in unroll_nested_dict(exp):
+            if k == 'env/score':
+                continue
+
             if k not in data:
                 data[k] = []
 
@@ -166,17 +170,16 @@ def cached_load(path, env_name, cache):
     del data['metrics/agent_steps']
 
     # Filter to pareto
-    '''
     steps = data['agent_steps']
     costs = data['uptime']
     scores = data['env/score']
+
     idxs = pareto_idx(steps, costs, scores)
     for k in data:
         try:
             data[k] = [data[k][i] for i in idxs]
         except IndexError:
             continue
-    '''
 
     data['sweep'] = sweep_metadata
     return data

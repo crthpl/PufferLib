@@ -13,9 +13,9 @@ void demo() {
         .do_human_control = true
     };
 
-    Weights* weights = load_weights("resources/trash_pickup/trash_pickup_weights.bin", 150245);
+    Weights* weights = load_weights("resources/trash_pickup/trash_pickup_weights.bin");
     int logit_sizes[1] = {4};
-    PufferNet* net = make_puffernet(weights, env.num_agents, 605, 128, 1, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, env.num_agents, 605, 128, 2, logit_sizes, 1);
 
     allocate(&env);
     c_reset(&env);

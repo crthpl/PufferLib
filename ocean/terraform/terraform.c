@@ -19,9 +19,9 @@ void free_allocated(Terraform* env) {
 }
 
 void demo() {
-    Weights* weights = load_weights("resources/terraform/puffer_terraform_weights.bin", 2476814);
+    Weights* weights = load_weights("resources/terraform/terraform_weights.bin");
     int logit_sizes[3] = {5, 5, 3};
-    PufferNet* net = make_puffernet(weights, 1, 319, 512, 1, logit_sizes, 3);
+    PufferNet* net = make_puffernet(weights, 1, 319, 512, 5, logit_sizes, 3);
     srand(time(NULL));
     Terraform env = {.size = 64, .num_agents = 1, .reset_frequency = 8192, .reward_scale = 0.04f};
     allocate(&env);

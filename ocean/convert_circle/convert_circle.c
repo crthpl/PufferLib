@@ -23,7 +23,7 @@ int main() {
   env.terminals = calloc(env.num_agents, sizeof(unsigned char));
 
   Weights *weights =
-      load_weights("resources/convert/convert_weights.bin", 137743);
+      load_weights("resources/convert/convert_weights.bin");
   int logit_sizes[2] = {9, 5};
   LinearLSTM *net =
       make_linearlstm(weights, env.num_agents, num_obs, logit_sizes, 2);

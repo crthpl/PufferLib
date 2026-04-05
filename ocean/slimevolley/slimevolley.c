@@ -20,11 +20,6 @@ void abranti_simple_policy(float* obs, float* action) {
     action[2] = 1.0f; // always jump
 }
 
-void random_policy(float* obs, float* action) {
-    action[0] = 2.0f*randf() - 1.0f;
-    action[1] = 2.0f*randf() - 1.0f;
-    action[2] = 2.0f*randf() - 1.0f;
-}
 
 void demo() {
     int num_obs = 12;
@@ -36,9 +31,9 @@ void demo() {
     env.rewards = (float*)calloc(env.num_agents, sizeof(float));
     env.terminals = (float*)calloc(env.num_agents, sizeof(float));
 
-    Weights* weights = load_weights("resources/slimevolley/slimevolley_weights.bin", 0);
+    Weights* weights = load_weights("resources/slimevolley/slimevolley_weights.bin");
     int logit_sizes[3] = {2, 2, 2};
-    PufferNet* net = make_puffernet(weights, 1, num_obs, 64, 2, logit_sizes, 3);
+    PufferNet* net = make_puffernet(weights, 1, num_obs, 128, 3, logit_sizes, 3);
 
     // Always call reset and render first
     c_reset(&env);

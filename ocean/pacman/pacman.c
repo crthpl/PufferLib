@@ -4,12 +4,9 @@
 
 void demo() {
     // printf("OBSERVATIONS_COUNT: %d\n", OBSERVATIONS_COUNT);
-    Weights* weights = load_weights("resources/pacman/pacman_weights.bin", 170117);
+    Weights* weights = load_weights("resources/pacman/pacman_weights.bin");
     int logit_sizes[1] = {4};
-    // Using default hidden_dim=128, num_layers=4 as pacman.ini doesn't specify, or maybe it was something else, 
-    // but the prompt said "use defaults like hidden_dim=512, num_layers=5 if not easily found."
-    // Given the weight size 170117, it's hard to guess, let's use 512, 5.
-    PufferNet* net = make_puffernet(weights, 1, OBSERVATIONS_COUNT, 512, 5, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, OBSERVATIONS_COUNT, 256, 6, logit_sizes, 1);
 
     PacmanEnv env = {
         .randomize_starting_position = false,

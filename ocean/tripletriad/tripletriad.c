@@ -5,9 +5,9 @@
 #define NOOP -1
 
 void demo() {
-    Weights* weights = load_weights("resources/tripletriad/tripletriad_weights.bin", 148751);
+    Weights* weights = load_weights("resources/tripletriad/tripletriad_weights.bin");
     int logit_sizes[1] = {14};
-    PufferNet* net = make_puffernet(weights, 1, 114, 128, 1, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 114, 256, 2, logit_sizes, 1);
 
     CTripleTriad env = {
         .width = 990,

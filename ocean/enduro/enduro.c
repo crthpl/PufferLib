@@ -33,9 +33,9 @@ void get_input(Enduro* env) {
 }
 
 int demo() {
-    Weights* weights = load_weights("resources/enduro/enduro_weights.bin", 142218);
+    Weights* weights = load_weights("resources/enduro/enduro_weights.bin");
     int logit_sizes[1] = {9};
-    PufferNet* net = make_puffernet(weights, 1, 68, 64, 2, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 68, 128, 2, logit_sizes, 1);
 
     Enduro env = {
         .num_envs = 1,

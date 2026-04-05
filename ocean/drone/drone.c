@@ -18,15 +18,6 @@ void emscriptenStep(void* e) {
     WebRenderArgs* args = (WebRenderArgs*)e;
     DroneEnv* env = args->env;
     PufferNet* net = args->net;
-    size_t obs_size = 23;
-
-    for (int i = 0; i < env->num_agents; i++) {
-        int base = i * obs_size;
-        env->observations[base + 19] = 0.0f;
-        env->observations[base + 20] = 0.0f;
-        env->observations[base + 21] = 0.0f;
-        env->observations[base + 22] = 0.0f;
-    }
 
     forward_puffernet(net, env->observations, env->actions);
     c_step(env);
@@ -36,28 +27,35 @@ void emscriptenStep(void* e) {
 WebRenderArgs* web_args = NULL;
 #endif
 
-void demo() {
+int main() {
     srand(time(NULL));
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
     size_t obs_size = 23;
 
-    env->num_agents = 64;
+    env->num_agents = 16;
     env->max_rings = 10;
     env->task = HOVER;
-    env->hover_target_dist = 0.5f;
-    env->hover_dist = 0.05f;
-    env->hover_omega = 0.05;
-    env->hover_vel = 0.01;
-    init(env);
+    env->alpha_dist = 0.782192f;
+    env->alpha_hover = 0.071445f;
+    env->alpha_shaping = 3.9754f;
+    env->alpha_omega = 0.00135588f;
+    env->hover_target_dist = 5.0f;
+    env->hover_dist = 0.1f;
+    env->hover_omega = 0.1f;
+    env->hover_vel = 0.1f;
 
-    allocate(env);
+    env->observations = (float*)calloc(env->num_agents * obs_size, sizeof(float));
+    env->actions = (float*)calloc(env->num_agents * 4, sizeof(float));
+    env->rewards = (float*)calloc(env->num_agents, sizeof(float));
+    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 
-    Weights* weights = load_weights("resources/drone/puffer_drone_weights.bin", 4841);
+    Weights* weights = load_weights("resources/drone/drone_weights.bin");
     int logit_sizes[4] = {1, 1, 1, 1};
     // make_puffernet(weights, num_agents, obs_size, hidden_size, num_layers, logit_sizes, num_actions)
-    PufferNet* net = make_puffernet(weights, env->num_agents, obs_size, 64, 2, logit_sizes, 4);
+    PufferNet* net = make_puffernet(weights, env->num_agents, obs_size, 128, 3, logit_sizes, 4);
 
+    init(env);
     c_reset(env);
 
 #ifdef __EMSCRIPTEN__
@@ -73,13 +71,6 @@ void demo() {
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
-        for (int i = 0; i < env->num_agents; i++) {
-            int base = i * obs_size;
-            env->observations[base + 19] = 0.0f;
-            env->observations[base + 20] = 0.0f;
-            env->observations[base + 21] = 0.0f;
-            env->observations[base + 22] = 0.0f;
-        }
         forward_puffernet(net, env->observations, env->actions);
         c_step(env);
         c_render(env);
@@ -88,12 +79,12 @@ void demo() {
     c_close(env);
     free_puffernet(net);
     free(weights);
-    free_allocated(env);
+    free(env->observations);
+    free(env->actions);
+    free(env->rewards);
+    free(env->terminals);
     free(env);
 #endif
-}
 
-int main() {
-    demo();
     return 0;
 }

@@ -13,7 +13,7 @@ void demo() {
     env.rewards = (float*)calloc(1, sizeof(float));
     env.terminals = (float*)calloc(1, sizeof(float));
 
-    Weights* weights = load_weights("resources/squared_continuous/squared_continuous_weights.bin", 0);
+    Weights* weights = load_weights("resources/squared_continuous/squared_continuous_weights.bin");
     int logit_sizes[2] = {1, 1};
     PufferNet* net = make_puffernet(weights, 1, 121, 128, 1, logit_sizes, 2);
 
