@@ -9,7 +9,7 @@ void demo() {
         .human_agent_idx = 0,
         .reward_vehicle_collision = -0.1f,
         .reward_offroad_collision = -0.1f,
-	    .map_name = "resources/drive/map_942.bin",
+	    .map_name = "resources/drive/map_010.bin",
     };
     allocate(&env);
     c_reset(&env);
