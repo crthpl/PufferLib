@@ -152,7 +152,7 @@ void forward(MMONet* net, unsigned char* observations, float* terminals, float* 
 }
 
 void demo(int num_players) {
-    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 4430976);
+    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin");
     MMONet* net = init_mmonet(weights, num_players);
 
     MMO env = {
@@ -212,7 +212,7 @@ void demo(int num_players) {
 }
 
 void test_mmonet_performance(int num_players, int timeout) {
-    Weights* weights = load_weights("nmmo3_weights.bin", 1101403);
+    Weights* weights = load_weights("nmmo3_weights.bin");
     MMONet* net = init_mmonet(weights, num_players);
 
     MMO env = {
@@ -465,7 +465,7 @@ void test_performance(int num_players, int timeout) {
 }
 
 void test_no_render_log(int num_players, int target_episodes) {
-    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin", 4430976);
+    Weights* weights = load_weights("resources/nmmo3/nmmo3_weights.bin");
     MMONet* net = init_mmonet(weights, num_players);
 
     MMO env = {

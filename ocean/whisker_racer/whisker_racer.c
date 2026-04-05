@@ -4,7 +4,7 @@
 
 void demo() {
     printf("demo\n");
-    Weights* weights = load_weights("resources/whisker_racer/puffer_whisker_racer_weights.bin", 133124);
+    Weights* weights = load_weights("resources/whisker_racer/puffer_whisker_racer_weights.bin");
     int logit_sizes[1] = {3};
     LinearLSTM* net = make_linearlstm(weights, 1, 3, logit_sizes, 1);
 

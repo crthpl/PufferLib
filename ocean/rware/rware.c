@@ -32,7 +32,7 @@ void demo(int map_choice) {
         .human_agent_idx = 0,
 	.reward_type = 2
     };
-    Weights* weights = load_weights("resources/rware/rware_weights.bin", 136454);
+    Weights* weights = load_weights("resources/rware/rware_weights.bin");
     int logit_sizes[1] = {5};
     LinearLSTM* net = make_linearlstm(weights, env.num_agents, 27, logit_sizes, 1);
 

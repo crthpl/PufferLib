@@ -36,25 +36,28 @@ struct Weights {
     int idx;
 };
 
-void _load_weights(const char* filename, float* weights, size_t num_weights) {
+Weights* load_weights(const char* filename) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
         perror("Error opening file");
+        return NULL;
     }
     fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
     rewind(file);
-    size_t read_size = fread(weights, sizeof(float), num_weights, file);
+    size_t num_weights = file_size / sizeof(float);
+    // +7 ensures get_weights_aligned never reads past the buffer: the native
+    // backend uses 16-byte alignment with bf16 params (2 bytes), so each tensor
+    // starts at an 8-float boundary. After the last tensor, up to 7 extra floats
+    // may be addressed before the next 8-aligned boundary.
+    Weights* weights = (Weights*)calloc(1, sizeof(Weights) + (num_weights + 7)*sizeof(float));
+    weights->data = (float*)(weights + 1);
+    size_t read_size = fread(weights->data, sizeof(float), num_weights, file);
     fclose(file);
     if (read_size != num_weights) {
         perror("Error reading file");
     }
-}
-
-Weights* load_weights(const char* filename, size_t num_weights) {
-    Weights* weights = (Weights*)calloc(1, sizeof(Weights) + num_weights*sizeof(float));
-    weights->data = (float*)(weights + 1);
-    _load_weights(filename, weights->data, num_weights);
-    weights->size = num_weights;
+    weights->size = num_weights + 7;
     weights->idx = 0;
     return weights;
 }
@@ -66,12 +69,12 @@ float* get_weights(Weights* weights, int num_weights) {
     return data;
 }
 
-// Advances index aligned to 16-byte (4-float) boundary after reading,
-// matching the native backend's Allocator padding between tensors.
+// Advances index to next 8-float (16-byte) boundary after reading, matching
+// the native backend's Allocator which aligns to 16 bytes with bf16 params.
 float* get_weights_aligned(Weights* weights, int num_weights) {
     float* data = &weights->data[weights->idx];
     weights->idx += num_weights;
-    weights->idx = (weights->idx + 3) & ~3;
+    weights->idx = (weights->idx + 7) & ~7;
     assert(weights->idx <= weights->size);
     return data;
 }
@@ -1045,7 +1048,7 @@ PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
     net->decoder = make_linear(weights, num_agents, hidden_dim, atn_sum + 1);
     if (net->is_continuous) {
-        net->log_std = get_weights(weights, num_actions);
+        net->log_std = get_weights_aligned(weights, num_actions);
     }
     net->mingru  = make_mingru(weights, num_agents, hidden_dim, num_layers);
     if (!net->is_continuous) {
@@ -1054,12 +1057,21 @@ PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     return net;
 }
 
+void _gaussian_mean(float* input, float* output, int batch_size, int num_actions) {
+    for (int b = 0; b < batch_size; b++) {
+        // +1 skips the value head fused into the decoder output
+        int in_adr = b * (num_actions + 1);
+        for (int a = 0; a < num_actions; a++)
+            output[b * num_actions + a] = input[in_adr + a];
+    }
+}
+
 void forward_puffernet(PufferNet* net, float* observations, float* actions) {
     linear(net->encoder, observations);
     mingru(net->mingru, net->encoder->output);
     linear(net->decoder, net->mingru->output);
     if (net->is_continuous) {
-        _gaussian_sample(net->decoder->output, net->log_std, actions, net->num_agents, net->num_actions);
+        _gaussian_mean(net->decoder->output, actions, net->num_agents, net->num_actions);
     } else {
         softmax_multidiscrete(net->multidiscrete, net->decoder->output, actions);
     }

@@ -18,7 +18,7 @@ int main() {
   c_reset(&env);
   c_render(&env);
 
-  Weights* weights = load_weights("resources/cpr/cpr_weights.bin", 139270);
+  Weights* weights = load_weights("resources/cpr/cpr_weights.bin");
   int logit_sizes[] = {5};
   LinearLSTM* net = make_linearlstm(weights, env.num_agents, 49, logit_sizes, 1);
  

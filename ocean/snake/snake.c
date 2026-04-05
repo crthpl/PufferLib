@@ -18,7 +18,7 @@ int demo() {
     allocate_csnake(&env);
     c_reset(&env);
 
-    Weights* weights = load_weights("resources/snake/snake_weights.bin", 256773);
+    Weights* weights = load_weights("resources/snake/snake_weights.bin");
     int logit_sizes[] = {4};
     LinearLSTM* net = make_linearlstm(weights, env.num_agents, 968, logit_sizes, 1);
     env.client = make_client(2, env.width, env.height);

@@ -41,7 +41,7 @@ int main() {
             if (len > 4 && strcmp(entry->d_name + len - 4, ".bin") == 0) {
                 char fullpath[256];
                 sprintf(fullpath, "%s%s", dirpath, entry->d_name);
-                Weights* weights = load_weights(fullpath, 136847);
+                Weights* weights = load_weights(fullpath);
                 int logit_sizes[2] = {9, 5};
                 nets[idx] = make_linearlstm(weights, 1, 21, logit_sizes, 2);
 

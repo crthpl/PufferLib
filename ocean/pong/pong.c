@@ -4,7 +4,7 @@
 
 void demo() {
     // Weight count: encoder(32x8=256) + decoder(4x32=128) + 1x mingru(3x32x32=3072) = 3456
-    Weights* weights = load_weights("resources/pong/pong_weights.bin", 3456);
+    Weights* weights = load_weights("resources/pong/pong_weights.bin");
 
     int logit_sizes[1] = {3};
     PufferNet* net = make_puffernet(weights, 1, 8, 32, 1, logit_sizes, 1);

@@ -3,7 +3,7 @@
 #include "puffernet.h"
 
 void demo() {
-    Weights* weights = load_weights("resources/breakout/breakout_weights.bin", 32384);
+    Weights* weights = load_weights("resources/breakout/breakout_weights.bin");
     int logit_sizes[1] = {3};
     PufferNet* net = make_puffernet(weights, 1, 118, 64, 2, logit_sizes, 1);
 

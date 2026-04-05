@@ -196,7 +196,7 @@ void allocate(CGo* env) {
         env->observations = (float*)calloc(2*((env->grid_size)*(env->grid_size)*4 +2), sizeof(float));
         env->actions = (float*)calloc(2, sizeof(float));
     } else{
-        env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*4 +1, sizeof(float));
+        env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*4 +2, sizeof(float));
         env->actions = (float*)calloc(1, sizeof(float));
     }
     env->rewards = (float*)calloc(1, sizeof(float));

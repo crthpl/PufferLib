@@ -61,8 +61,8 @@ const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
 
-int hyper_count = 24;
-char *hyper_key[24] = {
+int hyper_count = 25;
+char *hyper_key[25] = {
     "agent_steps",
     "uptime",
     "env/perf",
@@ -86,6 +86,7 @@ char *hyper_key[24] = {
     "train/replay_ratio",
     "train/minibatch_size",
     "policy/hidden_size",
+    "policy/num_layers",
     "vec/total_agents",
 };
 
@@ -573,7 +574,16 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
 
         char* suffix = slash + 1;
         double val = hyper->ary[ary_idx];
-        if (strcmp(suffix, "agent_steps") == 0 || strcmp(suffix, "total_timesteps") == 0) {
+        if (strcmp(suffix, "total_timesteps") == 0) {
+            // Use agent_steps (training-only) instead of total_timesteps (train+eval)
+            for (int k = 0; k < env->n; k++) {
+                if (strcmp(env->hypers[k].key, "agent_steps") == 0) {
+                    val = env->hypers[k].ary[ary_idx];
+                    break;
+                }
+            }
+            buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)(val * 1e6));
+        } else if (strcmp(suffix, "agent_steps") == 0) {
             buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)(val * 1e6));
         } else if (val == (long long)val) {
             buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)val);

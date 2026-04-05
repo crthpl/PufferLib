@@ -4,9 +4,9 @@
 #include <unistd.h>
 
 void demo() {
-    Weights* weights = load_weights("resources/freeway/freeway_weights.bin", 137092);
+    Weights* weights = load_weights("resources/freeway/freeway_weights.bin");
     int logit_sizes[1] = {3};
-    PufferNet* net = make_puffernet(weights, 1, 34, 64, 2, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 34, 128, 7, logit_sizes, 1);
 
     Freeway env = {
         .frameskip=4,

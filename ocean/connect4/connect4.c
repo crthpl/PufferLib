@@ -5,11 +5,11 @@
 const unsigned char NOOP = 8;
 
 void demo() {
-    Weights* weights = load_weights("resources/connect4/connect4_weights.bin", 138632);
+    Weights* weights = load_weights("resources/connect4/connect4_weights.bin");
     int logit_sizes[] = {7};
-    PufferNet* net = make_puffernet(weights, 1, 42, 64, 2, logit_sizes, 1);
+    PufferNet* net = make_puffernet(weights, 1, 42, 256, 1, logit_sizes, 1);
 
-    CConnect4 env = {
+    Connect4 env = {
     };
     allocate_cconnect4(&env);
     c_reset(&env);
