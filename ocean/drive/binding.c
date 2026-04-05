@@ -3,7 +3,7 @@
 #define ACT_SIZES {7, 13}
 #define OBS_TENSOR_T FloatTensor
 
-#define MAP_BINARY_DIR "resources/drive/binaries/training"
+#define MAP_BINARY_DIR "drive_data/binaries"
 
 #define MY_VEC_INIT
 #define Env Drive

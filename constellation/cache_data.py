@@ -62,7 +62,7 @@ def pareto_idx(steps, costs, scores):
 
     return idxs
 
-def cached_load(path, env_name, cache):
+def cached_load(path, env_name, cache, full_dataset=False):
     data = {}
     num_metrics = 0
     metric_keys = []
@@ -170,21 +170,22 @@ def cached_load(path, env_name, cache):
     del data['metrics/agent_steps']
 
     # Filter to pareto
-    steps = data['agent_steps']
-    costs = data['uptime']
-    scores = data['env/score']
+    if not full_dataset:
+        steps = data['agent_steps']
+        costs = data['uptime']
+        scores = data['env/score']
 
-    idxs = pareto_idx(steps, costs, scores)
-    for k in data:
-        try:
-            data[k] = [data[k][i] for i in idxs]
-        except IndexError:
-            continue
+        idxs = pareto_idx(steps, costs, scores)
+        for k in data:
+            try:
+                data[k] = [data[k][i] for i in idxs]
+            except IndexError:
+                continue
 
     data['sweep'] = sweep_metadata
     return data
 
-def compute_tsne():
+def compute_tsne(full_dataset=False):
     all_data = {}
     normed = {}
 
@@ -196,7 +197,7 @@ def compute_tsne():
     env_names = sorted(os.listdir('logs'))
     for env in env_names:
         print('Loading: ', env)
-        all_data[env] = cached_load(f'logs/{env}/*.json', env, cache)
+        all_data[env] = cached_load(f'logs/{env}/*.json', env, cache, full_dataset)
 
     with open(cache_file, 'w') as f:
         json.dump(cache, f)
@@ -230,7 +231,7 @@ def compute_tsne():
                 and len(v) > 0 and isinstance(v[0], (int, float))
                 and (k == 'train/max_grad_norm' or not k.endswith('_norm'))}
         all_data[env] = dat
-        print(f'Env {env} has {len(dat['env/perf'])} points')
+        print(f"Env {env} has {len(dat['env/perf'])} points")
         for k, v in dat.items():
             if 'env/perf' in k or 'score' in k:
                 print(f'{env}/{k}: min={min(v)}, max={max(v)}')
@@ -243,4 +244,8 @@ def compute_tsne():
     json.dump(all_data, open('resources/constellation/experiments.json', 'w'))
 
 if __name__ == '__main__':
-    compute_tsne()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--full', action='store_true', help='Include full dataset (no pareto filtering)')
+    args = parser.parse_args()
+    compute_tsne(full_dataset=args.full)

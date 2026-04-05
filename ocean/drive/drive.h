@@ -755,7 +755,9 @@ int collision_check(Drive* env, int agent_idx) {
 
 // Agent Selection
 int valid_active_agent(Drive* env, int agent_idx) {
+    if (agent_idx < 0 || agent_idx >= env->num_entities) return 0;
     Entity* e = &env->entities[agent_idx];
+    if (e->type != VEHICLE || e->traj_valid[0] != 1) return 0;
     float cos_heading = cosf(e->traj_heading[0]);
     float sin_heading = sinf(e->traj_heading[0]);
     float goal_x = e->goal_position_x - e->traj_x[0];
