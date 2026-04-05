@@ -216,7 +216,7 @@ fi
 
 echo "Compiling static library for $ENV..."
 ${CC:-clang} -c "${CLANG_OPT[@]}" \
-    -I. -Isrc -I$SRC_DIR \
+    -I. -Isrc -I$SRC_DIR -Ivendor \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
