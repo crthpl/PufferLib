@@ -21,7 +21,6 @@ dependencies = [
     "torch>=2.9",
     "rich",
     "rich_argparse",
-    #"imageio",
     "gpytorch",
     "scikit-learn",
     "wandb",
