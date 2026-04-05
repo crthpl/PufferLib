@@ -647,25 +647,6 @@ int find_group_liberty(CGo* env, int root){
 void enemy_greedy_hard(CGo* env, int side){
 
     int opp = 3 - side;
-
-    // Count empty points that are adjacent to opponent stones (potential territory gain)
-    int profitable_moves = 0;
-    for (int i = 0; i < env->grid_size * env->grid_size; i++) {
-        if (env->board_states[i] != 0) continue;
-        int x = i % env->grid_size;
-        int y = i / env->grid_size;
-        for (int d = 0; d < 4; d++) {
-            int nx = x + DIRECTIONS[d][0];
-            int ny = y + DIRECTIONS[d][1];
-            if (!is_valid_position(env, nx, ny)) continue;
-            int npos = ny * env->grid_size + nx;
-            // Adjacent to opponent = potentially worth playing
-            if (env->board_states[npos] == opp) {
-                profitable_moves++;
-                break;
-            }
-        }
-    }
 	// Attempt to capture opponent stones in atari
     int liberties[4][(env->grid_size) * (env->grid_size)];
     int liberty_counts[4] = {0};
@@ -698,15 +679,7 @@ void enemy_greedy_hard(CGo* env, int side){
             }
         }
     }
-    if (profitable_moves == 0) {
-        // Double-pass detection: if agent also just passed, end the game
-        if (env->previous_move == NOOP) {
-            env->terminals[0] = 1;
-        }
-        env->previous_move = NOOP;
-        env->turn = (env->turn + 1) % 2;
-        return;
-    }
+
     // random move
     enemy_random_move(env, side);
 }

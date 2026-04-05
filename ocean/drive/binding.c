@@ -41,7 +41,6 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
         Env temp_env = {0};
         temp_env.map_name = map_file;
-        temp_env.num_agents = 64;
         init(&temp_env);
         agents_per_map[m] = temp_env.active_agent_count < MAX_AGENTS
                           ? temp_env.active_agent_count : MAX_AGENTS;
@@ -56,15 +55,6 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         printf("ERROR: No valid maps found\n");
         *num_envs_out = 0;
         return NULL;
-
-    // Calculate the number of environments to initialize per buffer
-    int agents_per_buffer = total_agents / num_buffers;
-    int envs_per_buffer = 0;
-    int agents_in_buffer = 0;
-    while (agents_in_buffer < agents_per_buffer) {
-        int m = envs_per_buffer % num_maps;
-        agents_in_buffer += agents_per_map[m];
-        envs_per_buffer++;
     }
 
     // Build per-env layout. Each buffer advances the global cursor so different
@@ -121,10 +111,6 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->max_agents = env_max_agents[i];
-
-        // Maximum number of agents to control in this env
-        env->max_agents = is_last_in_buffer ? last_map_capped_agents : agents_per_map[m];
-
         init(env);
         env->num_agents = env->active_agent_count;
     }
