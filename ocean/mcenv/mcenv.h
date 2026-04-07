@@ -16,15 +16,15 @@
 #define MC_OBS_GRID (MC_GRID_X * MC_GRID_Y * MC_GRID_Z)
 #define MC_OBS_TOTAL (MC_OBS_PLAYER + MC_OBS_TARGET + MC_OBS_GRID)
 
-#define MC_START_X 50.5      // Center of 100x100 area
+#define MC_START_X 25.5      // Center of 50x50 area
 #define MC_START_Y 3.0
-#define MC_START_Z 50.5
+#define MC_START_Z 25.5
 #define MC_START_YAW -90.0f
 #define MC_START_PITCH -45.0f
 
 #define MC_VOID_Y 0.0
-#define MC_PLATFORM_MAX_X 52 // Platform: x 49..51, so block x=51 ends at 52
-#define MC_AREA_SIZE 100
+#define MC_PLATFORM_MAX_X 26 // Single block at x=25, ends at x=26
+#define MC_AREA_SIZE 50
 #define MC_TARGET_REACH 1.0f // Within 1 block = reached
 
 // Default reward constants
@@ -109,7 +109,7 @@ static void mc_new_target(MCEnv* env) {
         float tz = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
         float dx = tx - (float)state.pos.x;
         float dz = tz - (float)state.pos.z;
-        if (dx*dx + dz*dz >= 100.0f) { // >= 10 blocks away
+        if (dx*dx + dz*dz >= 25.0f) { // >= 5 blocks away
             env->target_x = tx;
             env->target_z = tz;
             env->prev_dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
@@ -123,13 +123,9 @@ static void mc_new_target(MCEnv* env) {
 }
 
 static void setup_platform(MCEnv* env) {
-    // 3x1x3 platform at y=2 centered on start position
-    for (int x = -1; x <= 1; x++) {
-        for (int z = -1; z <= 1; z++) {
-            CBlockPos pos = {(int)env->start_x + x, 2, (int)env->start_z + z};
-            mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
-        }
-    }
+    // Single block at y=2 under start position — must bridge to move
+    CBlockPos pos = {(int)env->start_x, 2, (int)env->start_z};
+    mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
 }
 
 static void compute_observations(MCEnv* env) {
@@ -277,7 +273,7 @@ void c_step(MCEnv* env) {
                 CBlock blk;
                 mcenv_environment_get_block(env->mc, bp, &blk);
                 if (blk == CBLOCK_FULL_CUBE &&
-                    !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                    !(cx == px && cz == pz)) {
                     blocks_before++;
                 }
             }
@@ -302,7 +298,7 @@ void c_step(MCEnv* env) {
                 CBlock blk;
                 mcenv_environment_get_block(env->mc, bp, &blk);
                 if (blk == CBLOCK_FULL_CUBE &&
-                    !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                    !(cx == px && cz == pz)) {
                     blocks_after++;
                 }
             }
@@ -325,9 +321,9 @@ void c_step(MCEnv* env) {
         reward += env->rw_survival;
     }
 
-    // 2. Getting closer to target (delta distance, only at valid height)
+    // 2. Getting closer to target (only while on solid ground)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
-    if (state.pos.y >= env->start_y) {
+    if (state.on_ground) {
         float delta_dist = env->prev_dist - dist;
         reward += env->rw_speed * delta_dist;
     }
