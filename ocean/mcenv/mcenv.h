@@ -26,8 +26,9 @@
 
 // Reward constants
 #define MC_SURVIVAL_REWARD  0.001f // Tiny per-tick survival (full ep = ~1.0)
-#define MC_BLOCK_REWARD     20.0f  // Huge reward for placing a block beyond platform
+#define MC_BLOCK_REWARD     5.0f   // Reward for placing a block beyond platform
 #define MC_FALL_PENALTY    -1.0f   // Penalty for falling
+#define MC_SPEED_SCALE      1.0f   // Multiplier for delta-x reward (always on)
 
 // Yaw/pitch delta lookup tables (degrees)
 static const float YAW_DELTAS[7]   = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
@@ -235,7 +236,11 @@ void c_step(MCEnv* env) {
         reward += MC_SURVIVAL_REWARD;
     }
 
-    // 2. Block placement: big reward for extending the bridge
+    // 2. Delta-x: always rewards forward progress (and penalizes going backward)
+    float dx = (float)(state.pos.x - env->prev_x);
+    reward += MC_SPEED_SCALE * dx;
+
+    // 3. Block placement: big reward for extending the bridge
     if (place_action == 1) {
         int bx = (int)floorf((float)state.pos.x);
         for (int checkx = bx; checkx <= bx + 3; checkx++) {
