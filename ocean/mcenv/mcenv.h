@@ -22,7 +22,7 @@
 #define MC_START_YAW -90.0f
 #define MC_START_PITCH -45.0f
 
-#define MC_VOID_Y 0.0
+#define MC_VOID_Y 2.5   // Just below platform (y=2..3) — falling = instant death
 #define MC_PLATFORM_MAX_X 26 // Single block at x=25, ends at x=26
 #define MC_AREA_SIZE 50
 #define MC_TARGET_REACH 1.0f // Within 1 block = reached
