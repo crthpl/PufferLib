@@ -22,11 +22,13 @@
 
 #define MC_VOID_Y 0.0       // Just below the platform (y=2) — short fall = quick death
 #define MC_MAX_Z_DRIFT 10.0
-#define MC_PLACE_REWARD 0.5f // Bonus for placing a block at a new max-x
+#define MC_PLACE_REWARD 0.5f  // Bonus for placing a block at a new max-x
+#define MC_LOOK_REWARD  0.02f // Small shaping reward for looking down+back at edge
+#define MC_PLATFORM_MAX_X 2   // Platform blocks span x: -1..1, so block x=1 ends at x=2
 
 // Yaw/pitch delta lookup tables (degrees)
-static const float YAW_DELTAS[5]   = {-15.0f, -5.0f, 0.0f, 5.0f, 15.0f};
-static const float PITCH_DELTAS[5] = {-15.0f, -5.0f, 0.0f, 5.0f, 15.0f};
+static const float YAW_DELTAS[7]   = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
+static const float PITCH_DELTAS[7] = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
 
 typedef struct {
     float perf;
@@ -173,8 +175,8 @@ void c_step(MCEnv* env) {
     int strafe_action   = (int)env->actions[a_idx++];   // 0=left, 1=none, 2=right
     int jump_action     = (int)env->actions[a_idx++];    // 0=no, 1=yes
     int sneak_action    = (int)env->actions[a_idx++];    // 0=no, 1=yes
-    int yaw_action      = (int)env->actions[a_idx++];     // 0-4 index into YAW_DELTAS
-    int pitch_action    = (int)env->actions[a_idx++];   // 0-4 index into PITCH_DELTAS
+    int yaw_action      = (int)env->actions[a_idx++];     // 0-6 index into YAW_DELTAS
+    int pitch_action    = (int)env->actions[a_idx++];   // 0-6 index into PITCH_DELTAS
     int place_action    = (int)env->actions[a_idx++];   // 0=no, 1=yes
 
     // Update look direction
@@ -211,11 +213,11 @@ void c_step(MCEnv* env) {
     float reward = dx;
     env->prev_x = (float)state.pos.x;
 
-    // Check if a block was placed at a new max x by scanning ahead
+    // Check if a block was placed at a new max x beyond the starting platform
     if (place_action == 1) {
-        // Check blocks around where placement could have happened
         int bx = (int)floorf((float)state.pos.x);
         for (int checkx = bx; checkx <= bx + 3; checkx++) {
+            if (checkx < MC_PLATFORM_MAX_X) continue; // Skip platform blocks
             for (int checkz = (int)floorf((float)state.pos.z) - 1;
                  checkz <= (int)floorf((float)state.pos.z) + 1; checkz++) {
                 CBlockPos bp = {checkx, 2, checkz};
@@ -227,6 +229,20 @@ void c_step(MCEnv* env) {
                     reward += MC_PLACE_REWARD;
                 }
             }
+        }
+    }
+
+    // Shaping: small reward for looking down+back when near the edge of placed blocks.
+    // Bridging requires the player to look at the side of the last block to place on it.
+    // "Near edge" = player x within 1 block of max_block_x.
+    // "Looking right" = pitch < -30 (looking down) in mcenv-codex convention.
+    {
+        float dist_to_edge = env->max_block_x - (float)state.pos.x;
+        if (dist_to_edge >= -0.5f && dist_to_edge <= 1.5f && env->pitch < -30.0f) {
+            // Scale by how far down they're looking: -30 → 0, -90 → 1
+            float look_factor = (-env->pitch - 30.0f) / 60.0f;
+            if (look_factor > 1.0f) look_factor = 1.0f;
+            reward += MC_LOOK_REWARD * look_factor;
         }
     }
 
@@ -278,8 +294,8 @@ void c_render(MCEnv* env) {
     int str   = (int)env->actions[1]; if ((unsigned)str   >= 3) str   = 1;
     int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
     int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
-    int yaw_i = (int)env->actions[4]; if ((unsigned)yaw_i >= 5) yaw_i = 2;
-    int pit_i = (int)env->actions[5]; if ((unsigned)pit_i >= 5) pit_i = 2;
+    int yaw_i = (int)env->actions[4]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
+    int pit_i = (int)env->actions[5]; if ((unsigned)pit_i >= 7) pit_i = 3;
     int place = (int)env->actions[6]; if ((unsigned)place >= 2) place = 0;
     snprintf(hud, sizeof(hud),
         "Actions: fwd=%s  strafe=%s  jump=%s  sneak=%s  yaw=%+.0f  pitch=%+.0f  place=%s | tick=%d  max_x=%.1f  blocks=%d",
