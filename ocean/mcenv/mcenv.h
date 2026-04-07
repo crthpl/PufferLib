@@ -72,6 +72,7 @@ struct MCEnv {
     float max_block_x;
     int blocks_placed;
     Demo3dRenderer* renderer;
+    double render_accumulator;
 
     // Diagnostic accumulators
     int sneak_ticks;
@@ -291,8 +292,27 @@ static const char* BOOL_NAMES[2]  = {"no", "yes"};
 void c_render(MCEnv* env) {
     if (env->renderer == NULL) {
         env->renderer = mcenv_demo3d_renderer_new(env->mc);
+        env->render_accumulator = 0.0;
     }
 
+    // Accumulate frame time; only push new state at 20 TPS
+    double dt = mcenv_demo3d_get_frame_time();
+    double tick_sec = mcenv_demo3d_tick_seconds();
+    env->render_accumulator += dt;
+
+    if (env->render_accumulator >= tick_sec) {
+        env->render_accumulator -= tick_sec;
+        // Clamp so we don't spiral if frames are slow
+        if (env->render_accumulator > tick_sec) {
+            env->render_accumulator = 0.0;
+        }
+
+        CPlayerState state;
+        mcenv_environment_get_player(env->mc, &state);
+        mcenv_demo3d_renderer_push_player_state(env->renderer, &state);
+    }
+
+    // Update HUD every frame
     char hud[256];
     int fwd   = (int)env->actions[0]; if ((unsigned)fwd   >= 3) fwd   = 1;
     int str   = (int)env->actions[1]; if ((unsigned)str   >= 3) str   = 1;
@@ -310,9 +330,7 @@ void c_render(MCEnv* env) {
         env->tick, env->max_x, env->blocks_placed);
     mcenv_demo3d_renderer_set_hud_text(env->renderer, hud);
 
-    CPlayerState state;
-    mcenv_environment_get_player(env->mc, &state);
-    mcenv_demo3d_renderer_push_player_state(env->renderer, &state);
+    // Render every frame (60fps interpolation between 20 TPS state updates)
     mcenv_demo3d_renderer_render(env->renderer, env->mc);
 }
 
