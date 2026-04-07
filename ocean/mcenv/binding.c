@@ -25,4 +25,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "max_x", log->max_x);
     dict_set(out, "fell", log->fell);
     dict_set(out, "blocks_placed", log->blocks_placed);
+    dict_set(out, "sneak_frac", log->sneak_frac);
+    dict_set(out, "place_frac", log->place_frac);
+    dict_set(out, "avg_pitch", log->avg_pitch);
+    dict_set(out, "on_ground_frac", log->on_ground_frac);
 }

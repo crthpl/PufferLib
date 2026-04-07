@@ -14,17 +14,20 @@
 #define MC_OBS_GRID (MC_GRID_X * MC_GRID_Y * MC_GRID_Z)
 #define MC_OBS_TOTAL (MC_OBS_PLAYER + MC_OBS_GRID)
 
-#define MC_START_X 0.5
+#define MC_START_X 1.5       // Right at edge of platform
 #define MC_START_Y 3.0
 #define MC_START_Z 1.5
 #define MC_START_YAW -90.0f  // Facing +x
-#define MC_START_PITCH 0.0f
+#define MC_START_PITCH -45.0f // Looking down — close to bridging angle
 
-#define MC_VOID_Y 0.0       // Just below the platform (y=2) — short fall = quick death
+#define MC_VOID_Y 0.0
 #define MC_MAX_Z_DRIFT 10.0
-#define MC_PLACE_REWARD 0.5f  // Bonus for placing a block at a new max-x
-#define MC_LOOK_REWARD  0.02f // Small shaping reward for looking down+back at edge
-#define MC_PLATFORM_MAX_X 2   // Platform blocks span x: -1..1, so block x=1 ends at x=2
+#define MC_PLATFORM_MAX_X 2  // Platform blocks span x: -1..1, block x=1 ends at x=2
+
+// Reward constants
+#define MC_SURVIVAL_REWARD  0.001f // Tiny per-tick survival (full ep = ~1.0)
+#define MC_BLOCK_REWARD     20.0f  // Huge reward for placing a block beyond platform
+#define MC_FALL_PENALTY    -1.0f   // Penalty for falling
 
 // Yaw/pitch delta lookup tables (degrees)
 static const float YAW_DELTAS[7]   = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
@@ -38,6 +41,10 @@ typedef struct {
     float max_x;
     float fell;
     float blocks_placed;
+    float sneak_frac;
+    float place_frac;
+    float avg_pitch;
+    float on_ground_frac;
     float n;
 } Log;
 
@@ -62,13 +69,18 @@ struct MCEnv {
     int max_ticks;
     float episode_return;
     float max_x;
-    float max_block_x;    // Furthest x of any placed block
+    float max_block_x;
     int blocks_placed;
     Demo3dRenderer* renderer;
+
+    // Diagnostic accumulators
+    int sneak_ticks;
+    int place_ticks;
+    float pitch_sum;
+    int on_ground_ticks;
 };
 
 static void setup_platform(MCEnv* env) {
-    // 3x1x3 platform at y=2 centered on start position
     for (int x = -1; x <= 1; x++) {
         for (int z = 0; z <= 2; z++) {
             CBlockPos pos = {x, 2, z};
@@ -83,7 +95,6 @@ static void compute_observations(MCEnv* env) {
 
     int idx = 0;
 
-    // Player state (11 values)
     env->observations[idx++] = (float)(state.pos.x - env->start_x) / 50.0f;
     env->observations[idx++] = (float)(state.pos.y - env->start_y) / 10.0f;
     env->observations[idx++] = (float)(state.pos.z - env->start_z) / 10.0f;
@@ -98,14 +109,13 @@ static void compute_observations(MCEnv* env) {
     env->observations[idx++] = cosf(pitch_rad);
     env->observations[idx++] = state.on_ground ? 1.0f : 0.0f;
 
-    // Local block grid: 7x3x3 centered on player's block position
     int bx = (int)floorf((float)state.pos.x);
     int by = (int)floorf((float)state.pos.y);
     int bz = (int)floorf((float)state.pos.z);
 
-    for (int dx = -1; dx < MC_GRID_X - 1; dx++) {       // x: -1 to +5
-        for (int dy = -MC_GRID_Y; dy < 0; dy++) {        // y: -3 to -1 (below feet)
-            for (int dz = -(MC_GRID_Z/2); dz <= MC_GRID_Z/2; dz++) { // z: -1 to +1
+    for (int dx = -1; dx < MC_GRID_X - 1; dx++) {
+        for (int dy = -MC_GRID_Y; dy < 0; dy++) {
+            for (int dz = -(MC_GRID_Z/2); dz <= MC_GRID_Z/2; dz++) {
                 CBlockPos pos = {bx + dx, by + dy, bz + dz};
                 CBlock block;
                 mcenv_environment_get_block(env->mc, pos, &block);
@@ -116,24 +126,27 @@ static void compute_observations(MCEnv* env) {
 }
 
 void add_log(MCEnv* env) {
+    int t = env->tick > 0 ? env->tick : 1;
     env->log.score += env->max_x;
     env->log.perf += env->max_x / 50.0f;
     env->log.episode_return += env->episode_return;
     env->log.episode_length += env->tick;
     env->log.max_x += env->max_x;
     env->log.blocks_placed += env->blocks_placed;
+    env->log.sneak_frac += (float)env->sneak_ticks / t;
+    env->log.place_frac += (float)env->place_ticks / t;
+    env->log.avg_pitch += env->pitch_sum / t;
+    env->log.on_ground_frac += (float)env->on_ground_ticks / t;
     env->log.n++;
 }
 
 void c_reset(MCEnv* env) {
-    // Recreate mc environment for clean world state
     if (env->mc != NULL) {
         mcenv_environment_free(env->mc);
     }
     env->mc = mcenv_environment_new();
     setup_platform(env);
 
-    // Set player position and orientation
     CPlayerState pstate;
     mcenv_environment_get_player(env->mc, &pstate);
     pstate.pos = (CVec3){MC_START_X, MC_START_Y, MC_START_Z};
@@ -147,10 +160,13 @@ void c_reset(MCEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->max_x = 0.0f;
-    env->max_block_x = 1.0f;  // Platform extends to x=1
+    env->max_block_x = (float)MC_PLATFORM_MAX_X;
     env->blocks_placed = 0;
+    env->sneak_ticks = 0;
+    env->place_ticks = 0;
+    env->pitch_sum = 0.0f;
+    env->on_ground_ticks = 0;
 
-    // Set initial look direction
     CPlayerInput input = mcenv_player_input_default();
     input.has_look = true;
     input.look_yaw = env->yaw;
@@ -171,25 +187,24 @@ void c_step(MCEnv* env) {
 
     // Decode actions
     int a_idx = 0;
-    int forward_action  = (int)env->actions[a_idx++];  // 0=back, 1=none, 2=forward
-    int strafe_action   = (int)env->actions[a_idx++];   // 0=left, 1=none, 2=right
-    int jump_action     = (int)env->actions[a_idx++];    // 0=no, 1=yes
-    int sneak_action    = (int)env->actions[a_idx++];    // 0=no, 1=yes
-    int yaw_action      = (int)env->actions[a_idx++];     // 0-6 index into YAW_DELTAS
-    int pitch_action    = (int)env->actions[a_idx++];   // 0-6 index into PITCH_DELTAS
-    int place_action    = (int)env->actions[a_idx++];   // 0=no, 1=yes
+    int forward_action  = (int)env->actions[a_idx++];
+    int strafe_action   = (int)env->actions[a_idx++];
+    int jump_action     = (int)env->actions[a_idx++];
+    int sneak_action    = (int)env->actions[a_idx++];
+    int yaw_action      = (int)env->actions[a_idx++];
+    int pitch_action    = (int)env->actions[a_idx++];
+    int place_action    = (int)env->actions[a_idx++];
 
     // Update look direction
     env->yaw += YAW_DELTAS[yaw_action];
     env->pitch += PITCH_DELTAS[pitch_action];
-    // Clamp pitch (in mcenv-codex: negative = down, positive = up)
     if (env->pitch > 90.0f) env->pitch = 90.0f;
     if (env->pitch < -90.0f) env->pitch = -90.0f;
 
     // Build input
     CPlayerInput input = mcenv_player_input_default();
-    input.forward = (float)(forward_action - 1);  // -1, 0, or 1
-    input.strafe = (float)(strafe_action - 1);     // -1, 0, or 1
+    input.forward = (float)(forward_action - 1);
+    input.strafe = (float)(strafe_action - 1);
     input.jump = (jump_action == 1);
     input.sneak = (sneak_action == 1);
     input.sprint = false;
@@ -199,25 +214,31 @@ void c_step(MCEnv* env) {
     input.place = (place_action == 1);
     input.break_block = false;
 
-    // Snapshot block count before tick to detect placement
-    // We check the block at the raycast target after tick
     mcenv_environment_input(env->mc, input);
     mcenv_environment_tick(env->mc);
 
-    // Get resulting state
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
 
-    // Compute reward: delta x progress
-    float dx = (float)(state.pos.x - env->prev_x);
-    float reward = dx;
-    env->prev_x = (float)state.pos.x;
+    // Accumulate diagnostics
+    if (sneak_action == 1) env->sneak_ticks++;
+    if (place_action == 1) env->place_ticks++;
+    env->pitch_sum += env->pitch;
+    if (state.on_ground) env->on_ground_ticks++;
 
-    // Check if a block was placed at a new max x beyond the starting platform
+    // ---- Reward computation ----
+    float reward = 0.0f;
+
+    // 1. Survival: reward for being on ground (teaches not-falling)
+    if (state.on_ground) {
+        reward += MC_SURVIVAL_REWARD;
+    }
+
+    // 2. Block placement: big reward for extending the bridge
     if (place_action == 1) {
         int bx = (int)floorf((float)state.pos.x);
         for (int checkx = bx; checkx <= bx + 3; checkx++) {
-            if (checkx < MC_PLATFORM_MAX_X) continue; // Skip platform blocks
+            if (checkx < MC_PLATFORM_MAX_X) continue;
             for (int checkz = (int)floorf((float)state.pos.z) - 1;
                  checkz <= (int)floorf((float)state.pos.z) + 1; checkz++) {
                 CBlockPos bp = {checkx, 2, checkz};
@@ -226,26 +247,14 @@ void c_step(MCEnv* env) {
                 if (blk == CBLOCK_FULL_CUBE && (float)checkx >= env->max_block_x) {
                     env->max_block_x = (float)(checkx + 1);
                     env->blocks_placed++;
-                    reward += MC_PLACE_REWARD;
+                    reward += MC_BLOCK_REWARD;
                 }
             }
         }
     }
 
-    // Shaping: small reward for looking down+back when near the edge of placed blocks.
-    // Bridging requires the player to look at the side of the last block to place on it.
-    // "Near edge" = player x within 1 block of max_block_x.
-    // "Looking right" = pitch < -30 (looking down) in mcenv-codex convention.
-    {
-        float dist_to_edge = env->max_block_x - (float)state.pos.x;
-        if (dist_to_edge >= -0.5f && dist_to_edge <= 1.5f && env->pitch < -30.0f) {
-            // Scale by how far down they're looking: -30 → 0, -90 → 1
-            float look_factor = (-env->pitch - 30.0f) / 60.0f;
-            if (look_factor > 1.0f) look_factor = 1.0f;
-            reward += MC_LOOK_REWARD * look_factor;
-        }
-    }
-
+    // Track progress
+    env->prev_x = (float)state.pos.x;
     float x_progress = (float)(state.pos.x - env->start_x);
     if (x_progress > env->max_x) {
         env->max_x = x_progress;
@@ -254,15 +263,12 @@ void c_step(MCEnv* env) {
     // Check termination
     int done = 0;
     if (state.pos.y < MC_VOID_Y) {
-        // Fell into void
-        reward = -1.0f;
+        reward = MC_FALL_PENALTY;
         done = 1;
         env->log.fell++;
     } else if (fabs(state.pos.z - env->start_z) > MC_MAX_Z_DRIFT) {
-        // Drifted too far off z-axis
         done = 1;
     } else if (env->tick >= env->max_ticks) {
-        // Time limit
         done = 1;
     }
 
@@ -279,7 +285,7 @@ void c_step(MCEnv* env) {
 }
 
 static const char* FWD_NAMES[3]   = {"back", "none", "fwd"};
-static const char* STR_NAMES[3]   = {"left", "none", "right"};
+static const char* STR_NAMES[3]   = {"right", "none", "left"};
 static const char* BOOL_NAMES[2]  = {"no", "yes"};
 
 void c_render(MCEnv* env) {
@@ -287,8 +293,6 @@ void c_render(MCEnv* env) {
         env->renderer = mcenv_demo3d_renderer_new(env->mc);
     }
 
-    // Format action HUD line (clamp indices to valid range — actions may be
-    // uninitialized on the very first render before any step has run).
     char hud[256];
     int fwd   = (int)env->actions[0]; if ((unsigned)fwd   >= 3) fwd   = 1;
     int str   = (int)env->actions[1]; if ((unsigned)str   >= 3) str   = 1;
