@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <time.h>
 #include "mcenv_codex.h"
 
 #define MC_OBS_PLAYER 11
@@ -78,6 +79,7 @@ struct MCEnv {
     float rw_speed;
     Demo3dRenderer* renderer;
     double render_accumulator;
+    struct timespec render_last_time;
 
     // Diagnostic accumulators
     int sneak_ticks;
@@ -240,9 +242,11 @@ void c_step(MCEnv* env) {
         reward += env->rw_survival;
     }
 
-    // 2. Delta-x: always rewards forward progress (and penalizes going backward)
+    // 2. Delta-x: only beyond platform and at valid height (not falling)
     float dx = (float)(state.pos.x - env->prev_x);
-    reward += env->rw_speed * dx;
+    if (state.pos.x > MC_PLATFORM_MAX_X && state.pos.y >= env->start_y) {
+        reward += env->rw_speed * dx;
+    }
 
     // 3. Block placement: big reward for extending the bridge
     if (place_action == 1) {
@@ -302,16 +306,21 @@ void c_render(MCEnv* env) {
     if (env->renderer == NULL) {
         env->renderer = mcenv_demo3d_renderer_new(env->mc);
         env->render_accumulator = 0.0;
+        clock_gettime(CLOCK_MONOTONIC, &env->render_last_time);
     }
 
-    // Accumulate frame time; only push new state at 20 TPS
-    double dt = mcenv_demo3d_get_frame_time();
-    double tick_sec = mcenv_demo3d_tick_seconds();
+    // Measure elapsed time with wall clock (not macroquad frame time)
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double dt = (now.tv_sec - env->render_last_time.tv_sec)
+              + (now.tv_nsec - env->render_last_time.tv_nsec) * 1e-9;
+    env->render_last_time = now;
+
+    double tick_sec = mcenv_demo3d_tick_seconds(); // 0.05 = 20 TPS
     env->render_accumulator += dt;
 
     if (env->render_accumulator >= tick_sec) {
         env->render_accumulator -= tick_sec;
-        // Clamp so we don't spiral if frames are slow
         if (env->render_accumulator > tick_sec) {
             env->render_accumulator = 0.0;
         }
