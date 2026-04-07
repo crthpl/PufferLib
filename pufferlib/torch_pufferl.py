@@ -386,9 +386,24 @@ class PuffeRL:
         torch.save(self.policy.state_dict(), path)
 
     def load_weights(self, path):
-        state_dict = torch.load(path, map_location=self.device)
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        self.policy.load_state_dict(state_dict)
+        try:
+            state_dict = torch.load(path, map_location=self.device, weights_only=False)
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            self.policy.load_state_dict(state_dict)
+        except Exception:
+            # Native CUDA backend saves raw float32 weights only (no biases)
+            import numpy as np
+            raw = np.fromfile(path, dtype=np.float32)
+            flat = torch.from_numpy(raw).to(self.device)
+            offset = 0
+            state_dict = {}
+            for name, param in self.policy.named_parameters():
+                if 'bias' in name:
+                    continue
+                n = param.numel()
+                state_dict[name] = flat[offset:offset+n].reshape(param.shape)
+                offset += n
+            self.policy.load_state_dict(state_dict, strict=False)
 
     def render(self, env_id=0):
         self._vec.render(env_id)
@@ -492,7 +507,7 @@ def load_policy(args, vec):
         else:
             raise ValueError('load_id requires --wandb')
 
-        state_dict = torch.load(path, map_location=device)
+        state_dict = torch.load(path, map_location=device, weights_only=False)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
 
@@ -503,9 +518,21 @@ def load_policy(args, vec):
         load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
-        state_dict = torch.load(load_path, map_location=device)
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        policy.load_state_dict(state_dict)
+        try:
+            state_dict = torch.load(load_path, map_location=device, weights_only=False)
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        except Exception:
+            raw = np.fromfile(load_path, dtype=np.float32)
+            flat = torch.from_numpy(raw).to(device)
+            offset = 0
+            state_dict = {}
+            for name, param in policy.named_parameters():
+                if 'bias' in name:
+                    continue
+                n = param.numel()
+                state_dict[name] = flat[offset:offset+n].reshape(param.shape)
+                offset += n
+        policy.load_state_dict(state_dict, strict=False)
 
     return policy
 
