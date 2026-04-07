@@ -7,6 +7,11 @@
 #define Env MCEnv
 #include "vecenv.h"
 
+static double dict_get_or(Dict* d, const char* key, double fallback) {
+    DictItem* item = dict_get_unsafe(d, key);
+    return item ? item->value : fallback;
+}
+
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->max_ticks = (int)dict_get(kwargs, "max_ticks")->value;
@@ -15,6 +20,10 @@ void my_init(Env* env, Dict* kwargs) {
     env->start_x = MC_START_X;
     env->start_y = MC_START_Y;
     env->start_z = MC_START_Z;
+    env->rw_survival = (float)dict_get_or(kwargs, "rw_survival", MC_SURVIVAL_DEFAULT);
+    env->rw_block    = (float)dict_get_or(kwargs, "rw_block",    MC_BLOCK_DEFAULT);
+    env->rw_fall     = (float)dict_get_or(kwargs, "rw_fall",     MC_FALL_DEFAULT);
+    env->rw_speed    = (float)dict_get_or(kwargs, "rw_speed",    MC_SPEED_DEFAULT);
 }
 
 void my_log(Log* log, Dict* out) {

@@ -24,11 +24,11 @@
 #define MC_MAX_Z_DRIFT 10.0
 #define MC_PLATFORM_MAX_X 2  // Platform blocks span x: -1..1, block x=1 ends at x=2
 
-// Reward constants
-#define MC_SURVIVAL_REWARD  0.001f // Tiny per-tick survival (full ep = ~1.0)
-#define MC_BLOCK_REWARD     5.0f   // Reward for placing a block beyond platform
-#define MC_FALL_PENALTY    -1.0f   // Penalty for falling
-#define MC_SPEED_SCALE      1.0f   // Multiplier for delta-x reward (always on)
+// Default reward constants (overridable via [env] config at init)
+#define MC_SURVIVAL_DEFAULT  0.001f
+#define MC_BLOCK_DEFAULT     5.0f
+#define MC_FALL_DEFAULT     -1.0f
+#define MC_SPEED_DEFAULT     0.1f
 
 // Yaw/pitch delta lookup tables (degrees)
 static const float YAW_DELTAS[7]   = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
@@ -72,6 +72,10 @@ struct MCEnv {
     float max_x;
     float max_block_x;
     int blocks_placed;
+    float rw_survival;
+    float rw_block;
+    float rw_fall;
+    float rw_speed;
     Demo3dRenderer* renderer;
     double render_accumulator;
 
@@ -233,12 +237,12 @@ void c_step(MCEnv* env) {
 
     // 1. Survival: reward for being on ground (teaches not-falling)
     if (state.on_ground) {
-        reward += MC_SURVIVAL_REWARD;
+        reward += env->rw_survival;
     }
 
     // 2. Delta-x: always rewards forward progress (and penalizes going backward)
     float dx = (float)(state.pos.x - env->prev_x);
-    reward += MC_SPEED_SCALE * dx;
+    reward += env->rw_speed * dx;
 
     // 3. Block placement: big reward for extending the bridge
     if (place_action == 1) {
@@ -253,7 +257,7 @@ void c_step(MCEnv* env) {
                 if (blk == CBLOCK_FULL_CUBE && (float)checkx >= env->max_block_x) {
                     env->max_block_x = (float)(checkx + 1);
                     env->blocks_placed++;
-                    reward += MC_BLOCK_REWARD;
+                    reward += env->rw_block;
                 }
             }
         }
@@ -269,7 +273,7 @@ void c_step(MCEnv* env) {
     // Check termination
     int done = 0;
     if (state.pos.y < MC_VOID_Y) {
-        reward = MC_FALL_PENALTY;
+        reward = env->rw_fall;
         done = 1;
         env->log.fell++;
     } else if (fabs(state.pos.z - env->start_z) > MC_MAX_Z_DRIFT) {
