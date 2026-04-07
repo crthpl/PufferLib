@@ -271,15 +271,16 @@ void c_render(MCEnv* env) {
         env->renderer = mcenv_demo3d_renderer_new(env->mc);
     }
 
-    // Format action HUD line
+    // Format action HUD line (clamp indices to valid range — actions may be
+    // uninitialized on the very first render before any step has run).
     char hud[256];
-    int fwd   = (int)env->actions[0];
-    int str   = (int)env->actions[1];
-    int jump  = (int)env->actions[2];
-    int sneak = (int)env->actions[3];
-    int yaw_i = (int)env->actions[4];
-    int pit_i = (int)env->actions[5];
-    int place = (int)env->actions[6];
+    int fwd   = (int)env->actions[0]; if ((unsigned)fwd   >= 3) fwd   = 1;
+    int str   = (int)env->actions[1]; if ((unsigned)str   >= 3) str   = 1;
+    int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
+    int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
+    int yaw_i = (int)env->actions[4]; if ((unsigned)yaw_i >= 5) yaw_i = 2;
+    int pit_i = (int)env->actions[5]; if ((unsigned)pit_i >= 5) pit_i = 2;
+    int place = (int)env->actions[6]; if ((unsigned)place >= 2) place = 0;
     snprintf(hud, sizeof(hud),
         "Actions: fwd=%s  strafe=%s  jump=%s  sneak=%s  yaw=%+.0f  pitch=%+.0f  place=%s | tick=%d  max_x=%.1f  blocks=%d",
         FWD_NAMES[fwd], STR_NAMES[str],
