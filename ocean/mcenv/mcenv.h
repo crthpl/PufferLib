@@ -309,26 +309,22 @@ void c_render(MCEnv* env) {
         clock_gettime(CLOCK_MONOTONIC, &env->render_last_time);
     }
 
-    // Measure elapsed time with wall clock (not macroquad frame time)
+    // Sleep until next tick boundary (20 TPS = 50ms per tick)
+    double tick_sec = mcenv_demo3d_tick_seconds();
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    double dt = (now.tv_sec - env->render_last_time.tv_sec)
-              + (now.tv_nsec - env->render_last_time.tv_nsec) * 1e-9;
-    env->render_last_time = now;
-
-    double tick_sec = mcenv_demo3d_tick_seconds(); // 0.05 = 20 TPS
-    env->render_accumulator += dt;
-
-    if (env->render_accumulator >= tick_sec) {
-        env->render_accumulator -= tick_sec;
-        if (env->render_accumulator > tick_sec) {
-            env->render_accumulator = 0.0;
-        }
-
-        CPlayerState state;
-        mcenv_environment_get_player(env->mc, &state);
-        mcenv_demo3d_renderer_push_player_state(env->renderer, &state);
+    double elapsed = (now.tv_sec - env->render_last_time.tv_sec)
+                   + (now.tv_nsec - env->render_last_time.tv_nsec) * 1e-9;
+    double remaining = tick_sec - elapsed;
+    if (remaining > 0.001) {
+        struct timespec sleep_ts = {0, (long)(remaining * 1e9)};
+        nanosleep(&sleep_ts, NULL);
     }
+    clock_gettime(CLOCK_MONOTONIC, &env->render_last_time);
+
+    CPlayerState state;
+    mcenv_environment_get_player(env->mc, &state);
+    mcenv_demo3d_renderer_push_player_state(env->renderer, &state);
 
     // Update HUD every frame
     char hud[256];
