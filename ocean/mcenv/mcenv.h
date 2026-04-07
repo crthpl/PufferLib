@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include "mcenv_codex.h"
 
@@ -261,10 +262,33 @@ void c_step(MCEnv* env) {
     }
 }
 
+static const char* FWD_NAMES[3]   = {"back", "none", "fwd"};
+static const char* STR_NAMES[3]   = {"left", "none", "right"};
+static const char* BOOL_NAMES[2]  = {"no", "yes"};
+
 void c_render(MCEnv* env) {
     if (env->renderer == NULL) {
         env->renderer = mcenv_demo3d_renderer_new(env->mc);
     }
+
+    // Format action HUD line
+    char hud[256];
+    int fwd   = (int)env->actions[0];
+    int str   = (int)env->actions[1];
+    int jump  = (int)env->actions[2];
+    int sneak = (int)env->actions[3];
+    int yaw_i = (int)env->actions[4];
+    int pit_i = (int)env->actions[5];
+    int place = (int)env->actions[6];
+    snprintf(hud, sizeof(hud),
+        "Actions: fwd=%s  strafe=%s  jump=%s  sneak=%s  yaw=%+.0f  pitch=%+.0f  place=%s | tick=%d  max_x=%.1f  blocks=%d",
+        FWD_NAMES[fwd], STR_NAMES[str],
+        BOOL_NAMES[jump], BOOL_NAMES[sneak],
+        YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
+        BOOL_NAMES[place],
+        env->tick, env->max_x, env->blocks_placed);
+    mcenv_demo3d_renderer_set_hud_text(env->renderer, hud);
+
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
     mcenv_demo3d_renderer_push_player_state(env->renderer, &state);
