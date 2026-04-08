@@ -84,6 +84,8 @@ struct MCEnv {
     float rw_fall;
     float rw_speed;
     float rw_target_reach;
+    int curriculum_phase;      // 0=block only, 1=block+target, 2=target only
+    int phase_transition;      // blocks_placed threshold to advance phase
     Demo3dRenderer* renderer;
     struct timespec render_last_time;
 
@@ -109,7 +111,7 @@ static void mc_new_target(MCEnv* env) {
         float tz = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
         float dx = tx - (float)state.pos.x;
         float dz = tz - (float)state.pos.z;
-        if (dx*dx + dz*dz >= 25.0f) { // >= 5 blocks away
+        if (dx*dx + dz*dz >= 9.0f) { // >= 3 blocks away
             env->target_x = tx;
             env->target_z = tz;
             env->prev_dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
@@ -265,25 +267,22 @@ void c_step(MCEnv* env) {
     input.place = (place_action == 1);
     input.break_block = false;
 
-    // Snapshot scan position and block count BEFORE tick
+    // Count non-platform blocks at y=2 BEFORE tick (fixed scan window)
     CPlayerState pre;
     mcenv_environment_get_player(env->mc, &pre);
-    float player_dist_before = mc_dist_to_target(env, pre.pos.x, pre.pos.z);
     int scan_bx = (int)floorf((float)pre.pos.x);
     int scan_bz = (int)floorf((float)pre.pos.z);
     int px = (int)env->start_x, pz = (int)env->start_z;
 
-    int target_blocks_before = 0;
+    int blocks_before = 0;
     for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
         for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
             CBlockPos bp = {cx, 2, cz};
             CBlock blk;
             mcenv_environment_get_block(env->mc, bp, &blk);
             if (blk == CBLOCK_FULL_CUBE
-                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
-                float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
-                if (bd < player_dist_before) target_blocks_before++;
-            }
+                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1))
+                blocks_before++;
         }
     }
 
@@ -293,21 +292,19 @@ void c_step(MCEnv* env) {
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
 
-    // Count at SAME scan position after tick (detects only genuinely new blocks)
-    int target_blocks_after = 0;
+    // Count at SAME scan position after tick
+    int blocks_after = 0;
     for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
         for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
             CBlockPos bp = {cx, 2, cz};
             CBlock blk;
             mcenv_environment_get_block(env->mc, bp, &blk);
             if (blk == CBLOCK_FULL_CUBE
-                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
-                float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
-                if (bd < player_dist_before) target_blocks_after++;
-            }
+                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1))
+                blocks_after++;
         }
     }
-    int placed_this_tick = target_blocks_after - target_blocks_before;
+    int placed_this_tick = blocks_after - blocks_before;
     if (placed_this_tick > 0) env->blocks_placed += placed_this_tick;
 
     // Diagnostics
@@ -315,6 +312,22 @@ void c_step(MCEnv* env) {
     if (place_action == 1) env->place_ticks++;
     env->pitch_sum += env->pitch;
     if (state.on_ground) env->on_ground_ticks++;
+
+    // ---- Curriculum phase ----
+    // Phase 0: block reward only (learn to bridge)
+    // Phase 1: block + target rewards (learn to navigate while bridging)
+    // Phase 2: target reward only (pure navigation)
+    // Transition based on blocks_placed within this episode
+    int phase = env->curriculum_phase;
+    if (env->phase_transition > 0) {
+        if (env->blocks_placed >= env->phase_transition * 2) phase = 2;
+        else if (env->blocks_placed >= env->phase_transition) phase = 1;
+        else phase = 0;
+    }
+
+    // Phase blend factors
+    float block_weight  = (phase <= 1) ? 1.0f : 0.0f;
+    float target_weight = (phase >= 1) ? 1.0f : 0.0f;
 
     // ---- Reward computation ----
     float reward = 0.0f;
@@ -324,25 +337,25 @@ void c_step(MCEnv* env) {
         reward += env->rw_survival;
     }
 
-    // 2. Getting closer to target (only while on solid ground)
+    // 2. Getting closer to target (only in phases 1+2, on ground)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
-    if (state.on_ground) {
+    if (state.on_ground && target_weight > 0.0f) {
         float delta_dist = env->prev_dist - dist;
-        reward += env->rw_speed * delta_dist;
+        reward += env->rw_speed * delta_dist * target_weight;
     }
     env->prev_dist = dist;
 
-    // 3. Block placement reward (only for genuinely new blocks)
-    if (placed_this_tick > 0) {
-        reward += env->rw_block * placed_this_tick;
+    // 3. Block placement reward (phases 0+1)
+    if (placed_this_tick > 0 && block_weight > 0.0f) {
+        reward += env->rw_block * placed_this_tick * block_weight;
     }
 
-    // 4. Target reached
-    if (dist < MC_TARGET_REACH) {
-        reward += env->rw_target_reach;
+    // 4. Target reached (phases 1+2)
+    if (dist < MC_TARGET_REACH && target_weight > 0.0f) {
+        reward += env->rw_target_reach * target_weight;
         env->targets_reached++;
         mc_new_target(env);
-        dist = env->prev_dist; // prev_dist updated by mc_new_target
+        dist = env->prev_dist;
     }
 
     // Track progress

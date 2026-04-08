@@ -25,6 +25,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->rw_fall         = (float)dict_get_or(kwargs, "rw_fall",         MC_FALL_DEFAULT);
     env->rw_speed        = (float)dict_get_or(kwargs, "rw_speed",        MC_SPEED_DEFAULT);
     env->rw_target_reach = (float)dict_get_or(kwargs, "rw_target_reach", MC_TARGET_DEFAULT);
+    env->curriculum_phase = (int)dict_get_or(kwargs, "curriculum_phase", 0);
+    env->phase_transition = (int)dict_get_or(kwargs, "phase_transition", 0);
 }
 
 void my_log(Log* log, Dict* out) {
