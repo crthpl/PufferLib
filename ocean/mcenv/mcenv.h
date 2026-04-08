@@ -23,7 +23,7 @@
 #define MC_START_PITCH -45.0f
 
 #define MC_VOID_Y 2.5   // Just below platform (y=2..3) — falling = instant death
-#define MC_PLATFORM_MAX_X 27 // Platform: x 24..26, ends at x=27
+#define MC_PLATFORM_MAX_X 26 // Single block at x=25, ends at x=26
 #define MC_AREA_SIZE 50
 #define MC_TARGET_REACH 1.0f // Within 1 block = reached
 
@@ -125,14 +125,9 @@ static void mc_new_target(MCEnv* env) {
 }
 
 static void setup_platform(MCEnv* env) {
-    // 3x3 platform at y=2 centered on start position
-    int px = (int)env->start_x, pz = (int)env->start_z;
-    for (int x = px - 1; x <= px + 1; x++) {
-        for (int z = pz - 1; z <= pz + 1; z++) {
-            CBlockPos pos = {x, 2, z};
-            mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
-        }
-    }
+    // Single block at y=2 under start position
+    CBlockPos pos = {(int)env->start_x, 2, (int)env->start_z};
+    mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
 }
 
 static void compute_observations(MCEnv* env) {
@@ -281,7 +276,7 @@ void c_step(MCEnv* env) {
             CBlock blk;
             mcenv_environment_get_block(env->mc, bp, &blk);
             if (blk == CBLOCK_FULL_CUBE
-                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1))
+                && !(cx == px && cz == pz))
                 blocks_before++;
         }
     }
@@ -300,7 +295,7 @@ void c_step(MCEnv* env) {
             CBlock blk;
             mcenv_environment_get_block(env->mc, bp, &blk);
             if (blk == CBLOCK_FULL_CUBE
-                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1))
+                && !(cx == px && cz == pz))
                 blocks_after++;
         }
     }
@@ -350,8 +345,8 @@ void c_step(MCEnv* env) {
         reward += env->rw_block * placed_this_tick * block_weight;
     }
 
-    // 4. Target reached (phases 1+2)
-    if (dist < MC_TARGET_REACH && target_weight > 0.0f) {
+    // 4. Target reached (phases 1+2, must be on ground)
+    if (dist < MC_TARGET_REACH && target_weight > 0.0f && state.on_ground) {
         reward += env->rw_target_reach * target_weight;
         env->targets_reached++;
         mc_new_target(env);
