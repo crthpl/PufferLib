@@ -23,7 +23,7 @@
 #define MC_START_PITCH -45.0f
 
 #define MC_VOID_Y 2.5   // Just below platform (y=2..3) — falling = instant death
-#define MC_PLATFORM_MAX_X 26 // Single block at x=25, ends at x=26
+#define MC_PLATFORM_MAX_X 27 // Platform: x 24..26, ends at x=27
 #define MC_AREA_SIZE 50
 #define MC_TARGET_REACH 1.0f // Within 1 block = reached
 
@@ -123,9 +123,14 @@ static void mc_new_target(MCEnv* env) {
 }
 
 static void setup_platform(MCEnv* env) {
-    // Single block at y=2 under start position — must bridge to move
-    CBlockPos pos = {(int)env->start_x, 2, (int)env->start_z};
-    mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
+    // 3x3 platform at y=2 centered on start position
+    int px = (int)env->start_x, pz = (int)env->start_z;
+    for (int x = px - 1; x <= px + 1; x++) {
+        for (int z = pz - 1; z <= pz + 1; z++) {
+            CBlockPos pos = {x, 2, z};
+            mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
+        }
+    }
 }
 
 static void compute_observations(MCEnv* env) {
@@ -259,11 +264,13 @@ void c_step(MCEnv* env) {
     input.place = (place_action == 1);
     input.break_block = false;
 
-    // Count nearby non-platform blocks BEFORE tick to detect new placements
-    int blocks_before = 0;
+    // Count target-ward blocks BEFORE tick
+    int target_blocks_before = 0;
+    float player_dist_before;
     {
         CPlayerState pre;
         mcenv_environment_get_player(env->mc, &pre);
+        player_dist_before = mc_dist_to_target(env, pre.pos.x, pre.pos.z);
         int bx = (int)floorf((float)pre.pos.x);
         int bz = (int)floorf((float)pre.pos.z);
         int px = (int)env->start_x, pz = (int)env->start_z;
@@ -272,9 +279,9 @@ void c_step(MCEnv* env) {
                 CBlockPos bp = {cx, 2, cz};
                 CBlock blk;
                 mcenv_environment_get_block(env->mc, bp, &blk);
-                if (blk == CBLOCK_FULL_CUBE &&
-                    !(cx == px && cz == pz)) {
-                    blocks_before++;
+                if (blk == CBLOCK_FULL_CUBE && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                    float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
+                    if (bd < player_dist_before) target_blocks_before++;
                 }
             }
         }
@@ -286,8 +293,8 @@ void c_step(MCEnv* env) {
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
 
-    // Count blocks AFTER tick (same area — player barely moved in 1 tick)
-    int blocks_after = 0;
+    // Count target-ward blocks AFTER tick (same scan window)
+    int target_blocks_after = 0;
     {
         int bx = (int)floorf((float)state.pos.x);
         int bz = (int)floorf((float)state.pos.z);
@@ -297,14 +304,14 @@ void c_step(MCEnv* env) {
                 CBlockPos bp = {cx, 2, cz};
                 CBlock blk;
                 mcenv_environment_get_block(env->mc, bp, &blk);
-                if (blk == CBLOCK_FULL_CUBE &&
-                    !(cx == px && cz == pz)) {
-                    blocks_after++;
+                if (blk == CBLOCK_FULL_CUBE && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                    float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
+                    if (bd < player_dist_before) target_blocks_after++;
                 }
             }
         }
     }
-    int placed_this_tick = blocks_after - blocks_before;
+    int placed_this_tick = target_blocks_after - target_blocks_before;
     if (placed_this_tick > 0) env->blocks_placed += placed_this_tick;
 
     // Diagnostics
