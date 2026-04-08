@@ -243,6 +243,7 @@ void c_step(MCEnv* env) {
     int strafe_action   = (int)env->actions[a_idx++];
     int jump_action     = (int)env->actions[a_idx++];
     int sneak_action    = (int)env->actions[a_idx++];
+    int sprint_action   = (int)env->actions[a_idx++];
     int yaw_action      = (int)env->actions[a_idx++];
     int pitch_action    = (int)env->actions[a_idx++];
     int place_action    = (int)env->actions[a_idx++];
@@ -257,32 +258,31 @@ void c_step(MCEnv* env) {
     input.strafe = (float)(strafe_action - 1);
     input.jump = (jump_action == 1);
     input.sneak = (sneak_action == 1);
-    input.sprint = false;
+    input.sprint = (sprint_action == 1);
     input.has_look = true;
     input.look_yaw = env->yaw;
     input.look_pitch = env->pitch;
     input.place = (place_action == 1);
     input.break_block = false;
 
-    // Count target-ward blocks BEFORE tick
+    // Snapshot scan position and block count BEFORE tick
+    CPlayerState pre;
+    mcenv_environment_get_player(env->mc, &pre);
+    float player_dist_before = mc_dist_to_target(env, pre.pos.x, pre.pos.z);
+    int scan_bx = (int)floorf((float)pre.pos.x);
+    int scan_bz = (int)floorf((float)pre.pos.z);
+    int px = (int)env->start_x, pz = (int)env->start_z;
+
     int target_blocks_before = 0;
-    float player_dist_before;
-    {
-        CPlayerState pre;
-        mcenv_environment_get_player(env->mc, &pre);
-        player_dist_before = mc_dist_to_target(env, pre.pos.x, pre.pos.z);
-        int bx = (int)floorf((float)pre.pos.x);
-        int bz = (int)floorf((float)pre.pos.z);
-        int px = (int)env->start_x, pz = (int)env->start_z;
-        for (int cx = bx - 1; cx <= bx + 2; cx++) {
-            for (int cz = bz - 1; cz <= bz + 2; cz++) {
-                CBlockPos bp = {cx, 2, cz};
-                CBlock blk;
-                mcenv_environment_get_block(env->mc, bp, &blk);
-                if (blk == CBLOCK_FULL_CUBE && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
-                    float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
-                    if (bd < player_dist_before) target_blocks_before++;
-                }
+    for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
+        for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
+            CBlockPos bp = {cx, 2, cz};
+            CBlock blk;
+            mcenv_environment_get_block(env->mc, bp, &blk);
+            if (blk == CBLOCK_FULL_CUBE
+                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
+                if (bd < player_dist_before) target_blocks_before++;
             }
         }
     }
@@ -293,21 +293,17 @@ void c_step(MCEnv* env) {
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
 
-    // Count target-ward blocks AFTER tick (same scan window)
+    // Count at SAME scan position after tick (detects only genuinely new blocks)
     int target_blocks_after = 0;
-    {
-        int bx = (int)floorf((float)state.pos.x);
-        int bz = (int)floorf((float)state.pos.z);
-        int px = (int)env->start_x, pz = (int)env->start_z;
-        for (int cx = bx - 1; cx <= bx + 2; cx++) {
-            for (int cz = bz - 1; cz <= bz + 2; cz++) {
-                CBlockPos bp = {cx, 2, cz};
-                CBlock blk;
-                mcenv_environment_get_block(env->mc, bp, &blk);
-                if (blk == CBLOCK_FULL_CUBE && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
-                    float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
-                    if (bd < player_dist_before) target_blocks_after++;
-                }
+    for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
+        for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
+            CBlockPos bp = {cx, 2, cz};
+            CBlock blk;
+            mcenv_environment_get_block(env->mc, bp, &blk);
+            if (blk == CBLOCK_FULL_CUBE
+                && !(cx >= px-1 && cx <= px+1 && cz >= pz-1 && cz <= pz+1)) {
+                float bd = mc_dist_to_target(env, cx + 0.5f, cz + 0.5f);
+                if (bd < player_dist_before) target_blocks_after++;
             }
         }
     }
@@ -410,26 +406,18 @@ void c_render(MCEnv* env) {
     int str   = (int)env->actions[1]; if ((unsigned)str   >= 3) str   = 1;
     int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
     int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
-    int yaw_i = (int)env->actions[4]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
-    int pit_i = (int)env->actions[5]; if ((unsigned)pit_i >= 7) pit_i = 3;
-    int place = (int)env->actions[6]; if ((unsigned)place >= 2) place = 0;
-    snprintf(hud, sizeof(hud),
-        "fwd=%s str=%s snk=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d",
-        FWD_NAMES[fwd], STR_NAMES[str],
-        BOOL_NAMES[sneak], BOOL_NAMES[place],
-        YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
-        env->tick, env->target_x, env->target_z,
-        mc_dist_to_target(env, 0, 0), // will recompute properly below
-        env->targets_reached, env->blocks_placed);
-    // Fix: compute actual distance for HUD
+    int sprint= (int)env->actions[4]; if ((unsigned)sprint>= 2) sprint= 0;
+    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
+    int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 7) pit_i = 3;
+    int place = (int)env->actions[7]; if ((unsigned)place >= 2) place = 0;
     {
         CPlayerState s;
         mcenv_environment_get_player(env->mc, &s);
         float d = mc_dist_to_target(env, s.pos.x, s.pos.z);
         snprintf(hud, sizeof(hud),
-            "fwd=%s str=%s snk=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d",
+            "fwd=%s str=%s snk=%s spr=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d",
             FWD_NAMES[fwd], STR_NAMES[str],
-            BOOL_NAMES[sneak], BOOL_NAMES[place],
+            BOOL_NAMES[sneak], BOOL_NAMES[sprint], BOOL_NAMES[place],
             YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
             env->tick, env->target_x, env->target_z,
             d, env->targets_reached, env->blocks_placed);

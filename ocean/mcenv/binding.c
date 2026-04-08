@@ -1,7 +1,7 @@
 #include "mcenv.h"
 #define OBS_SIZE MC_OBS_TOTAL
-#define NUM_ATNS 7
-#define ACT_SIZES {3, 3, 2, 2, 7, 7, 2}
+#define NUM_ATNS 8
+#define ACT_SIZES {3, 3, 2, 2, 2, 7, 7, 2}
 #define OBS_TENSOR_T FloatTensor
 
 #define Env MCEnv
