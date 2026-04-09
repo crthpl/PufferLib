@@ -35,7 +35,7 @@
 #define MC_TARGET_DEFAULT    10.0f
 
 // Yaw/pitch delta lookup tables (degrees)
-static const float YAW_DELTAS[7]   = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
+static const float YAW_DELTAS[11]  = {-180.0f, -90.0f, -15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f, 90.0f, 180.0f};
 static const float PITCH_DELTAS[7] = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
 
 typedef struct {
@@ -415,7 +415,7 @@ void c_render(MCEnv* env) {
     int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
     int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
     int sprint= (int)env->actions[4]; if ((unsigned)sprint>= 2) sprint= 0;
-    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
+    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 11) yaw_i = 5;
     int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 7) pit_i = 3;
     int place = (int)env->actions[7]; if ((unsigned)place >= 2) place = 0;
     {
