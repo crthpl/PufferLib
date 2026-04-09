@@ -27,6 +27,10 @@ void my_init(Env* env, Dict* kwargs) {
     env->rw_target_reach = (float)dict_get_or(kwargs, "rw_target_reach", MC_TARGET_DEFAULT);
     env->curriculum_phase = (int)dict_get_or(kwargs, "curriculum_phase", 0);
     env->phase_transition = (int)dict_get_or(kwargs, "phase_transition", 0);
+    env->lifetime_blocks = 0;
+    env->avg_targets_ema = 0.0f;
+    env->phase2_unlocked = 0;
+    env->force_phase2 = (int)dict_get_or(kwargs, "force_phase2", 0);
 }
 
 void my_log(Log* log, Dict* out) {
@@ -42,4 +46,5 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "place_frac", log->place_frac);
     dict_set(out, "avg_pitch", log->avg_pitch);
     dict_set(out, "on_ground_frac", log->on_ground_frac);
+    dict_set(out, "phase", log->phase);
 }

@@ -375,6 +375,9 @@ def sweep(env_name, args=None, pareto=False):
             for s, c, t in zip(scores, costs, timesteps):
                 done_args['train']['total_timesteps'] = t
                 sweep_obj.observe(done_args, s, c, is_failure=False)
+            best_score = max(scores) if scores else 0
+            print(f'[Sweep {completed}/{num_experiments}] score={best_score:.3f} steps={max(timesteps):.0f} '
+                  + ' '.join(f'{k}={done_args["env"][k]}' for k in done_args.get("env", {}) if k.startswith('rw_')))
 
         idx = completed + len(active)
         if idx >= num_experiments:

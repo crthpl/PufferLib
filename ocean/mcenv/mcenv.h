@@ -51,6 +51,7 @@ typedef struct {
     float place_frac;
     float avg_pitch;
     float on_ground_frac;
+    float phase;
     float n;
 } Log;
 
@@ -77,6 +78,9 @@ struct MCEnv {
     float max_dist_from_start;
     int blocks_placed;
     int targets_reached;
+    int lifetime_blocks;   // Persists across resets — drives global curriculum
+    float avg_targets_ema; // EMA of targets/episode (~20 ep window)
+    int phase2_unlocked;   // Ratchet: once phase 2 activates, stays permanent
     float target_x;
     float target_z;
     float rw_survival;
@@ -88,6 +92,8 @@ struct MCEnv {
     int phase_transition;      // blocks_placed threshold to advance phase
     Demo3dRenderer* renderer;
     struct timespec render_last_time;
+    int force_phase2;  // Toggle via P key during eval render
+    int camera_locked; // Toggle via L key: lock camera to agent's look
 
     // Diagnostic accumulators
     int sneak_ticks;
@@ -128,6 +134,20 @@ static void setup_platform(MCEnv* env) {
     // Single block at y=2 under start position
     CBlockPos pos = {(int)env->start_x, 2, (int)env->start_z};
     mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
+}
+
+static int mc_get_phase(MCEnv* env) {
+    if (env->force_phase2) return 2;
+    if (env->phase_transition <= 0) return env->curriculum_phase;
+    int pt = env->phase_transition;
+    // Phase 2: ratchet — once unlocked by EMA > 2.0, stays permanent
+    if (env->lifetime_blocks >= pt * 5) {
+        if (!env->phase2_unlocked && env->avg_targets_ema > 2.0f)
+            env->phase2_unlocked = 1;
+        if (env->phase2_unlocked) return 2;
+    }
+    if (env->lifetime_blocks >= pt) return 1;
+    return 0;
 }
 
 static void compute_observations(MCEnv* env) {
@@ -186,6 +206,7 @@ void add_log(MCEnv* env) {
     env->log.place_frac += (float)env->place_ticks / t;
     env->log.avg_pitch += env->pitch_sum / t;
     env->log.on_ground_frac += (float)env->on_ground_ticks / t;
+    env->log.phase += (float)mc_get_phase(env);
     env->log.n++;
 }
 
@@ -208,8 +229,11 @@ void c_reset(MCEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->max_dist_from_start = 0.0f;
+    // Update EMA of targets/episode (~20 episode window)
+    env->avg_targets_ema = 0.95f * env->avg_targets_ema + 0.05f * (float)env->targets_reached;
     env->blocks_placed = 0;
     env->targets_reached = 0;
+    // NOTE: lifetime_* fields are NOT reset — they drive global curriculum
     env->sneak_ticks = 0;
     env->place_ticks = 0;
     env->pitch_sum = 0.0f;
@@ -250,6 +274,8 @@ void c_step(MCEnv* env) {
     if (env->pitch > 90.0f) env->pitch = 90.0f;
     if (env->pitch < -90.0f) env->pitch = -90.0f;
 
+    int phase = mc_get_phase(env);
+
     CPlayerInput input = mcenv_player_input_default();
     input.forward = (float)(forward_action - 1);
     input.strafe = (float)(strafe_action - 1);
@@ -262,45 +288,57 @@ void c_step(MCEnv* env) {
     input.place = (place_action == 1);
     input.break_block = false;
 
-    // Count non-platform blocks at y=2 BEFORE tick (fixed scan window)
-    CPlayerState pre;
-    mcenv_environment_get_player(env->mc, &pre);
-    int scan_bx = (int)floorf((float)pre.pos.x);
-    int scan_bz = (int)floorf((float)pre.pos.z);
-    int px = (int)env->start_x, pz = (int)env->start_z;
 
-    int blocks_before = 0;
-    for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
-        for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
-            CBlockPos bp = {cx, 2, cz};
-            CBlock blk;
-            mcenv_environment_get_block(env->mc, bp, &blk);
-            if (blk == CBLOCK_FULL_CUBE
-                && !(cx == px && cz == pz))
-                blocks_before++;
+
+    // --- Block placement detection (only scan when place pressed) ---
+    int placed_this_tick = 0;
+    if (place_action == 1) {
+        CPlayerState pre;
+        mcenv_environment_get_player(env->mc, &pre);
+        int scan_bx = (int)floorf((float)pre.pos.x);
+        int scan_bz = (int)floorf((float)pre.pos.z);
+        int px = (int)env->start_x, pz = (int)env->start_z;
+
+        int blocks_before = 0;
+        for (int cx = scan_bx - 5; cx <= scan_bx + 5; cx++) {
+            for (int cz = scan_bz - 5; cz <= scan_bz + 5; cz++) {
+                if (cx == px && cz == pz) continue;
+                for (int cy = 2; cy <= 3; cy++) {
+                    CBlock blk;
+                    mcenv_environment_get_block(env->mc, (CBlockPos){cx, cy, cz}, &blk);
+                    if (blk == CBLOCK_FULL_CUBE) blocks_before++;
+                }
+            }
         }
+
+        mcenv_environment_input(env->mc, input);
+        mcenv_environment_tick(env->mc);
+
+        int blocks_after = 0;
+        for (int cx = scan_bx - 5; cx <= scan_bx + 5; cx++) {
+            for (int cz = scan_bz - 5; cz <= scan_bz + 5; cz++) {
+                if (cx == px && cz == pz) continue;
+                for (int cy = 2; cy <= 3; cy++) {
+                    CBlock blk;
+                    mcenv_environment_get_block(env->mc, (CBlockPos){cx, cy, cz}, &blk);
+                    if (blk == CBLOCK_FULL_CUBE) blocks_after++;
+                }
+            }
+        }
+        placed_this_tick = blocks_after - blocks_before;
+        if (placed_this_tick < 0) placed_this_tick = 0;
+    } else {
+        mcenv_environment_input(env->mc, input);
+        mcenv_environment_tick(env->mc);
     }
 
-    mcenv_environment_input(env->mc, input);
-    mcenv_environment_tick(env->mc);
+    if (placed_this_tick > 0) {
+        env->blocks_placed += placed_this_tick;
+        env->lifetime_blocks += placed_this_tick;
+    }
 
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
-
-    // Count at SAME scan position after tick
-    int blocks_after = 0;
-    for (int cx = scan_bx - 1; cx <= scan_bx + 2; cx++) {
-        for (int cz = scan_bz - 1; cz <= scan_bz + 2; cz++) {
-            CBlockPos bp = {cx, 2, cz};
-            CBlock blk;
-            mcenv_environment_get_block(env->mc, bp, &blk);
-            if (blk == CBLOCK_FULL_CUBE
-                && !(cx == px && cz == pz))
-                blocks_after++;
-        }
-    }
-    int placed_this_tick = blocks_after - blocks_before;
-    if (placed_this_tick > 0) env->blocks_placed += placed_this_tick;
 
     // Diagnostics
     if (sneak_action == 1) env->sneak_ticks++;
@@ -308,46 +346,57 @@ void c_step(MCEnv* env) {
     env->pitch_sum += env->pitch;
     if (state.on_ground) env->on_ground_ticks++;
 
-    // ---- Curriculum phase ----
-    // Phase 0: block reward only (learn to bridge)
-    // Phase 1: block + target rewards (learn to navigate while bridging)
-    // Phase 2: target reward only (pure navigation)
-    // Transition based on blocks_placed within this episode
-    int phase = env->curriculum_phase;
-    if (env->phase_transition > 0) {
-        if (env->blocks_placed >= env->phase_transition * 2) phase = 2;
-        else if (env->blocks_placed >= env->phase_transition) phase = 1;
-        else phase = 0;
-    }
+    // ---- Global curriculum (phase computed above for input overrides) ----
+    // Phase 0: block reward only — learn bridging mechanics
+    // Phase 1: block + target + speed, on_ground gated — learn navigation
+    // Phase 2: same as phase 1 but on_ground gate removed + sprint-jump reward
 
-    // Phase blend factors
-    float block_weight  = (phase <= 1) ? 1.0f : 0.0f;
-    float target_weight = (phase >= 1) ? 1.0f : 0.0f;
+    float block_weight = 1.0f;
+    float target_weight = 0.0f;
+    int require_ground = 1;
+    if (phase >= 1) {
+        target_weight = 1.0f;
+        if (phase >= 2) {
+            require_ground = 0;
+            block_weight = 0.0f;  // No explicit block reward — bridges are instrumental
+        }
+    }
 
     // ---- Reward computation ----
     float reward = 0.0f;
 
-    // 1. Survival
-    if (state.on_ground) {
-        reward += env->rw_survival;
+    // 1. Survival / movement shaping
+    if (phase < 2) {
+        if (state.on_ground) reward += env->rw_survival;
+    } else {
+        // Phase 2: small sprint-jump combo bonus (doesn't dominate speed/target)
+        if (state.on_ground && forward_action == 2 && sprint_action == 1 && jump_action == 1)
+            reward += 0.2f;
+        // Punish standing on stacked blocks (not at bridge level y=3)
+        if (state.on_ground && fabsf((float)state.pos.y - MC_START_Y) > 0.5f)
+            reward -= 0.5f;
     }
 
-    // 2. Getting closer to target (only in phases 1+2, on ground)
+    // 2. Speed: getting closer to target (phases 1+2)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
-    if (state.on_ground && target_weight > 0.0f) {
+    if (target_weight > 0.0f && (!require_ground || state.on_ground)) {
         float delta_dist = env->prev_dist - dist;
         reward += env->rw_speed * delta_dist * target_weight;
     }
     env->prev_dist = dist;
 
-    // 3. Block placement reward (phases 0+1)
+    // 3. Block placement reward
     if (placed_this_tick > 0 && block_weight > 0.0f) {
         reward += env->rw_block * placed_this_tick * block_weight;
     }
 
-    // 4. Target reached (phases 1+2, must be on ground)
-    if (dist < MC_TARGET_REACH && target_weight > 0.0f && state.on_ground) {
-        reward += env->rw_target_reach * target_weight;
+    // 4. Target reached — always detect, reward with time bonus in phases 1+2
+    if (dist < MC_TARGET_REACH && (!require_ground || state.on_ground)) {
+        if (target_weight > 0.0f) {
+            float escalate = 1.0f + 0.5f * (float)env->targets_reached;
+            float time_bonus = 1.0f + (float)(env->max_ticks - env->tick) / (float)env->max_ticks;
+            reward += env->rw_target_reach * escalate * time_bonus * target_weight;
+        }
         env->targets_reached++;
         mc_new_target(env);
         dist = env->prev_dist;
@@ -360,6 +409,8 @@ void c_step(MCEnv* env) {
     if (dist_from_start > env->max_dist_from_start) {
         env->max_dist_from_start = dist_from_start;
     }
+
+
 
     // Termination
     int done = 0;
@@ -422,15 +473,26 @@ void c_render(MCEnv* env) {
         CPlayerState s;
         mcenv_environment_get_player(env->mc, &s);
         float d = mc_dist_to_target(env, s.pos.x, s.pos.z);
+        int phase = mc_get_phase(env);
         snprintf(hud, sizeof(hud),
-            "fwd=%s str=%s snk=%s spr=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d",
-            FWD_NAMES[fwd], STR_NAMES[str],
+            "fwd=%s str=%s jmp=%s snk=%s spr=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d ph=%d%s%s",
+            FWD_NAMES[fwd], STR_NAMES[str], BOOL_NAMES[jump],
             BOOL_NAMES[sneak], BOOL_NAMES[sprint], BOOL_NAMES[place],
             YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
             env->tick, env->target_x, env->target_z,
-            d, env->targets_reached, env->blocks_placed);
+            d, env->targets_reached, env->blocks_placed,
+            phase, env->force_phase2 ? "[P]" : "",
+            env->camera_locked ? "[L]" : "");
     }
     mcenv_demo3d_renderer_set_hud_text(env->renderer, hud);
+
+    if (mcenv_demo3d_is_key_pressed(MCENV_DEMO3D_KEY_P))
+        env->force_phase2 = !env->force_phase2;
+
+    if (mcenv_demo3d_is_key_pressed(MCENV_DEMO3D_KEY_L)) {
+        env->camera_locked = !env->camera_locked;
+        mcenv_demo3d_renderer_set_camera_locked(env->renderer, env->camera_locked);
+    }
 
     mcenv_demo3d_renderer_render(env->renderer, env->mc);
 }
