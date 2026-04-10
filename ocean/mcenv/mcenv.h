@@ -104,6 +104,7 @@ struct MCEnv {
     // Sprint-jump progress tracking
     int sj_timer;
     float sj_dist;
+    float sj_dot;
 
     // Diagnostic accumulators
     int sneak_ticks;
@@ -155,9 +156,9 @@ static void mc_new_target(MCEnv* env) {
 }
 
 static void setup_platform(MCEnv* env) {
-    // Single block at y=2 under start position
-    CBlockPos pos = {(int)env->start_x, 2, (int)env->start_z};
-    mcenv_environment_set_block(env->mc, pos, CBLOCK_FULL_CUBE);
+    // Single block at y=2 under start
+    CBlockPos platform_pos = {(int)env->start_x, 2, (int)env->start_z};
+    mcenv_environment_set_block(env->mc, platform_pos, CBLOCK_FULL_CUBE);
 }
 
 static int mc_get_phase(MCEnv* env) {
@@ -270,6 +271,7 @@ void c_reset(MCEnv* env) {
     // NOTE: lifetime_* fields are NOT reset — they drive global curriculum
     env->sj_timer = 0;
     env->sj_dist = 0.0f;
+    env->sj_dot = 0.0f;
 
     env->sneak_ticks = 0;
     env->pitch_sum = 0.0f;
@@ -344,7 +346,7 @@ void c_step(MCEnv* env) {
     CBlockPos placed_pos;
     if (mcenv_environment_last_placed_block(env->mc, &placed_pos)) {
         int px = (int)env->start_x, pz = (int)env->start_z;
-        if (!(placed_pos.x == px && placed_pos.z == pz) && placed_pos.y <= 5) {
+        if (!(placed_pos.x == px && placed_pos.z == pz) && placed_pos.y == 2) {
             place_scale = 1.0f;
             env->blocks_placed++;
             env->lifetime_blocks++;
@@ -380,49 +382,64 @@ void c_step(MCEnv* env) {
     float rw_air = 0.0f, rw_sprint_jump = 0.0f, rw_speed = 0.0f;
     float rw_block = 0.0f, rw_target = 0.0f;
 
-    // 1. Movement shaping (phase 1+)
-    if (phase >= 1) {
-        if (!state.on_ground) { reward += 0.1f; rw_air += 0.1f; }
+    // Facing-toward-target dot product (yaw only)
+    float yaw_rad = env->yaw * (3.14159265f / 180.0f);
+    float face_x = -sinf(yaw_rad), face_z = cosf(yaw_rad);
+    float tgt_dx = env->target_x - (float)state.pos.x;
+    float tgt_dz = env->target_z - (float)state.pos.z;
+    float tgt_len = sqrtf(tgt_dx * tgt_dx + tgt_dz * tgt_dz);
+    float facing_dot = 0.0f;
+    if (tgt_len > 0.01f) facing_dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
+    // facing_dot can be negative (facing away from target)
+
+    // 1. Survival / movement shaping
+    if (phase < 1) {
+        if (state.on_ground) reward += env->rw_survival;
     }
 
     // 2. Speed: getting closer to target (phases 1+2)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
 
-    // Sprint-jump progress reward, scaled by facing-toward-target dot product
+    // Sprint-jump: progress reward + airborne block bonus timer
     if (phase >= 1) {
-        float yaw_rad = env->yaw * (3.14159265f / 180.0f);
-        float face_x = -sinf(yaw_rad), face_z = cosf(yaw_rad);
-        float tgt_dx = env->target_x - (float)state.pos.x;
-        float tgt_dz = env->target_z - (float)state.pos.z;
-        float tgt_len = sqrtf(tgt_dx * tgt_dx + tgt_dz * tgt_dz);
-        float dot = 0.0f;
-        if (tgt_len > 0.01f) dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
-        if (dot < 0.0f) dot = 0.0f;
-
         if (env->sj_timer > 0) {
             env->sj_timer--;
-            if (env->sj_dist - dist > 0.3f) {
-                float sj_rw = 100.0f * dot;
+            if (env->sj_dist - dist > 0.05f) {
+                float sj_rw = 200.0f * env->sj_dot;
                 reward += sj_rw; rw_sprint_jump += sj_rw;
                 env->sj_timer = 0;
             }
         }
-        if (forward_action == 2 && sprint_action == 1 && jump_action == 1) {
+        if (forward_action == 2 && sprint_action == 1 && jump_action == 1 && state.on_ground && env->sj_timer == 0) {
             env->sj_timer = 20;
             env->sj_dist = dist;
+            env->sj_dot = facing_dot;
         }
     }
+    float delta_dist = env->prev_dist - dist;
     if (target_weight > 0.0f && (!require_ground || state.on_ground)) {
-        float delta_dist = env->prev_dist - dist;
-        float s_rw = env->rw_speed * delta_dist * target_weight;
+        float abs_delta = fabsf(delta_dist);
+        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, 2.0f);
+        float s_rw = env->rw_speed * shaped_delta * target_weight;
         reward += s_rw; rw_speed += s_rw;
     }
     env->prev_dist = dist;
 
+    // Facing bonus: reward facing target + moving toward it, punish otherwise
+    float facing_rw = 0.01f * (facing_dot < 0.0f && delta_dist < 0.0f
+        ? -(fabsf(facing_dot) * fabsf(delta_dist))
+        : facing_dot * delta_dist);
+    reward += facing_rw;
+
     // 3. Block placement reward
     if (place_scale > 0.0f && block_weight > 0.0f) {
-        float air_mult = state.on_ground ? 1.0f : 4.0f;
+        int air_eligible = !state.on_ground && env->sj_timer > 8 && placed_pos.y == 2;
+        float air_mult = air_eligible ? 10.0f : 1.0f;
         float b_rw = env->rw_block * place_scale * block_weight * air_mult;
+        if (air_mult > 1.0f) {
+            float air_bonus = env->rw_block * place_scale * block_weight * (air_mult - 1.0f);
+            rw_air += air_bonus;
+        }
         reward += b_rw; rw_block += b_rw;
     }
 
@@ -461,7 +478,7 @@ void c_step(MCEnv* env) {
     // Termination
     int done = 0;
     if (state.pos.y < MC_VOID_Y) {
-        reward = env->rw_fall;
+        reward = (phase >= 1) ? env->rw_fall * 0.1f : env->rw_fall;
         done = 1;
     } else if (env->tick >= env->max_ticks) {
         done = 1;
@@ -523,8 +540,12 @@ void c_render(MCEnv* env) {
         mcenv_environment_get_player(env->mc, &s);
         float d = mc_dist_to_target(env, s.pos.x, s.pos.z);
         int phase = mc_get_phase(env);
+        // Sprint-jump flash: show dot when timer active
+        char sj_buf[16] = "";
+        if (env->sj_timer > 0 && env->sj_dot > 0.0f)
+            snprintf(sj_buf, sizeof(sj_buf), " SPRJ=%.2f", env->sj_dot);
         snprintf(hud, sizeof(hud),
-            "fwd=%s str=%s jmp=%s snk=%s spr=%s plc=%s yaw=%+7.1f pit=%+7.1f rot=%.2f | t=%4d tgt=%5.0f,%5.0f dist=%5.1f rch=%2d blk=%3d ph=%d%s%s",
+            "fwd=%s str=%s jmp=%s snk=%s spr=%s plc=%s yaw=%+7.1f pit=%+7.1f rot=%.2f | t=%4d tgt=%5.0f,%5.0f dist=%5.1f rch=%2d blk=%3d ph=%d%s%s%s",
             FWD_NAMES[fwd], STR_NAMES[str], BOOL_NAMES[jump],
             BOOL_NAMES[sneak], BOOL_NAMES[sprint], PLACE_NAMES[place],
             YAW_DELTAS[yaw_i] * rot_pct_hud, PITCH_DELTAS[pit_i] * rot_pct_hud,
@@ -532,7 +553,8 @@ void c_render(MCEnv* env) {
             env->tick, env->target_x, env->target_z,
             d, env->targets_reached, env->blocks_placed,
             phase, env->force_phase2 ? "[P]" : "",
-            env->camera_locked ? "[L]" : "");
+            env->camera_locked ? "[L]" : "",
+            sj_buf);
     }
     mcenv_demo3d_renderer_set_hud_text(env->renderer, hud);
 

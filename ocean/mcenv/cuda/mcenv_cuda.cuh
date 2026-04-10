@@ -171,6 +171,7 @@ struct McEnvState {
     // Sprint-jump progress tracking
     int   sj_timer;
     float sj_dist;
+    float sj_dot;
 
     // Diagnostics
     int   sneak_ticks;

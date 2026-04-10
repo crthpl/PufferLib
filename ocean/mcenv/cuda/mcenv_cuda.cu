@@ -92,7 +92,7 @@ __global__ void mcenv_pufferlib_step_kernel(
     float place_scale = 0.0f;
     if (s->last_placed_valid) {
         int px = (int)s->start_x, pz = (int)s->start_z;
-        if (!(s->last_placed_x == px && s->last_placed_z == pz) && s->last_placed_y <= 5) {
+        if (!(s->last_placed_x == px && s->last_placed_z == pz) && s->last_placed_y == 2) {
             place_scale = 1.0f;
             s->blocks_placed++;
             s->lifetime_blocks++;
@@ -120,51 +120,64 @@ __global__ void mcenv_pufferlib_step_kernel(
     float rw_air = 0.0f, rw_sprint_jump = 0.0f, rw_speed = 0.0f;
     float rw_block = 0.0f, rw_target = 0.0f;
 
+    // Facing-toward-target dot product (yaw only)
+    float yaw_rad = s->yaw * (3.14159265f / 180.0f);
+    float face_x = -sinf(yaw_rad), face_z = cosf(yaw_rad);
+    float tgt_dx = s->target_x - (float)s->pos_x;
+    float tgt_dz = s->target_z - (float)s->pos_z;
+    float tgt_len = sqrtf(tgt_dx * tgt_dx + tgt_dz * tgt_dz);
+    float facing_dot = 0.0f;
+    if (tgt_len > 0.01f) facing_dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
+    // facing_dot can be negative (facing away from target)
+
     // 1. Survival / movement shaping
     if (phase < 1) {
         if (s->on_ground) reward += config->rw_survival;
-    } else {
-        if (!s->on_ground) { reward += 0.1f; rw_air += 0.1f; }
     }
 
     // 2. Speed: getting closer to target
     float dist = mc_dist_to_target(s, s->pos_x, s->pos_z);
 
-    // Sprint-jump progress reward, scaled by facing-toward-target dot product
+    // Sprint-jump: progress reward + airborne block bonus timer
     if (phase >= 1) {
-        float yaw_rad = s->yaw * (3.14159265f / 180.0f);
-        float face_x = -sinf(yaw_rad), face_z = cosf(yaw_rad);
-        float tgt_dx = s->target_x - (float)s->pos_x;
-        float tgt_dz = s->target_z - (float)s->pos_z;
-        float tgt_len = sqrtf(tgt_dx * tgt_dx + tgt_dz * tgt_dz);
-        float dot = 0.0f;
-        if (tgt_len > 0.01f) dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
-        if (dot < 0.0f) dot = 0.0f;
-
         if (s->sj_timer > 0) {
             s->sj_timer--;
-            if (s->sj_dist - dist > 0.3f) {
-                float sj_rw = 100.0f * dot;
+            if (s->sj_dist - dist > 0.05f) {
+                float sj_rw = 200.0f * s->sj_dot;
                 reward += sj_rw; rw_sprint_jump += sj_rw;
                 s->sj_timer = 0;
             }
         }
-        if (forward_action == 2 && sprint_action == 1 && jump_action == 1) {
+        if (forward_action == 2 && sprint_action == 1 && jump_action == 1 && s->on_ground && s->sj_timer == 0) {
             s->sj_timer = 20;
             s->sj_dist = dist;
+            s->sj_dot = facing_dot;
         }
     }
+    float delta_dist = s->prev_dist - dist;
     if (target_weight > 0.0f && (!require_ground || s->on_ground)) {
-        float delta_dist = s->prev_dist - dist;
-        float s_rw = config->rw_speed * delta_dist * target_weight;
+        float abs_delta = fabsf(delta_dist);
+        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, 2.0f);
+        float s_rw = config->rw_speed * shaped_delta * target_weight;
         reward += s_rw; rw_speed += s_rw;
     }
     s->prev_dist = dist;
 
+    // Facing bonus: reward facing target + moving toward it, punish otherwise
+    float facing_rw = 0.01f * (facing_dot < 0.0f && delta_dist < 0.0f
+        ? -(fabsf(facing_dot) * fabsf(delta_dist))
+        : facing_dot * delta_dist);
+    reward += facing_rw;
+
     // 3. Block placement reward
     if (place_scale > 0.0f && block_weight > 0.0f) {
-        float air_mult = s->on_ground ? 1.0f : 4.0f;
+        int air_eligible = !s->on_ground && s->sj_timer > 8 && s->last_placed_y == 2;
+        float air_mult = air_eligible ? 10.0f : 1.0f;
         float b_rw = config->rw_block * place_scale * block_weight * air_mult;
+        if (air_mult > 1.0f) {
+            float air_bonus = config->rw_block * place_scale * block_weight * (air_mult - 1.0f);
+            rw_air += air_bonus;
+        }
         reward += b_rw; rw_block += b_rw;
     }
 
@@ -200,7 +213,7 @@ __global__ void mcenv_pufferlib_step_kernel(
     // --- Termination ---
     int done = 0;
     if (s->pos_y < (double)MC_VOID_Y) {
-        reward = config->rw_fall;
+        reward = (phase >= 1) ? config->rw_fall * 0.1f : config->rw_fall;
         done = 1;
     } else if (s->tick >= s->max_ticks) {
         done = 1;

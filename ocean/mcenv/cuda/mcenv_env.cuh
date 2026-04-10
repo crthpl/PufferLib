@@ -64,7 +64,7 @@ __host__ __device__ inline void mcenv_reset(
     int grid_size = w->size_x * w->size_y * w->size_z;
     for (int i = 0; i < grid_size; i++) grid[i] = 0;
 
-    // Setup platform: single block at y=2 under start
+    // Single block at y=2 under start
     set_block(grid, w, (int)s->start_x, 2, (int)s->start_z, 1);
 
     // Reset player
@@ -85,6 +85,7 @@ __host__ __device__ inline void mcenv_reset(
 
     s->sj_timer = 0;
     s->sj_dist = 0.0f;
+    s->sj_dot = 0.0f;
 
     s->sneak_ticks = 0;
     s->pitch_sum = 0.0f;
