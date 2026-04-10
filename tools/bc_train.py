@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Behavioral cloning trainer for mcenv.
 
-Reads mcenv-codex MCREC001 recordings, converts to obs/action pairs,
-and trains the PufferLib policy with cross-entropy loss.
+Reads mcenv-codex MCREC001 recordings, converts to obs/action sequences,
+and trains the PufferLib policy (encoder + MinGRU + decoder) with full
+recurrent forward passes and cross-entropy loss.
+
 Saves weights in .bin format compatible with --load-model-path.
 
 Usage:
@@ -13,10 +15,15 @@ import argparse
 import struct
 import math
 import sys
+import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+
+# Add parent to path so we can import pufferlib
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ---------------------------------------------------------------------------
 # Constants (must match mcenv.h / binding.c)
@@ -89,19 +96,18 @@ def load_recording(path):
             elif tag == 0x01:
                 state = read_player_state(f)
                 n = read_u32(f)
-                changes = []
-                for _ in range(n):
-                    changes.append({
-                        'x': read_i32(f), 'y': read_i32(f), 'z': read_i32(f),
-                        'solid': read_bool(f)
-                    })
+                changes = [{'x': read_i32(f), 'y': read_i32(f), 'z': read_i32(f),
+                            'solid': read_bool(f)} for _ in range(n)]
                 events.append(('tick', state, changes))
+            elif tag == 0x02:
+                tx, tz = read_f32(f), read_f32(f)
+                events.append(('target', tx, tz))
             else:
                 raise ValueError(f"Unknown tag: {tag:#x}")
     return initial_player, initial_blocks, events
 
 # ---------------------------------------------------------------------------
-# Convert recording to obs/action pairs
+# Convert recording to obs/action sequences
 # ---------------------------------------------------------------------------
 
 def compute_obs(state, yaw, pitch, target_x, target_z, blocks):
@@ -136,20 +142,92 @@ def compute_obs(state, yaw, pitch, target_x, target_z, blocks):
     return obs
 
 
-def input_to_actions(inp, prev_yaw, prev_pitch):
+def recording_to_sequence(path, target_x=None, target_z=None):
+    """Convert a recording to a single (obs_seq, act_seq) sequence.
+
+    Handles fps != tps correctly:
+    - fps > tps: multiple INPUTs before TICK — uses last input, but computes
+      yaw/pitch delta from tick states (captures accumulated camera movement)
+    - fps < tps: multiple TICKs per INPUT — emits zero-rotation action for
+      extra ticks, reusing movement/button state from the input
+    """
+    initial_player, initial_blocks, events = load_recording(path)
+    blocks = set(initial_blocks)
+
+    # Track yaw/pitch from tick states for accurate delta computation
+    prev_tick_yaw = initial_player['yaw']
+    prev_tick_pitch = initial_player['pitch']
+
+    # Default target; overridden by Target events in recording
+    if target_x is None: target_x = 40.5
+    if target_z is None: target_z = 40.5
+
+    all_obs, all_actions = [], []
+    current_state = initial_player
+    pending_input = None
+
+    for event in events:
+        if event[0] == 'input':
+            pending_input = event[1]
+        elif event[0] == 'target':
+            target_x = event[1]
+            target_z = event[2]
+        elif event[0] == 'tick':
+            state, changes = event[1], event[2]
+
+            # Compute yaw/pitch delta from tick states (handles multi-input accumulation)
+            tick_yaw = state['yaw']
+            tick_pitch = state['pitch']
+
+            if pending_input is not None:
+                # Compute action using tick-state yaw/pitch delta
+                yaw_delta = tick_yaw - prev_tick_yaw
+                pitch_delta = tick_pitch - prev_tick_pitch
+                obs = compute_obs(current_state, prev_tick_yaw, prev_tick_pitch,
+                                  target_x, target_z, blocks)
+                actions = input_to_actions_with_delta(
+                    pending_input, yaw_delta, pitch_delta)
+                all_obs.append(obs)
+                all_actions.append(actions)
+                pending_input = None
+            else:
+                # Extra tick without new input (fps < tps): zero rotation,
+                # reuse last movement/button state
+                obs = compute_obs(current_state, prev_tick_yaw, prev_tick_pitch,
+                                  target_x, target_z, blocks)
+                # No-op rotation action: yaw=3(none), pitch=3(none), rot=0
+                actions = np.zeros(NUM_ATNS, dtype=np.int64)
+                actions[0] = 1  # forward=none
+                actions[1] = 1  # strafe=none
+                actions[5] = 3  # yaw=none
+                actions[6] = 3  # pitch=none
+                all_obs.append(obs)
+                all_actions.append(actions)
+
+            prev_tick_yaw = tick_yaw
+            prev_tick_pitch = tick_pitch
+
+            for c in changes:
+                key = (c['x'], c['y'], c['z'])
+                if c['solid']:
+                    blocks.add(key)
+                else:
+                    blocks.discard(key)
+            current_state = state
+
+    if not all_obs:
+        return np.array([]), np.array([])
+    return np.array(all_obs, dtype=np.float32), np.array(all_actions, dtype=np.int64)
+
+
+def input_to_actions_with_delta(inp, yaw_delta, pitch_delta):
+    """Convert PlayerInput to discrete actions, using pre-computed yaw/pitch deltas."""
     actions = np.zeros(NUM_ATNS, dtype=np.int64)
     actions[0] = int(round(inp['forward'])) + 1
     actions[1] = int(round(inp['strafe'])) + 1
     actions[2] = 1 if inp['jump'] else 0
     actions[3] = 1 if inp['sneak'] else 0
     actions[4] = 1 if inp['sprint'] else 0
-
-    if inp['has_look']:
-        yaw_delta = inp['look_yaw'] - prev_yaw
-        pitch_delta = inp['look_pitch'] - prev_pitch
-    else:
-        yaw_delta = 0.0
-        pitch_delta = 0.0
 
     best_yaw_idx, best_pitch_idx, best_rot_idx = 3, 3, 4
     best_error = abs(yaw_delta) + abs(pitch_delta)
@@ -174,109 +252,55 @@ def input_to_actions(inp, prev_yaw, prev_pitch):
     actions[8] = best_rot_idx
     return actions
 
-
-def recording_to_dataset(path, target_x=None, target_z=None):
-    initial_player, initial_blocks, events = load_recording(path)
-    blocks = set(initial_blocks)
-    yaw = initial_player['yaw']
-    pitch = initial_player['pitch']
-    if target_x is None: target_x = 40.5
-    if target_z is None: target_z = 40.5
-
-    all_obs, all_actions = [], []
-    current_state = initial_player
-
-    for event in events:
-        if event[0] == 'input':
-            inp = event[1]
-            obs = compute_obs(current_state, yaw, pitch, target_x, target_z, blocks)
-            actions = input_to_actions(inp, yaw, pitch)
-            all_obs.append(obs)
-            all_actions.append(actions)
-            rot_pct = actions[8] * 0.25
-            yaw += YAW_DELTAS[actions[5]] * rot_pct
-            pitch += PITCH_DELTAS[actions[6]] * rot_pct
-            pitch = max(-90.0, min(90.0, pitch))
-        elif event[0] == 'tick':
-            state, changes = event[1], event[2]
-            for c in changes:
-                key = (c['x'], c['y'], c['z'])
-                if c['solid']:
-                    blocks.add(key)
-                else:
-                    blocks.discard(key)
-            current_state = state
-
-    if not all_obs:
-        return np.array([]), np.array([])
-    return np.array(all_obs, dtype=np.float32), np.array(all_actions, dtype=np.int64)
-
 # ---------------------------------------------------------------------------
-# Policy model — exact architecture match for PufferLib CUDA backend
-#
-# Weight layout in .bin: encoder | decoder | mingru_layer_0 | ... | mingru_layer_N
-# - Encoder: (hidden_size, obs_size) — no bias
-# - Decoder: (total_actions+1, hidden_size) — no bias, +1 for value
-# - MinGRU: (3*hidden_size, hidden_size) per layer — no bias
-#
-# For BC we do feedforward: encoder -> relu -> mingru_layers_as_linear -> decoder
-# The MinGRU layers are (3H, H) matrices. In feedforward mode we just use
-# the first H rows as a linear transform (the "hidden" portion).
-# This gives us weight-compatible initialization that RL can fine-tune.
+# Policy — uses PufferLib's exact MinGRU implementation
 # ---------------------------------------------------------------------------
+
+from pufferlib.models import MinGRU
 
 class BCPolicy(nn.Module):
+    """Exact architecture match for PufferLib CUDA backend.
+
+    Weight layout in .bin: encoder | decoder | mingru_layer_0 | ... | mingru_layer_N
+    All weights are (out, in) with no bias.
+    """
     def __init__(self, obs_size, act_sizes, hidden_size=256, num_layers=4):
         super().__init__()
         self.act_sizes = list(act_sizes)
         self.hidden_size = hidden_size
         total_actions = sum(act_sizes)
 
-        # Encoder: (hidden_size, obs_size) — matches CUDA
-        self.encoder_weight = nn.Parameter(torch.empty(hidden_size, obs_size))
+        self.encoder = nn.Linear(obs_size, hidden_size, bias=False)
+        self.network = MinGRU(hidden_size, num_layers=num_layers)
+        # Decoder: fused (total_actions + 1) for logits + value
+        self.decoder = nn.Linear(hidden_size, total_actions + 1, bias=False)
 
-        # Decoder: (total_actions+1, hidden_size) — matches CUDA
-        self.decoder_weight = nn.Parameter(torch.empty(total_actions + 1, hidden_size))
+    def forward(self, obs_seq):
+        """Forward pass on a sequence.
 
-        # MinGRU layers: (3*hidden_size, hidden_size) each — matches CUDA
-        self.gru_weights = nn.ParameterList([
-            nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
-            for _ in range(num_layers)
-        ])
+        Args:
+            obs_seq: (B, T, obs_size) tensor
 
-        self._init_weights()
-
-    def _init_weights(self):
-        for p in self.parameters():
-            nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-
-    def forward(self, obs):
-        # Encoder
-        h = torch.relu(obs @ self.encoder_weight.t())
-
-        # MinGRU layers used as feedforward (just the first H rows = "hidden" transform)
-        for w in self.gru_weights:
-            H = self.hidden_size
-            # w is (3H, H). Split into hidden(H,H), gate(H,H), proj(H,H)
-            w_hidden = w[:H]     # (H, H)
-            w_proj = w[2*H:3*H]  # (H, H) — highway projection
-            hidden_out = torch.relu(h @ w_hidden.t())
-            proj = torch.sigmoid(h @ w_proj.t())
-            h = proj * hidden_out + (1.0 - proj) * h  # highway connection
-
-        # Decoder
-        out = h @ self.decoder_weight.t()  # (B, total_actions+1)
+        Returns:
+            list of (B*T, act_size_i) logit tensors per action head
+        """
+        B, T, _ = obs_seq.shape
+        h = self.encoder(obs_seq.reshape(B * T, -1))  # (B*T, H)
+        h = self.network.forward_train(h.reshape(B, T, -1))  # (B, T, H)
+        out = self.decoder(h.reshape(B * T, -1))  # (B*T, total_actions+1)
         action_logits = out[:, :-1]  # drop value head
         return list(action_logits.split(self.act_sizes, dim=1))
 
     def save_bin(self, path):
-        """Save weights in flat .bin format matching PufferLib CUDA layout."""
+        """Save weights in flat .bin format matching PufferLib CUDA layout.
+
+        Order: encoder weight, decoder weight, then each MinGRU layer weight.
+        """
         flat = []
-        # Order: encoder, decoder, gru layers
-        flat.append(self.encoder_weight.detach().cpu().numpy().flatten())
-        flat.append(self.decoder_weight.detach().cpu().numpy().flatten())
-        for w in self.gru_weights:
-            flat.append(w.detach().cpu().numpy().flatten())
+        flat.append(self.encoder.weight.detach().cpu().numpy().flatten())
+        flat.append(self.decoder.weight.detach().cpu().numpy().flatten())
+        for layer in self.network.layers:
+            flat.append(layer.weight.detach().cpu().numpy().flatten())
         flat = np.concatenate(flat).astype(np.float32)
         flat.tofile(path)
         print(f"Saved {path} ({flat.shape[0]} floats, {flat.nbytes} bytes)")
@@ -286,40 +310,69 @@ class BCPolicy(nn.Module):
 # Training
 # ---------------------------------------------------------------------------
 
-def train_bc(obs_data, act_data, output_path, hidden_size=256, num_layers=4,
-             epochs=200, batch_size=512, lr=1e-3, device='cuda'):
+def make_batches(sequences, seq_len, batch_size, stride=None):
+    """Chop sequences into overlapping fixed-length chunks and batch them."""
+    if stride is None:
+        stride = seq_len // 2  # 50% overlap by default
+    chunks_obs, chunks_act = [], []
+    for obs_seq, act_seq in sequences:
+        T = len(obs_seq)
+        for start in range(0, T - seq_len + 1, stride):
+            chunks_obs.append(obs_seq[start:start + seq_len])
+            chunks_act.append(act_seq[start:start + seq_len])
+    if not chunks_obs:
+        return [], []
+    obs = np.stack(chunks_obs)  # (N, T, obs_size)
+    act = np.stack(chunks_act)  # (N, T, num_atns)
+    # Shuffle
+    perm = np.random.permutation(len(obs))
+    obs, act = obs[perm], act[perm]
+    # Split into batches
+    batches = []
+    for i in range(0, len(obs), batch_size):
+        batches.append((obs[i:i+batch_size], act[i:i+batch_size]))
+    return batches
+
+
+def train_bc(sequences, output_path, hidden_size=256, num_layers=4,
+             epochs=200, batch_size=32, seq_len=128, lr=1e-3, device='cuda'):
     policy = BCPolicy(MC_OBS_TOTAL, ACT_SIZES, hidden_size, num_layers).to(device)
-
-    obs_t = torch.from_numpy(obs_data).to(device)
-    act_t = torch.from_numpy(act_data).to(device)
-    dataset = torch.utils.data.TensorDataset(obs_t, act_t)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
-    n = len(obs_data)
+    total_ticks = sum(len(s[0]) for s in sequences)
     n_params = sum(p.numel() for p in policy.parameters())
-    print(f"Training BC: {n} samples, {n_params:,} params, {epochs} epochs")
+    print(f"Training BC: {total_ticks} ticks across {len(sequences)} sequences")
+    print(f"Policy: {n_params:,} params, seq_len={seq_len}, batch_size={batch_size}")
 
     for epoch in range(epochs):
+        batches = make_batches(sequences, seq_len, batch_size)
         total_loss = 0.0
         total_correct = [0] * NUM_ATNS
         total_count = 0
 
-        for batch_obs, batch_act in loader:
-            logit_heads = policy(batch_obs)
-            loss = sum(criterion(logits, batch_act[:, i])
+        for obs_np, act_np in batches:
+            obs_t = torch.from_numpy(obs_np).to(device)  # (B, T, obs)
+            act_t = torch.from_numpy(act_np).to(device)  # (B, T, atns)
+            B, T, _ = obs_t.shape
+
+            logit_heads = policy(obs_t)  # list of (B*T, act_size_i)
+            act_flat = act_t.reshape(B * T, -1)
+
+            loss = sum(criterion(logits, act_flat[:, i])
                        for i, logits in enumerate(logit_heads))
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * batch_obs.shape[0]
+            total_loss += loss.item() * B * T
             for i, logits in enumerate(logit_heads):
-                total_correct[i] += (logits.argmax(1) == batch_act[:, i]).sum().item()
-            total_count += batch_obs.shape[0]
+                total_correct[i] += (logits.argmax(1) == act_flat[:, i]).sum().item()
+            total_count += B * T
+
+        if total_count == 0:
+            continue
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             avg_loss = total_loss / total_count
@@ -337,33 +390,30 @@ def main():
     parser.add_argument('--target-x', type=float, default=None)
     parser.add_argument('--target-z', type=float, default=None)
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--seq-len', type=int, default=128,
+                        help='Sequence length for recurrent training (matches RL horizon)')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden-size', type=int, default=256)
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
 
-    all_obs, all_acts = [], []
+    sequences = []
     for rec_path in args.recordings:
         print(f"Loading {rec_path}...")
-        obs, acts = recording_to_dataset(rec_path, args.target_x, args.target_z)
+        obs, acts = recording_to_sequence(rec_path, args.target_x, args.target_z)
         if len(obs) > 0:
-            all_obs.append(obs)
-            all_acts.append(acts)
-            print(f"  {len(obs)} samples")
+            sequences.append((obs, acts))
+            print(f"  {len(obs)} ticks")
 
-    if not all_obs:
-        print("No samples!"); sys.exit(1)
+    if not sequences:
+        print("No data!"); sys.exit(1)
 
-    obs_data = np.concatenate(all_obs)
-    act_data = np.concatenate(all_acts)
-    print(f"Total: {len(obs_data)} samples")
-
-    train_bc(obs_data, act_data, args.output,
+    train_bc(sequences, args.output,
              hidden_size=args.hidden_size, num_layers=args.num_layers,
              epochs=args.epochs, batch_size=args.batch_size,
-             lr=args.lr, device=args.device)
+             seq_len=args.seq_len, lr=args.lr, device=args.device)
 
 
 if __name__ == '__main__':
