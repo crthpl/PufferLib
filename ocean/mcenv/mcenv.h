@@ -8,11 +8,11 @@
 #include <time.h>
 #include "mcenv_codex.h"
 
-#define MC_OBS_PLAYER 11
+#define MC_OBS_PLAYER 14
 #define MC_OBS_TARGET 2
-#define MC_GRID_X 7
+#define MC_GRID_X 7  // -3 to +3
 #define MC_GRID_Y 3
-#define MC_GRID_Z 3
+#define MC_GRID_Z 7  // -3 to +3
 #define MC_OBS_GRID (MC_GRID_X * MC_GRID_Y * MC_GRID_Z)
 #define MC_OBS_TOTAL (MC_OBS_PLAYER + MC_OBS_TARGET + MC_OBS_GRID)
 
@@ -35,8 +35,8 @@
 #define MC_TARGET_DEFAULT    10.0f
 
 // Yaw/pitch delta lookup tables (degrees)
-static const float YAW_DELTAS[11]  = {-180.0f, -90.0f, -15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f, 90.0f, 180.0f};
-static const float PITCH_DELTAS[7] = {-15.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 15.0f};
+static const float YAW_DELTAS[7]   = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
+static const float PITCH_DELTAS[7] = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
 
 typedef struct {
     float perf;
@@ -44,14 +44,19 @@ typedef struct {
     float episode_return;
     float episode_length;
     float max_dist;
+    float max_height;
     float fell;
     float blocks_placed;
     float targets_reached;
     float sneak_frac;
-    float place_frac;
     float avg_pitch;
     float on_ground_frac;
     float phase;
+    float rw_air;
+    float rw_sprint_jump;
+    float rw_speed;
+    float rw_block;
+    float rw_target;
     float n;
 } Log;
 
@@ -76,6 +81,7 @@ struct MCEnv {
     int max_ticks;
     float episode_return;
     float max_dist_from_start;
+    float max_height;
     int blocks_placed;
     int targets_reached;
     int lifetime_blocks;   // Persists across resets — drives global curriculum
@@ -95,11 +101,21 @@ struct MCEnv {
     int force_phase2;  // Toggle via P key during eval render
     int camera_locked; // Toggle via L key: lock camera to agent's look
 
+    // Sprint-jump progress tracking
+    int sj_timer;
+    float sj_dist;
+
     // Diagnostic accumulators
     int sneak_ticks;
-    int place_ticks;
     float pitch_sum;
     int on_ground_ticks;
+
+    // Reward source accumulators (per episode)
+    float rw_air_sum;
+    float rw_sprint_jump_sum;
+    float rw_speed_sum;
+    float rw_block_sum;
+    float rw_target_sum;
 };
 
 static float mc_dist_to_target(MCEnv* env, double px, double pz) {
@@ -108,25 +124,33 @@ static float mc_dist_to_target(MCEnv* env, double px, double pz) {
     return sqrtf(dx*dx + dz*dz);
 }
 
+static unsigned int xorshift32(unsigned int* state) {
+    unsigned int x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
 static void mc_new_target(MCEnv* env) {
-    // Random target in [0.5, 99.5] x [0.5, 99.5], at least 10 blocks from player
+    // Random target in [0.5, 99.5] x [0.5, 99.5], at least 3 blocks from player
     CPlayerState state;
     mcenv_environment_get_player(env->mc, &state);
     for (int attempt = 0; attempt < 100; attempt++) {
-        float tx = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
-        float tz = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
+        float tx = 0.5f + (float)(xorshift32(&env->rng) % MC_AREA_SIZE);
+        float tz = 0.5f + (float)(xorshift32(&env->rng) % MC_AREA_SIZE);
         float dx = tx - (float)state.pos.x;
         float dz = tz - (float)state.pos.z;
-        if (dx*dx + dz*dz >= 9.0f) { // >= 3 blocks away
+        if (dx*dx + dz*dz >= 9.0f) {
             env->target_x = tx;
             env->target_z = tz;
             env->prev_dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
             return;
         }
     }
-    // Fallback: just pick something
-    env->target_x = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
-    env->target_z = 0.5f + (float)(rand_r(&env->rng) % MC_AREA_SIZE);
+    env->target_x = 0.5f + (float)(xorshift32(&env->rng) % MC_AREA_SIZE);
+    env->target_z = 0.5f + (float)(xorshift32(&env->rng) % MC_AREA_SIZE);
     env->prev_dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
 }
 
@@ -138,14 +162,9 @@ static void setup_platform(MCEnv* env) {
 
 static int mc_get_phase(MCEnv* env) {
     if (env->force_phase2) return 2;
-    if (env->phase_transition <= 0) return env->curriculum_phase;
+    // TEMP: phase 2 disabled — cap at 1
+    if (env->phase_transition <= 0) return env->curriculum_phase < 2 ? env->curriculum_phase : 1;
     int pt = env->phase_transition;
-    // Phase 2: ratchet — once unlocked by EMA > 2.0, stays permanent
-    if (env->lifetime_blocks >= pt * 5) {
-        if (!env->phase2_unlocked && env->avg_targets_ema > 2.0f)
-            env->phase2_unlocked = 1;
-        if (env->phase2_unlocked) return 2;
-    }
     if (env->lifetime_blocks >= pt) return 1;
     return 0;
 }
@@ -156,10 +175,13 @@ static void compute_observations(MCEnv* env) {
 
     int idx = 0;
 
-    // Player state (11 values)
+    // Player state (14 values)
     env->observations[idx++] = (float)(state.pos.x - env->start_x) / 50.0f;
     env->observations[idx++] = (float)(state.pos.y - env->start_y) / 10.0f;
     env->observations[idx++] = (float)(state.pos.z - env->start_z) / 10.0f;
+    env->observations[idx++] = (float)(state.pos.x - floorf((float)state.pos.x)); // frac x
+    env->observations[idx++] = (float)(state.pos.y - floorf((float)state.pos.y)); // frac y
+    env->observations[idx++] = (float)(state.pos.z - floorf((float)state.pos.z)); // frac z
     env->observations[idx++] = (float)state.vel.x;
     env->observations[idx++] = (float)state.vel.y;
     env->observations[idx++] = (float)state.vel.z;
@@ -175,12 +197,12 @@ static void compute_observations(MCEnv* env) {
     env->observations[idx++] = (env->target_x - (float)state.pos.x) / 50.0f;
     env->observations[idx++] = (env->target_z - (float)state.pos.z) / 50.0f;
 
-    // Local block grid: 7x3x3
+    // Local block grid: 7x3x7 (±3 in x and z)
     int bx = (int)floorf((float)state.pos.x);
     int by = (int)floorf((float)state.pos.y);
     int bz = (int)floorf((float)state.pos.z);
 
-    for (int dx = -1; dx < MC_GRID_X - 1; dx++) {
+    for (int dx = -(MC_GRID_X/2); dx <= MC_GRID_X/2; dx++) {
         for (int dy = -MC_GRID_Y; dy < 0; dy++) {
             for (int dz = -(MC_GRID_Z/2); dz <= MC_GRID_Z/2; dz++) {
                 CBlockPos pos = {bx + dx, by + dy, bz + dz};
@@ -199,14 +221,25 @@ void add_log(MCEnv* env) {
     env->log.episode_return += env->episode_return;
     env->log.episode_length += env->tick;
     env->log.max_dist += env->max_dist_from_start;
+    env->log.max_height += env->max_height;
     env->log.fell += (env->tick < env->max_ticks) ? 1.0f : 0.0f;
     env->log.blocks_placed += env->blocks_placed;
     env->log.targets_reached += env->targets_reached;
     env->log.sneak_frac += (float)env->sneak_ticks / t;
-    env->log.place_frac += (float)env->place_ticks / t;
     env->log.avg_pitch += env->pitch_sum / t;
     env->log.on_ground_frac += (float)env->on_ground_ticks / t;
     env->log.phase += (float)mc_get_phase(env);
+    float rw_total = fabsf(env->rw_air_sum) + fabsf(env->rw_sprint_jump_sum)
+                   + fabsf(env->rw_speed_sum) + fabsf(env->rw_block_sum)
+                   + fabsf(env->rw_target_sum);
+    if (rw_total > 0.0f) {
+        float inv = 1.0f / rw_total;
+        env->log.rw_air += fabsf(env->rw_air_sum) * inv;
+        env->log.rw_sprint_jump += fabsf(env->rw_sprint_jump_sum) * inv;
+        env->log.rw_speed += fabsf(env->rw_speed_sum) * inv;
+        env->log.rw_block += fabsf(env->rw_block_sum) * inv;
+        env->log.rw_target += fabsf(env->rw_target_sum) * inv;
+    }
     env->log.n++;
 }
 
@@ -229,15 +262,24 @@ void c_reset(MCEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->max_dist_from_start = 0.0f;
+    env->max_height = 0.0f;
     // Update EMA of targets/episode (~20 episode window)
     env->avg_targets_ema = 0.95f * env->avg_targets_ema + 0.05f * (float)env->targets_reached;
     env->blocks_placed = 0;
     env->targets_reached = 0;
     // NOTE: lifetime_* fields are NOT reset — they drive global curriculum
+    env->sj_timer = 0;
+    env->sj_dist = 0.0f;
+
     env->sneak_ticks = 0;
-    env->place_ticks = 0;
     env->pitch_sum = 0.0f;
     env->on_ground_ticks = 0;
+
+    env->rw_air_sum = 0.0f;
+    env->rw_sprint_jump_sum = 0.0f;
+    env->rw_speed_sum = 0.0f;
+    env->rw_block_sum = 0.0f;
+    env->rw_target_sum = 0.0f;
 
     mc_new_target(env);
 
@@ -268,9 +310,11 @@ void c_step(MCEnv* env) {
     int yaw_action      = (int)env->actions[a_idx++];
     int pitch_action    = (int)env->actions[a_idx++];
     int place_action    = (int)env->actions[a_idx++];
+    int rot_pct_action  = (int)env->actions[a_idx++];
 
-    env->yaw += YAW_DELTAS[yaw_action];
-    env->pitch += PITCH_DELTAS[pitch_action];
+    float rot_pct = rot_pct_action * 0.25f;  // 0, 0.25, 0.5, 0.75, 1.0
+    env->yaw += YAW_DELTAS[yaw_action] * rot_pct;
+    env->pitch += PITCH_DELTAS[pitch_action] * rot_pct;
     if (env->pitch > 90.0f) env->pitch = 90.0f;
     if (env->pitch < -90.0f) env->pitch = -90.0f;
 
@@ -285,56 +329,26 @@ void c_step(MCEnv* env) {
     input.has_look = true;
     input.look_yaw = env->yaw;
     input.look_pitch = env->pitch;
-    input.place = (place_action == 1);
+    // place_action: 0=no, 1=single (edge-triggered), 2=repeat (every tick)
+    input.place = (place_action >= 1);
+    input.place_repeat = (place_action == 2);
     input.break_block = false;
 
 
 
-    // --- Block placement detection (only scan when place pressed) ---
-    int placed_this_tick = 0;
-    if (place_action == 1) {
-        CPlayerState pre;
-        mcenv_environment_get_player(env->mc, &pre);
-        int scan_bx = (int)floorf((float)pre.pos.x);
-        int scan_bz = (int)floorf((float)pre.pos.z);
+    // --- Tick + block placement detection ---
+    mcenv_environment_input(env->mc, input);
+    mcenv_environment_tick(env->mc);
+
+    float place_scale = 0.0f;
+    CBlockPos placed_pos;
+    if (mcenv_environment_last_placed_block(env->mc, &placed_pos)) {
         int px = (int)env->start_x, pz = (int)env->start_z;
-
-        int blocks_before = 0;
-        for (int cx = scan_bx - 5; cx <= scan_bx + 5; cx++) {
-            for (int cz = scan_bz - 5; cz <= scan_bz + 5; cz++) {
-                if (cx == px && cz == pz) continue;
-                for (int cy = 2; cy <= 3; cy++) {
-                    CBlock blk;
-                    mcenv_environment_get_block(env->mc, (CBlockPos){cx, cy, cz}, &blk);
-                    if (blk == CBLOCK_FULL_CUBE) blocks_before++;
-                }
-            }
+        if (!(placed_pos.x == px && placed_pos.z == pz) && placed_pos.y <= 5) {
+            place_scale = 1.0f;
+            env->blocks_placed++;
+            env->lifetime_blocks++;
         }
-
-        mcenv_environment_input(env->mc, input);
-        mcenv_environment_tick(env->mc);
-
-        int blocks_after = 0;
-        for (int cx = scan_bx - 5; cx <= scan_bx + 5; cx++) {
-            for (int cz = scan_bz - 5; cz <= scan_bz + 5; cz++) {
-                if (cx == px && cz == pz) continue;
-                for (int cy = 2; cy <= 3; cy++) {
-                    CBlock blk;
-                    mcenv_environment_get_block(env->mc, (CBlockPos){cx, cy, cz}, &blk);
-                    if (blk == CBLOCK_FULL_CUBE) blocks_after++;
-                }
-            }
-        }
-        placed_this_tick = blocks_after - blocks_before;
-        if (placed_this_tick < 0) placed_this_tick = 0;
-    } else {
-        mcenv_environment_input(env->mc, input);
-        mcenv_environment_tick(env->mc);
-    }
-
-    if (placed_this_tick > 0) {
-        env->blocks_placed += placed_this_tick;
-        env->lifetime_blocks += placed_this_tick;
     }
 
     CPlayerState state;
@@ -342,7 +356,6 @@ void c_step(MCEnv* env) {
 
     // Diagnostics
     if (sneak_action == 1) env->sneak_ticks++;
-    if (place_action == 1) env->place_ticks++;
     env->pitch_sum += env->pitch;
     if (state.on_ground) env->on_ground_ticks++;
 
@@ -353,41 +366,64 @@ void c_step(MCEnv* env) {
 
     float block_weight = 1.0f;
     float target_weight = 0.0f;
-    int require_ground = 1;
+    int require_ground = 0;
     if (phase >= 1) {
         target_weight = 1.0f;
+        block_weight = 0.25f;
         if (phase >= 2) {
-            require_ground = 0;
-            block_weight = 0.0f;  // No explicit block reward — bridges are instrumental
+            block_weight = 0.0f;
         }
     }
 
     // ---- Reward computation ----
     float reward = 0.0f;
+    float rw_air = 0.0f, rw_sprint_jump = 0.0f, rw_speed = 0.0f;
+    float rw_block = 0.0f, rw_target = 0.0f;
 
-    // 1. Survival / movement shaping
-    if (phase < 2) {
-        if (state.on_ground) reward += env->rw_survival;
-    } else {
-        // Phase 2: small sprint-jump combo bonus (doesn't dominate speed/target)
-        if (state.on_ground && forward_action == 2 && sprint_action == 1 && jump_action == 1)
-            reward += 0.2f;
-        // Punish standing on stacked blocks (not at bridge level y=3)
-        if (state.on_ground && fabsf((float)state.pos.y - MC_START_Y) > 0.5f)
-            reward -= 0.5f;
+    // 1. Movement shaping (phase 1+)
+    if (phase >= 1) {
+        if (!state.on_ground) { reward += 0.1f; rw_air += 0.1f; }
     }
 
     // 2. Speed: getting closer to target (phases 1+2)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
+
+    // Sprint-jump progress reward, scaled by facing-toward-target dot product
+    if (phase >= 1) {
+        float yaw_rad = env->yaw * (3.14159265f / 180.0f);
+        float face_x = -sinf(yaw_rad), face_z = cosf(yaw_rad);
+        float tgt_dx = env->target_x - (float)state.pos.x;
+        float tgt_dz = env->target_z - (float)state.pos.z;
+        float tgt_len = sqrtf(tgt_dx * tgt_dx + tgt_dz * tgt_dz);
+        float dot = 0.0f;
+        if (tgt_len > 0.01f) dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
+        if (dot < 0.0f) dot = 0.0f;
+
+        if (env->sj_timer > 0) {
+            env->sj_timer--;
+            if (env->sj_dist - dist > 0.3f) {
+                float sj_rw = 100.0f * dot;
+                reward += sj_rw; rw_sprint_jump += sj_rw;
+                env->sj_timer = 0;
+            }
+        }
+        if (forward_action == 2 && sprint_action == 1 && jump_action == 1) {
+            env->sj_timer = 20;
+            env->sj_dist = dist;
+        }
+    }
     if (target_weight > 0.0f && (!require_ground || state.on_ground)) {
         float delta_dist = env->prev_dist - dist;
-        reward += env->rw_speed * delta_dist * target_weight;
+        float s_rw = env->rw_speed * delta_dist * target_weight;
+        reward += s_rw; rw_speed += s_rw;
     }
     env->prev_dist = dist;
 
     // 3. Block placement reward
-    if (placed_this_tick > 0 && block_weight > 0.0f) {
-        reward += env->rw_block * placed_this_tick * block_weight;
+    if (place_scale > 0.0f && block_weight > 0.0f) {
+        float air_mult = state.on_ground ? 1.0f : 4.0f;
+        float b_rw = env->rw_block * place_scale * block_weight * air_mult;
+        reward += b_rw; rw_block += b_rw;
     }
 
     // 4. Target reached — always detect, reward with time bonus in phases 1+2
@@ -395,12 +431,19 @@ void c_step(MCEnv* env) {
         if (target_weight > 0.0f) {
             float escalate = 1.0f + 0.5f * (float)env->targets_reached;
             float time_bonus = 1.0f + (float)(env->max_ticks - env->tick) / (float)env->max_ticks;
-            reward += env->rw_target_reach * escalate * time_bonus * target_weight;
+            float t_rw = env->rw_target_reach * escalate * time_bonus * target_weight;
+            reward += t_rw; rw_target += t_rw;
         }
         env->targets_reached++;
         mc_new_target(env);
         dist = env->prev_dist;
     }
+
+    env->rw_air_sum += rw_air;
+    env->rw_sprint_jump_sum += rw_sprint_jump;
+    env->rw_speed_sum += rw_speed;
+    env->rw_block_sum += rw_block;
+    env->rw_target_sum += rw_target;
 
     // Track progress
     float dist_from_start = sqrtf(
@@ -409,7 +452,10 @@ void c_step(MCEnv* env) {
     if (dist_from_start > env->max_dist_from_start) {
         env->max_dist_from_start = dist_from_start;
     }
-
+    float height = (float)state.pos.y - env->start_y;
+    if (height > env->max_height) {
+        env->max_height = height;
+    }
 
 
     // Termination
@@ -433,9 +479,10 @@ void c_step(MCEnv* env) {
     }
 }
 
-static const char* FWD_NAMES[3]   = {"back", "none", "fwd"};
-static const char* STR_NAMES[3]   = {"right", "none", "left"};
-static const char* BOOL_NAMES[2]  = {"no", "yes"};
+static const char* FWD_NAMES[3]   = {"back", "none", " fwd"};
+static const char* STR_NAMES[3]   = {" rgt", "none", "left"};
+static const char* BOOL_NAMES[2]  = {" no", "yes"};
+static const char* PLACE_NAMES[3] = {"  no", " sgl", " rpt"};
 
 void c_render(MCEnv* env) {
     if (env->renderer == NULL) {
@@ -466,19 +513,22 @@ void c_render(MCEnv* env) {
     int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
     int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
     int sprint= (int)env->actions[4]; if ((unsigned)sprint>= 2) sprint= 0;
-    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 11) yaw_i = 5;
+    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
     int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 7) pit_i = 3;
-    int place = (int)env->actions[7]; if ((unsigned)place >= 2) place = 0;
+    int place = (int)env->actions[7]; if ((unsigned)place >= 3) place = 0;
+    int rot_i = (int)env->actions[8]; if ((unsigned)rot_i >= 5) rot_i = 0;
+    float rot_pct_hud = rot_i * 0.25f;
     {
         CPlayerState s;
         mcenv_environment_get_player(env->mc, &s);
         float d = mc_dist_to_target(env, s.pos.x, s.pos.z);
         int phase = mc_get_phase(env);
         snprintf(hud, sizeof(hud),
-            "fwd=%s str=%s jmp=%s snk=%s spr=%s place=%s yaw=%+.0f pit=%+.0f | t=%d tgt=%.0f,%.0f dist=%.1f reached=%d blk=%d ph=%d%s%s",
+            "fwd=%s str=%s jmp=%s snk=%s spr=%s plc=%s yaw=%+7.1f pit=%+7.1f rot=%.2f | t=%4d tgt=%5.0f,%5.0f dist=%5.1f rch=%2d blk=%3d ph=%d%s%s",
             FWD_NAMES[fwd], STR_NAMES[str], BOOL_NAMES[jump],
-            BOOL_NAMES[sneak], BOOL_NAMES[sprint], BOOL_NAMES[place],
-            YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
+            BOOL_NAMES[sneak], BOOL_NAMES[sprint], PLACE_NAMES[place],
+            YAW_DELTAS[yaw_i] * rot_pct_hud, PITCH_DELTAS[pit_i] * rot_pct_hud,
+            rot_pct_hud,
             env->tick, env->target_x, env->target_z,
             d, env->targets_reached, env->blocks_placed,
             phase, env->force_phase2 ? "[P]" : "",

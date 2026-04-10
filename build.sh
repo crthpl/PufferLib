@@ -121,6 +121,8 @@ elif [ "$ENV" = "mcenv" ]; then
     MCENV_DIR="${MCENV_DIR:-$HOME/dev/mcenv-codex}"
     INCLUDES+=(-I"$MCENV_DIR/include")
     LINK_ARCHIVES+=("$MCENV_DIR/target/release/libmcenv_codex.a")
+    MCENV_CUDA_SRC="ocean/mcenv/cuda/mcenv_cuda.cu"
+    MCENV_CUDA_INC="-Iocean/mcenv/cuda"
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
@@ -238,6 +240,19 @@ if [ -z "$OBS_TENSOR_T" ]; then
 fi
 
 if [ -z "$MODE" ]; then
+    # Compile env-specific CUDA kernel if present (e.g. mcenv)
+    MCENV_CUDA_OBJ=""
+    if [ -n "$MCENV_CUDA_SRC" ] && [ -f "$MCENV_CUDA_SRC" ]; then
+        echo "Compiling mcenv CUDA kernel..."
+        $NVCC -c -arch=$ARCH -Xcompiler -fPIC \
+            -std=c++17 \
+            $MCENV_CUDA_INC \
+            -I$CUDA_HOME/include \
+            $NVCC_OPT \
+            "$MCENV_CUDA_SRC" -o build/mcenv_cuda.o
+        MCENV_CUDA_OBJ="build/mcenv_cuda.o"
+    fi
+
     echo "Compiling CUDA ($ARCH) training backend..."
     $NVCC -c -arch=$ARCH -Xcompiler -fPIC \
         -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
@@ -255,7 +270,7 @@ if [ -z "$MODE" ]; then
 
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
+        build/bindings.o $MCENV_CUDA_OBJ "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
         $OMP_LIB $LINK_OPT

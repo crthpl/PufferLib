@@ -193,7 +193,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if args['wandb']:
         import wandb
         run_id = wandb.util.generate_id()
-        wandb.init(id=run_id, config=args,
+        wandb.init(id=run_id, config=args, name=args['wandb_name'],
             project=args['wandb_project'], group=args['wandb_group'],
             tags=[args['tag']] if args['tag'] is not None else [],
             settings=wandb.Settings(console="off"),
@@ -217,6 +217,18 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
+    load_path = args.get('load_model_path')
+    if load_path == 'latest':
+        pattern = os.path.join(args['checkpoint_dir'], args['env_name'], '**', '*.bin')
+        candidates = glob.glob(pattern, recursive=True)
+        if candidates:
+            load_path = max(candidates, key=os.path.getctime)
+        else:
+            load_path = None
+    if load_path is not None:
+        backend.load_weights(pufferl, load_path)
+        print(f'Loaded weights from {load_path}')
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
@@ -233,7 +245,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if epoch < train_epochs:
             backend.train(pufferl)
 
-        if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
+        if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1):
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
 
@@ -441,6 +453,7 @@ def load_config(env_name):
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
+    parser.add_argument('--wandb-name', type=str, default=None)
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
     parser.add_argument('--save-frames', type=int, default=0)
