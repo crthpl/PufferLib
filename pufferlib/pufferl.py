@@ -248,6 +248,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1):
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
+            # Save policy config for eval
+            import json
+            config_path = os.path.join(checkpoint_dir, 'policy_config.json')
+            if not os.path.exists(config_path):
+                json.dump(args.get('policy', {}), open(config_path, 'w'))
 
         # Rate limit, but always log for eval to maintain determinism
         if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
@@ -413,6 +418,32 @@ def sweep(env_name, args=None, pareto=False):
         train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
             sweep_obj=sweep_obj, result_queue=result_queue)
 
+def _load_policy_config(args, checkpoint_dir):
+    '''Load policy config from policy_config.json or wandb run config.'''
+    import json, yaml
+    # Try policy_config.json first (new checkpoints)
+    config_path = os.path.join(checkpoint_dir, 'policy_config.json')
+    if os.path.exists(config_path):
+        saved = json.load(open(config_path))
+        for k, v in saved.items():
+            args['policy'][k] = type(args['policy'].get(k, v))(v)
+        print(f'Loaded policy config from {config_path}')
+        return
+    # Fall back to wandb config (old checkpoints)
+    run_id = os.path.basename(checkpoint_dir)
+    wandb_dirs = glob.glob(os.path.join('wandb', f'run-*-{run_id}', 'files', 'config.yaml'))
+    if wandb_dirs:
+        with open(wandb_dirs[0]) as f:
+            wandb_config = yaml.safe_load(f)
+        policy = wandb_config.get('policy', {})
+        if isinstance(policy, dict) and 'value' in policy:
+            policy = policy['value']
+        if isinstance(policy, dict):
+            for k, v in policy.items():
+                if k in args['policy']:
+                    args['policy'][k] = type(args['policy'][k])(v)
+            print(f'Loaded policy config from wandb run {run_id}')
+
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy. Supports both native and --slowly torch backends.'''
     args = args or load_config(env_name)
@@ -431,8 +462,19 @@ def eval(env_name, args=None, load_path=None):
         if not candidates:
             raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
         load_path = max(candidates, key=os.path.getctime)
+    elif load_path and os.path.isdir(load_path):
+        candidates = sorted(glob.glob(os.path.join(load_path, '*.bin')))
+        if not candidates:
+            raise FileNotFoundError(f'No .bin checkpoints found in {load_path}/')
+        load_path = candidates[-1]
 
     if load_path is not None:
+        # Auto-detect policy config from checkpoint directory
+        checkpoint_parent = os.path.dirname(load_path)
+        _load_policy_config(args, checkpoint_parent)
+        # Recreate pufferl with correct policy config
+        backend = _resolve_backend(args)
+        pufferl = backend.create_pufferl(args)
         backend.load_weights(pufferl, load_path)
         print(f'Loaded weights from {load_path}')
 
