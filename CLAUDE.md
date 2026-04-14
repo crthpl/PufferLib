@@ -27,6 +27,8 @@ Multi-GPU: `torchrun --nproc-per-node=N -m pufferlib.pufferl train ENV_NAME`
 
 Config overrides use dot notation: `--train.learning-rate 0.001 --env.max-ticks 2000`
 
+Always use `--wandb` with a descriptive `--wandb-name` for training runs. Use names that describe what's being tested (e.g., `ablate-no-block`, `speed-3.75-fall-125`, `sweep-repro-1e46cuax`). This keeps the wandb project navigable — hundreds of unnamed runs make the dashboard unusable.
+
 ## Architecture
 
 PufferLib 4.0 is a GPU-native RL training framework. Three layers:
