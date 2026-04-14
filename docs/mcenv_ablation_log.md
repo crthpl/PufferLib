@@ -423,6 +423,3 @@ For warmstarting RL with demonstration data. See CLAUDE.md for full instructions
 - `~/dev/mcenv-codex/` — Rust physics engine with recording infrastructure
 - `tools/bc_train.py` — BC trainer (must update constants to match current action/obs layout)
 
-### What's Committed
-
-All changes from this session are committed and pushed to `fork` remote (github.com/crthpl/PufferLib, branch 4.0). The code is in a clean state with MC_BC_ACTIONS enabled as the best action space.
