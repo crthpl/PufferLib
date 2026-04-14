@@ -1,6 +1,9 @@
 #ifndef MCENV_CUDA_CUH
 #define MCENV_CUDA_CUH
 
+// #define MC_FULL_ANGLE  // Fine-grained angle — must match binding.c
+#define MC_BC_ACTIONS  // Best action space — must match binding.c
+
 #include <cstdint>
 #include "math.cuh"
 
@@ -167,6 +170,7 @@ struct McEnvState {
     int   lifetime_blocks;
     float avg_targets_ema;
     int   phase2_unlocked;
+    int   phase3_unlocked;
 
     // Sprint-jump progress tracking
     int   sj_timer;
@@ -184,6 +188,10 @@ struct McEnvState {
     float rw_speed_sum;
     float rw_block_sum;
     float rw_target_sum;
+    float rw_look_reversal_sum;
+
+    // Yaw reversal tracking
+    float prev_yaw_delta;
 
     // RNG
     unsigned int rng;
@@ -200,9 +208,16 @@ struct McEnvConfig {
     float rw_fall;
     float rw_speed;
     float rw_target_reach;
+    float rw_look_reversal;
     int   curriculum_phase;
     int   phase_transition;
     int   force_phase2;
+    float rw_sprint_jump;
+    int   require_ground;
+    float fall_scale_phase1;
+    float speed_power;
+    int   rot_pct_enabled;
+    int   place_repeat_enabled;
 };
 
 // ---------------------------------------------------------------------------
@@ -229,6 +244,7 @@ struct McEnvLog {
     float rw_speed;
     float rw_block;
     float rw_target;
+    float rw_look_reversal;
     float n;
 };
 
@@ -243,7 +259,11 @@ struct McEnvLog {
 #define MC_GRID_Z 7  // -3 to +3
 #define MC_OBS_GRID (MC_GRID_X * MC_GRID_Y * MC_GRID_Z)
 #define MC_OBS_TOTAL (MC_OBS_PLAYER + MC_OBS_TARGET + MC_OBS_GRID)
+#if defined(MC_BC_ACTIONS)
 #define MC_NUM_ATNS 9
+#else
+#define MC_NUM_ATNS 8
+#endif
 
 #define MC_START_X 25.5f
 #define MC_START_Y 3.0f
@@ -259,8 +279,16 @@ struct McEnvLog {
 // Lookup tables (action decoding)
 // ---------------------------------------------------------------------------
 
-__device__ __constant__ float d_YAW_DELTAS[7]   = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
+#if defined(MC_FULL_ANGLE)
+__device__ __constant__ float d_YAW_DELTAS[153] = {-180.0f, -178.0f, -174.0f, -170.0f, -166.0f, -162.0f, -158.0f, -154.0f, -150.0f, -146.0f, -142.0f, -138.0f, -134.0f, -130.0f, -126.0f, -122.0f, -118.0f, -114.0f, -110.0f, -106.0f, -102.0f, -98.0f, -94.0f, -90.0f, -88.0f, -86.0f, -84.0f, -82.0f, -80.0f, -78.0f, -76.0f, -74.0f, -72.0f, -70.0f, -68.0f, -66.0f, -64.0f, -62.0f, -60.0f, -58.0f, -56.0f, -54.0f, -52.0f, -50.0f, -48.0f, -46.0f, -44.0f, -42.0f, -40.0f, -38.0f, -36.0f, -34.0f, -32.0f, -30.0f, -28.0f, -26.0f, -24.0f, -22.0f, -20.0f, -18.0f, -16.0f, -15.0f, -14.0f, -13.0f, -12.0f, -11.0f, -10.0f, -9.0f, -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f, 34.0f, 36.0f, 38.0f, 40.0f, 42.0f, 44.0f, 46.0f, 48.0f, 50.0f, 52.0f, 54.0f, 56.0f, 58.0f, 60.0f, 62.0f, 64.0f, 66.0f, 68.0f, 70.0f, 72.0f, 74.0f, 76.0f, 78.0f, 80.0f, 82.0f, 84.0f, 86.0f, 88.0f, 90.0f, 94.0f, 98.0f, 102.0f, 106.0f, 110.0f, 114.0f, 118.0f, 122.0f, 126.0f, 130.0f, 134.0f, 138.0f, 142.0f, 146.0f, 150.0f, 154.0f, 158.0f, 162.0f, 166.0f, 170.0f, 174.0f, 178.0f, 180.0f};
+__device__ __constant__ float d_PITCH_DELTAS[107] = {-90.0f, -88.0f, -86.0f, -84.0f, -82.0f, -80.0f, -78.0f, -76.0f, -74.0f, -72.0f, -70.0f, -68.0f, -66.0f, -64.0f, -62.0f, -60.0f, -58.0f, -56.0f, -54.0f, -52.0f, -50.0f, -48.0f, -46.0f, -44.0f, -42.0f, -40.0f, -38.0f, -36.0f, -34.0f, -32.0f, -30.0f, -28.0f, -26.0f, -24.0f, -22.0f, -20.0f, -18.0f, -16.0f, -15.0f, -14.0f, -13.0f, -12.0f, -11.0f, -10.0f, -9.0f, -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f, 34.0f, 36.0f, 38.0f, 40.0f, 42.0f, 44.0f, 46.0f, 48.0f, 50.0f, 52.0f, 54.0f, 56.0f, 58.0f, 60.0f, 62.0f, 64.0f, 66.0f, 68.0f, 70.0f, 72.0f, 74.0f, 76.0f, 78.0f, 80.0f, 82.0f, 84.0f, 86.0f, 88.0f, 90.0f};
+#elif defined(MC_BC_ACTIONS)
+__device__ __constant__ float d_YAW_DELTAS[7]    = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
 __device__ __constant__ float d_PITCH_DELTAS[7]  = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
+#else
+__device__ __constant__ float d_YAW_DELTAS[25]   = {-180.0f,-135.0f,-90.0f,-45.0f,-15.0f,-11.25f,-7.5f,-3.75f,-1.0f,-0.75f,-0.5f,-0.25f,0.0f,0.25f,0.5f,0.75f,1.0f,3.75f,7.5f,11.25f,15.0f,45.0f,90.0f,135.0f,180.0f};
+__device__ __constant__ float d_PITCH_DELTAS[25] = {-180.0f,-135.0f,-90.0f,-45.0f,-15.0f,-11.25f,-7.5f,-3.75f,-1.0f,-0.75f,-0.5f,-0.25f,0.0f,0.25f,0.5f,0.75f,1.0f,3.75f,7.5f,11.25f,15.0f,45.0f,90.0f,135.0f,180.0f};
+#endif
 
 // ---------------------------------------------------------------------------
 // RNG — xorshift32 (replaces rand_r for GPU)
@@ -383,19 +411,30 @@ __host__ __device__ inline void mc_new_target(McEnvState* s) {
 }
 
 __host__ __device__ inline int mc_get_phase(const McEnvState* s, const McEnvConfig* cfg) {
-    // TEMP: phase 2 disabled — cap at 1
     if (cfg->force_phase2) return 2;
     int pt = cfg->phase_transition;
-    if (pt <= 0) return cfg->curriculum_phase < 2 ? cfg->curriculum_phase : 1;
+    if (pt <= 0) return cfg->curriculum_phase;
+    if (s->phase3_unlocked) return 3;
+    if (s->lifetime_blocks >= pt * 5 && s->phase2_unlocked) return 2;
     if (s->lifetime_blocks >= pt) return 1;
     return 0;
 }
 
 __host__ __device__ inline int mc_get_phase_mut(McEnvState* s, const McEnvConfig* cfg) {
-    // TEMP: phase 2 disabled — cap at 1
     if (cfg->force_phase2) return 2;
     int pt = cfg->phase_transition;
-    if (pt <= 0) return cfg->curriculum_phase < 2 ? cfg->curriculum_phase : 1;
+    if (pt <= 0) return cfg->curriculum_phase;
+    if (s->phase3_unlocked) return 3;
+    if (s->lifetime_blocks >= pt * 5) {
+        if (!s->phase2_unlocked && s->avg_targets_ema > 2.0f)
+            s->phase2_unlocked = 1;
+        if (s->phase2_unlocked) {
+            if (!s->phase3_unlocked && s->avg_targets_ema > 4.0f)
+                s->phase3_unlocked = 1;
+            if (s->phase3_unlocked) return 3;
+            return 2;
+        }
+    }
     if (s->lifetime_blocks >= pt) return 1;
     return 0;
 }
@@ -417,7 +456,7 @@ __host__ __device__ inline void mcenv_add_log(McEnvLog* log, const McEnvState* s
     log->phase += (float)mc_get_phase(s, cfg);
     float rw_total = fabsf(s->rw_air_sum) + fabsf(s->rw_sprint_jump_sum)
                     + fabsf(s->rw_speed_sum) + fabsf(s->rw_block_sum)
-                    + fabsf(s->rw_target_sum);
+                    + fabsf(s->rw_target_sum) + fabsf(s->rw_look_reversal_sum);
     if (rw_total > 0.0f) {
         float inv = 1.0f / rw_total;
         log->rw_air += fabsf(s->rw_air_sum) * inv;
@@ -425,6 +464,7 @@ __host__ __device__ inline void mcenv_add_log(McEnvLog* log, const McEnvState* s
         log->rw_speed += fabsf(s->rw_speed_sum) * inv;
         log->rw_block += fabsf(s->rw_block_sum) * inv;
         log->rw_target += fabsf(s->rw_target_sum) * inv;
+        log->rw_look_reversal += fabsf(s->rw_look_reversal_sum) * inv;
     }
     log->n++;
 }
@@ -439,6 +479,7 @@ __host__ __device__ inline void mcenv_full_init(
     s->lifetime_blocks = 0;
     s->avg_targets_ema = 0.0f;
     s->phase2_unlocked = 0;
+    s->phase3_unlocked = 0;
     s->targets_reached = 0;
     s->blocks_placed = 0;
     s->rng = (unsigned int)(env_idx + 1);

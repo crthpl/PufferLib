@@ -120,6 +120,7 @@ class PuffeRL:
 
         self._vec = vec
         self.gpu = vec.gpu
+        self._gpu_native = getattr(vec, 'gpu_native', 0) and vec.gpu
         total_agents = vec.total_agents
         self.total_agents = total_agents
         obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
@@ -230,7 +231,10 @@ class PuffeRL:
             actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
             if self.gpu:
                 actions_flat = actions_flat.cuda()
-                self._vec.gpu_step(actions_flat.data_ptr())
+                if self._gpu_native:
+                    self._vec.gpu_native_step(actions_flat.data_ptr())
+                else:
+                    self._vec.gpu_step(actions_flat.data_ptr())
                 torch.cuda.synchronize()
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())

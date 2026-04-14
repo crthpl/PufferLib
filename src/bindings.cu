@@ -129,6 +129,51 @@ void render(pybind11::object pufferl_obj, int env_id) {
     static_vec_render(pufferl.vec, env_id);
 }
 
+static void dump_tensor(const char* path, const void* gpu_data, int64_t bytes) {
+    void* host = malloc(bytes);
+    cudaMemcpy(host, gpu_data, bytes, cudaMemcpyDeviceToHost);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(host, 1, bytes, f); fclose(f); }
+    free(host);
+}
+
+static void dump_puf(const char* prefix, const char* name, PrecisionTensor t) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s_%s.bin", prefix, name);
+    dump_tensor(path, t.data, numel(t.shape) * PRECISION_SIZE);
+}
+
+static void dump_epoch(const char* prefix, PuffeRL& pufferl) {
+    cudaDeviceSynchronize();
+    RolloutBuf& r = pufferl.rollouts;
+    dump_puf(prefix, "obs", r.observations);
+    dump_puf(prefix, "actions", r.actions);
+    dump_puf(prefix, "values", r.values);
+    dump_puf(prefix, "logprobs", r.logprobs);
+    dump_puf(prefix, "rewards", r.rewards);
+    dump_puf(prefix, "terminals", r.terminals);
+
+    // Env buffers (float, not precision_t)
+    EnvBuf& e = pufferl.env;
+    int total = pufferl.hypers.total_agents;
+    char path[256];
+    snprintf(path, sizeof(path), "%s_env_obs.bin", prefix);
+    dump_tensor(path, e.obs.data, (int64_t)total * e.obs.shape[1] * sizeof(float));
+    snprintf(path, sizeof(path), "%s_env_rew.bin", prefix);
+    dump_tensor(path, e.rewards.data, (int64_t)total * sizeof(float));
+    snprintf(path, sizeof(path), "%s_env_term.bin", prefix);
+    dump_tensor(path, e.terminals.data, (int64_t)total * sizeof(float));
+    snprintf(path, sizeof(path), "%s_env_act.bin", prefix);
+    dump_tensor(path, e.actions.data, (int64_t)total * e.actions.shape[1] * sizeof(float));
+
+    // Model params
+    snprintf(path, sizeof(path), "%s_params.bin", prefix);
+    dump_tensor(path, pufferl.master_weights.data,
+        numel(pufferl.master_weights.shape) * sizeof(float));
+
+    fprintf(stderr, "Dumped epoch to %s_*.bin\n", prefix);
+}
+
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
@@ -150,6 +195,7 @@ void rollouts(pybind11::object pufferl_obj) {
     pufferl.profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
     pufferl.profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
     pufferl.global_step += pufferl.hypers.horizon * pufferl.hypers.total_agents;
+
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {
@@ -305,6 +351,17 @@ void gpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
     {
         py::gil_scoped_release no_gil;
         gpu_vec_step(ve.vec);
+    }
+}
+
+void gpu_native_vec_step_py(VecEnv& ve, long long actions_ptr) {
+    // Copy actions directly into gpu_actions (already on GPU)
+    cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float),
+        cudaMemcpyDeviceToDevice);
+    {
+        py::gil_scoped_release no_gil;
+        gpu_native_vec_step(ve.vec);
     }
 }
 
@@ -550,7 +607,9 @@ PYBIND11_MODULE(_C, m) {
         .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
         .def("reset", &vec_reset)
         .def("gpu_step", &gpu_vec_step_py)
+        .def("gpu_native_step", &gpu_native_vec_step_py)
         .def("cpu_step", &cpu_vec_step_py)
+        .def_property_readonly("gpu_native", [](VecEnv& ve) { return ve.vec->gpu_native; })
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log",   &vec_log)
         .def("close", &vec_close);

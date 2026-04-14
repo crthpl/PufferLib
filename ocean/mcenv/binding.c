@@ -1,7 +1,17 @@
+// #define MC_FULL_ANGLE  // Fine-grained angle: 153 yaw × 107 pitch, no rot_pct
+#define MC_BC_ACTIONS  // Best action space: 7 yaw/pitch + rot_pct + 3-way place
 #include "mcenv.h"
 #define OBS_SIZE MC_OBS_TOTAL
+#if defined(MC_FULL_ANGLE)
+#define NUM_ATNS 8
+#define ACT_SIZES {3, 3, 2, 2, 2, 153, 107, 3}
+#elif defined(MC_BC_ACTIONS)
 #define NUM_ATNS 9
 #define ACT_SIZES {3, 3, 2, 2, 2, 7, 7, 3, 5}
+#else
+#define NUM_ATNS 8
+#define ACT_SIZES {3, 3, 2, 2, 2, 25, 25, 3}
+#endif
 #define OBS_TENSOR_T FloatTensor
 
 #define Env MCEnv
@@ -61,9 +71,16 @@ void my_gpu_native_init(StaticVec* vec, Dict* env_kwargs) {
         float rw_fall;
         float rw_speed;
         float rw_target_reach;
+        float rw_look_reversal;
         int   curriculum_phase;
         int   phase_transition;
         int   force_phase2;
+        float rw_sprint_jump;
+        int   require_ground;
+        float fall_scale_phase1;
+        float speed_power;
+        int   rot_pct_enabled;
+        int   place_repeat_enabled;
     } h_config;
     h_config.max_ticks       = (int)dict_get(env_kwargs, "max_ticks")->value;
     h_config.rw_survival     = (float)dict_get_or(env_kwargs, "rw_survival",     MC_SURVIVAL_DEFAULT);
@@ -71,9 +88,16 @@ void my_gpu_native_init(StaticVec* vec, Dict* env_kwargs) {
     h_config.rw_fall         = (float)dict_get_or(env_kwargs, "rw_fall",         MC_FALL_DEFAULT);
     h_config.rw_speed        = (float)dict_get_or(env_kwargs, "rw_speed",        MC_SPEED_DEFAULT);
     h_config.rw_target_reach = (float)dict_get_or(env_kwargs, "rw_target_reach", MC_TARGET_DEFAULT);
+    h_config.rw_look_reversal = (float)dict_get_or(env_kwargs, "rw_look_reversal", MC_LOOK_REVERSAL_DEFAULT);
     h_config.curriculum_phase = (int)dict_get_or(env_kwargs, "curriculum_phase", 0);
     h_config.phase_transition = (int)dict_get_or(env_kwargs, "phase_transition", 0);
     h_config.force_phase2    = (int)dict_get_or(env_kwargs, "force_phase2",     0);
+    h_config.rw_sprint_jump  = (float)dict_get_or(env_kwargs, "rw_sprint_jump",  MC_SPRINT_JUMP_DEFAULT);
+    h_config.require_ground  = (int)dict_get_or(env_kwargs, "require_ground",   MC_REQUIRE_GROUND_DEFAULT);
+    h_config.fall_scale_phase1 = (float)dict_get_or(env_kwargs, "fall_scale_phase1", MC_FALL_SCALE_PHASE1_DEFAULT);
+    h_config.speed_power     = (float)dict_get_or(env_kwargs, "speed_power",     MC_SPEED_POWER_DEFAULT);
+    h_config.rot_pct_enabled = (int)dict_get_or(env_kwargs, "rot_pct_enabled", MC_ROT_PCT_ENABLED_DEFAULT);
+    h_config.place_repeat_enabled = (int)dict_get_or(env_kwargs, "place_repeat_enabled", MC_PLACE_REPEAT_ENABLED_DEFAULT);
     mcenv_cuda_upload_config(d_config, (const McEnvConfig*)&h_config);
 
     vec->gpu_env_states = d_states;
@@ -158,12 +182,20 @@ void my_init(Env* env, Dict* kwargs) {
     env->rw_fall         = (float)dict_get_or(kwargs, "rw_fall",         MC_FALL_DEFAULT);
     env->rw_speed        = (float)dict_get_or(kwargs, "rw_speed",        MC_SPEED_DEFAULT);
     env->rw_target_reach = (float)dict_get_or(kwargs, "rw_target_reach", MC_TARGET_DEFAULT);
+    env->rw_look_reversal = (float)dict_get_or(kwargs, "rw_look_reversal", MC_LOOK_REVERSAL_DEFAULT);
     env->curriculum_phase = (int)dict_get_or(kwargs, "curriculum_phase", 0);
     env->phase_transition = (int)dict_get_or(kwargs, "phase_transition", 0);
     env->lifetime_blocks = 0;
     env->avg_targets_ema = 0.0f;
     env->phase2_unlocked = 0;
+    env->phase3_unlocked = 0;
     env->force_phase2 = (int)dict_get_or(kwargs, "force_phase2", 0);
+    env->rw_sprint_jump  = (float)dict_get_or(kwargs, "rw_sprint_jump",  MC_SPRINT_JUMP_DEFAULT);
+    env->require_ground  = (int)dict_get_or(kwargs, "require_ground",   MC_REQUIRE_GROUND_DEFAULT);
+    env->fall_scale_phase1 = (float)dict_get_or(kwargs, "fall_scale_phase1", MC_FALL_SCALE_PHASE1_DEFAULT);
+    env->speed_power     = (float)dict_get_or(kwargs, "speed_power",     MC_SPEED_POWER_DEFAULT);
+    env->rot_pct_enabled = (int)dict_get_or(kwargs, "rot_pct_enabled", MC_ROT_PCT_ENABLED_DEFAULT);
+    env->place_repeat_enabled = (int)dict_get_or(kwargs, "place_repeat_enabled", MC_PLACE_REPEAT_ENABLED_DEFAULT);
 }
 
 void my_log(Log* log, Dict* out) {
@@ -185,4 +217,5 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "rw_speed", log->rw_speed);
     dict_set(out, "rw_block", log->rw_block);
     dict_set(out, "rw_target", log->rw_target);
+    dict_set(out, "rw_look_reversal", log->rw_look_reversal);
 }

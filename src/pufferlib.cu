@@ -522,6 +522,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         rew_dst.data, env.rewards.data + start, n);
 
+
     PrecisionTensor term_dst = puf_slice(rollouts.terminals, t, start, block_size);
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         term_dst.data, env.terminals.data + start, n);

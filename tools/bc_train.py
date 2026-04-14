@@ -39,11 +39,23 @@ MC_GRID_Z = 7
 MC_OBS_GRID = MC_GRID_X * MC_GRID_Y * MC_GRID_Z
 MC_OBS_TOTAL = MC_OBS_PLAYER + MC_OBS_TARGET + MC_OBS_GRID
 
-ACT_SIZES = [3, 3, 2, 2, 2, 7, 7, 3, 5]
+ACT_SIZES = [3, 3, 2, 2, 2, 153, 107, 3]
 NUM_ATNS = len(ACT_SIZES)
 
-YAW_DELTAS = [-180.0, -15.0, -1.0, 0.0, 1.0, 15.0, 180.0]
-PITCH_DELTAS = [-180.0, -15.0, -1.0, 0.0, 1.0, 15.0, 180.0]
+# Full angle tables: 0-16@1°, 16-90@2°, 90-180@4° (yaw only for coarse)
+_fine = list(range(1, 17))
+_medium = list(range(18, 91, 2))
+_coarse = list(range(94, 179, 4)) + [180]
+_yaw_pos = _fine + _medium + _coarse
+YAW_DELTAS = [-v for v in reversed(_yaw_pos)] + [0.0] + [float(v) for v in _yaw_pos]
+_pitch_pos = _fine + _medium
+PITCH_DELTAS = [-v for v in reversed(_pitch_pos)] + [0.0] + [float(v) for v in _pitch_pos]
+assert len(YAW_DELTAS) == 153
+assert len(PITCH_DELTAS) == 107
+
+# Index of 0.0 in each table (for no-rotation default)
+YAW_ZERO = YAW_DELTAS.index(0.0)
+PITCH_ZERO = PITCH_DELTAS.index(0.0)
 
 # ---------------------------------------------------------------------------
 # Recording parser (mirrors recording.rs binary format)
@@ -142,27 +154,31 @@ def compute_obs(state, yaw, pitch, target_x, target_z, blocks):
     return obs
 
 
-def recording_to_sequence(path, target_x=None, target_z=None):
-    """Convert a recording to a single (obs_seq, act_seq) sequence.
+def nearest_bucket(delta, table):
+    """Find index of nearest value in a sorted table."""
+    best_i, best_err = 0, abs(delta - table[0])
+    for i in range(1, len(table)):
+        err = abs(delta - table[i])
+        if err < best_err:
+            best_i, best_err = i, err
+    return best_i
 
-    Handles fps != tps correctly:
-    - fps > tps: multiple INPUTs before TICK — uses last input, but computes
-      yaw/pitch delta from tick states (captures accumulated camera movement)
-    - fps < tps: multiple TICKs per INPUT — emits zero-rotation action for
-      extra ticks, reusing movement/button state from the input
+
+def recording_to_sequence(path, target_x=None, target_z=None):
+    """Convert a recording to (obs_seq, act_seq, yaw_deltas, pitch_deltas).
+
+    Returns continuous yaw/pitch deltas alongside discrete actions for soft-target training.
     """
     initial_player, initial_blocks, events = load_recording(path)
     blocks = set(initial_blocks)
 
-    # Track yaw/pitch from tick states for accurate delta computation
     prev_tick_yaw = initial_player['yaw']
     prev_tick_pitch = initial_player['pitch']
 
-    # Default target; overridden by Target events in recording
     if target_x is None: target_x = 40.5
     if target_z is None: target_z = 40.5
 
-    all_obs, all_actions = [], []
+    all_obs, all_actions, all_yaw_d, all_pitch_d = [], [], [], []
     current_state = initial_player
     pending_input = None
 
@@ -174,35 +190,32 @@ def recording_to_sequence(path, target_x=None, target_z=None):
             target_z = event[2]
         elif event[0] == 'tick':
             state, changes = event[1], event[2]
-
-            # Compute yaw/pitch delta from tick states (handles multi-input accumulation)
             tick_yaw = state['yaw']
             tick_pitch = state['pitch']
 
             if pending_input is not None:
-                # Compute action using tick-state yaw/pitch delta
                 yaw_delta = tick_yaw - prev_tick_yaw
                 pitch_delta = tick_pitch - prev_tick_pitch
                 obs = compute_obs(current_state, prev_tick_yaw, prev_tick_pitch,
                                   target_x, target_z, blocks)
-                actions = input_to_actions_with_delta(
-                    pending_input, yaw_delta, pitch_delta)
+                actions = input_to_actions(pending_input, yaw_delta, pitch_delta)
                 all_obs.append(obs)
                 all_actions.append(actions)
+                all_yaw_d.append(yaw_delta)
+                all_pitch_d.append(pitch_delta)
                 pending_input = None
             else:
-                # Extra tick without new input (fps < tps): zero rotation,
-                # reuse last movement/button state
                 obs = compute_obs(current_state, prev_tick_yaw, prev_tick_pitch,
                                   target_x, target_z, blocks)
-                # No-op rotation action: yaw=3(none), pitch=3(none), rot=0
                 actions = np.zeros(NUM_ATNS, dtype=np.int64)
                 actions[0] = 1  # forward=none
                 actions[1] = 1  # strafe=none
-                actions[5] = 3  # yaw=none
-                actions[6] = 3  # pitch=none
+                actions[5] = YAW_ZERO
+                actions[6] = PITCH_ZERO
                 all_obs.append(obs)
                 all_actions.append(actions)
+                all_yaw_d.append(0.0)
+                all_pitch_d.append(0.0)
 
             prev_tick_yaw = tick_yaw
             prev_tick_pitch = tick_pitch
@@ -216,40 +229,24 @@ def recording_to_sequence(path, target_x=None, target_z=None):
             current_state = state
 
     if not all_obs:
-        return np.array([]), np.array([])
-    return np.array(all_obs, dtype=np.float32), np.array(all_actions, dtype=np.int64)
+        return np.array([]), np.array([]), np.array([]), np.array([])
+    return (np.array(all_obs, dtype=np.float32),
+            np.array(all_actions, dtype=np.int64),
+            np.array(all_yaw_d, dtype=np.float32),
+            np.array(all_pitch_d, dtype=np.float32))
 
 
-def input_to_actions_with_delta(inp, yaw_delta, pitch_delta):
-    """Convert PlayerInput to discrete actions, using pre-computed yaw/pitch deltas."""
+def input_to_actions(inp, yaw_delta, pitch_delta):
+    """Convert PlayerInput to discrete actions with nearest-bucket angle lookup."""
     actions = np.zeros(NUM_ATNS, dtype=np.int64)
     actions[0] = int(round(inp['forward'])) + 1
     actions[1] = int(round(inp['strafe'])) + 1
     actions[2] = 1 if inp['jump'] else 0
     actions[3] = 1 if inp['sneak'] else 0
     actions[4] = 1 if inp['sprint'] else 0
-
-    best_yaw_idx, best_pitch_idx, best_rot_idx = 3, 3, 4
-    best_error = abs(yaw_delta) + abs(pitch_delta)
-    for rot_idx in range(5):
-        rot_pct = rot_idx * 0.25
-        if rot_pct == 0.0:
-            err = abs(yaw_delta) + abs(pitch_delta)
-            if err < best_error:
-                best_error = err
-                best_yaw_idx, best_pitch_idx, best_rot_idx = 3, 3, 0
-            continue
-        for yi, yd in enumerate(YAW_DELTAS):
-            for pi, pd in enumerate(PITCH_DELTAS):
-                err = abs(yaw_delta - yd * rot_pct) + abs(pitch_delta - pd * rot_pct)
-                if err < best_error:
-                    best_error = err
-                    best_yaw_idx, best_pitch_idx, best_rot_idx = yi, pi, rot_idx
-
-    actions[5] = best_yaw_idx
-    actions[6] = best_pitch_idx
+    actions[5] = nearest_bucket(yaw_delta, YAW_DELTAS)
+    actions[6] = nearest_bucket(pitch_delta, PITCH_DELTAS)
     actions[7] = 2 if inp['place_repeat'] else (1 if inp['place'] else 0)
-    actions[8] = best_rot_idx
     return actions
 
 # ---------------------------------------------------------------------------
@@ -311,56 +308,150 @@ class BCPolicy(nn.Module):
 # ---------------------------------------------------------------------------
 
 def make_batches(sequences, seq_len, batch_size, stride=None):
-    """Chop sequences into overlapping fixed-length chunks and batch them."""
+    """Chop sequences into overlapping fixed-length chunks and batch them.
+
+    Each sequence is (obs, act, yaw_d, pitch_d).
+    """
     if stride is None:
-        stride = seq_len // 2  # 50% overlap by default
-    chunks_obs, chunks_act = [], []
-    for obs_seq, act_seq in sequences:
+        stride = seq_len // 2
+    chunks_obs, chunks_act, chunks_yd, chunks_pd = [], [], [], []
+    for obs_seq, act_seq, yd_seq, pd_seq in sequences:
         T = len(obs_seq)
         for start in range(0, T - seq_len + 1, stride):
-            chunks_obs.append(obs_seq[start:start + seq_len])
-            chunks_act.append(act_seq[start:start + seq_len])
+            end = start + seq_len
+            chunks_obs.append(obs_seq[start:end])
+            chunks_act.append(act_seq[start:end])
+            chunks_yd.append(yd_seq[start:end])
+            chunks_pd.append(pd_seq[start:end])
     if not chunks_obs:
-        return [], []
-    obs = np.stack(chunks_obs)  # (N, T, obs_size)
-    act = np.stack(chunks_act)  # (N, T, num_atns)
-    # Shuffle
+        return []
+    obs = np.stack(chunks_obs)
+    act = np.stack(chunks_act)
+    yd = np.stack(chunks_yd)
+    pd = np.stack(chunks_pd)
     perm = np.random.permutation(len(obs))
-    obs, act = obs[perm], act[perm]
-    # Split into batches
+    obs, act, yd, pd = obs[perm], act[perm], yd[perm], pd[perm]
     batches = []
     for i in range(0, len(obs), batch_size):
-        batches.append((obs[i:i+batch_size], act[i:i+batch_size]))
+        batches.append((obs[i:i+batch_size], act[i:i+batch_size],
+                        yd[i:i+batch_size], pd[i:i+batch_size]))
     return batches
 
 
-def train_bc(sequences, output_path, hidden_size=256, num_layers=4,
-             epochs=200, batch_size=32, seq_len=128, lr=1e-3, device='cuda'):
-    policy = BCPolicy(MC_OBS_TOTAL, ACT_SIZES, hidden_size, num_layers).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+def make_soft_targets(continuous_deltas, table_tensor, temperature=2.0):
+    """Create soft targets from continuous deltas via inverse-distance weighting.
 
-    total_ticks = sum(len(s[0]) for s in sequences)
+    Args:
+        continuous_deltas: (N,) tensor of true continuous deltas
+        table_tensor: (K,) tensor of bucket values
+        temperature: controls sharpness (lower = sharper, 1.0 = linear interp)
+
+    Returns:
+        (N, K) soft target distribution
+    """
+    # (N, K) distance from each delta to each bucket
+    dist = (continuous_deltas.unsqueeze(1) - table_tensor.unsqueeze(0)).abs()
+    # Inverse distance weights with temperature
+    weights = 1.0 / (dist / temperature + 1.0)
+    return weights / weights.sum(dim=1, keepdim=True)
+
+
+# Pre-compute table tensors for soft targets
+YAW_TABLE = torch.tensor(YAW_DELTAS, dtype=torch.float32)
+PITCH_TABLE = torch.tensor(PITCH_DELTAS, dtype=torch.float32)
+# Indices of the angle heads in ACT_SIZES
+YAW_HEAD = 5
+PITCH_HEAD = 6
+
+
+def eval_loss(policy, sequences, seq_len, batch_size, criterion, device):
+    """Compute loss and accuracy on a set of sequences without gradient updates."""
+    batches = make_batches(sequences, seq_len, batch_size, stride=seq_len)
+    total_loss = 0.0
+    total_correct = [0] * NUM_ATNS
+    total_count = 0
+    with torch.no_grad():
+        for obs_np, act_np, _, _ in batches:
+            obs_t = torch.from_numpy(obs_np).to(device)
+            act_t = torch.from_numpy(act_np).to(device)
+            B, T, _ = obs_t.shape
+            logit_heads = policy(obs_t)
+            act_flat = act_t.reshape(B * T, -1)
+            loss = sum(criterion(logits, act_flat[:, i])
+                       for i, logits in enumerate(logit_heads))
+            total_loss += loss.item() * B * T
+            for i, logits in enumerate(logit_heads):
+                total_correct[i] += (logits.argmax(1) == act_flat[:, i]).sum().item()
+            total_count += B * T
+    if total_count == 0:
+        return 0.0, [0.0] * NUM_ATNS
+    return total_loss / total_count, [c / total_count for c in total_correct]
+
+
+def train_bc(train_sequences, val_sequences, output_path, hidden_size=256, num_layers=4,
+             epochs=200, batch_size=32, seq_len=128, stride=None, lr=1e-3,
+             weight_decay=0.0, label_smoothing=0.0, soft_temp=2.0, device='cuda'):
+    policy = BCPolicy(MC_OBS_TOTAL, ACT_SIZES, hidden_size, num_layers).to(device)
+    optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    val_criterion = nn.CrossEntropyLoss()
+
+    yaw_table_d = YAW_TABLE.to(device)
+    pitch_table_d = PITCH_TABLE.to(device)
+
+    if stride is None:
+        stride = seq_len // 2
+    train_ticks = sum(len(s[0]) for s in train_sequences)
+    val_ticks = sum(len(s[0]) for s in val_sequences) if val_sequences else 0
     n_params = sum(p.numel() for p in policy.parameters())
-    print(f"Training BC: {total_ticks} ticks across {len(sequences)} sequences")
-    print(f"Policy: {n_params:,} params, seq_len={seq_len}, batch_size={batch_size}")
+    print(f"Training BC: {train_ticks} train ticks, {val_ticks} val ticks "
+          f"({len(train_sequences)} train / {len(val_sequences)} val sequences)")
+    print(f"Policy: {n_params:,} params, seq_len={seq_len}, stride={stride}, batch_size={batch_size}")
+    print(f"Soft targets: temp={soft_temp}, label_smoothing={label_smoothing}, weight_decay={weight_decay}")
+
+    # Best checkpoint tracking
+    best_val_loss = float('inf')
+    best_epoch = -1
+
+    # Epoch 0: evaluate before any training
+    if val_sequences:
+        val_loss, val_accs = eval_loss(policy, val_sequences, seq_len, batch_size, val_criterion, device)
+        val_acc_str = ' '.join(f"{a:.2f}" for a in val_accs)
+        print(f"  epoch    0  (init)  | val loss={val_loss:.4f}  acc=[{val_acc_str}]")
+        best_val_loss = val_loss
+        policy.save_bin(output_path)
+        best_epoch = 0
 
     for epoch in range(epochs):
-        batches = make_batches(sequences, seq_len, batch_size)
+        batches = make_batches(train_sequences, seq_len, batch_size, stride=stride)
         total_loss = 0.0
         total_correct = [0] * NUM_ATNS
         total_count = 0
 
-        for obs_np, act_np in batches:
-            obs_t = torch.from_numpy(obs_np).to(device)  # (B, T, obs)
-            act_t = torch.from_numpy(act_np).to(device)  # (B, T, atns)
+        for obs_np, act_np, yd_np, pd_np in batches:
+            obs_t = torch.from_numpy(obs_np).to(device)
+            act_t = torch.from_numpy(act_np).to(device)
+            yd_t = torch.from_numpy(yd_np).to(device)
+            pd_t = torch.from_numpy(pd_np).to(device)
             B, T, _ = obs_t.shape
 
-            logit_heads = policy(obs_t)  # list of (B*T, act_size_i)
+            logit_heads = policy(obs_t)
             act_flat = act_t.reshape(B * T, -1)
+            yd_flat = yd_t.reshape(B * T)
+            pd_flat = pd_t.reshape(B * T)
 
+            # Standard cross-entropy for non-angle heads
             loss = sum(criterion(logits, act_flat[:, i])
-                       for i, logits in enumerate(logit_heads))
+                       for i, logits in enumerate(logit_heads)
+                       if i != YAW_HEAD and i != PITCH_HEAD)
+
+            # Soft-target KL divergence for angle heads
+            yaw_soft = make_soft_targets(yd_flat, yaw_table_d, soft_temp)
+            pitch_soft = make_soft_targets(pd_flat, pitch_table_d, soft_temp)
+            yaw_log_probs = F.log_softmax(logit_heads[YAW_HEAD], dim=1)
+            pitch_log_probs = F.log_softmax(logit_heads[PITCH_HEAD], dim=1)
+            loss += F.kl_div(yaw_log_probs, yaw_soft, reduction='batchmean')
+            loss += F.kl_div(pitch_log_probs, pitch_soft, reduction='batchmean')
 
             optimizer.zero_grad()
             loss.backward()
@@ -377,15 +468,30 @@ def train_bc(sequences, output_path, hidden_size=256, num_layers=4,
         if (epoch + 1) % 10 == 0 or epoch == 0:
             avg_loss = total_loss / total_count
             accs = [f"{c/total_count:.2f}" for c in total_correct]
-            print(f"  epoch {epoch+1:4d}  loss={avg_loss:.4f}  acc=[{' '.join(accs)}]")
+            line = f"  epoch {epoch+1:4d}  train loss={avg_loss:.4f}  acc=[{' '.join(accs)}]"
+            if val_sequences:
+                val_loss, val_accs = eval_loss(policy, val_sequences, seq_len, batch_size, val_criterion, device)
+                val_acc_str = ' '.join(f"{a:.2f}" for a in val_accs)
+                line += f"  | val loss={val_loss:.4f}  acc=[{val_acc_str}]"
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch + 1
+                    policy.save_bin(output_path)
+                    line += "  *best*"
+            print(line)
 
-    policy.save_bin(output_path)
+    if best_epoch >= 0:
+        print(f"Best checkpoint: epoch {best_epoch}, val loss={best_val_loss:.4f}")
+    else:
+        policy.save_bin(output_path)
     return policy
 
 
 def main():
     parser = argparse.ArgumentParser(description='Behavioral cloning for mcenv')
     parser.add_argument('recordings', nargs='+', help='MCREC001 recording files')
+    parser.add_argument('--val', nargs='+', default=None,
+                        help='Recordings to hold out for validation')
     parser.add_argument('--output', '-o', default='bc_weights.bin')
     parser.add_argument('--target-x', type=float, default=None)
     parser.add_argument('--target-z', type=float, default=None)
@@ -393,27 +499,42 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--seq-len', type=int, default=128,
                         help='Sequence length for recurrent training (matches RL horizon)')
+    parser.add_argument('--stride', type=int, default=None,
+                        help='Window stride (default: seq_len/2, use --stride SEQ_LEN for no overlap)')
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight-decay', type=float, default=0.01)
+    parser.add_argument('--label-smoothing', type=float, default=0.1)
+    parser.add_argument('--soft-temp', type=float, default=2.0,
+                        help='Soft target temperature for angle heads (lower=sharper)')
     parser.add_argument('--hidden-size', type=int, default=256)
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
 
-    sequences = []
+    val_paths = set(os.path.abspath(p) for p in (args.val or []))
+
+    train_sequences, val_sequences = [], []
     for rec_path in args.recordings:
         print(f"Loading {rec_path}...")
-        obs, acts = recording_to_sequence(rec_path, args.target_x, args.target_z)
+        obs, acts, yd, pd = recording_to_sequence(rec_path, args.target_x, args.target_z)
         if len(obs) > 0:
-            sequences.append((obs, acts))
-            print(f"  {len(obs)} ticks")
+            if os.path.abspath(rec_path) in val_paths:
+                val_sequences.append((obs, acts, yd, pd))
+                print(f"  {len(obs)} ticks [val]")
+            else:
+                train_sequences.append((obs, acts, yd, pd))
+                print(f"  {len(obs)} ticks [train]")
 
-    if not sequences:
-        print("No data!"); sys.exit(1)
+    if not train_sequences:
+        print("No training data!"); sys.exit(1)
 
-    train_bc(sequences, args.output,
+    train_bc(train_sequences, val_sequences, args.output,
              hidden_size=args.hidden_size, num_layers=args.num_layers,
              epochs=args.epochs, batch_size=args.batch_size,
-             seq_len=args.seq_len, lr=args.lr, device=args.device)
+             seq_len=args.seq_len, stride=args.stride,
+             lr=args.lr, weight_decay=args.weight_decay,
+             label_smoothing=args.label_smoothing, soft_temp=args.soft_temp,
+             device=args.device)
 
 
 if __name__ == '__main__':

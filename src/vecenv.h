@@ -91,6 +91,16 @@ typedef struct StaticVec {
     int obs_size;
     int num_atns;
     int gpu;
+    // GPU-native env stepping (zero-copy path)
+    void* gpu_env_states;   // McEnvState* on device
+    void* gpu_blocks;       // uint8_t* block grids on device
+    void* gpu_sine_table;   // float* sine table on device
+    void* gpu_env_config;   // McEnvConfig* on device
+    void* gpu_env_logs;     // McEnvLog* on device
+    int gpu_native;         // 1 if gpu_native_step is available
+    cudaStream_t gpu_native_stream; // active stream for gpu_native_step
+    int gpu_native_agent_start;     // first agent index for this buffer
+    int gpu_native_agent_count;     // number of agents in this buffer
 } StaticVec;
 
 // Callback types
@@ -129,6 +139,8 @@ size_t get_obs_elem_size(void);
 void static_vec_step(StaticVec* vec);
 void gpu_vec_step(StaticVec* vec);
 void cpu_vec_step(StaticVec* vec);
+void gpu_native_vec_step(StaticVec* vec);
+void gpu_native_vec_reset(StaticVec* vec);
 
 // Optional shared state functions
 void* my_shared(void* env, Dict* kwargs);
@@ -185,12 +197,29 @@ extern cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned int);
 extern cudaError_t cudaStreamQuery(cudaStream_t);
 extern const char* cudaGetErrorString(cudaError_t);
 
+// CUDA events for GPU-native env profiling
+typedef struct CUevent_st* cudaEvent_t;
+extern cudaError_t cudaEventCreate(cudaEvent_t*);
+extern cudaError_t cudaEventDestroy(cudaEvent_t);
+extern cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t);
+extern cudaError_t cudaEventSynchronize(cudaEvent_t);
+extern cudaError_t cudaEventElapsedTime(float*, cudaEvent_t, cudaEvent_t);
+
 #define OMP_WAITING 5
 #define OMP_RUNNING 6
 
 // Forward declare env-provided functions (defined in binding.c after this include)
 void my_init(Env* env, Dict* kwargs);
 void my_log(Log* log, Dict* out);
+
+// Forward declare GPU-native hooks (defined in binding.c before this include)
+#ifdef MY_GPU_NATIVE
+void my_gpu_native_init(StaticVec* vec, Dict* env_kwargs);
+void my_gpu_native_step(StaticVec* vec);
+void my_gpu_native_reset(StaticVec* vec);
+void my_gpu_native_close(StaticVec* vec);
+void my_gpu_native_log(StaticVec* vec);
+#endif
 
 
 struct StaticThreading {
@@ -200,6 +229,10 @@ struct StaticThreading {
     int num_buffers;
     pthread_t* threads;
     float* accum;  // [num_buffers * NUM_EVAL_PROF] per-buffer timing in ms
+    // Per-buffer CUDA events for async env kernel timing
+    cudaEvent_t* env_start_events;  // [num_buffers]
+    cudaEvent_t* env_end_events;    // [num_buffers]
+    int* env_events_valid;          // [num_buffers] 1 if previous events are readable
 };
 
 typedef struct StaticOMPArg {
@@ -236,7 +269,7 @@ static void* static_omp_threadmanager(void* arg) {
 
     Env* envs = (Env*)vec->envs;
 
-    printf("Num workers: %d\n", num_workers);
+    printf("Num workers: %d, gpu_native: %d\n", num_workers, vec->gpu_native);
     while (true) {
         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
             if (atomic_load(&threading->shutdown)) {
@@ -252,6 +285,35 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             net_callback(ctx, buf, t);
 
+#ifdef MY_GPU_NATIVE
+            if (vec->gpu_native && horizon > 1) {
+                // GPU-native path: actions already in gpu_actions from net_callback.
+                // Launch CUDA kernel — reads gpu_actions, writes gpu_obs/rewards/terminals.
+                // No memcpy needed.
+                cudaStreamSynchronize(stream);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+
+                // Read previous tick's env kernel time (non-blocking — event already completed)
+                if (threading->env_events_valid[buf]) {
+                    float env_ms = 0.0f;
+                    cudaEventElapsedTime(&env_ms, threading->env_start_events[buf], threading->env_end_events[buf]);
+                    my_accum[EVAL_ENV_STEP] += env_ms;
+                }
+
+                // Launch env kernel with timing events
+                cudaEventRecord(threading->env_start_events[buf], stream);
+                vec->gpu_native_stream = stream;
+                vec->gpu_native_agent_start = agent_start;
+                vec->gpu_native_agent_count = agents_per_buffer;
+                my_gpu_native_step(vec);
+                cudaEventRecord(threading->env_end_events[buf], stream);
+                threading->env_events_valid[buf] = 1;
+
+
+            } else
+#endif
+            {
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
                 &vec->gpu_actions[agent_start * NUM_ATNS],
@@ -286,6 +348,7 @@ static void* static_omp_threadmanager(void* arg) {
                 &vec->terminals[agent_start],
                 agents_per_buffer * sizeof(float),
                 cudaMemcpyHostToDevice, stream);
+            }
         }
         cudaStreamSynchronize(stream);
         atomic_store(&buffer_states[buf], OMP_WAITING);
@@ -330,7 +393,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int agents_created = 0;
     while (agents_created < total_agents) {
         srand(num_envs);
-        envs[num_envs].rng = num_envs;
+        envs[num_envs].rng = num_envs + 1;  // +1 to avoid xorshift32 zero-seed
         my_init(&envs[num_envs], env_kwargs);
         agents_created += envs[num_envs].num_agents;
         num_envs++;
@@ -414,6 +477,19 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         vec->gpu_terminals = vec->terminals;
     }
 
+    // GPU-native env stepping
+    vec->gpu_native = 0;
+    vec->gpu_env_states = NULL;
+    vec->gpu_blocks = NULL;
+    vec->gpu_sine_table = NULL;
+    vec->gpu_env_config = NULL;
+#ifdef MY_GPU_NATIVE
+    if (gpu) {
+        my_gpu_native_init(vec, env_kwargs);
+        vec->gpu_native = 1;
+    }
+#endif
+
     // Streams allocated here, created in create_static_threads
     vec->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
 
@@ -440,6 +516,19 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
 }
 
 void static_vec_reset(StaticVec* vec) {
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu_native) {
+        my_gpu_native_reset(vec);
+        cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
+        cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
+        cudaDeviceSynchronize();
+        Env* envs = (Env*)vec->envs;
+        for (int i = 0; i < vec->size; i++) {
+            c_reset(&envs[i]);
+        }
+        return;
+    }
+#endif
     Env* envs = (Env*)vec->envs;
     for (int i = 0; i < vec->size; i++) {
         c_reset(&envs[i]);
@@ -464,6 +553,15 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     vec->threading->buffer_states = (atomic_int*)calloc(vec->buffers, sizeof(atomic_int));
     vec->threading->threads = (pthread_t*)calloc(vec->buffers, sizeof(pthread_t));
     vec->threading->accum = (float*)calloc(vec->buffers * NUM_EVAL_PROF, sizeof(float));
+
+    // CUDA events for async env kernel timing
+    vec->threading->env_start_events = (cudaEvent_t*)calloc(vec->buffers, sizeof(cudaEvent_t));
+    vec->threading->env_end_events = (cudaEvent_t*)calloc(vec->buffers, sizeof(cudaEvent_t));
+    vec->threading->env_events_valid = (int*)calloc(vec->buffers, sizeof(int));
+    for (int i = 0; i < vec->buffers; i++) {
+        cudaEventCreate(&vec->threading->env_start_events[i]);
+        cudaEventCreate(&vec->threading->env_end_events[i]);
+    }
 
     // Streams are now created by pufferlib.cu (PyTorch-managed streams)
     // Do NOT create streams here - they've already been set up
@@ -505,6 +603,12 @@ void static_vec_close(StaticVec* vec) {
     }
     free(vec->buffer_env_starts);
     free(vec->buffer_env_counts);
+
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu_native) {
+        my_gpu_native_close(vec);
+    }
+#endif
 
     if (vec->gpu) {
         cudaDeviceSynchronize();
@@ -551,6 +655,11 @@ static inline float static_vec_aggregate_logs(StaticVec* vec, Log* out) {
 }
 
 void static_vec_log(StaticVec* vec, Dict* out) {
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu_native) {
+        my_gpu_native_log(vec);
+    }
+#endif
     Env* envs = (Env*)vec->envs;
     Log aggregate;
     float n = static_vec_aggregate_logs(vec, &aggregate);
@@ -636,6 +745,24 @@ void cpu_vec_step(StaticVec* vec) {
 void static_vec_step(StaticVec* vec) {
     if (vec->gpu) gpu_vec_step(vec);
     else cpu_vec_step(vec);
+}
+
+void gpu_native_vec_step(StaticVec* vec) {
+#ifdef MY_GPU_NATIVE
+    my_gpu_native_step(vec);
+#else
+    (void)vec;
+    assert(0 && "gpu_native_step not supported for this env");
+#endif
+}
+
+void gpu_native_vec_reset(StaticVec* vec) {
+#ifdef MY_GPU_NATIVE
+    my_gpu_native_reset(vec);
+#else
+    (void)vec;
+    assert(0 && "gpu_native_reset not supported for this env");
+#endif
 }
 
 // Optional shared state functions - default implementations

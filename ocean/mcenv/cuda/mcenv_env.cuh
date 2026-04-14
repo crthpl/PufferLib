@@ -20,9 +20,9 @@ __host__ __device__ inline void compute_observations(
     obs[idx++] = (float)(s->pos_x - (double)s->start_x) / 50.0f;
     obs[idx++] = (float)(s->pos_y - (double)s->start_y) / 10.0f;
     obs[idx++] = (float)(s->pos_z - (double)s->start_z) / 10.0f;
-    obs[idx++] = (float)(s->pos_x - floor(s->pos_x)); // frac x
-    obs[idx++] = (float)(s->pos_y - floor(s->pos_y)); // frac y
-    obs[idx++] = (float)(s->pos_z - floor(s->pos_z)); // frac z
+    obs[idx++] = (float)(s->pos_x - floor(s->pos_x));
+    obs[idx++] = (float)(s->pos_y - floor(s->pos_y));
+    obs[idx++] = (float)(s->pos_z - floor(s->pos_z));
     obs[idx++] = (float)s->vel_x;
     obs[idx++] = (float)s->vel_y;
     obs[idx++] = (float)s->vel_z;
@@ -39,7 +39,7 @@ __host__ __device__ inline void compute_observations(
     obs[idx++] = (s->target_x - (float)s->pos_x) / 50.0f;
     obs[idx++] = (s->target_z - (float)s->pos_z) / 50.0f;
 
-    // Local block grid: 7x3x7 (±3 in x and z)
+    // Local block grid: 7x3x7 (±3 in x and z, symmetric)
     int bx = (int)floorf((float)s->pos_x);
     int by = (int)floorf((float)s->pos_y);
     int bz = (int)floorf((float)s->pos_z);
@@ -96,6 +96,8 @@ __host__ __device__ inline void mcenv_reset(
     s->rw_speed_sum = 0.0f;
     s->rw_block_sum = 0.0f;
     s->rw_target_sum = 0.0f;
+    s->rw_look_reversal_sum = 0.0f;
+    s->prev_yaw_delta = 0.0f;
 
     mc_new_target(s);
 

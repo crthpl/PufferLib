@@ -33,10 +33,25 @@
 #define MC_FALL_DEFAULT     -1.0f
 #define MC_SPEED_DEFAULT     1.0f
 #define MC_TARGET_DEFAULT    10.0f
+#define MC_LOOK_REVERSAL_DEFAULT 0.05f
+#define MC_SPRINT_JUMP_DEFAULT   0.0f
+#define MC_REQUIRE_GROUND_DEFAULT 1
+#define MC_FALL_SCALE_PHASE1_DEFAULT 1.0f
+#define MC_SPEED_POWER_DEFAULT   1.0f
+#define MC_ROT_PCT_ENABLED_DEFAULT 0
+#define MC_PLACE_REPEAT_ENABLED_DEFAULT 0
 
 // Yaw/pitch delta lookup tables (degrees)
+#if defined(MC_FULL_ANGLE)
+static const float YAW_DELTAS[153] = {-180.0f, -178.0f, -174.0f, -170.0f, -166.0f, -162.0f, -158.0f, -154.0f, -150.0f, -146.0f, -142.0f, -138.0f, -134.0f, -130.0f, -126.0f, -122.0f, -118.0f, -114.0f, -110.0f, -106.0f, -102.0f, -98.0f, -94.0f, -90.0f, -88.0f, -86.0f, -84.0f, -82.0f, -80.0f, -78.0f, -76.0f, -74.0f, -72.0f, -70.0f, -68.0f, -66.0f, -64.0f, -62.0f, -60.0f, -58.0f, -56.0f, -54.0f, -52.0f, -50.0f, -48.0f, -46.0f, -44.0f, -42.0f, -40.0f, -38.0f, -36.0f, -34.0f, -32.0f, -30.0f, -28.0f, -26.0f, -24.0f, -22.0f, -20.0f, -18.0f, -16.0f, -15.0f, -14.0f, -13.0f, -12.0f, -11.0f, -10.0f, -9.0f, -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f, 34.0f, 36.0f, 38.0f, 40.0f, 42.0f, 44.0f, 46.0f, 48.0f, 50.0f, 52.0f, 54.0f, 56.0f, 58.0f, 60.0f, 62.0f, 64.0f, 66.0f, 68.0f, 70.0f, 72.0f, 74.0f, 76.0f, 78.0f, 80.0f, 82.0f, 84.0f, 86.0f, 88.0f, 90.0f, 94.0f, 98.0f, 102.0f, 106.0f, 110.0f, 114.0f, 118.0f, 122.0f, 126.0f, 130.0f, 134.0f, 138.0f, 142.0f, 146.0f, 150.0f, 154.0f, 158.0f, 162.0f, 166.0f, 170.0f, 174.0f, 178.0f, 180.0f};
+static const float PITCH_DELTAS[107] = {-90.0f, -88.0f, -86.0f, -84.0f, -82.0f, -80.0f, -78.0f, -76.0f, -74.0f, -72.0f, -70.0f, -68.0f, -66.0f, -64.0f, -62.0f, -60.0f, -58.0f, -56.0f, -54.0f, -52.0f, -50.0f, -48.0f, -46.0f, -44.0f, -42.0f, -40.0f, -38.0f, -36.0f, -34.0f, -32.0f, -30.0f, -28.0f, -26.0f, -24.0f, -22.0f, -20.0f, -18.0f, -16.0f, -15.0f, -14.0f, -13.0f, -12.0f, -11.0f, -10.0f, -9.0f, -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f, 34.0f, 36.0f, 38.0f, 40.0f, 42.0f, 44.0f, 46.0f, 48.0f, 50.0f, 52.0f, 54.0f, 56.0f, 58.0f, 60.0f, 62.0f, 64.0f, 66.0f, 68.0f, 70.0f, 72.0f, 74.0f, 76.0f, 78.0f, 80.0f, 82.0f, 84.0f, 86.0f, 88.0f, 90.0f};
+#elif defined(MC_BC_ACTIONS)
 static const float YAW_DELTAS[7]   = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
 static const float PITCH_DELTAS[7] = {-180.0f, -15.0f, -1.0f, 0.0f, 1.0f, 15.0f, 180.0f};
+#else
+static const float YAW_DELTAS[25]  = {-180.0f,-135.0f,-90.0f,-45.0f,-15.0f,-11.25f,-7.5f,-3.75f,-1.0f,-0.75f,-0.5f,-0.25f,0.0f,0.25f,0.5f,0.75f,1.0f,3.75f,7.5f,11.25f,15.0f,45.0f,90.0f,135.0f,180.0f};
+static const float PITCH_DELTAS[25]= {-180.0f,-135.0f,-90.0f,-45.0f,-15.0f,-11.25f,-7.5f,-3.75f,-1.0f,-0.75f,-0.5f,-0.25f,0.0f,0.25f,0.5f,0.75f,1.0f,3.75f,7.5f,11.25f,15.0f,45.0f,90.0f,135.0f,180.0f};
+#endif
 
 typedef struct {
     float perf;
@@ -57,6 +72,7 @@ typedef struct {
     float rw_speed;
     float rw_block;
     float rw_target;
+    float rw_look_reversal;
     float n;
 } Log;
 
@@ -87,6 +103,7 @@ struct MCEnv {
     int lifetime_blocks;   // Persists across resets — drives global curriculum
     float avg_targets_ema; // EMA of targets/episode (~20 ep window)
     int phase2_unlocked;   // Ratchet: once phase 2 activates, stays permanent
+    int phase3_unlocked;
     float target_x;
     float target_z;
     float rw_survival;
@@ -94,11 +111,18 @@ struct MCEnv {
     float rw_fall;
     float rw_speed;
     float rw_target_reach;
+    float rw_look_reversal;
     int curriculum_phase;      // 0=block only, 1=block+target, 2=target only
     int phase_transition;      // blocks_placed threshold to advance phase
     Demo3dRenderer* renderer;
     struct timespec render_last_time;
     int force_phase2;  // Toggle via P key during eval render
+    float rw_sprint_jump;
+    int require_ground;
+    float fall_scale_phase1;
+    float speed_power;
+    int rot_pct_enabled;
+    int place_repeat_enabled;
     int camera_locked; // Toggle via L key: lock camera to agent's look
 
     // Sprint-jump progress tracking
@@ -117,6 +141,10 @@ struct MCEnv {
     float rw_speed_sum;
     float rw_block_sum;
     float rw_target_sum;
+    float rw_look_reversal_sum;
+
+    // Yaw reversal tracking
+    float prev_yaw_delta;
 };
 
 static float mc_dist_to_target(MCEnv* env, double px, double pz) {
@@ -125,6 +153,7 @@ static float mc_dist_to_target(MCEnv* env, double px, double pz) {
     return sqrtf(dx*dx + dz*dz);
 }
 
+// Match glibc rand_r: LCG returning 15 bits (0-32767)
 static unsigned int xorshift32(unsigned int* state) {
     unsigned int x = *state;
     x ^= x << 13;
@@ -163,9 +192,19 @@ static void setup_platform(MCEnv* env) {
 
 static int mc_get_phase(MCEnv* env) {
     if (env->force_phase2) return 2;
-    // TEMP: phase 2 disabled — cap at 1
-    if (env->phase_transition <= 0) return env->curriculum_phase < 2 ? env->curriculum_phase : 1;
+    if (env->phase_transition <= 0) return env->curriculum_phase;
     int pt = env->phase_transition;
+    if (env->phase3_unlocked) return 3;
+    if (env->lifetime_blocks >= pt * 5) {
+        if (!env->phase2_unlocked && env->avg_targets_ema > 2.0f)
+            env->phase2_unlocked = 1;
+        if (env->phase2_unlocked) {
+            if (!env->phase3_unlocked && env->avg_targets_ema > 4.0f)
+                env->phase3_unlocked = 1;
+            if (env->phase3_unlocked) return 3;
+            return 2;
+        }
+    }
     if (env->lifetime_blocks >= pt) return 1;
     return 0;
 }
@@ -180,9 +219,9 @@ static void compute_observations(MCEnv* env) {
     env->observations[idx++] = (float)(state.pos.x - env->start_x) / 50.0f;
     env->observations[idx++] = (float)(state.pos.y - env->start_y) / 10.0f;
     env->observations[idx++] = (float)(state.pos.z - env->start_z) / 10.0f;
-    env->observations[idx++] = (float)(state.pos.x - floorf((float)state.pos.x)); // frac x
-    env->observations[idx++] = (float)(state.pos.y - floorf((float)state.pos.y)); // frac y
-    env->observations[idx++] = (float)(state.pos.z - floorf((float)state.pos.z)); // frac z
+    env->observations[idx++] = (float)(state.pos.x - floorf((float)state.pos.x));
+    env->observations[idx++] = (float)(state.pos.y - floorf((float)state.pos.y));
+    env->observations[idx++] = (float)(state.pos.z - floorf((float)state.pos.z));
     env->observations[idx++] = (float)state.vel.x;
     env->observations[idx++] = (float)state.vel.y;
     env->observations[idx++] = (float)state.vel.z;
@@ -198,7 +237,7 @@ static void compute_observations(MCEnv* env) {
     env->observations[idx++] = (env->target_x - (float)state.pos.x) / 50.0f;
     env->observations[idx++] = (env->target_z - (float)state.pos.z) / 50.0f;
 
-    // Local block grid: 7x3x7 (±3 in x and z)
+    // Local block grid: 7x3x7 (±3 in x and z, symmetric)
     int bx = (int)floorf((float)state.pos.x);
     int by = (int)floorf((float)state.pos.y);
     int bz = (int)floorf((float)state.pos.z);
@@ -232,7 +271,7 @@ void add_log(MCEnv* env) {
     env->log.phase += (float)mc_get_phase(env);
     float rw_total = fabsf(env->rw_air_sum) + fabsf(env->rw_sprint_jump_sum)
                    + fabsf(env->rw_speed_sum) + fabsf(env->rw_block_sum)
-                   + fabsf(env->rw_target_sum);
+                   + fabsf(env->rw_target_sum) + fabsf(env->rw_look_reversal_sum);
     if (rw_total > 0.0f) {
         float inv = 1.0f / rw_total;
         env->log.rw_air += fabsf(env->rw_air_sum) * inv;
@@ -240,6 +279,7 @@ void add_log(MCEnv* env) {
         env->log.rw_speed += fabsf(env->rw_speed_sum) * inv;
         env->log.rw_block += fabsf(env->rw_block_sum) * inv;
         env->log.rw_target += fabsf(env->rw_target_sum) * inv;
+        env->log.rw_look_reversal += fabsf(env->rw_look_reversal_sum) * inv;
     }
     env->log.n++;
 }
@@ -282,6 +322,8 @@ void c_reset(MCEnv* env) {
     env->rw_speed_sum = 0.0f;
     env->rw_block_sum = 0.0f;
     env->rw_target_sum = 0.0f;
+    env->rw_look_reversal_sum = 0.0f;
+    env->prev_yaw_delta = 0.0f;
 
     mc_new_target(env);
 
@@ -312,11 +354,17 @@ void c_step(MCEnv* env) {
     int yaw_action      = (int)env->actions[a_idx++];
     int pitch_action    = (int)env->actions[a_idx++];
     int place_action    = (int)env->actions[a_idx++];
+#ifdef MC_BC_ACTIONS
     int rot_pct_action  = (int)env->actions[a_idx++];
-
-    float rot_pct = rot_pct_action * 0.25f;  // 0, 0.25, 0.5, 0.75, 1.0
-    env->yaw += YAW_DELTAS[yaw_action] * rot_pct;
+    float rot_pct = rot_pct_action * 0.25f;
+    float yaw_delta = YAW_DELTAS[yaw_action] * rot_pct;
+    env->yaw += yaw_delta;
     env->pitch += PITCH_DELTAS[pitch_action] * rot_pct;
+#else
+    float yaw_delta = YAW_DELTAS[yaw_action];
+    env->yaw += yaw_delta;
+    env->pitch += PITCH_DELTAS[pitch_action];
+#endif
     if (env->pitch > 90.0f) env->pitch = 90.0f;
     if (env->pitch < -90.0f) env->pitch = -90.0f;
 
@@ -368,10 +416,10 @@ void c_step(MCEnv* env) {
 
     float block_weight = 1.0f;
     float target_weight = 0.0f;
-    int require_ground = 0;
+    int require_ground = env->require_ground;
     if (phase >= 1) {
         target_weight = 1.0f;
-        block_weight = 0.25f;
+        block_weight = 1.0f;
         if (phase >= 2) {
             block_weight = 0.0f;
         }
@@ -392,11 +440,6 @@ void c_step(MCEnv* env) {
     if (tgt_len > 0.01f) facing_dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
     // facing_dot can be negative (facing away from target)
 
-    // 1. Survival / movement shaping
-    if (phase < 1) {
-        if (state.on_ground) reward += env->rw_survival;
-    }
-
     // 2. Speed: getting closer to target (phases 1+2)
     float dist = mc_dist_to_target(env, state.pos.x, state.pos.z);
 
@@ -405,7 +448,7 @@ void c_step(MCEnv* env) {
         if (env->sj_timer > 0) {
             env->sj_timer--;
             if (env->sj_dist - dist > 0.05f) {
-                float sj_rw = 200.0f * env->sj_dot;
+                float sj_rw = env->rw_sprint_jump * env->sj_dot;
                 reward += sj_rw; rw_sprint_jump += sj_rw;
                 env->sj_timer = 0;
             }
@@ -419,27 +462,18 @@ void c_step(MCEnv* env) {
     float delta_dist = env->prev_dist - dist;
     if (target_weight > 0.0f && (!require_ground || state.on_ground)) {
         float abs_delta = fabsf(delta_dist);
-        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, 2.0f);
+        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, env->speed_power);
         float s_rw = env->rw_speed * shaped_delta * target_weight;
         reward += s_rw; rw_speed += s_rw;
     }
     env->prev_dist = dist;
 
-    // Facing bonus: reward facing target + moving toward it, punish otherwise
-    float facing_rw = 0.01f * (facing_dot < 0.0f && delta_dist < 0.0f
-        ? -(fabsf(facing_dot) * fabsf(delta_dist))
-        : facing_dot * delta_dist);
-    reward += facing_rw;
+    // Facing bonus: disabled (old code had none)
+    float facing_rw = 0.0f;
 
     // 3. Block placement reward
     if (place_scale > 0.0f && block_weight > 0.0f) {
-        int air_eligible = !state.on_ground && env->sj_timer > 8 && placed_pos.y == 2;
-        float air_mult = air_eligible ? 10.0f : 1.0f;
-        float b_rw = env->rw_block * place_scale * block_weight * air_mult;
-        if (air_mult > 1.0f) {
-            float air_bonus = env->rw_block * place_scale * block_weight * (air_mult - 1.0f);
-            rw_air += air_bonus;
-        }
+        float b_rw = env->rw_block * place_scale * block_weight;
         reward += b_rw; rw_block += b_rw;
     }
 
@@ -456,11 +490,21 @@ void c_step(MCEnv* env) {
         dist = env->prev_dist;
     }
 
+    // Yaw reversal penalty: penalize sign changes in consecutive yaw turns
+    float rw_look_reversal = 0.0f;
+    if (phase >= 1 && env->prev_yaw_delta != 0.0f && yaw_delta != 0.0f &&
+        ((env->prev_yaw_delta > 0.0f) != (yaw_delta > 0.0f))) {
+        rw_look_reversal = -env->rw_look_reversal;
+        reward += rw_look_reversal;
+    }
+    env->prev_yaw_delta = yaw_delta;
+
     env->rw_air_sum += rw_air;
     env->rw_sprint_jump_sum += rw_sprint_jump;
     env->rw_speed_sum += rw_speed;
     env->rw_block_sum += rw_block;
     env->rw_target_sum += rw_target;
+    env->rw_look_reversal_sum += rw_look_reversal;
 
     // Track progress
     float dist_from_start = sqrtf(
@@ -478,7 +522,7 @@ void c_step(MCEnv* env) {
     // Termination
     int done = 0;
     if (state.pos.y < MC_VOID_Y) {
-        reward = (phase >= 1) ? env->rw_fall * 0.1f : env->rw_fall;
+        reward = (phase >= 1) ? env->rw_fall * env->fall_scale_phase1 : env->rw_fall;
         done = 1;
     } else if (env->tick >= env->max_ticks) {
         done = 1;
@@ -530,11 +574,17 @@ void c_render(MCEnv* env) {
     int jump  = (int)env->actions[2]; if ((unsigned)jump  >= 2) jump  = 0;
     int sneak = (int)env->actions[3]; if ((unsigned)sneak >= 2) sneak = 0;
     int sprint= (int)env->actions[4]; if ((unsigned)sprint>= 2) sprint= 0;
+#if defined(MC_FULL_ANGLE)
+    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 153) yaw_i = 76;
+    int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 107) pit_i = 53;
+#elif defined(MC_BC_ACTIONS)
     int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 7) yaw_i = 3;
     int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 7) pit_i = 3;
+#else
+    int yaw_i = (int)env->actions[5]; if ((unsigned)yaw_i >= 25) yaw_i = 12;
+    int pit_i = (int)env->actions[6]; if ((unsigned)pit_i >= 25) pit_i = 12;
+#endif
     int place = (int)env->actions[7]; if ((unsigned)place >= 3) place = 0;
-    int rot_i = (int)env->actions[8]; if ((unsigned)rot_i >= 5) rot_i = 0;
-    float rot_pct_hud = rot_i * 0.25f;
     {
         CPlayerState s;
         mcenv_environment_get_player(env->mc, &s);
@@ -545,11 +595,10 @@ void c_render(MCEnv* env) {
         if (env->sj_timer > 0 && env->sj_dot > 0.0f)
             snprintf(sj_buf, sizeof(sj_buf), " SPRJ=%.2f", env->sj_dot);
         snprintf(hud, sizeof(hud),
-            "fwd=%s str=%s jmp=%s snk=%s spr=%s plc=%s yaw=%+7.1f pit=%+7.1f rot=%.2f | t=%4d tgt=%5.0f,%5.0f dist=%5.1f rch=%2d blk=%3d ph=%d%s%s%s",
+            "fwd=%s str=%s jmp=%s snk=%s spr=%s plc=%d yaw=%+7.1f pit=%+7.1f | t=%4d tgt=%5.0f,%5.0f dist=%5.1f rch=%2d blk=%3d ph=%d%s%s%s",
             FWD_NAMES[fwd], STR_NAMES[str], BOOL_NAMES[jump],
-            BOOL_NAMES[sneak], BOOL_NAMES[sprint], PLACE_NAMES[place],
-            YAW_DELTAS[yaw_i] * rot_pct_hud, PITCH_DELTAS[pit_i] * rot_pct_hud,
-            rot_pct_hud,
+            BOOL_NAMES[sneak], BOOL_NAMES[sprint], place,
+            YAW_DELTAS[yaw_i], PITCH_DELTAS[pit_i],
             env->tick, env->target_x, env->target_z,
             d, env->targets_reached, env->blocks_placed,
             phase, env->force_phase2 ? "[P]" : "",
@@ -566,6 +615,7 @@ void c_render(MCEnv* env) {
         mcenv_demo3d_renderer_set_camera_locked(env->renderer, env->camera_locked);
     }
 
+    mcenv_demo3d_renderer_set_nav_target(env->renderer, env->target_x, env->target_z);
     mcenv_demo3d_renderer_render(env->renderer, env->mc);
 }
 

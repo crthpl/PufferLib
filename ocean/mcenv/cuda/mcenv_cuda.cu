@@ -32,7 +32,7 @@ static __host__ __device__ inline WorldDims mcenv_world_dims() {
 __global__ void mcenv_pufferlib_step_kernel(
     McEnvState*       states,       // [N]
     const float*      actions,      // [N * 8]  discrete actions as floats
-    float*            observations, // [N * 76] output
+    float*            observations, // [N * MC_OBS_TOTAL] output
     float*            rewards,      // [N]      output
     float*            terminals,    // [N]      output
     uint8_t*          blocks,       // [N * MCENV_GRID_SIZE]
@@ -61,11 +61,17 @@ __global__ void mcenv_pufferlib_step_kernel(
     int yaw_action      = (int)act[5];
     int pitch_action    = (int)act[6];
     int place_action    = (int)act[7];
+#ifdef MC_BC_ACTIONS
     int rot_pct_action  = (int)act[8];
-
-    float rot_pct = rot_pct_action * 0.25f;  // 0, 0.25, 0.5, 0.75, 1.0
-    s->yaw   += d_YAW_DELTAS[yaw_action] * rot_pct;
+    float rot_pct = rot_pct_action * 0.25f;
+    float yaw_delta = d_YAW_DELTAS[yaw_action] * rot_pct;
+    s->yaw   += yaw_delta;
     s->pitch += d_PITCH_DELTAS[pitch_action] * rot_pct;
+#else
+    float yaw_delta = d_YAW_DELTAS[yaw_action];
+    s->yaw   += yaw_delta;
+    s->pitch += d_PITCH_DELTAS[pitch_action];
+#endif
     if (s->pitch > 90.0f) s->pitch = 90.0f;
     if (s->pitch < -90.0f) s->pitch = -90.0f;
 
@@ -81,6 +87,7 @@ __global__ void mcenv_pufferlib_step_kernel(
     input.has_look = 1;
     input.look_yaw = s->yaw;
     input.look_pitch = s->pitch;
+    // place_action: 0=no, 1=single (edge-triggered), 2=repeat (every tick)
     input.place = (place_action >= 1);
     input.place_repeat = (place_action == 2);
     input.break_block = 0;
@@ -107,10 +114,10 @@ __global__ void mcenv_pufferlib_step_kernel(
     // --- Reward computation (from mcenv.h) ---
     float block_weight = 1.0f;
     float target_weight = 0.0f;
-    int require_ground = 0;
+    int require_ground = config->require_ground;
     if (phase >= 1) {
         target_weight = 1.0f;
-        block_weight = 0.25f;
+        block_weight = 1.0f;
         if (phase >= 2) {
             block_weight = 0.0f;
         }
@@ -130,11 +137,6 @@ __global__ void mcenv_pufferlib_step_kernel(
     if (tgt_len > 0.01f) facing_dot = (face_x * tgt_dx + face_z * tgt_dz) / tgt_len;
     // facing_dot can be negative (facing away from target)
 
-    // 1. Survival / movement shaping
-    if (phase < 1) {
-        if (s->on_ground) reward += config->rw_survival;
-    }
-
     // 2. Speed: getting closer to target
     float dist = mc_dist_to_target(s, s->pos_x, s->pos_z);
 
@@ -143,7 +145,7 @@ __global__ void mcenv_pufferlib_step_kernel(
         if (s->sj_timer > 0) {
             s->sj_timer--;
             if (s->sj_dist - dist > 0.05f) {
-                float sj_rw = 200.0f * s->sj_dot;
+                float sj_rw = config->rw_sprint_jump * s->sj_dot;
                 reward += sj_rw; rw_sprint_jump += sj_rw;
                 s->sj_timer = 0;
             }
@@ -157,27 +159,18 @@ __global__ void mcenv_pufferlib_step_kernel(
     float delta_dist = s->prev_dist - dist;
     if (target_weight > 0.0f && (!require_ground || s->on_ground)) {
         float abs_delta = fabsf(delta_dist);
-        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, 2.0f);
+        float shaped_delta = (delta_dist >= 0.0f ? 1.0f : -1.0f) * powf(abs_delta, config->speed_power);
         float s_rw = config->rw_speed * shaped_delta * target_weight;
         reward += s_rw; rw_speed += s_rw;
     }
     s->prev_dist = dist;
 
     // Facing bonus: reward facing target + moving toward it, punish otherwise
-    float facing_rw = 0.01f * (facing_dot < 0.0f && delta_dist < 0.0f
-        ? -(fabsf(facing_dot) * fabsf(delta_dist))
-        : facing_dot * delta_dist);
-    reward += facing_rw;
+    float facing_rw = 0.0f;
 
     // 3. Block placement reward
     if (place_scale > 0.0f && block_weight > 0.0f) {
-        int air_eligible = !s->on_ground && s->sj_timer > 8 && s->last_placed_y == 2;
-        float air_mult = air_eligible ? 10.0f : 1.0f;
-        float b_rw = config->rw_block * place_scale * block_weight * air_mult;
-        if (air_mult > 1.0f) {
-            float air_bonus = config->rw_block * place_scale * block_weight * (air_mult - 1.0f);
-            rw_air += air_bonus;
-        }
+        float b_rw = config->rw_block * place_scale * block_weight;
         reward += b_rw; rw_block += b_rw;
     }
 
@@ -194,11 +187,21 @@ __global__ void mcenv_pufferlib_step_kernel(
         dist = s->prev_dist;
     }
 
+    // Yaw reversal penalty: penalize sign changes in consecutive yaw turns
+    float rw_look_reversal = 0.0f;
+    if (phase >= 1 && s->prev_yaw_delta != 0.0f && yaw_delta != 0.0f &&
+        ((s->prev_yaw_delta > 0.0f) != (yaw_delta > 0.0f))) {
+        rw_look_reversal = -config->rw_look_reversal;
+        reward += rw_look_reversal;
+    }
+    s->prev_yaw_delta = yaw_delta;
+
     s->rw_air_sum += rw_air;
     s->rw_sprint_jump_sum += rw_sprint_jump;
     s->rw_speed_sum += rw_speed;
     s->rw_block_sum += rw_block;
     s->rw_target_sum += rw_target;
+    s->rw_look_reversal_sum += rw_look_reversal;
 
     // Track progress
     float dist_from_start = sqrtf(
@@ -213,7 +216,7 @@ __global__ void mcenv_pufferlib_step_kernel(
     // --- Termination ---
     int done = 0;
     if (s->pos_y < (double)MC_VOID_Y) {
-        reward = (phase >= 1) ? config->rw_fall * 0.1f : config->rw_fall;
+        reward = (phase >= 1) ? config->rw_fall * config->fall_scale_phase1 : config->rw_fall;
         done = 1;
     } else if (s->tick >= s->max_ticks) {
         done = 1;
