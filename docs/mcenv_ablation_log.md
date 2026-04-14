@@ -301,3 +301,128 @@ Action space: MC_BC_ACTIONS (9 heads: {3,3,2,2,2,7,7,3,5})
 Observations: 163 (14 player + 2 target + 147 grid 7x3x7)
 Phase 2 enabled with EMA ratchet (avg_targets_ema > 2.0)
 No survival reward, no facing bonus, no air bonus, no yaw reversal
+
+### Minibatch size matters
+
+| Minibatch | Score (68M) | Gradient updates/epoch |
+|---|---|---|
+| 16384 | 6.239 | 8 |
+| **4096** | **7.946** | **32** |
+| 2048 | 0.231 | 64 (diverged — learned degenerate strategy) |
+| 1024 | 7.690 | 128 |
+
+mb=4096 is optimal for this LR/config. Smaller batches diverge; larger batches underfit.
+
+---
+
+## Practical Reference for Future Sessions
+
+### MCEnv Environment Architecture
+
+**What it is:** A Minecraft-inspired bridging + navigation environment. The agent starts on a single block (y=2) over void in a 50x50 area. It must place blocks to build bridges toward randomly-placed navigation targets. Falling below y=2.5 is instant death. Each episode is 1000 ticks.
+
+**Files (must stay in sync):**
+- `ocean/mcenv/mcenv.h` — CPU environment (eval/render path). Contains reward logic, observation computation, phase functions, action decoding, HUD rendering. This is the reference implementation.
+- `ocean/mcenv/cuda/mcenv_cuda.cu` — CUDA step kernel (training path). Must match mcenv.h reward/obs/action logic exactly. One thread per environment, zero CPU-GPU copies.
+- `ocean/mcenv/cuda/mcenv_cuda.cuh` — Shared structs (McEnvState, McEnvConfig, McEnvLog), constants, phase functions, RNG, lookup tables. Included by both .cu and indirectly by binding.c.
+- `ocean/mcenv/cuda/mcenv_env.cuh` — CUDA reset + observation computation.
+- `ocean/mcenv/binding.c` — PufferLib binding. Defines OBS_SIZE, NUM_ATNS, ACT_SIZES. Implements GPU-native hooks and CPU eval hooks. Reads config from ini via Dict.
+- `config/mcenv.ini` — All configurable params: rewards, training hparams, sweep config.
+
+**Compile-time action space flags** (must match in both `binding.c` line 1 AND `mcenv_cuda.cuh` line 4):
+- `MC_BC_ACTIONS` — 9 heads {3,3,2,2,2,7,7,3,5}: 7 yaw/pitch deltas + rot_pct multiplier + 3-way place. **Currently the best layout.**
+- `MC_FULL_ANGLE` — 8 heads {3,3,2,2,2,153,107,3}: fine-grained angle tables, no rot_pct. Worse at 200M (3.99 vs 4.95).
+- Neither — 8 heads {3,3,2,2,2,11,7,3}: 11 yaw deltas, 7 pitch, no rot_pct. Worse (4.39).
+
+**Curriculum phases:**
+- Phase 0: block reward only (block_weight=1.0, target_weight=0). Agent learns to place blocks.
+- Phase 1: block + target + speed (block_weight=1.0, target_weight=1.0). Activated when lifetime_blocks >= phase_transition (30). Agent learns navigation.
+- Phase 2: target + speed only (block_weight=0.0). Activated via EMA ratchet when lifetime_blocks >= 5*phase_transition AND avg_targets_ema > 2.0. Agent uses blocks instrumentally.
+- Phase 3: same as phase 2 (speed_weight code exists but currently =1.0). Activated when avg_targets_ema > 4.0.
+
+**Observations (163 total):**
+- 14 player state: pos_xyz (relative, normalized), frac_xyz (sub-block position 0-1), vel_xyz, sin/cos(yaw), sin/cos(pitch), on_ground
+- 2 target: relative target_x, target_z (normalized by 50)
+- 147 block grid: 7x3x7 symmetric (±3 in x and z, 3 y levels below player), binary solid/air
+
+**Reward components (current best config):**
+- rw_block (15.6): per block placed at y=2, not at start position. Scaled by block_weight per phase.
+- rw_speed (4.6): delta_dist^speed_power * target_weight. Linear (speed_power=1.0). Gated on on_ground when require_ground=1.
+- rw_target_reach (79.5): escalate * time_bonus * target_weight. escalate = 1 + 0.5*targets_reached. time_bonus = 1 + remaining_ticks/max_ticks.
+- rw_fall (-151.8): on void death. Scaled by fall_scale_phase1 in phase 1+ (currently 1.0 = full penalty).
+- Sprint-jump, facing, air bonus, yaw reversal, survival: all disabled (set to 0 or removed from code).
+
+### How to Reproduce a Wandb Run
+
+**Critical:** When reproducing a sweep run, you must check ALL parameters, not just rewards. The sweep varies many params beyond what's in the `[sweep.*]` ini sections, including:
+- `train.minibatch_size` (default 16384 but sweep found 4096 optimal)
+- `vec.total_agents` (default 2048 but sweep uses 1024)
+- `policy.num_layers` (default 4 but sweep found 3 better)
+- `train.gae_lambda` (default 0.95 but sweep found 0.2 optimal)
+- `train.beta1`, `train.beta2`, `train.clip_coef`, `train.vf_coef`, `train.vf_clip_coef`
+- `train.replay_ratio`, `train.prio_alpha`, `train.prio_beta0`
+- `train.vtrace_c_clip`, `train.vtrace_rho_clip`
+
+**To get the full config:**
+```bash
+cat wandb/run-*RUNID*/files/config.yaml
+```
+
+**LR annealing gotcha:** `total_timesteps` controls both training duration AND LR annealing schedule (LR decays linearly to 0 at total_timesteps). Using a different total_timesteps than the original run will produce different LR trajectories and may diverge.
+
+**num_layers gotcha:** Python `int()` truncates, so `num_layers=3.1` becomes 3, and `num_layers=1.9` becomes 1, NOT 2.
+
+### Eval
+
+```bash
+# Auto-detects policy config from wandb or policy_config.json
+uv run puffer eval mcenv --load-model-path checkpoints/mcenv/RUNID
+
+# If auto-detect fails, override manually
+uv run puffer eval mcenv --load-model-path checkpoints/mcenv/RUNID --policy.num-layers 3 --policy.hidden-size 256
+```
+
+Passing a directory picks the latest .bin checkpoint automatically. The eval code looks up the wandb run config by matching the directory name (= wandb run ID) against `wandb/run-*-RUNID/files/config.yaml`.
+
+New checkpoints also save `policy_config.json` alongside the .bin files for standalone eval without wandb.
+
+### Running Training
+
+```bash
+# Basic
+uv run puffer train mcenv --wandb --wandb-name my-run --train.total-timesteps 200000000
+
+# Full sweep-found config
+uv run puffer train mcenv --wandb --wandb-name name \
+  --env.rw-block 15.636 --env.rw-speed 4.591 --env.rw-fall -151.794 --env.rw-target-reach 79.548 \
+  --train.gamma 0.98 --train.learning-rate 0.006160 --train.ent-coef 0.02536 \
+  --train.gae-lambda 0.2 --train.minibatch-size 4096 \
+  --train.beta1 0.877 --train.beta2 0.9998 \
+  --train.clip-coef 0.42 --train.vf-coef 1.712 --train.vf-clip-coef 0.01 \
+  --train.replay-ratio 2.22 --train.prio-alpha 0.511 --train.prio-beta0 0.202 \
+  --train.vtrace-c-clip 4.199 --train.vtrace-rho-clip 2.692 \
+  --vec.total-agents 1024 --policy.num-layers 3 \
+  --train.total-timesteps 68000000
+```
+
+GPU memory: each training process uses ~2GB VRAM. Two processes can usually run in parallel on a 24GB GPU, but sometimes OOM if other GPU processes are running. Three processes will OOM.
+
+### Running Sweeps
+
+```bash
+uv run puffer sweep mcenv --wandb --train.total-timesteps 200000000
+```
+
+Sweep config is in `[sweep]` and `[sweep.*]` sections of the ini. The sweep uses Protein (Bayesian optimization with GP surrogate + expected improvement). It will run up to `max_runs` experiments, then exit. There is no built-in resume — restarting is a cold start.
+
+The sweep varies ALL params that have `[sweep.*]` sections, plus PufferLib's built-in default sweepable params (hidden_size, num_layers, minibatch_size, total_agents, gae_lambda, beta1/2, etc.). This means sweep runs may have different model sizes than your ini defaults.
+
+### Behavioral Cloning Pipeline
+
+For warmstarting RL with demonstration data. See CLAUDE.md for full instructions. Key files:
+- `~/dev/mcenv-codex/` — Rust physics engine with recording infrastructure
+- `tools/bc_train.py` — BC trainer (must update constants to match current action/obs layout)
+
+### What's Committed
+
+All changes from this session are committed and pushed to `fork` remote (github.com/crthpl/PufferLib, branch 4.0). The code is in a clean state with MC_BC_ACTIONS enabled as the best action space.
